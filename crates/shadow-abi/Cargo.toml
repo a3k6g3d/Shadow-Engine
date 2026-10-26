@@ -1,0 +1,8 @@
+[package]
+name = "shadow-abi"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "The Rust mirror of the C ABI seam. No bindgen, no cxx, no generated code in the build."
+
+[dependencies]

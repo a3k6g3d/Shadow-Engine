@@ -1,0 +1,31 @@
+Shadow
+Copyright (c) 2026 Andre. SPDX-License-Identifier: MIT
+
+Shadow is based on the Strata project (Copyright (c) 2026 Niko1221 and the Strata
+contributors), which is MIT licensed. The full MIT text is in LICENSE and it carries
+both notices, because the upstream one has to be kept in every copy and substantial
+portion of the work.
+
+What is carried across from Strata, and what is not:
+
+  docs/BENCH_NOISE.md     written on the Strata checkout 2026-10-xx, ours. The measurement floor
+                          Shadow holds itself to: 10.1% median, 27.0% p90, 51.9% worst.
+  docs/SPEED_BRANCH.md    ours (Andre and a3k6g). Every number in it was measured on Strata
+                          hardware and is quoted as measured there, not re-claimed here.
+  docs/RUST_HOST.md       ours. The decision about where the seam goes.
+  docs/RUST_ENGINE.md     ours. The order the hybrid work was walked in (M1-M8).
+  docs/RUST_ENGINE_NEXT.md ours. What was left of that.
+  docs/SHADOW_PLAN.md     ours. The plan for this project, written 2026-10-25.
+  include/shadow/c/abi.h  ours, hand-written. Copied verbatim from Strata's
+                          include/strata/c/abi.h, prefix and all, and the prefix stays
+                          `strata_` on purpose: the seam is not to be redesigned, and the
+                          drift test on both sides parses this file by that name.
+  tools/shadow_harness.py ours (was tools/pi_harness.py on the Strata checkout).
+
+No source code from Strata itself has been copied into this project. Strata's engine is
+C++/CUDA/HIP and 1% of it is ours; nothing of it is here. What is here is the plan, the
+measurements, the seam's contract and the harness - all of which were written by us on a
+Strata checkout, and all of which are MIT for the same reason Strata is.
+
+The model this is built to run - Qwen3.8-Flash-Next, abliterated, IQ3_S - is not part of
+this repository and is not covered by this license.
