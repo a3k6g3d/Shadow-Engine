@@ -84,7 +84,7 @@ impl Ring {
 }
 
 /// STRATA_HOST_IORING=1 asks for the I/O ring; it is taken only where this Windows has one, else the completion port.
-fn want_ioring() -> bool {
+pub(crate) fn want_ioring() -> bool {
     #[cfg(windows)]
     {
         std::env::var("STRATA_HOST_IORING").is_ok_and(|v| v == "1") && crate::ioring::RingFile::available()

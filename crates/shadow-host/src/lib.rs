@@ -23,6 +23,7 @@ pub mod ffi;
 pub mod transient;
 pub mod window;
 pub mod protocol;
+pub mod scheduler;
 #[cfg(windows)]
 pub mod ioring;
 
@@ -56,6 +57,19 @@ pub struct Buffer {
     huge: bool,
 }
 
+/// A buffer can move between threads, for the same reason `Box<[u8]>` can: it is the only handle to its
+/// allocation, and every safe way to touch that allocation goes through `&self` or `&mut self`, so the borrow
+/// checker already stops two threads touching it at once.  And what it does on drop - `VirtualFree` - is one of
+/// the Win32 calls that may run on any thread, so the drop is safe wherever the buffer lands.
+///
+/// The argument is about ownership, not about how the ring happens to be used: it holds on whatever thread the
+/// scheduler lands a buffer on, and it would hold if a future version moved rings between threads.
+///
+/// `Sync` is deliberately *not* asserted - nothing asks for it, and it is a stronger claim: sharing a `&Buffer`
+/// across threads would let two of them read the same memory through `as_slice`, which the argument above does
+/// not cover.
+unsafe impl Send for Buffer {}
+
 impl Buffer {
     /// Memory the caller owns, held by the ring for exactly as long as a read is in flight.  This is the shape
     /// the C exports need: the engine passes a pointer it allocated, and gets it back inside a completion.
@@ -64,7 +78,8 @@ impl Buffer {
     /// `base` must point to `len` writable bytes that stay valid, and that nobody else reads or writes, until the
     /// completion carrying this buffer has been reaped or the ring has been dropped.  Across the C ABI that is the
     /// header's rule for `strata_host_file_submit`; here it is the caller's promise, because Rust cannot check
-    /// memory it did not allocate.
+    /// memory it did not allocate.  The lender also accepts that the buffer may be dropped, or handed back, on a
+    /// different thread from the one that lent it.
     pub unsafe fn borrowed(base: *mut u8, len: usize) -> Buffer {
         Buffer { base, len, owned: false, huge: false }
     }
@@ -229,6 +244,20 @@ impl Waker {
         }
     }
 }
+
+/// The thread-crossing rules, pinned at compile time (the same job the `compile_fail` doctests do for the
+/// lifetime rules).  These are the types the scheduler hands between threads, so if one stops being what the
+/// scheduler needs, the build should fail here and say so, not three files away in a `tokio::spawn` body.
+///
+/// `Waker` is `Send + Sync` because it is only ever a handle stored as a `usize`, and posting to a completion
+/// port - or setting an event - is thread-safe by construction.  `Buffer` is `Send` for the ownership reason
+/// stated at its `unsafe impl` above, and `Completion` follows it automatically, being `Buffer` plus three
+/// plain values.  `Buffer` is *not* asserted `Sync`, and the reason is in that comment.
+const fn assert_send<T: Send>() {}
+const fn assert_send_sync<T: Send + Sync>() {}
+const _: () = assert_send::<Buffer>();
+const _: () = assert_send::<Completion>();
+const _: () = assert_send_sync::<Waker>();
 
 /// A submitted read whose completion has not been reaped yet.
 struct Pending {

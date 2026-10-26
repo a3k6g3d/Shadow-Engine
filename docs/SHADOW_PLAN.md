@@ -91,6 +91,16 @@ What goes Rust first, in this order, because each item is independently shippabl
    core. This is where the lifetime rules the hybrid work pinned with `compile_fail` doctests actually pay:
    *"a reference into a slot cannot live across a layer advance"*, and a lease kept past its window is refused with
    `BadSlot`.
+
+   **Built (the scheduler half; `crates/shadow-host/src/scheduler.rs`), and one word of the plan did not survive
+   contact with the type:** not `spawn_blocking`, **one dedicated OS thread per drive**. A blocking-pool thread is
+   not a thread, it is whichever thread the pool happens to lend, so it cannot hold a per-drive ring — the ring is
+   `!Send` and a `!Send` type cannot be *moved* onto a thread, only built on one. So the ring is built on its own
+   thread and stays there, and what crosses is only the handle (a channel sender and a wake) plus the request
+   message, both of which the compile-time pins in `lib.rs` already say are `Send`/`Sync`.  Cost, said plainly: two
+   allocations per request (the channel's node, the oneshot's cell) and a map lookup per completion, all of it on
+   the way *to* the ring's hot path, which is untouched.  `spawn_blocking` would have cost the same and been a
+   smaller lie about the plan; the thread is here because the type forces it, not because it is nicer.
 2. **The placement policy** — which 15 layers get RAM, which experts get touched twice per token, which are dead.
    A policy is pure and testable; a policy in C++ is a policy you can't change at runtime.
 3. **The router's bookkeeping** — the counters, the hysteresis, the eviction. Not the score itself: that's a kernel.
