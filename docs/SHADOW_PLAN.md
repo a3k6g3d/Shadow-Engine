@@ -144,7 +144,10 @@ the calls Rust exports) — and the skip path run too, on the same tree with `ST
 tests say so out loud and pass. Then both arms for real, `STRATA_FACADE_DIR` pointed at each in turn: the CUDA arm and
 the CPU arm, each loading **its own** `strata_facade.dll` by absolute path (the test prints which one it loaded, which
 is how this is known and not assumed), and the vertical slice — one expert off a file through the Rust ring — crossing
-the seam on both. The full workspace suite is green on both arms: 93 tests, 0 failed, 0 ignored.
+the seam on both. The full workspace suite is green on both arms: **83** tests, 0 failed, 0 ignored — 73 from the two
+seam crates plus 10 from `shadow-eval`; the 93 this paragraph first said had counted `shadow-eval` twice, and the
+recount is 83 on both arms. One run of the full workspace suite exited 1 with every test printing `ok`; it did not
+reproduce in the 13 runs after it, so it is recorded as a one-off and not explained.
 
 ### Phase 2 — the things that can actually make it faster
 These are the levers with a measured number behind them, in the order they measured, from `SPEED_BRANCH.md`:
