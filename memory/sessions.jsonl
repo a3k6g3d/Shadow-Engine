@@ -1,0 +1,4 @@
+﻿{"task": "why is the C symbol prefix still strata_ and not shadow_", "answer": "The prefix stays strata_ on purpose: the ABI symbols are the contract with the already-built facade DLL, renaming them would break the link.", "turns": 4}
+{"task": "how many tests pass in the cargo workspace", "answer": "47 passed, 0 failed: 41 real tests plus 6 designed skips because no built facade DLL exists.", "turns": 3}
+{"task": "should the harness depend on numpy", "answer": "No. The harness stays stdlib-only; embedding is done by a subprocess to a small GGUF embedder, not by a python library.", "turns": 6}
+{"task": "what happened to the RTX 4060 slot", "answer": "It went to Qwen3-8B on llama.cpp port 8080; the 32GB card kept the big models.", "turns": 2}
