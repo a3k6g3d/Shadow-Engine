@@ -29,13 +29,13 @@ That rule is not a formality and it has killed more ideas than any reviewer.
 
 ## Layout
 
-    crates/          the Rust side
+    crates/          the Rust side, including shadow-eval, the yardstick
     include/shadow/  the seam's contract (C ABI, hand-written)
     docs/            the plan, and the measurements it is built on
-    tools/           the harness, shadow_memory.py, and the eval
+    tools/           the harness and shadow_memory.py, both Python for now
     bin/ models/     the embedder the memory tool drives
     memory/          the store — committed, so it travels with the repo
-    eval/            the frozen yardstick: cases.jsonl, prompts/, answers/
+    eval/            the frozen yardstick: cases.jsonl, baseline.jsonl, prompts/, answers/
 
 `tools/shadow_memory.py` is stdlib-only: `add`, `index`, `search`, `stats`. Embedding is not done in Python —
 the tool shells out to `bin/llama-embedding.exe` with `models/bge-small-en-v1.5-q8_0.gguf` (384 dims). Search
@@ -48,15 +48,19 @@ is cosine over the whole store, no ANN, since the store is a few thousand record
 a ruler the measured thing is allowed to move stops being a ruler. Grading is substring matching, not an LLM
 judge, because a judge inside the loop is slow and gets gameable the moment the loop learns what it likes.
 
-Two arms, split on purpose:
+The tool is `crates/shadow-eval` — Rust, because the project is Rust. Two arms, split on purpose:
 
-- **`shadow_eval.py rank`** — retrieval only. It touches no model, so it is deterministic and it can be run from
-  inside the session being improved. Baseline 2026-10-26, 16 records: **12/14 top-1, MRR 0.911**.
-- **`shadow_eval_run.py`** — the answer arm. It needs a live model, and it spawns a **fresh** harness session per
-  case (one call, no tools, no skills) so the answer comes from the retrieved notes alone. Baseline, same day:
-  **14/14**. Two of the fourteen cases are answered correctly *despite* the retriever ranking them 2nd and 4th —
-  the answer arm passes where the rank arm does not, which is the honest reason to keep both arms and not just the
-  convenient one.
+- **`cargo run -p shadow-eval -- rank`** — retrieval only. It touches no model, so it is deterministic and it can be
+  run from inside the session being improved. Baseline 2026-10-26, 16 records: **12/14 top-1, MRR 0.911**, recorded
+  in `eval/baseline.jsonl`; `verify` re-ranks and fails loudly if it has moved.
+- **`cargo run -p shadow-eval -- run`** — the answer arm. It needs a live model, and it spawns a **fresh** harness
+  session per case (one call, no tools, no skills) so the answer comes from the retrieved notes alone. Baseline, same
+  day: **14/14**, graded with `answers`. Two of the fourteen are answered correctly *despite* the retriever ranking
+  them 2nd and 4th — the answer arm passes where the rank arm does not, which is the honest reason to keep both arms
+  and not just the convenient one.
+
+The rank arm reproduces exactly; the answer arm does not, because it is a live model — re-running it reproduces the
+verdict, not the wording. That is the whole reason the deterministic arm is the one with a recorded baseline.
 
 The loop this enables is one edit at a time — a skill file, a prompt, an index parameter — re-scored, kept only if
 it beats baseline by more than the noise floor in [BENCH_NOISE.md](docs/BENCH_NOISE.md), and reverted otherwise.

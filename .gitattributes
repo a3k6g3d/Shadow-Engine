@@ -1,0 +1,6 @@
+# Data files the tools write.  core.autocrlf is on for this machine, which means every
+# regeneration of the yardstick came back as a whole-file diff on line endings alone.
+# Pin them so a diff means the content moved, not the platform.
+eval/** text eol=lf
+memory/*.jsonl text eol=lf
+crates/**/tests/**/*.jsonl text eol=lf

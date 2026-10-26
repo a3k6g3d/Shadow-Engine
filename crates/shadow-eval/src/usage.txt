@@ -1,0 +1,19 @@
+shadow-eval - the frozen yardstick: does the memory actually answer the question it is asked
+
+    shadow-eval rank              # retrieval only, no model, runs anywhere
+    shadow-eval prompts           # write eval/prompts/<id>.txt for the answer arm
+    shadow-eval answers [dir]     # grade the answers an external session wrote
+    shadow-eval full              # rank + prompts, in one go
+    shadow-eval verify            # rank, and fail loudly if it moved off eval/baseline.jsonl
+    shadow-eval run [ids...]      # the answer arm: one fresh session per case
+
+Two arms, deliberately split.  The retrieval arm touches no model session at all - it is the same embedder
+subprocess the memory tool uses, so it is deterministic and it can be run from inside the session that is being
+improved.  The answer arm cannot: it needs a live session, and the session doing the asking must not be the
+session being judged, or the loop is grading its own homework.
+
+Grading is substring matching, not an LLM judge, on purpose: a judge inside the loop is slow, costs tokens, and
+gets gameable the moment the loop learns what the judge likes.
+
+eval/cases.jsonl and eval/baseline.jsonl are frozen.  The loop may edit skills, prompts and index parameters; it
+may not edit those two, because a yardstick the measured thing is allowed to move is not a yardstick.

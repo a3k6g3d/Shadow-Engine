@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/shadow-abi", "crates/shadow-host"]
+members = ["crates/shadow-abi", "crates/shadow-host", "crates/shadow-eval"]
 
 [workspace.package]
 version = "0.1.0"
