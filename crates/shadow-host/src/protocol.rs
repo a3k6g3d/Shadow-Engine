@@ -63,11 +63,7 @@ impl Checker {
                 self.requests += 1;
                 let refused = if !self.ready {
                     Some(format!("{w} before READY"))
-                } else if let Some(o) = self.open {
-                    Some(format!("{w} while a request is still open ({o:?})"))
-                } else {
-                    None
-                };
+                } else { self.open.map(|o| format!("{w} while a request is still open ({o:?})")) };
                 self.open = Some(if w.starts_with('B') { Open::Admit(num(rest.first()).unwrap_or(-1)) } else { Open::Solo });
                 match refused {
                     Some(r) => self.bad(r),

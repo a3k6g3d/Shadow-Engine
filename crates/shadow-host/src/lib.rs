@@ -176,7 +176,7 @@ impl Buffer {
     }
 
     pub fn is_aligned(&self) -> bool {
-        self.base as usize % SECTOR as usize == 0
+        (self.base as usize).is_multiple_of(SECTOR as usize)
     }
 }
 
@@ -491,7 +491,7 @@ impl DirectFile {
             let ovs: Box<[win::Overlapped]> = (0..capacity)
                 .map(|_| win::Overlapped { internal: 0, internal_high: 0, anon: [0], event: std::ptr::null_mut() })
                 .collect();
-            return Ok(DirectFile {
+            Ok(DirectFile {
                 file,
                 port,
                 capacity,
@@ -506,7 +506,7 @@ impl DirectFile {
                     1 => None,
                     n => Some(Issuers::start(n, file as usize, port as usize)),
                 },
-            });
+            })
         }
         #[cfg(not(windows))]
         {
@@ -533,10 +533,10 @@ impl DirectFile {
     pub fn alloc(&self, len: usize) -> Option<Buffer> {
         #[cfg(windows)]
         {
-            if len == 0 || len as u64 % SECTOR != 0 || len > self.capacity as usize * BLOB_WINDOW as usize {
+            if len == 0 || !(len as u64).is_multiple_of(SECTOR) || len > self.capacity * BLOB_WINDOW as usize {
                 return None;
             }
-            return Buffer::aligned(len);
+            Buffer::aligned(len)
         }
         #[cfg(not(windows))]
         {
@@ -559,7 +559,7 @@ impl DirectFile {
         {
             // The contract of direct access, checked rather than assumed: a violation is an error here, not a
             // silent short read or a ERROR_INVALID_PARAMETER from the kernel much later.
-            if offset % SECTOR != 0 || buffer.len as u64 % SECTOR != 0 || !buffer.is_aligned() {
+            if !offset.is_multiple_of(SECTOR) || !(buffer.len as u64).is_multiple_of(SECTOR) || !buffer.is_aligned() {
                 return Err((Status::BufferTooShort, buffer));
             }
             let Some(i) = self.free.pop() else {
@@ -598,7 +598,7 @@ impl DirectFile {
             // port without FILE_SKIP_COMPLETION_PORT_ON_SUCCESS, so the port still gets its packet, and that packet
             // is what reaps it.  Reaping it here instead used to free the OVERLAPPED while its packet was still
             // queued - and a later read whose Box landed at the same address would have been completed by it.
-            return Ok(());
+            Ok(())
         }
         #[cfg(not(windows))]
         {
@@ -678,7 +678,7 @@ impl DirectFile {
             // that is not in our array, or names a slot with nothing in flight, is not ours to answer for.
             let off = (e.overlapped as usize).wrapping_sub(base);
             let i = off / size;
-            if off % size != 0 || i >= self.capacity {
+            if !off.is_multiple_of(size) || i >= self.capacity {
                 continue;
             }
             let Some(p) = self.slots[i].take() else { continue };

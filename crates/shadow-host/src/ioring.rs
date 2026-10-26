@@ -230,7 +230,7 @@ impl RingFile {
 
     /// Queue one read; the buffer is the ring's until its completion.  A refusal hands it back.
     pub fn submit(&mut self, offset: u64, buffer: Buffer, tag: u64) -> Result<(), (Status, Buffer)> {
-        if offset % SECTOR != 0 || buffer.len() as u64 % SECTOR != 0 || !buffer.is_aligned() {
+        if !offset.is_multiple_of(SECTOR) || !(buffer.len() as u64).is_multiple_of(SECTOR) || !buffer.is_aligned() {
             return Err((Status::BufferTooShort, buffer));
         }
         let Some(i) = self.free.pop() else { return Err((Status::WouldBlock, buffer)) };

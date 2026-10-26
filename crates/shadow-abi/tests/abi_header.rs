@@ -17,7 +17,7 @@ fn define_value(src: &str, name: &str) -> u32 {
     for line in src.lines() {
         let line = line.trim();
         if let Some(rest) = line.strip_prefix(&format!("#define {name}")) {
-            if let Some(v) = rest.trim().split_whitespace().next() {
+            if let Some(v) = rest.split_whitespace().next() {
                 if let Ok(n) = v.parse::<u32>() {
                     return n;
                 }

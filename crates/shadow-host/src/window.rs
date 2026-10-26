@@ -233,7 +233,8 @@ mod tests {
         let exact = |t: u32, l: u32| (1..=4).filter(|j| l + j < LAYERS).map(|j| (l + j, route(t, l + j))).collect::<Vec<_>>();
         let wrong = |t: u32, l: u32| (1..=4).filter(|j| l + j < LAYERS).map(|j| (l + j, route(t + 7777, l + j))).collect::<Vec<_>>();
         let thrash = |_: u32, l: u32| (1..=4).filter(|j| l + j < LAYERS).map(|j| (l + j, (0..EXPERTS).collect())).collect::<Vec<_>>();
-        let preds: [(&str, &dyn Fn(u32, u32) -> Vec<(u32, Vec<u32>)>); 4] =
+        type Pred = dyn Fn(u32, u32) -> Vec<(u32, Vec<u32>)>;
+        let preds: [(&str, &Pred); 4] =
             [("none", &none), ("exact", &exact), ("wrong", &wrong), ("thrash", &thrash)];
 
         let mut reference = None;

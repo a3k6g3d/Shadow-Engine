@@ -195,7 +195,7 @@ fn reads_go_through_the_dll_into_memory_the_caller_owns() {
     // Two reads in flight at once: the first page whole, and the last page, which runs into the end of the file
     // and must come back as a legal short read (100 bytes, Ok) - the C++ reader's STATUS_END_OF_FILE rule.
     let buf = unsafe { (h.alloc)(2 * 4096) };
-    assert!(!buf.is_null() && buf as usize % 4096 == 0, "alloc_aligned gave {buf:p}");
+    assert!(!buf.is_null() && (buf as usize).is_multiple_of(4096), "alloc_aligned gave {buf:p}");
     assert_eq!(unsafe { (h.submit)(file, 0, buf, 4096, 10) }, Status::Ok as i32);
     assert_eq!(unsafe { (h.submit)(file, 8192, buf.add(4096), 4096, 11) }, Status::Ok as i32);
 

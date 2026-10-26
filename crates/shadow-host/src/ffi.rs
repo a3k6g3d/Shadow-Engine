@@ -188,7 +188,7 @@ pub unsafe extern "C" fn strata_host_file_submit(file: *mut HostFile, offset: u6
         if file.is_null() || buffer.is_null() || len == 0 {
             return Err((Status::BufferTooShort, "null file or buffer, or zero length".into()));
         }
-        if len as u64 % SECTOR != 0 || offset % SECTOR != 0 || buffer as usize % SECTOR as usize != 0 {
+        if !(len as u64).is_multiple_of(SECTOR) || !offset.is_multiple_of(SECTOR) || !(buffer as usize).is_multiple_of(SECTOR as usize) {
             return Err((Status::BufferTooShort, "unaligned request".into()));
         }
         let ring = &mut *(*file).ring.get();

@@ -84,7 +84,7 @@ impl TransientRing {
         let free = self
             .slots
             .iter()
-            .position(|s| s.epoch.map_or(true, |e| e + keep < epoch))
+            .position(|s| s.epoch.is_none_or(|e| e + keep < epoch))
             .ok_or(Status::WouldBlock)?;
         let s = &mut self.slots[free];
         if len > s.buffer.len() {

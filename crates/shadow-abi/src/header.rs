@@ -83,7 +83,7 @@ pub fn prototypes(src: &str, macro_name: &str) -> Vec<Prototype> {
         let ret = ret.replace(" * *", " **");
         let params: Vec<String> = decl[open + 1..close]
             .split(',')
-            .map(|p| squash(p))
+            .map(squash)
             .filter(|p| !p.is_empty() && p != "void")
             .collect();
         out.push(Prototype { ret, name, params });
