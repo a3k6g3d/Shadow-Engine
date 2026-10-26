@@ -106,7 +106,45 @@ What goes Rust first, in this order, because each item is independently shippabl
 3. **The router's bookkeeping** — the counters, the hysteresis, the eviction. Not the score itself: that's a kernel.
 4. **The API surface** — the OpenAI-compatible HTTP layer, the session state, the harness loop.
 
+   **Decided (2026-10-26), because this is the first item that needs a network stack and the workspace has been
+   dependency-free on purpose:** take **hyper** (axum if it wants a router, hyper if not) and **serde_json**, and
+   *declare* them in `Cargo.toml` with the reason, the way the tokio line does. A hand-rolled HTTP/1.1 parser is the
+   wrong place to save dependencies — `shadow-eval` hand-rolls its JSON because a yardstick must not break on an
+   unrelated `cargo update`, which is not an argument about a server that has to speak SSE to a browser.
+   Scope, and it is deliberately small: **streaming `/v1/chat/completions` on a separate port**, nothing else.
+   **Gate:** it matches the Python server's output at temperature 0, and `tools/strata_bench.py` runs against it
+   unchanged. **MCP, Discord, vision and the conversation store stay in Python.**
+
+   **The route list, checked against the tool rather than guessed (2026-10-26).**  Pointing the bench at this server
+   means `--url`, and the tool asks six paths, which are *not* all equal — the difference is what happens to the run
+   when one answers nothing:
+
+   * `POST /v1/chat/completions` — the measurement itself.
+   * `GET /health` — **hard**, and the plan used to leave it out.  `is_strata()` (line 725) is the only one of the six
+     whose failure ends the run: under `--url` a server it does not recognise is `return 2`, "No Strata server answers
+     at …", before a single token is generated.  And it is not a status code, it is a *field* — `h.get("service") ==
+     "strata"`.  A Rust server that answers `/health` with `{}` fails the gate exactly as hard as one that 404s it.
+   * `GET /v1/status`, `/metrics`, `/props`, `/v1/models` — **tolerated**, and the plan used to list two of these as
+     needed.  Each is read as `try_json(...) or {}` inside `collect_machine`, so a missing one blanks a row of the
+     machine block and the run finishes.  They are the report, not the gate: `/metrics` alone feeds eight fields
+     (`hardware_static`, `engine`, `totals`, `requests_kept`, `requests`, …), so answering them is what makes the
+     Rust number comparable with a Strata row in the same table — but the bench does not *require* them.
+
+   So the honest cut is two routes that must work and four that should.  The shape of `/health`'s answer is the part
+   that cannot be inferred from the status code, so it is written here — the Python server's answer, verbatim
+   (`server.py:5578`): `{"status": "ok", "max_context": …, "model": …, "images": …, "api_key": …, "loaded": …,
+   "service": "strata"}`.  Only `service` is read by the bench, but that is the field the gate turns on, so copy the
+   whole answer from there rather than inventing a field.
+
 **Gate:** the seam's drift test green both directions on the merged tree, both arms, and the skip path run too.
+
+**Ran (2026-10-26, the merged tree at `c73018c`): all three clauses, and the arms ran as arms.** Both directions
+green — `shadow-abi`'s side (the header read as text, against the Rust mirror) and `shadow-host`'s side (`host_exports`,
+the calls Rust exports) — and the skip path run too, on the same tree with `STRATA_FACADE_DIR` unset, where both seam
+tests say so out loud and pass. Then both arms for real, `STRATA_FACADE_DIR` pointed at each in turn: the CUDA arm and
+the CPU arm, each loading **its own** `strata_facade.dll` by absolute path (the test prints which one it loaded, which
+is how this is known and not assumed), and the vertical slice — one expert off a file through the Rust ring — crossing
+the seam on both. The full workspace suite is green on both arms: 93 tests, 0 failed, 0 ignored.
 
 ### Phase 2 — the things that can actually make it faster
 These are the levers with a measured number behind them, in the order they measured, from `SPEED_BRANCH.md`:
