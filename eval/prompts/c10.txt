@@ -1,0 +1,14 @@
+Answer from the notes below alone. If they do not answer it, say so.
+
+Question: can I run the phase 0 bench from inside this session
+
+Notes:
+- (0.80) Phase 0 cannot be run from inside the session: strata.json is the harness's own config, so benching it restarts the assistant. It runs externally, >=8 interleaved runs per arm.
+- (0.66) I am running on the model the plan is about: strata.json points at the swift15 IQ3_S pair with --resident-budget-gib 36, and its MCP servers are the tools answering right now. So the live tier is 36 GiB, not the plan's stale 11.25 - and at 1.032 GiB per J-layer the full 36-layer J chain is 37.14 GiB, just over budget: it needs 40 GiB, which the plan's own Phase 2 table already benched at 13.2 tok/s against 10.7 at 36.
+
+Also: Phase 0 cannot be run from inside this session. Running the existing engine cold/warm/pinned restarts the host, which takes this process with it. It has to be run by the user, or from a separate process.
+- (0.62) the harness must stay stdlib-only, so vector work happens in a subprocess
+- (0.62) The self-improvement loop may edit skills, prompts and index parameters. eval/cases.jsonl is frozen and the loop is not allowed to edit it.
+- (0.62) BENCH_NOISE floor: 10.1% median, 27.0% p90, 51.9% worst. A change must clear it on >=8 interleaved runs, decode_warm, paired turn by turn, or it is a tie.
+
+Answer in one or two sentences.

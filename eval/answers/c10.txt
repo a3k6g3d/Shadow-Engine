@@ -1,0 +1,1 @@
+No — Phase 0 can't be run from inside this session: it benches `strata.json`, which is the harness's own config (and the existing engine), so running it restarts the assistant/host and takes this process with it. It has to be run externally — by you, or from a separate process — with ≥8 interleaved runs per arm to clear the BENCH_NOISE floor.

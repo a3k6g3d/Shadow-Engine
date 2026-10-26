@@ -1,0 +1,1 @@
+26.82 GiB — though the notes stress it isn't actually inside any layer (it's 35% of the model), while the measured per-layer tensors are 1.032 GiB (J) and 1.086 GiB (K).

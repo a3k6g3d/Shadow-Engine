@@ -1,0 +1,1 @@
+The prefix stays `strata_` on purpose: those ABI symbols are the contract with the already-built facade DLL, so renaming them to `shadow_` would break the link.

@@ -1,0 +1,1 @@
+No. The harness must stay stdlib-only, so the memory tool cannot import a Python library for embeddings — the vector/embedding work is done by a subprocess calling a small GGUF embedder.

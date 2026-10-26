@@ -1,0 +1,1 @@
+47 tests pass (0 failed), and yes — all 47 are real. The earlier record claiming 41 real tests plus 6 designed skips (because no built facade DLL exists) was wrong: a built facade DLL does exist, so the six designed skips did not fire and the vertical slice actually ran.

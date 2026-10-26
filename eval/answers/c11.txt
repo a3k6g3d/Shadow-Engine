@@ -1,0 +1,1 @@
+No — the notes explicitly say not to requant: the IQ3_S recipe came from a 40-candidate sweep, and the smaller Q3_K_S only benches 10.7 tok/s versus 13.2 tok/s for the 37.14 GiB J chain that fits in the 40 GiB budget (it doesn't fit the 36 GiB live budget from strata.json).

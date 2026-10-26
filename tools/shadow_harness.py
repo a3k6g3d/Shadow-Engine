@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""tools/pi_harness.py - a small command-line agent for Strata: six tools, one short prompt, no approval popups.
+"""tools/shadow_harness.py - a small command-line agent for Strata: six tools, one short prompt, no approval popups.
 
-    python tools/pi_harness.py "find where the MCP result cap is set and tell me what it is"
-    python tools/pi_harness.py                      # a chat that keeps its history
-    python tools/pi_harness.py --skills tools/skills "add a probe for the sprite sheet"
+    python tools/shadow_harness.py "find where the MCP result cap is set and tell me what it is"
+    python tools/shadow_harness.py                      # a chat that keeps its history
+    python tools/shadow_harness.py --skills tools/skills "add a probe for the sprite sheet"
 
 Shaped like Pi (the small MIT harness this borrows the idea from) and not like the web app: the tools run in this
 process, so there is no MCP server to start and no round-trip per call; the prompt is short and does not change from

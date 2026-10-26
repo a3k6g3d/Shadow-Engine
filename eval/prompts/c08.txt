@@ -1,0 +1,12 @@
+Answer from the notes below alone. If they do not answer it, say so.
+
+Question: what noise floor does a speed claim have to clear
+
+Notes:
+- (0.78) BENCH_NOISE floor: 10.1% median, 27.0% p90, 51.9% worst. A change must clear it on >=8 interleaved runs, decode_warm, paired turn by turn, or it is a tie.
+- (0.61) Correction: all 47 tests are real - 47 passed, 0 failed, and the vertical slice ran against a built facade, so the six designed skips did not fire. The earlier record saying no built facade DLL exists was wrong.
+- (0.61) The live resident budget is 36 GiB from strata.json. The whole 36-layer J chain is 37.14 GiB so it does not fit in 36; it fits in 40, which benches 13.2 tok/s against 10.7.
+- (0.60) Phase 0 cannot be run from inside the session: strata.json is the harness's own config, so benching it restarts the assistant. It runs externally, >=8 interleaved runs per arm.
+- (0.59) docs/SHADOW_PLAN.md's metadata table was measured on a file that is not on this PC (the 20.06 GiB / 40-shard swift15 IQ3_S). The files actually on disk are the swift15 and sc117 IQ3_S pairs, 78 GB each: qwen4exp, 48 blocks (36 recurrent J + 12 full-attention K, interval 4), 24 heads / 2 KV heads, hidden 2560, 512 experts at 640, vocab 248320, ctx 262144, ChatML with a system role. Measured per layer: 1.032 GiB (J) / 1.086 GiB (K). The placement answer at an 11.25 GiB RAM tier is about 10 of 48 layers, not 15 of 84.
+
+Answer in one or two sentences.

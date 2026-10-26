@@ -1,0 +1,14 @@
+{"id": "c01", "ask": "why is the C symbol prefix still strata_ and not shadow_", "gold_sub": "The prefix stays strata_", "must_contain": ["abi", "link"]}
+{"id": "c02", "ask": "how many tests pass in the Rust crates, and are they all real", "gold_sub": "Correction: all 47 tests are real", "must_contain": ["47", "0 failed"]}
+{"id": "c03", "ask": "can the memory tool import a python library to do the embeddings", "gold_sub": "not by a python library", "must_contain": ["subprocess"]}
+{"id": "c04", "ask": "which model is this session actually running on", "gold_sub": "I am running on the model the plan is about", "must_contain": ["36"]}
+{"id": "c05", "ask": "was the plan's metadata table measured on the right file", "gold_sub": "measured on a file that is not on this PC", "must_contain": ["on this pc"]}
+{"id": "c06", "ask": "what is the resident budget in the config that is live right now", "gold_sub": "The live resident budget is 36 GiB", "must_contain": ["36"]}
+{"id": "c07", "ask": "how big is the per-layer token embedding tensor", "gold_sub": "per_layer_token_embd is 26.82 GiB", "must_contain": ["26.82"]}
+{"id": "c08", "ask": "what noise floor does a speed claim have to clear", "gold_sub": "10.1% median, 27.0% p90", "must_contain": ["10.1"]}
+{"id": "c09", "ask": "does the whole J layer chain fit inside the current budget", "gold_sub": "The live resident budget is 36 GiB", "must_contain": ["40"]}
+{"id": "c10", "ask": "can I run the phase 0 bench from inside this session", "gold_sub": "Phase 0 cannot be run from inside the session", "must_contain": ["externally"]}
+{"id": "c11", "ask": "should the model be requantised to something smaller", "gold_sub": "Do not requant the model", "must_contain": ["sweep"]}
+{"id": "c12", "ask": "where does the Rust engine actually get its speed from", "gold_sub": "speed comes from scheduling", "must_contain": ["52 ms"]}
+{"id": "c13", "ask": "what model did the harness run on before this one, the smaller", "gold_sub": "It went to Qwen3-8B on llama.cpp port 8080", "must_contain": ["8080"]}
+{"id": "c14", "ask": "which parts of the loop is the optimizer allowed to change", "gold_sub": "self-improvement loop may edit skills", "must_contain": ["frozen"]}

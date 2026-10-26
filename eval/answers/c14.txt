@@ -1,0 +1,1 @@
+The optimizer may edit skills, prompts, and index parameters — but not `eval/cases.jsonl`, which is frozen and off-limits to the loop.

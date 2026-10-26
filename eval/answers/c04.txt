@@ -1,0 +1,1 @@
+This session is running on the swift15 IQ3_S model — i.e. the qwen4exp, 48‑block (36 recurrent J + 12 full‑attention K) checkpoint on disk — with a live resident budget tier of 36 GiB (not the plan's stale 11.25 GiB).

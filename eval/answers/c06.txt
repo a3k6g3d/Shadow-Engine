@@ -1,0 +1,1 @@
+36 GiB — the live config (strata.json, pointing at the swift15 IQ3_S pair with `--resident-budget-gib 36`), not the plan's stale 11.25 GiB figure.

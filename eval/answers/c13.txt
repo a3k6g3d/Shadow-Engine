@@ -1,0 +1,1 @@
+Qwen3-8B — the notes say it went to Qwen3-8B on llama.cpp at port 8080, with the 32GB card keeping the big models.

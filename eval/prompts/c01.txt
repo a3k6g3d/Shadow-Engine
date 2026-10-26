@@ -1,0 +1,12 @@
+Answer from the notes below alone. If they do not answer it, say so.
+
+Question: why is the C symbol prefix still strata_ and not shadow_
+
+Notes:
+- (0.77) The prefix stays strata_ on purpose: the ABI symbols are the contract with the already-built facade DLL, renaming them would break the link.
+- (0.66) docs/SHADOW_PLAN.md's metadata table was measured on a file that is not on this PC (the 20.06 GiB / 40-shard swift15 IQ3_S). The files actually on disk are the swift15 and sc117 IQ3_S pairs, 78 GB each: qwen4exp, 48 blocks (36 recurrent J + 12 full-attention K, interval 4), 24 heads / 2 KV heads, hidden 2560, 512 experts at 640, vocab 248320, ctx 262144, ChatML with a system role. Measured per layer: 1.032 GiB (J) / 1.086 GiB (K). The placement answer at an 11.25 GiB RAM tier is about 10 of 48 layers, not 15 of 84.
+- (0.65) No. The harness stays stdlib-only; embedding is done by a subprocess to a small GGUF embedder, not by a python library.
+- (0.62) the harness must stay stdlib-only, so vector work happens in a subprocess
+- (0.62) The live resident budget is 36 GiB from strata.json. The whole 36-layer J chain is 37.14 GiB so it does not fit in 36; it fits in 40, which benches 13.2 tok/s against 10.7.
+
+Answer in one or two sentences.

@@ -1,0 +1,1 @@
+It comes from scheduling, not from the Rust language itself — 52 ms of the 115 ms decode window is the CPU running RAM-tier experts.

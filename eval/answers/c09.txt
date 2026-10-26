@@ -1,0 +1,1 @@
+No. The live budget is 36 GiB (from strata.json), and the full 36-layer J chain measures 37.14 GiB (36 × 1.032 GiB per J-layer), so it just overflows — it needs a 40 GiB tier, which the plan's Phase 2 table benched at 13.2 tok/s versus 10.7 tok/s at 36 GiB.

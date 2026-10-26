@@ -1,0 +1,12 @@
+Answer from the notes below alone. If they do not answer it, say so.
+
+Question: can the memory tool import a python library to do the embeddings
+
+Notes:
+- (0.81) No. The harness stays stdlib-only; embedding is done by a subprocess to a small GGUF embedder, not by a python library.
+- (0.66) the harness must stay stdlib-only, so vector work happens in a subprocess
+- (0.65) docs/SHADOW_PLAN.md's metadata table was measured on a file that is not on this PC (the 20.06 GiB / 40-shard swift15 IQ3_S). The files actually on disk are the swift15 and sc117 IQ3_S pairs, 78 GB each: qwen4exp, 48 blocks (36 recurrent J + 12 full-attention K, interval 4), 24 heads / 2 KV heads, hidden 2560, 512 experts at 640, vocab 248320, ctx 262144, ChatML with a system role. Measured per layer: 1.032 GiB (J) / 1.086 GiB (K). The placement answer at an 11.25 GiB RAM tier is about 10 of 48 layers, not 15 of 84.
+- (0.62) swift15 IQ3_S pair on disk: 41.77 + 36.04 GB, 1224 tensors, 77.80 GiB tensor data. 48 blocks = 36 J + 12 K, interval 4. 24 heads, 2 KV heads, hidden 2560, 512 experts at 640, vocab 248320.
+- (0.60) The Rust engine's speed comes from scheduling, not from the language. 52 ms of a 115 ms decode window is the CPU running RAM-tier experts.
+
+Answer in one or two sentences.

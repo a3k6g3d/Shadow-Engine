@@ -1,0 +1,14 @@
+Answer from the notes below alone. If they do not answer it, say so.
+
+Question: was the plan's metadata table measured on the right file
+
+Notes:
+- (0.79) docs/SHADOW_PLAN.md's metadata table was measured on a file that is not on this PC (the 20.06 GiB / 40-shard swift15 IQ3_S). The files actually on disk are the swift15 and sc117 IQ3_S pairs, 78 GB each: qwen4exp, 48 blocks (36 recurrent J + 12 full-attention K, interval 4), 24 heads / 2 KV heads, hidden 2560, 512 experts at 640, vocab 248320, ctx 262144, ChatML with a system role. Measured per layer: 1.032 GiB (J) / 1.086 GiB (K). The placement answer at an 11.25 GiB RAM tier is about 10 of 48 layers, not 15 of 84.
+- (0.66) I am running on the model the plan is about: strata.json points at the swift15 IQ3_S pair with --resident-budget-gib 36, and its MCP servers are the tools answering right now. So the live tier is 36 GiB, not the plan's stale 11.25 - and at 1.032 GiB per J-layer the full 36-layer J chain is 37.14 GiB, just over budget: it needs 40 GiB, which the plan's own Phase 2 table already benched at 13.2 tok/s against 10.7 at 36.
+
+Also: Phase 0 cannot be run from inside this session. Running the existing engine cold/warm/pinned restarts the host, which takes this process with it. It has to be run by the user, or from a separate process.
+- (0.64) The live resident budget is 36 GiB from strata.json. The whole 36-layer J chain is 37.14 GiB so it does not fit in 36; it fits in 40, which benches 13.2 tok/s against 10.7.
+- (0.63) Correction: all 47 tests are real - 47 passed, 0 failed, and the vertical slice ran against a built facade, so the six designed skips did not fire. The earlier record saying no built facade DLL exists was wrong.
+- (0.62) The prefix stays strata_ on purpose: the ABI symbols are the contract with the already-built facade DLL, renaming them would break the link.
+
+Answer in one or two sentences.

@@ -1,0 +1,12 @@
+Answer from the notes below alone. If they do not answer it, say so.
+
+Question: what model did the harness run on before this one, the smaller
+
+Notes:
+- (0.62) No. The harness stays stdlib-only; embedding is done by a subprocess to a small GGUF embedder, not by a python library.
+- (0.60) Phase 0 cannot be run from inside the session: strata.json is the harness's own config, so benching it restarts the assistant. It runs externally, >=8 interleaved runs per arm.
+- (0.60) the harness must stay stdlib-only, so vector work happens in a subprocess
+- (0.55) It went to Qwen3-8B on llama.cpp port 8080; the 32GB card kept the big models.
+- (0.53) BENCH_NOISE floor: 10.1% median, 27.0% p90, 51.9% worst. A change must clear it on >=8 interleaved runs, decode_warm, paired turn by turn, or it is a tie.
+
+Answer in one or two sentences.

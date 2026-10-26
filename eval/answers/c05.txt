@@ -1,0 +1,1 @@
+No — the metadata table in docs/SHADOW_PLAN.md was measured on a file that isn't even on this PC (the 20.06 GiB, 40-shard swift15 IQ3_S), whereas the files actually on disk are the swift15 and sc117 IQ3_S pairs at 78 GB each (measured per layer: 1.032 GiB J / 1.086 GiB K).

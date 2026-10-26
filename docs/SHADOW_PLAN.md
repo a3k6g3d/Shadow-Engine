@@ -147,7 +147,7 @@ Pulled from outside, each one stated with its cost and its honest ceiling, becau
 claim that hasn't cleared the floor. All four are the existing plan's rules and they stand.
 
 ### Phase 4 — the harness
-The current harness (`tools/pi_harness.py`) suffices, with three changes, none of them a rewrite:
+The current harness (`tools/shadow_harness.py`) suffices, with three changes, none of them a rewrite:
 
 1. **It must run against the new engine through the same OpenAI endpoint**, so the only thing that changes is the
    server URL. It already takes it from `J:\Strata-work\strata.json`.

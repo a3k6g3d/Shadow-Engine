@@ -1,0 +1,12 @@
+Answer from the notes below alone. If they do not answer it, say so.
+
+Question: should the model be requantised to something smaller
+
+Notes:
+- (0.68) Do not requant the model. The IQ3_S recipe came from a 40-candidate sweep; Q3_K_S is 10.7 GB and 13 tok/s.
+- (0.64) The live resident budget is 36 GiB from strata.json. The whole 36-layer J chain is 37.14 GiB so it does not fit in 36; it fits in 40, which benches 13.2 tok/s against 10.7.
+- (0.63) BENCH_NOISE floor: 10.1% median, 27.0% p90, 51.9% worst. A change must clear it on >=8 interleaved runs, decode_warm, paired turn by turn, or it is a tie.
+- (0.61) Correction: all 47 tests are real - 47 passed, 0 failed, and the vertical slice ran against a built facade, so the six designed skips did not fire. The earlier record saying no built facade DLL exists was wrong.
+- (0.60) Measured per layer: J 1.032 GiB, K 1.086 GiB. per_layer_token_embd is 26.82 GiB, 35% of the model, and it is not inside any layer.
+
+Answer in one or two sentences.

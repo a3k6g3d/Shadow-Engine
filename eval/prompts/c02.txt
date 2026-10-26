@@ -1,0 +1,12 @@
+Answer from the notes below alone. If they do not answer it, say so.
+
+Question: how many tests pass in the Rust crates, and are they all real
+
+Notes:
+- (0.70) Correction: all 47 tests are real - 47 passed, 0 failed, and the vertical slice ran against a built facade, so the six designed skips did not fire. The earlier record saying no built facade DLL exists was wrong.
+- (0.63) docs/SHADOW_PLAN.md's metadata table was measured on a file that is not on this PC (the 20.06 GiB / 40-shard swift15 IQ3_S). The files actually on disk are the swift15 and sc117 IQ3_S pairs, 78 GB each: qwen4exp, 48 blocks (36 recurrent J + 12 full-attention K, interval 4), 24 heads / 2 KV heads, hidden 2560, 512 experts at 640, vocab 248320, ctx 262144, ChatML with a system role. Measured per layer: 1.032 GiB (J) / 1.086 GiB (K). The placement answer at an 11.25 GiB RAM tier is about 10 of 48 layers, not 15 of 84.
+- (0.61) Do not requant the model. The IQ3_S recipe came from a 40-candidate sweep; Q3_K_S is 10.7 GB and 13 tok/s.
+- (0.60) 47 passed, 0 failed: 41 real tests plus 6 designed skips because no built facade DLL exists.
+- (0.60) swift15 IQ3_S pair on disk: 41.77 + 36.04 GB, 1224 tensors, 77.80 GiB tensor data. 48 blocks = 36 J + 12 K, interval 4. 24 heads, 2 KV heads, hidden 2560, 512 experts at 640, vocab 248320.
+
+Answer in one or two sentences.
