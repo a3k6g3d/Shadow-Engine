@@ -11,7 +11,6 @@
 use shadow_host::Buffer;
 
 fn fill_and_check(buf: &mut Buffer, seed: u8) {
-    let n = buf.len();
     for (i, b) in buf.as_mut_slice().iter_mut().enumerate() {
         *b = seed.wrapping_add(i as u8);
     }
