@@ -27,27 +27,39 @@ reported as a tie and not written up as a win.
 
 ## What we are running, from the file itself
 
-`Qwen3.8-flash-next-swift15-abliterated-iq3s.GGUF`, 20.06 GiB, 40 shards, 256 experts, 8 active per token.
+`J:\Strata-work\models\swift15\IQ3_S\...-00001-of-00002.gguf` + `-00002-of-00002.gguf`, 41.77 + 36.04 GB,
+1,224 tensors, 77.80 GiB of tensor data. Parsed from the GGUF key-value section and from the tensor offsets —
+every number below is measured off the file, none of it is taken from the filename.
 
 | | |
 |---|---|
-| architecture | `qwen3next` — hybrid attention: **48 K layers, 36 J layers** (Gated DeltaNet), the 36 J layers every 4th layer |
-| attention | 16 heads, head dim 256, **8 KV heads** → GQA 2:1 |
-| hidden / MLP | 2048; shared expert 5120 intermediate; 256 routed experts at **512** each |
-| quant | `IQ3_S` (3.0625 bpv) on the routed experts; **attention projections and shared expert stay Q8_0** |
-| context | **131,072** native, 1,024 train overfit, 8,192 train usable, RoPE yarn ×2.0 / 4,096 |
-| vocab | 151,664 + 7 specials, byte-fallback, no add_bos, `utf8dpc` |
-| chat template | ChatML, no system role; `internal_server_model` present |
+| architecture | `qwen4exp`, `general.size_label 512x56B`, quantized by ISTA DASLab, `file_type 26` |
+| layers | **48 blocks: 36 recurrent (J) + 12 full-attention (K)**, `full_attention_interval 4` — every 4th is K |
+| attention | 24 heads, **2 KV heads** → GQA 12:1, head/key length 256 |
+| hidden / MLP | 2,560; **512 routed experts at 640** intermediate; SSM inner 6,144, state 128, groups 16, conv 4 |
+| context | **262,144** native; no yarn keys in this file |
+| vocab | 248,320, `pre=qwen35`, model `gpt2`; chat template 9,993 bytes, ChatML **with** a system role |
+| per-layer, measured | J: **1.032 GiB/layer** (37.14 GiB over 36) — K: **1.086 GiB/layer** (13.03 GiB over 12) |
+| per layer, split | routed experts 0.961 GiB (J) / 1.020 GiB (K); attention 0.041; shared expert 0.020 |
+| embeddings | `per_layer_token_embd` **26.82 GiB** — 35% of the model, and it is not in any layer |
 
-**15 of the 84 layers fit in the 11.25 GiB RAM tier** — 4 J-layers (144 MiB each) + 11 K-layers (576 MiB each) =
-11.16 GiB, with 92 MiB spare. The K-layers are the expensive ones: 256 experts × 3 × 512 × 2048 × 3.0625 bits =
-**48.0 MiB per layer**.
+**The table this section had before was measured on a different file** —
+`Qwen3.8-flash-next-swift15-abliterated-iq3s.GGUF`, 20.06 GiB, 40 shards, 256 experts, vocab 151,664, which is not
+on this PC. Its rows were off by 2-21x on every geometry line, and its arithmetic did not close either: 4x144 MiB
++ 11x576 MiB is 6.87 GiB, not 11.16, and 256x3x512x2048x3.0625 bits is 294 MiB per layer, not 48.
 
-The 36 J-layers are the whole reason this model is fast: each one's state is 8 × 256 × 256 × 4 bytes = 2 MiB and it
-is **fixed size regardless of context**. The 48 K-layers' KV grows with context and is what gets expensive at 128K.
+**The placement answer, recomputed: about 10 of the 48 layers fit in the 11.25 GiB RAM tier** — nine J-layers
+greedy at 10.48 GiB, 0.77 GiB spare, and no room left for the 26.82 GiB embedding tier the old table never
+counted. The shape of the answer is the same as the plan said (resident set = the J chain, the rest streamed);
+only the size changed, and it changed by 21x. What has to be decided before Phase 0 is what the 11.25 GiB is
+for: layers, or the embedding.
+
+The J-layers are still the reason this model is fast — a fixed-size state per layer regardless of context — but
+the old state figure (8 x 256 x 256 x 4 = 2 MiB) was computed from the old table's geometry and needs measuring
+against `ssm.inner_size 6144` / `state_size 128` before anyone quotes it again.
 
 The quant is what it is — **don't requant**. It was measured: that recipe came from a 40-candidate sweep, and
-`Q3_K_S` is 10.7 GB and 13 tok/s.
+`Q3_K_S` is 10.7 GB and 13 tok/s. The two files on this PC are that quant; the 20 GiB one is not.
 
 ## The plan
 
