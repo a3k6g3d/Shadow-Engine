@@ -24,6 +24,7 @@ pub mod transient;
 pub mod window;
 pub mod protocol;
 pub mod scheduler;
+pub mod placement;
 #[cfg(windows)]
 pub mod ioring;
 
