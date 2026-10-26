@@ -1,0 +1,15 @@
+[package]
+name = "shadow-host"
+version.workspace = true
+edition.workspace = true
+
+# The runtime half of the plan, as opposed to shadow-abi's contract half.  Still dependency-free: the only
+# crate it depends on is the one that holds the ABI mirror and the ring type.
+# cdylib: shadow_host.dll, which the engine loads by absolute path (M5, src/ffi.rs).  A staticlib was measured and
+# rejected - MSVC cannot link it without adding onecoreuap.lib to the engine.  rlib: the crate's own tests and the
+# vertical slice still use it as a Rust library.
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+shadow-abi = { path = "../shadow-abi" }

@@ -85,6 +85,54 @@ STRATA_API int strata_facade_expert_apply(const strata_expert_ref *ref,
                                           const float *x, unsigned long long x_len,
                                           float *out, unsigned long long out_cap);
 
+/* ---------------------------------------------------------------------------------------------------------------
+ * The other direction (milestone 5, docs/RUST_ENGINE.md): calls Rust implements and C++ makes.
+ *
+ * Everything above is exported by strata_facade.dll and called by Rust.  Everything below is exported by
+ * strata_host.dll (rust-host/crates/strata-host, built as a cdylib) and called by the engine.  The engine loads
+ * that DLL by absolute path and resolves each name with GetProcAddress, typed as decltype(&strata_host_...): the
+ * prototypes here are for that, and nothing links against an import library.  So STRATA_HOST_API carries no
+ * dllimport - an engine built without the Rust side must still link, and does, because it never names these
+ * symbols as externals.
+ *
+ * A staticlib linked into the engine was measured and rejected: MSVC fails to link it (LNK2019
+ * __imp_GetUserProfileDirectoryW, from Rust's std) unless onecoreuap.lib joins the C++ link.  As a DLL, Rust's
+ * std stays inside it.
+ *
+ * The surface is platform::DirectFile's, one call per method, so the engine's reader can swap implementations
+ * without changing what it does.  Rules, on top of the ones at the top of this file:
+ *   - The file handle is Rust's; the engine holds it as an opaque pointer and gives it back to close.
+ *   - Read buffers are the engine's.  From submit until the completion with that tag comes back from wait (or
+ *     until close returns), the buffer is the ring's: the engine must not read, write or free it.  close does
+ *     not return while the kernel may still write one.
+ *   - One thread makes every call on a file except wake, which any thread may make (it must not race close).
+ *   - No panic crosses this line: a failure is a status, with text from strata_host_last_error on that thread.
+ *   - The rust-host test suite parses the prototypes below and fails if they and the Rust exports drift.
+ * --------------------------------------------------------------------------------------------------------------- */
+#define STRATA_HOST_API
+
+/* A wake shows up as one completion with this tag - the same value as platform::DirectFile::WAKE_TAG. */
+#define STRATA_HOST_WAKE_TAG 0xFFFFFFFFFFFFFFFFull
+
+typedef struct strata_host_file strata_host_file;   /* opaque; owned by the Rust side */
+
+/* One finished read: the caller's tag, the bytes transferred (short only at end of file), and a strata_status. */
+typedef struct strata_host_completion {
+    unsigned long long tag;
+    unsigned int bytes;
+    int status;
+} strata_host_completion;
+
+STRATA_HOST_API int strata_host_abi_version(void);
+STRATA_HOST_API const char *strata_host_last_error(void);
+STRATA_HOST_API int strata_host_file_open(const unsigned short *path_utf16, int capacity, strata_host_file **file_out, unsigned long long *size_out);
+STRATA_HOST_API int strata_host_file_submit(strata_host_file *file, unsigned long long offset, unsigned char *buffer, unsigned int len, unsigned long long tag);
+STRATA_HOST_API int strata_host_file_wait(strata_host_file *file, strata_host_completion *out, int max, int timeout_ms, int *got_out);
+STRATA_HOST_API int strata_host_file_wake(strata_host_file *file);
+STRATA_HOST_API void strata_host_file_close(strata_host_file *file);
+STRATA_HOST_API unsigned char *strata_host_alloc_aligned(unsigned long long bytes);
+STRATA_HOST_API void strata_host_free_aligned(unsigned char *p);
+
 #ifdef __cplusplus
 }
 #endif
