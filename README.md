@@ -32,7 +32,17 @@ That rule is not a formality and it has killed more ideas than any reviewer.
     crates/          the Rust side
     include/shadow/  the seam's contract (C ABI, hand-written)
     docs/            the plan, and the measurements it is built on
-    tools/           the harness
+    tools/           the harness, and shadow_memory.py
+    bin/ models/     the embedder the memory tool drives
+    memory/          the store — committed, so it travels with the repo
+
+`tools/shadow_memory.py` is stdlib-only: `add`, `index`, `search`, `stats`. Embedding is not done in Python —
+the tool shells out to `bin/llama-embedding.exe` with `models/bge-small-en-v1.5-q8_0.gguf` (384 dims). Search
+is cosine over the whole store, no ANN, since the store is a few thousand records at most.
+
+Its honest weakness, measured: on an 8-record store a paraphrased query put the answer to a *different*
+question first (0.67) and the directly relevant memory third (0.62). It is a 35 MB quantised embedder and it
+leans on phrasing overlap. Good enough to be worth having, not good enough to be trusted on one result.
 
 ## License
 

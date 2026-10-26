@@ -48,11 +48,24 @@ every number below is measured off the file, none of it is taken from the filena
 on this PC. Its rows were off by 2-21x on every geometry line, and its arithmetic did not close either: 4x144 MiB
 + 11x576 MiB is 6.87 GiB, not 11.16, and 256x3x512x2048x3.0625 bits is 294 MiB per layer, not 48.
 
-**The placement answer, recomputed: about 10 of the 48 layers fit in the 11.25 GiB RAM tier** — nine J-layers
-greedy at 10.48 GiB, 0.77 GiB spare, and no room left for the 26.82 GiB embedding tier the old table never
-counted. The shape of the answer is the same as the plan said (resident set = the J chain, the rest streamed);
-only the size changed, and it changed by 21x. What has to be decided before Phase 0 is what the 11.25 GiB is
-for: layers, or the embedding.
+**The tier is 36 GiB, not 11.25** — `J:\Strata-work\strata.json`, the config this session is actually running on,
+says `--resident-budget-gib 36`, and the plan's own Phase 2 table benched 36/40/44/45.5 GiB at
+10.7/13.2/15.5/17.1 tok/s. So the recomputed placement answer is short and it is this: **the whole 36-layer J
+chain is 37.14 GiB and does not quite fit in 36.** It fits in 40 — the next rung the table already has a number
+for, 13.2 tok/s against 10.7. Resident set = the entire J chain at a 40 GiB budget; the 12 K-layers and the
+26.82 GiB embedding stream.
+
+Phase 0 settles it, and **Phase 0 cannot be run from inside this session** — running the existing engine
+cold/warm/pinned restarts the host, and the host is what is answering. It runs from a separate process, or by
+hand. Three arms plus the cold baseline, ≥8 runs, interleaved, `decode_warm`, paired turn-by-turn, judged
+against the 10.1% floor:
+
+| arm | placement |
+|---|---|
+| cold | nothing resident — the floor itself, so the others mean something |
+| A | 36 GiB, the current config — the incumbent |
+| B | 40 GiB, the whole J chain resident — what the recomputed geometry says it should be |
+| C | 40 GiB, embedding resident, all 48 layers streamed — the other half of the same question |
 
 The J-layers are still the reason this model is fast — a fixed-size state per layer regardless of context — but
 the old state figure (8 x 256 x 256 x 4 = 2 MiB) was computed from the old table's geometry and needs measuring
