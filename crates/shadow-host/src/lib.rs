@@ -50,6 +50,10 @@ pub struct Buffer {
     /// False for memory the C++ side lent across the seam (`Buffer::borrowed`): the ring still holds it by value
     /// while the read is in flight, but dropping it frees nothing, because the allocation was never this module's.
     owned: bool,
+    /// Whether this buffer's pages are large pages (`MEM_LARGE_PAGES`) or ordinary ones.  Recorded, not assumed:
+    /// a pinned tier that asked for huge pages and silently did not get them is a trap, so the type has to be
+    /// able to say which it actually has.
+    huge: bool,
 }
 
 impl Buffer {
@@ -62,31 +66,92 @@ impl Buffer {
     /// header's rule for `strata_host_file_submit`; here it is the caller's promise, because Rust cannot check
     /// memory it did not allocate.
     pub unsafe fn borrowed(base: *mut u8, len: usize) -> Buffer {
-        Buffer { base, len, owned: false }
+        Buffer { base, len, owned: false, huge: false }
     }
 
     /// `len` bytes of fresh, page-aligned memory this buffer owns and frees on drop.  None if the system refuses.
+    ///
+    /// `SHADOW_HUGE_PAGES=1` asks for the allocation to be backed by large pages instead of ordinary ones.  It
+    /// is opt-in because that is the plan's rule for anything that changes the floor measurement, and because
+    /// asking does not mean getting: the process needs the lock-pages-in-memory privilege, and most machines
+    /// (this one included) do not have it.  So the answer is either huge pages or the old path, never a
+    /// half-huge surprise - and `is_huge` says which one you got.
     pub fn aligned(len: usize) -> Option<Buffer> {
-        #[cfg(windows)]
-        {
-            if len == 0 {
-                return None;
-            }
-            // SAFETY: a fresh reservation; nothing owns this memory yet, and VirtualAlloc's return is either a
-            // page-aligned pointer or null.
-            let base = unsafe {
-                win::VirtualAlloc(std::ptr::null_mut(), len, win::MEM_COMMIT_RESERVE, win::PAGE_READWRITE)
-            };
-            if base.is_null() {
-                return None;
-            }
-            Some(Buffer { base: base as *mut u8, len, owned: true })
+        let want_huge = match std::env::var("SHADOW_HUGE_PAGES") {
+            Ok(v) => v == "1" || v.eq_ignore_ascii_case("true"),
+            Err(_) => false,
+        };
+        Self::alloc(len, want_huge)
+    }
+
+    /// Whether this buffer's memory is actually backed by large pages.  Only ever true if it was asked for.
+    pub fn is_huge(&self) -> bool {
+        self.huge
+    }
+
+    /// True for memory this module allocated and frees on drop; false for memory borrowed across the seam.
+    pub fn is_owned(&self) -> bool {
+        self.owned
+    }
+
+    /// The address the buffer starts at, for callers that need to check it against a page size.
+    pub fn base_address(&self) -> usize {
+        self.base as usize
+    }
+
+    /// The large-page size this system offers - 0 if it offers none.  Public so a caller (or a test) can tell
+    /// an allocation that got huge pages from one that asked and was refused.
+    #[cfg(windows)]
+    pub fn large_page_minimum() -> usize {
+        // SAFETY: a query; it takes no arguments and touches no memory.
+        unsafe { win::GetLargePageMinimum() }
+    }
+
+    #[cfg(not(windows))]
+    pub fn large_page_minimum() -> usize {
+        0
+    }
+
+    /// The allocation with the page size chosen by the caller, so the tests can ask for either page size
+    /// directly instead of fighting over a process-global env var.  `aligned` is this, with the knob.
+    #[cfg(windows)]
+    pub fn alloc(len: usize, want_huge: bool) -> Option<Buffer> {
+        if len == 0 {
+            return None;
         }
-        #[cfg(not(windows))]
-        {
-            let _ = len;
-            None
+        if want_huge {
+            // The minimum is also the granularity: MEM_LARGE_PAGES wants a size that is a whole number of them
+            // and hands back a base on one.  A request that is not already a multiple gets rounded up for the
+            // allocation - `len` itself stays what the caller asked for, so nothing downstream has to know.
+            let gran = unsafe { win::GetLargePageMinimum() };
+            if gran > 0 {
+                let size = len.div_ceil(gran) * gran;
+                // SAFETY: as below - a fresh reservation, and the return is either aligned or null.
+                let base = unsafe {
+                    win::VirtualAlloc(std::ptr::null_mut(), size, win::MEM_COMMIT_RESERVE | win::MEM_LARGE_PAGES,
+                                     win::PAGE_READWRITE)
+                };
+                if !base.is_null() {
+                    return Some(Buffer { base: base as *mut u8, len, owned: true, huge: true });
+                }
+                // Refused.  The usual cause is the privilege, and the fallback is the honest answer, not a
+                // failure: the caller gets working memory and `is_huge` tells them it is the ordinary kind.
+            }
         }
+        // SAFETY: a fresh reservation; nothing owns this memory yet, and VirtualAlloc's return is either a
+        // page-aligned pointer or null.
+        let base = unsafe { win::VirtualAlloc(std::ptr::null_mut(), len, win::MEM_COMMIT_RESERVE, win::PAGE_READWRITE) };
+        if base.is_null() {
+            return None;
+        }
+        Some(Buffer { base: base as *mut u8, len, owned: true, huge: false })
+    }
+
+    /// The same, with no way to ask for large pages - the non-Windows build has never had them.
+    #[cfg(not(windows))]
+    pub fn alloc(len: usize, _want_huge: bool) -> Option<Buffer> {
+        let _ = len;
+        None
     }
 
     pub fn len(&self) -> usize {
@@ -130,7 +195,8 @@ impl Drop for Buffer {
 
 impl std::fmt::Debug for Buffer {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "Buffer({:p}, {} bytes)", self.base, self.len)
+        write!(f, "Buffer({:p}, {} bytes, {}pages)", self.base, self.len,
+               if self.huge { "large " } else { "small " })
     }
 }
 
@@ -335,6 +401,7 @@ mod win {
     pub const MEM_COMMIT_RESERVE: Dword = 0x3000; // MEM_COMMIT | MEM_RESERVE
     pub const PAGE_READWRITE: Dword = 0x04;
     pub const MEM_RELEASE: Dword = 0x8000;
+    pub const MEM_LARGE_PAGES: Dword = 0x2000_0000;
 
     // std links kernel32 for the MSVC target, so these resolve without a crate - the same fact milestone 2
     // established about the seam (see shadow-abi's build.rs).
@@ -348,6 +415,9 @@ mod win {
         pub fn CloseHandle(handle: Handle) -> Bool;
         pub fn VirtualAlloc(addr: *mut c_void, len: usize, typ: Dword, protect: Dword) -> *mut c_void;
         pub fn VirtualFree(addr: *mut c_void, len: usize, typ: Dword) -> Bool;
+        /// 0 if the system has no large-page support at all.  Non-zero is the size a `MEM_LARGE_PAGES`
+        /// allocation must be a multiple of - and the alignment its base gets.
+        pub fn GetLargePageMinimum() -> usize;
         pub fn GetLastError() -> Dword;
         pub fn GetFileSizeEx(file: Handle, size: *mut i64) -> Bool;
         pub fn PostQueuedCompletionStatus(port: Handle, bytes: Dword, key: UlongPtr,
