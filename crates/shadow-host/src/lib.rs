@@ -25,6 +25,7 @@ pub mod window;
 pub mod protocol;
 pub mod scheduler;
 pub mod placement;
+pub mod router;
 #[cfg(windows)]
 pub mod ioring;
 
