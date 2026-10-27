@@ -45,6 +45,60 @@ template <typename Q> struct Fast {
     }
 };
 
+template <> struct Fast<Q4K> {
+    static __device__ __forceinline__ float dot8(const u8* r, unsigned int i, const float* x) {
+        const u8* b = r + (i / 256) * 144;
+        unsigned int e0 = i % 256, ig = e0 / 32, c0 = e0 % 32, sh = (ig % 2) * 4;
+        u8 sc, mn;
+        q_scale_min_k4(b + 4, ig, &sc, &mn);
+        float ds = __fmul_rn(qf16(b), (float) sc), dm = __fmul_rn(qf16(b + 2), (float) mn), s = 0.0f;
+        const u8* q = b + 16 + (ig / 2) * 32 + c0;
+#pragma unroll
+        for (unsigned int k = 0; k < 8; k++) {
+            u8 v = (q[k] >> sh) & 0x0f;
+            s += __fsub_rn(__fmul_rn(ds, (float) v), dm) * x[k];
+        }
+        return s;
+    }
+};
+
+template <> struct Fast<Q5K> {
+    static __device__ __forceinline__ float dot8(const u8* r, unsigned int i, const float* x) {
+        const u8* b = r + (i / 256) * 176;
+        unsigned int e0 = i % 256, ig = e0 / 32, c0 = e0 % 32, sh = (ig % 2) * 4;
+        u8 sc, mn;
+        q_scale_min_k4(b + 4, ig, &sc, &mn);
+        float ds = __fmul_rn(qf16(b), (float) sc), dm = __fmul_rn(qf16(b + 2), (float) mn), s = 0.0f;
+        const u8* ql = b + 48 + (ig / 2) * 32 + c0;
+        const u8* qh = b + 16 + c0;
+#pragma unroll
+        for (unsigned int k = 0; k < 8; k++) {
+            u8 v = ((ql[k] >> sh) & 0x0f) | (((qh[k] >> ig) & 1) << 4);
+            s += __fsub_rn(__fmul_rn(ds, (float) v), dm) * x[k];
+        }
+        return s;
+    }
+};
+
+template <> struct Fast<Q6K> {
+    static __device__ __forceinline__ float dot8(const u8* r, unsigned int i, const float* x) {
+        const u8* b = r + (i / 256) * 210;
+        unsigned int e0 = i % 256, r_idx = e0 / 32, c0 = e0 % 32;
+        unsigned int g = r_idx / 4, h = (r_idx % 4) / 2, k_idx = r_idx % 2, s_idx = r_idx % 4;
+        float d = __fmul_rn(qf16(b + 208), (float) (signed char) b[192 + e0 / 16]), s = 0.0f;
+        const u8* ql = b + g * 64 + k_idx * 32 + c0;
+        const u8* qh = b + 128 + g * 32 + c0;
+#pragma unroll
+        for (unsigned int k = 0; k < 8; k++) {
+            u8 lo = (ql[k] >> (h * 4)) & 0x0f;
+            u8 hi = (qh[k] >> (2 * s_idx)) & 0x03;
+            int q = (int) (signed char) (u8) (lo | (hi << 4)) - 32;
+            s += __fmul_rn(d, (float) q) * x[k];
+        }
+        return s;
+    }
+};
+
 template <> struct Fast<IQ4NL> {
     static __device__ __forceinline__ float dot8(const u8* r, unsigned int i, const float* x) {
         const u8* b = r + (i / 32) * 18;
@@ -54,7 +108,25 @@ template <> struct Fast<IQ4NL> {
 #pragma unroll
         for (unsigned int k = 0; k < 8; k++) {
             u8 v = e0 < 16 ? (q[k] & 0x0f) : (q[k] >> 4);
-            s += __fmul_rn(d, (float) kIQ4NL[v]) * x[k];
+            s += __fmul_rn(d, iq4nl_val(v)) * x[k];
+        }
+        return s;
+    }
+};
+
+template <> struct Fast<IQ4XS> {
+    static __device__ __forceinline__ float dot8(const u8* r, unsigned int i, const float* x) {
+        const u8* b = r + (i / 256) * 136;
+        unsigned int e0 = i % 256, g = e0 / 32, c0 = e0 % 32;
+        u16 sh = (u16) b[2] | ((u16) b[3] << 8);
+        u8 lo = (b[4 + g / 2] >> (4 * (g % 2))) & 0x0f;
+        u8 hi = (sh >> (2 * g)) & 3;
+        float dl = __fmul_rn(qf16(b), (float) ((int) (u8) (lo | (hi << 4)) - 32)), s = 0.0f;
+        const u8* q = b + 8 + g * 16 + (c0 & 15);
+#pragma unroll
+        for (unsigned int k = 0; k < 8; k++) {
+            u8 v = c0 < 16 ? (q[k] & 0x0f) : (q[k] >> 4);
+            s += __fmul_rn(dl, iq4nl_val(v)) * x[k];
         }
         return s;
     }
@@ -228,5 +300,48 @@ extern "C" __global__ void matvec_fast_iq3_s(const u8* w, const float* x, float*
 extern "C" __global__ void matvec_batch_iq3_s(const u64* wtab, const float* x, unsigned int xs, float* y, unsigned int ys, unsigned int rows, unsigned int cols) { matvec_batch_rows<IQ3S>(wtab, x, xs, y, ys, rows, cols); }
 extern "C" __global__ void matvec_fast_bf16(const u8* w, const float* x, float* y, unsigned int rows, unsigned int cols) { matvec_fast_rows<BF16>(w, x, y, rows, cols); }
 extern "C" __global__ void matvec_batch_bf16(const u64* wtab, const float* x, unsigned int xs, float* y, unsigned int ys, unsigned int rows, unsigned int cols) { matvec_batch_rows<BF16>(wtab, x, xs, y, ys, rows, cols); }
+extern "C" __global__ void matvec_pair_bf16(const u8* w0, float* y0, unsigned int r0,
+                                            const u8* w1, float* y1, unsigned int r1,
+                                            const float* x, unsigned int cols) {
+    unsigned int row = blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32, lane = threadIdx.x % 32;
+    const u8* w;
+    float* y;
+    if (row < r0) {
+        w = w0; y = y0;
+    } else if (row < r0 + r1) {
+        row -= r0; w = w1; y = y1;
+    } else {
+        return;
+    }
+    const u8* r = w + (u64) row * cols * BF16::BYTES;
+    float acc = 0.0f;
+    for (unsigned int i = lane; i < cols; i += 32) acc += BF16::at(r + (u64) i * BF16::BYTES, 0) * x[i];
+    for (int off = 16; off > 0; off >>= 1) acc += __shfl_down_sync(0xffffffffu, acc, off);
+    if (lane == 0) y[row] = acc;
+}
+extern "C" __global__ void hc_down_inject_bf16(const u8* w_down, float* down, unsigned int r_down,
+                                               const u8* w_inj, float* g, unsigned int r_inj,
+                                               const float* rn, unsigned int cols, float div) {
+    unsigned int row = blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32, lane = threadIdx.x % 32;
+    bool is_inj = false;
+    const u8* w;
+    if (row < r_down) {
+        w = w_down;
+    } else if (row < r_down + r_inj) {
+        row -= r_down; w = w_inj; is_inj = true;
+    } else {
+        return;
+    }
+    const u8* r = w + (u64) row * cols * BF16::BYTES;
+    float acc = 0.0f;
+    for (unsigned int i = lane; i < cols; i += 32) acc += BF16::at(r + (u64) i * BF16::BYTES, 0) * rn[i];
+    for (int off = 16; off > 0; off >>= 1) acc += __shfl_down_sync(0xffffffffu, acc, off);
+    if (lane == 0) {
+        float v = acc / div;
+        float sig = (float) (1.0 / (1.0 + exp(-(double) v)));
+        if (is_inj) g[row] = 2.0f * sig;
+        else down[row] = v * sig;
+    }
+}
 extern "C" __global__ void matvec_fast_f32(const u8* w, const float* x, float* y, unsigned int rows, unsigned int cols) { matvec_fast_rows<F32>(w, x, y, rows, cols); }
 extern "C" __global__ void matvec_batch_f32(const u64* wtab, const float* x, unsigned int xs, float* y, unsigned int ys, unsigned int rows, unsigned int cols) { matvec_batch_rows<F32>(wtab, x, xs, y, ys, rows, cols); }

@@ -5,7 +5,14 @@
 // Per-weight decoding re-reads a block's scales for every weight: right for correctness, not for speed.  The fast
 // matvec kernels will decode a block's scales once per warp; these stay as their oracle.
 
-__constant__ signed char kIQ4NL[16] = {-127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113};
+// IQ4_NL's 16 non-linear levels {-127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113} packed in
+// four 32-bit immediate constants so warp lanes with different nibbles never serialize on __constant__ memory.
+static __device__ __forceinline__ float iq4nl_val(unsigned int q) {
+    unsigned int w = (q < 8u) ? ((q < 4u) ? 0xbfad9881u : 0xf6eaddcfu)
+                              : ((q < 12u) ? 0x26190d01u : 0x71594535u);
+    signed char b = (signed char) ((w >> ((q & 3u) * 8u)) & 0xffu);
+    return (float) b;
+}
 
 static __device__ __forceinline__ float qf16(const u8* b) { return f16_to_f32((u16) b[0] | ((u16) b[1] << 8)); }
 
@@ -62,7 +69,7 @@ struct IQ4NL {
     static const unsigned int QK = 32, BYTES = 18;
     static __device__ __forceinline__ float at(const u8* b, unsigned int e) {
         u8 q = e < 16 ? (b[2 + e] & 0x0f) : (b[2 + e - 16] >> 4);
-        return __fmul_rn(qf16(b), (float) kIQ4NL[q]);
+        return __fmul_rn(qf16(b), iq4nl_val(q));
     }
 };
 
@@ -75,7 +82,7 @@ struct IQ4XS {
         u8 hi = (sh >> (2 * g)) & 3;
         float dl = __fmul_rn(qf16(b), (float) ((int) (u8) (lo | (hi << 4)) - 32));
         u8 qb = b[8 + g * 16 + (c % 16)];
-        return __fmul_rn(dl, (float) kIQ4NL[c < 16 ? (qb & 0x0f) : (qb >> 4)]);
+        return __fmul_rn(dl, iq4nl_val(c < 16 ? (qb & 0x0f) : (qb >> 4)));
     }
 };
 

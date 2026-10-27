@@ -313,6 +313,10 @@ pub struct Stream<'c> {
 }
 
 impl Stream<'_> {
+    pub fn raw(&self) -> *mut c_void {
+        self.stream
+    }
+
     pub fn synchronize(&self) -> Result<(), CudaError> {
         self.ctx.bind()?;
         call!(self.ctx.api, cuStreamSynchronize(self.stream))

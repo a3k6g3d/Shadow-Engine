@@ -165,6 +165,49 @@ router top-10 on the host 1%. That is why the RAM tier came before moving the ro
   - **Lowest available RAM across all 8 launches: 9.6 GiB**; peak GPU memory 10,319-10,422 MiB; **0 answer differences**
     across all 48 turns.
 
+## Stage 5: Speed levers (`0.1.12`)
+
+- **What failed first (`Fast<BF16>::dot8` 8-per-lane uncoalesced loads, reverted for `matvec_pair_bf16` / `hc_down_inject_bf16`):**
+  having each warp lane read 8 contiguous `bf16` weights (`16` bytes/lane strided across a 512-byte cache region) dropped
+  `BF16` matvec throughput from **455.5 GB/s to 396.5 GB/s** (`tests/matvec.rs`), because `BF16` has no block-scale header
+  to amortize and strided `i = lane; i < cols; i += 32` loads coalesce into a single 64-byte cache sector per warp
+  instruction. Kept `BF16` on coalesced strided loads (`matvec_bf16`, `matvec_pair_bf16`, `hc_down_inject_bf16`).
+- **Register-immediate `iq4nl_val` + `Fast<Q4K/Q5K/Q6K/IQ4XS>` (`kernels/quants.cuh`, `kernels/matvec.cu`):**
+  - Replaced `__constant__ signed char kIQ4NL[16]` with a register-immediate byte lookup (`iq4nl_val` over four `uint32_t`
+    constants), eliminating 16-way warp serialization on `__constant__` memory across 44 GiB of `IQ4_NL` and `IQ4_XS`
+    weights.
+  - Added `Fast<Q4K>`, `Fast<Q5K>`, `Fast<Q6K>`, and `Fast<IQ4XS>` specializations (`matvec_fast_*` and `matvec_batch_*`).
+    Bit-exact with the reference dequantizers (`crates/shadow-cuda/tests/dequant.rs`); `crates/shadow-cuda/tests/matvec.rs`
+    measured:
+    - `Q4_K`: **118.5 -> 215.6 GB/s** (`1.8x` fast, `239.5 GB/s` `2.0x` batch)
+    - `Q5_K`: **139.6 -> 244.7 GB/s** (`1.8x` fast, `268.2 GB/s` `1.9x` batch)
+    - `Q6_K`: **263.6 -> 309.4 GB/s** (`1.2x` fast, `333.3 GB/s` `1.3x` batch)
+    - `IQ4_NL` batch: **213.1 GB/s (`2.0x`)** (`0.004 ms`/expert)
+    - `IQ4_XS`: **58.3 -> 105.3 GB/s** (`1.8x` fast, `212.1 GB/s` `3.6x` batch)
+- **Fused forward-pass kernels (`kernels/forward.cu`, `kernels/matvec.cu`, `crates/shadow-cuda/src/session.rs`):**
+  - `hc_down_inject_bf16` (`-288` launches/token), `hc_write_rmsnorm_groups` (`-95` launches/token), `moe_combine_qwen`
+    (`-144` launches and `-48` `cuMemsetD8` calls/token), `matvec_pair_bf16` + `l2norm_qk_heads` in `delta_net` (`-72`
+    launches/token), and `matvec_pair_bf16` + `head_norm_rope_qgk` + direct `at.v`/`at.raw` writes in `attention` (`-60`
+    launches/token). Synchronized GPU compute time (`SHADOW_PROFILE=1`) dropped from **52.5 ms/token to 31.6 ms/token
+    (`-40%`)**.
+- **Async `copy_stream` DMA + pinned file-miss staging + early shared-expert overlap (`crates/shadow-cuda/src/session.rs`):**
+  - Added a dedicated non-blocking `copy_stream` (`CU_STREAM_NON_BLOCKING`) and a `k * slot_bytes` (`25.4 MiB`) pinned
+    staging buffer (`PinnedRegion`) for file-tier misses (read in monotonic file-offset order `down -> gate -> up` via
+    `expert_into`, zero heap allocations).
+  - Launched Qwen's shared expert (`ffn_gate_shexp`, `ffn_up_shexp`, `swiglu`, `ffn_down_shexp`, `ffn_gate_inp_shexp`) on
+    stream 0 immediately after downloading router logits so GPU SMs compute the shared expert concurrently with host
+    `route()` and `copy_stream` PCIe DMA uploads.
+- **Gated & benchmarked (`bench/stage5-kernels-2026-10-27` vs `bench/floor-2026-10-27`):**
+  - Passed `cargo test --release -p shadow --test reference` (7/7) and the 48-layer GPU comparison (`shadow compare ... --gpu`:
+    all 48 layers `cosine 1.00000`, `10/10` routing in `4.1 s`).
+  - Over **8 launches x 5 warm turns (140 pairs)** with the identical `--ctx 8192 --ram-tier-gib 30 --placement profiles/routing-6prompts.shrc`
+    protocol:
+    - **`decode_warm` median: 15.34 tok/s** vs `10.20 tok/s` baseline (**`+50.4%` (`1.504x`) speedup**, p90 slow end `15.12`,
+      worst `15.12`, best `15.38 tok/s`; single-prompt decode `16.95 tok/s` / `0.059 s/token`)
+    - **Within-arm noise floor: median 0.3%, p90 1.3%, worst 1.7%**
+    - **Lowest available RAM: 12.9 GiB** (up from 9.6 GiB); peak GPU memory 10,012-10,019 MiB (down from 10,422 MiB);
+      **0 answer differences** across all 48 turns.
+
 ## Second architecture: `RecursiveSI/flint` (`Flint-40B-A2.5B-abliterated-NVFP4.gguf`)
 
 - **Model**: 40 layers (layers 0-1 dense SwiGLU, layers 2-39 128-expert top-6 sigmoid MoE + ungated shared expert),

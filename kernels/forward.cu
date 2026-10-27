@@ -105,6 +105,28 @@ extern "C" __global__ void hc_write(float* r, const float* g, const float* y, un
     r[i] += g[i / h] * y[i % h];
 }
 
+// Fuses hc_write (r[s*h+i] += g[s] * y[i]) and the next hc_read's rmsnorm_groups (rn[s*h+i] = rmsnorm(r_s, w_s)).
+// grid = streams, block = 256.
+extern "C" __global__ void hc_write_rmsnorm_groups(float* r, const float* g, const float* y, const float* w, float* rn,
+                                                   unsigned int group, float eps) {
+    unsigned int s = blockIdx.x;
+    float gs = g[s];
+    float* rs = r + (u64) s * group;
+    const float* ws = w + (u64) s * group;
+    float* ys = rn + (u64) s * group;
+    double ss = 0.0;
+    for (unsigned int i = threadIdx.x; i < group; i += blockDim.x) {
+        float v = rs[i] + gs * y[i];
+        rs[i] = v;
+        ss += (double) v * (double) v;
+    }
+    double ms = block_sum(ss) / (double) group;
+    double scale = 1.0 / sqrt(ms + (double) eps);
+    for (unsigned int i = threadIdx.x; i < group; i += blockDim.x) {
+        ys[i] = (float) ((double) rs[i] * scale) * ws[i];
+    }
+}
+
 // r[s*h+i] = x[i]
 extern "C" __global__ void broadcast(const float* x, float* r, unsigned int h, unsigned int streams) {
     unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -145,6 +167,19 @@ extern "C" __global__ void conv_silu_step(const float* x, float* state, const fl
 // Each `d`-wide head: x = x / sqrt(sum x^2 + 1e-6), then x /= div.  grid = heads, block = 128.
 extern "C" __global__ void l2norm_heads(float* x, unsigned int d, float div) {
     float* h = x + (u64) blockIdx.x * d;
+    double ss = 0.0;
+    for (unsigned int i = threadIdx.x; i < d; i += blockDim.x) ss += (double) h[i] * (double) h[i];
+    double n = 1.0 / sqrt(block_sum(ss) + 1e-6);
+    for (unsigned int i = threadIdx.x; i < d; i += blockDim.x) {
+        float v = (float) ((double) h[i] * n);
+        h[i] = div == 1.0f ? v : v / div;
+    }
+}
+
+// Blocks 0..kh-1 normalize Q heads (divided by q_div); blocks kh..2*kh-1 normalize K heads (div = 1.0).
+extern "C" __global__ void l2norm_qk_heads(float* x, unsigned int kh, unsigned int d, float q_div) {
+    float* h = x + (u64) blockIdx.x * d;
+    float div = blockIdx.x < kh ? q_div : 1.0f;
     double ss = 0.0;
     for (unsigned int i = threadIdx.x; i < d; i += blockDim.x) ss += (double) h[i] * (double) h[i];
     double n = 1.0 / sqrt(block_sum(ss) + 1e-6);
@@ -220,6 +255,31 @@ extern "C" __global__ void head_norm_rope_qk(const float* qg, float* q, const fl
     rmsnorm_one(x, w, y, d, eps);
     __syncthreads();
     rope_one(y, pos, rope_dims, theta);
+}
+
+// Qwen gated attention: blocks 0..nh-1 normalize+RoPE query heads (qg[h*2*d..h*2*d+d] -> q[h*d..]) AND split the gate
+// half (qg[h*2*d+d..h*2*d+2*d] -> gate[h*d..]); blocks nh..nh+nkv-1 normalize+RoPE key heads (kk -> kc).
+extern "C" __global__ void head_norm_rope_qgk(const float* qg, float* q, float* gate, const float* wq,
+                                              const float* kk, float* kc, const float* wk,
+                                              unsigned int nh, unsigned int d, float eps,
+                                              unsigned int pos, unsigned int rope_dims, float theta) {
+    unsigned int b = blockIdx.x;
+    if (b < nh) {
+        const float* x = qg + (u64) b * 2 * d;
+        float* y = q + (u64) b * d;
+        float* g = gate + (u64) b * d;
+        for (unsigned int i = threadIdx.x; i < d; i += blockDim.x) g[i] = x[d + i];
+        rmsnorm_one(x, wq, y, d, eps);
+        __syncthreads();
+        rope_one(y, pos, rope_dims, theta);
+    } else {
+        unsigned int kh = b - nh;
+        const float* x = kk + (u64) kh * d;
+        float* y = kc + (u64) kh * d;
+        rmsnorm_one(x, wk, y, d, eps);
+        __syncthreads();
+        rope_one(y, pos, rope_dims, theta);
+    }
 }
 
 // gate[h*hd + j] = qg[h*2*hd + hd + j]: the gate half of each query head
@@ -398,6 +458,16 @@ extern "C" __global__ void moe_combine_flint(float* y, const float* eo, const fl
 extern "C" __global__ void axpy_sigmoid(float* y, const float* x, const float* gl, unsigned int n) {
     unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) y[i] += sigmoidf_ref(gl[0]) * x[i];
+}
+
+// Fuses my.zero() + axpy_many + axpy_sigmoid + copy into one launch for Qwen's MoE combine.
+extern "C" __global__ void moe_combine_qwen(float* y, const float* eo, const float* w, const float* sh_eo,
+                                            const float* gl, unsigned int n, unsigned int k) {
+    unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    float acc = 0.0f;
+    for (unsigned int j = 0; j < k; j++) acc += w[j] * eo[(u64) j * n + i];
+    y[i] = acc + sigmoidf_ref(gl[0]) * sh_eo[i];
 }
 
 // ------------------------------------------------------------------------------------------------ PLE

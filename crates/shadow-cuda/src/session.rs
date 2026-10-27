@@ -12,7 +12,7 @@
 //! holding one expert's gate, up and down slices; a miss reads the slices from the file and uploads them into the
 //! least recently used slot.  The experts the current token routes to are never the victims of its own misses.
 
-use crate::driver::{Context, DeviceBuffer};
+use crate::driver::{Context, DeviceBuffer, Stream};
 use crate::kernels::{file, Arg, Program, FAST_KERNELS, QUANT_KERNELS};
 use crate::pinned::PinnedRegion;
 use shadow_model::forward::{ple_rows, route, route_sigmoid, Model, Stepper};
@@ -78,7 +78,6 @@ struct Bufs<'c> {
     down: DeviceBuffer<'c>,
     up: DeviceBuffer<'c>,
     u: DeviceBuffer<'c>,
-    gl: DeviceBuffer<'c>,
     g: DeviceBuffer<'c>,
     y: DeviceBuffer<'c>,
     e: DeviceBuffer<'c>,
@@ -94,17 +93,14 @@ struct Bufs<'c> {
     q: DeviceBuffer<'c>,
     gate: DeviceBuffer<'c>,
     kk: DeviceBuffer<'c>,
-    vv: DeviceBuffer<'c>,
     iq: DeviceBuffer<'c>,
     iqn: DeviceBuffer<'c>,
-    ik: DeviceBuffer<'c>,
     ao: DeviceBuffer<'c>,
     scores: DeviceBuffer<'c>,
     toks: DeviceBuffer<'c>,
     scratch: DeviceBuffer<'c>,
     // MoE
     rl: DeviceBuffer<'c>,
-    my: DeviceBuffer<'c>,
     eg: DeviceBuffer<'c>,
     eu: DeviceBuffer<'c>,
     act: DeviceBuffer<'c>,
@@ -148,6 +144,8 @@ pub struct GpuSession<'c, 'm> {
     pub expert_uploads: usize,
     cache: ExpertCache<'c>,
     ram: RamTier<'c>,
+    copy_stream: Stream<'c>,
+    staging: Option<PinnedRegion<'c>>,
     /// How often each (layer, expert) was routed to by this session (`--record-routing` saves it).
     pub routing: RoutingCounts,
     prof: Option<Prof>,
@@ -339,14 +337,14 @@ impl<'c, 'm> GpuSession<'c, 'm> {
         let k = c.n_expert_used;
         let max_ff = ((k + 2) * c.expert_ff).max(c.dense_ff).max(c.shared_ff);
         let b = Bufs {
-            r: a(ch)?, rn: a(ch)?, down: a(c.hc_rank)?, up: a(ch)?, u: a(h)?, gl: a(cs)?, g: a(cs)?, y: a(h)?, e: a(h)?,
+            r: a(ch)?, rn: a(ch)?, down: a(c.hc_rank)?, up: a(ch)?, u: a(h)?, g: a(cs)?, y: a(h)?, e: a(h)?,
             qkv: a(2 * kd + vd)?, x: a(2 * kd + vd)?, z: a(vd)?, beta: a(c.ssm_v_heads)?, alpha: a(c.ssm_v_heads)?,
             o: a(vd)?,
-            qg: a(2 * qd)?, q: a(qd)?, gate: a(qd)?, kk: a(kvd)?, vv: a(kvd)?, iq: a(c.idx_heads * id)?,
-            iqn: a(c.idx_heads * id)?, ik: a(id)?, ao: a(qd)?, scores: a(cap / ratio + 1)?,
+            qg: a(2 * qd)?, q: a(qd)?, gate: a(qd)?, kk: a(kvd)?, iq: a(c.idx_heads * id)?,
+            iqn: a(c.idx_heads * id)?, ao: a(qd)?, scores: a(cap / ratio + 1)?,
             toks: a(c.idx_budget + ratio)?, scratch: ctx.alloc(c.n_head * cap * 8).map_err(e)?,
             // the routed experts' intermediates, one row per routed expert (eg holds 2*max_ff when gate+up batch together)
-            rl: a(c.n_expert)?, my: a(h)?, eg: a(2 * max_ff)?, eu: a(max_ff)?, act: a(max_ff)?,
+            rl: a(c.n_expert)?, eg: a(2 * max_ff)?, eu: a(max_ff)?, act: a(max_ff)?,
             eo: a((k + 1).max(1) * h)?, sgl: a(1)?, wg: ctx.alloc(k * max_expert).map_err(e)?, wu: ctx.alloc(k * max_expert).map_err(e)?,
             wd: ctx.alloc(k * max_expert).map_err(e)?, tab: ctx.alloc((k + 2).max(1) * (3 * 8 + 4 * 4)).map_err(e)?,
             pe: a(h)?, key: a(ch)?, keyn: a(ch)?, val: a(h)?, qry: a(ch)?, gv: a(ch)?, gvn: a(ch)?,
@@ -446,9 +444,15 @@ impl<'c, 'm> GpuSession<'c, 'm> {
             }
             ctx.synchronize().map_err(e)?;
         }
+        let copy_stream = ctx.stream().map_err(e)?;
+        let staging = if slot_bytes > 0 && c.n_expert_used > 0 {
+            Some(PinnedRegion::new(ctx, c.n_expert_used * slot_bytes)?)
+        } else {
+            None
+        };
         Ok(GpuSession {
             ctx, m, mvp, fw, w, v, b, delta, attn, ple_state, tokens: vec![], cap, trace: None, stop_after: None,
-            resident_bytes, expert_uploads: 0, cache, ram,
+            resident_bytes, expert_uploads: 0, cache, ram, copy_stream, staging,
             routing: RoutingCounts::new(c.n_layer, c.n_expert),
             prof: std::env::var("SHADOW_PROFILE").is_ok_and(|v| v == "1")
                 .then(|| Prof { last: std::time::Instant::now(), phases: vec![] }),
@@ -521,8 +525,8 @@ impl<'c, 'm> GpuSession<'c, 'm> {
 
     fn matvec(&self, t: &TensorInfo, wptr: u64, rows: usize, x: u64, y: u64) {
         let ty = t.ty.name();
-        // the 8-at-a-time kernel where tests/matvec.rs measured it faster than the reference one
-        let fast = matches!(ty.as_str(), "IQ2_S" | "IQ3_XXS" | "IQ3_S" | "IQ4_XS" | "NVFP4" | "BF16") && t.dims[0].is_multiple_of(8);
+        // the 8-at-a-time kernel where tests/matvec.rs measured it faster than the reference one (every block-quantized type)
+        let fast = !matches!(ty.as_str(), "BF16" | "F32") && t.dims[0].is_multiple_of(8);
         let entry = if fast {
             FAST_KERNELS.iter().find(|q| q.0 == ty).unwrap().1
         } else {
@@ -595,13 +599,13 @@ impl<'c, 'm> GpuSession<'c, 'm> {
         assert_eq!(r, 0, "cuMemcpyHtoDAsync failed ({r})");
     }
 
-    /// Asynchronous host-to-device DMA from pinned memory (`PinnedRegion`) on the default stream.
-    fn upload_pinned_to(&self, ptr: u64, data: &[u8]) {
+    /// Asynchronous host-to-device DMA from pinned memory (`PinnedRegion`) on `stream` (null = default stream).
+    fn upload_pinned_on(&self, ptr: u64, data: &[u8], stream: *mut std::ffi::c_void) {
         let api = self.ctx.api;
         self.ctx.bind().unwrap();
         // SAFETY: `data` lies inside `PinnedRegion` (registered page-locked memory), so `cuMemcpyHtoDAsync` will not
-        // stage through pageable memory and stays ordered with kernel launches on the default stream.
-        let r = unsafe { (api.cuMemcpyHtoDAsync)(ptr, data.as_ptr() as *const std::ffi::c_void, data.len(), std::ptr::null_mut()) };
+        // stage through pageable memory.
+        let r = unsafe { (api.cuMemcpyHtoDAsync)(ptr, data.as_ptr() as *const std::ffi::c_void, data.len(), stream) };
         assert_eq!(r, 0, "cuMemcpyHtoDAsync failed ({r})");
     }
 
@@ -630,9 +634,10 @@ impl<'c, 'm> GpuSession<'c, 'm> {
         self.rec_host("embed".into(), &emb);
         self.mark("embedding");
 
+        let mut rn_ready = false;
         for l in 0..c.n_layer {
             if self.stop_after == Some(l) {
-                self.hc_read("output_hc", false);
+                self.hc_read("output_hc", false, rn_ready);
                 self.rec("final_u".into(), self.b.u.ptr, h);
                 return vec![];
             }
@@ -640,8 +645,9 @@ impl<'c, 'm> GpuSession<'c, 'm> {
                 self.ple(l);
                 self.k1("add", h * cs, &[Arg::Ptr(self.b.r.ptr), Arg::Ptr(self.b.gv.ptr), Arg::U32((h * cs) as u32)]);
                 self.rec(format!("layer{l}.ple"), self.b.gv.ptr, h * cs);
+                rn_ready = false;
             }
-            self.hc_read(&format!("blk.{l}.hc_attn"), true);
+            self.hc_read(&format!("blk.{l}.hc_attn"), true, rn_ready);
             self.rec(format!("layer{l}.attn_hc_u"), self.b.u.ptr, h);
             if c.is_attention(l) {
                 self.attention(l);
@@ -649,15 +655,24 @@ impl<'c, 'm> GpuSession<'c, 'm> {
                 self.delta_net(l);
             }
             self.rec(format!("layer{l}.mixer"), self.b.y.ptr, h);
-            self.hc_write();
-            self.hc_read(&format!("blk.{l}.hc_ffn"), true);
+            self.hc_write_norm(&format!("blk.{l}.hc_ffn_norm.weight"));
+            self.hc_read(&format!("blk.{l}.hc_ffn"), true, true);
             self.rec(format!("layer{l}.mlp_hc_u"), self.b.u.ptr, h);
             self.moe(l);
             self.rec(format!("layer{l}.moe"), self.b.y.ptr, h);
-            self.hc_write();
+            if l + 1 == c.ple_layer {
+                self.hc_write();
+                rn_ready = false;
+            } else if l + 1 < c.n_layer && self.stop_after != Some(l + 1) {
+                self.hc_write_norm(&format!("blk.{}.hc_attn_norm.weight", l + 1));
+                rn_ready = true;
+            } else {
+                self.hc_write_norm("output_hc_norm.weight");
+                rn_ready = true;
+            }
             self.rec(format!("layer{l}.out"), self.b.r.ptr, h * cs);
         }
-        self.hc_read("output_hc", false);
+        self.hc_read("output_hc", false, rn_ready);
         self.rec("final_u".into(), self.b.u.ptr, h);
         self.mv("output.weight", self.b.u.ptr, self.b.logits.ptr);
         let mut out = vec![0u8; c.vocab * 4];
@@ -742,21 +757,29 @@ impl<'c, 'm> GpuSession<'c, 'm> {
     }
 
     /// The hyper-connection read: u (and g, with `inject`) from the streams r.
-    fn hc_read(&self, p: &str, inject: bool) {
+    fn hc_read(&self, p: &str, inject: bool, skip_norm: bool) {
         let c = &self.m.cfg;
         let (h, cs) = (c.hidden as u32, c.streams as u32);
         let b = &self.b;
-        self.k("rmsnorm_groups", cs, 256, &[Arg::Ptr(b.r.ptr), Arg::Ptr(self.sv(&format!("{p}_norm.weight"))),
-                                           Arg::Ptr(b.rn.ptr), Arg::U32(h), Arg::F32(c.eps)]);
-        self.mv(&format!("{p}_down.weight"), b.rn.ptr, b.down.ptr);
-        self.k1("silu_div", c.hc_rank, &[Arg::Ptr(b.down.ptr), Arg::U32(c.hc_rank as u32), Arg::F32(cs as f32)]);
+        if !skip_norm {
+            self.k("rmsnorm_groups", cs, 256, &[Arg::Ptr(b.r.ptr), Arg::Ptr(self.sv(&format!("{p}_norm.weight"))),
+                                               Arg::Ptr(b.rn.ptr), Arg::U32(h), Arg::F32(c.eps)]);
+        }
+        let r_down = c.hc_rank as u32;
+        let (w_inj, r_inj) = if inject {
+            (self.w[&format!("{p}_inject.weight")].ptr, cs)
+        } else {
+            (0, 0)
+        };
+        unsafe {
+            self.mvp.launch("hc_down_inject_bf16", ((r_down + r_inj).div_ceil(8), 1, 1), (256, 1, 1), 0, None, &[
+                Arg::Ptr(self.w[&format!("{p}_down.weight")].ptr), Arg::Ptr(b.down.ptr), Arg::U32(r_down),
+                Arg::Ptr(w_inj), Arg::Ptr(b.g.ptr), Arg::U32(r_inj),
+                Arg::Ptr(b.rn.ptr), Arg::U32(h * cs), Arg::F32(cs as f32),
+            ]).unwrap_or_else(|err| panic!("hc_down_inject_bf16: {err}"));
+        }
         self.mv(&format!("{p}_up.weight"), b.down.ptr, b.up.ptr);
         self.k1("hc_mix", h as usize, &[Arg::Ptr(b.rn.ptr), Arg::Ptr(b.up.ptr), Arg::Ptr(b.u.ptr), Arg::U32(h), Arg::U32(cs)]);
-        if inject {
-            self.mv(&format!("{p}_inject.weight"), b.rn.ptr, b.gl.ptr);
-            self.k1("sigmoid_div", cs as usize, &[Arg::Ptr(b.gl.ptr), Arg::Ptr(b.g.ptr), Arg::U32(cs), Arg::F32(cs as f32),
-                                                  Arg::F32(2.0)]);
-        }
     }
 
     fn hc_write(&self) {
@@ -764,6 +787,14 @@ impl<'c, 'm> GpuSession<'c, 'm> {
         let b = &self.b;
         self.k1("hc_write", c.hidden * c.streams, &[Arg::Ptr(b.r.ptr), Arg::Ptr(b.g.ptr), Arg::Ptr(b.y.ptr),
                                                    Arg::U32(c.hidden as u32), Arg::U32(c.streams as u32)]);
+    }
+
+    fn hc_write_norm(&self, next_norm: &str) {
+        let c = &self.m.cfg;
+        let b = &self.b;
+        self.k("hc_write_rmsnorm_groups", c.streams as u32, 256, &[
+            Arg::Ptr(b.r.ptr), Arg::Ptr(b.g.ptr), Arg::Ptr(b.y.ptr), Arg::Ptr(self.sv(next_norm)),
+            Arg::Ptr(b.rn.ptr), Arg::U32(c.hidden as u32), Arg::F32(c.eps)]);
     }
 
     fn delta_net(&self, l: usize) {
@@ -775,13 +806,18 @@ impl<'c, 'm> GpuSession<'c, 'm> {
         let ch = 2 * kd + vd;
         self.mv(&format!("{p}.attn_qkv.weight"), b.u.ptr, b.qkv.ptr);
         self.mv(&format!("{p}.attn_gate.weight"), b.u.ptr, b.z.ptr);
-        self.mv(&format!("{p}.ssm_beta.weight"), b.u.ptr, b.beta.ptr);
-        self.mv(&format!("{p}.ssm_alpha.weight"), b.u.ptr, b.alpha.ptr);
+        unsafe {
+            self.mvp.launch("matvec_pair_bf16", (((2 * vh) as u32).div_ceil(8), 1, 1), (256, 1, 1), 0, None, &[
+                Arg::Ptr(self.w[&format!("{p}.ssm_beta.weight")].ptr), Arg::Ptr(b.beta.ptr), Arg::U32(vh as u32),
+                Arg::Ptr(self.w[&format!("{p}.ssm_alpha.weight")].ptr), Arg::Ptr(b.alpha.ptr), Arg::U32(vh as u32),
+                Arg::Ptr(b.u.ptr), Arg::U32(c.hidden as u32),
+            ]).unwrap_or_else(|err| panic!("matvec_pair_bf16: {err}"));
+        }
         let (s, conv) = self.delta[l].as_ref().unwrap();
         self.k1("conv_silu_step", ch, &[Arg::Ptr(b.qkv.ptr), Arg::Ptr(conv.ptr), Arg::Ptr(self.sv(&format!("{p}.ssm_conv1d.weight"))),
                                        Arg::Ptr(b.x.ptr), Arg::U32(ch as u32), Arg::U32(c.conv_k as u32)]);
-        self.k("l2norm_heads", kh as u32, 128, &[Arg::Ptr(b.x.ptr), Arg::U32(d as u32), Arg::F32((d as f32).sqrt())]);
-        self.k("l2norm_heads", kh as u32, 128, &[Arg::Ptr(b.x.ptr + (kd * 4) as u64), Arg::U32(d as u32), Arg::F32(1.0)]);
+        self.k("l2norm_qk_heads", (2 * kh) as u32, 128, &[
+            Arg::Ptr(b.x.ptr), Arg::U32(kh as u32), Arg::U32(d as u32), Arg::F32((d as f32).sqrt())]);
         self.k("delta_step", vh as u32, d as u32, &[
             Arg::Ptr(b.x.ptr), Arg::Ptr(b.x.ptr + (kd * 4) as u64), Arg::Ptr(b.x.ptr + (2 * kd * 4) as u64),
             Arg::Ptr(b.beta.ptr), Arg::Ptr(b.alpha.ptr), Arg::Ptr(self.sv(&format!("{p}.ssm_a"))),
@@ -802,24 +838,24 @@ impl<'c, 'm> GpuSession<'c, 'm> {
         let (rd, th, eps) = (c.rope_dims as u32, c.rope_theta as f32, c.eps);
         {
             let b = &self.b;
-            self.mv(&format!("{p}.attn_q.weight"), b.u.ptr, b.qg.ptr);
-            self.mv(&format!("{p}.attn_k.weight"), b.u.ptr, b.kk.ptr);
-            self.mv(&format!("{p}.attn_v.weight"), b.u.ptr, b.vv.ptr);
-            self.mv(&format!("{p}.indexer.q_proj.weight"), b.u.ptr, b.iq.ptr);
-            self.mv(&format!("{p}.indexer.k_proj.weight"), b.u.ptr, b.ik.ptr);
-            self.k("head_norm_rope", nh as u32, 128, &[
-                Arg::Ptr(b.qg.ptr), Arg::U32((2 * hd) as u32), Arg::Ptr(b.q.ptr), Arg::U32(hd as u32),
-                Arg::Ptr(self.sv(&format!("{p}.attn_q_norm.weight"))), Arg::U32(hd as u32), Arg::F32(eps), Arg::U32(pos as u32),
-                Arg::U32(rd), Arg::F32(th)]);
-            self.k1("split_gate", nh * hd, &[Arg::Ptr(b.qg.ptr), Arg::Ptr(b.gate.ptr), Arg::U32(nh as u32), Arg::U32(hd as u32)]);
             let at = self.attn[l].as_ref().unwrap();
             let slot = (pos * nkv * hd * 4) as u64;
-            self.k("head_norm_rope", nkv as u32, 128, &[
-                Arg::Ptr(b.kk.ptr), Arg::U32(hd as u32), Arg::Ptr(at.k.ptr + slot), Arg::U32(hd as u32),
-                Arg::Ptr(self.sv(&format!("{p}.attn_k_norm.weight"))), Arg::U32(hd as u32), Arg::F32(eps), Arg::U32(pos as u32),
-                Arg::U32(rd), Arg::F32(th)]);
-            self.k1("copy", nkv * hd, &[Arg::Ptr(at.v.ptr + slot), Arg::Ptr(b.vv.ptr), Arg::U32((nkv * hd) as u32)]);
-            self.k1("copy", id, &[Arg::Ptr(at.raw.ptr + (pos * id * 4) as u64), Arg::Ptr(b.ik.ptr), Arg::U32(id as u32)]);
+            let raw_slot = at.raw.ptr + (pos * id * 4) as u64;
+            self.mv(&format!("{p}.attn_q.weight"), b.u.ptr, b.qg.ptr);
+            self.mv(&format!("{p}.attn_k.weight"), b.u.ptr, b.kk.ptr);
+            self.mv(&format!("{p}.attn_v.weight"), b.u.ptr, at.v.ptr + slot);
+            let iq_rows = (c.idx_heads * id) as u32;
+            unsafe {
+                self.mvp.launch("matvec_pair_bf16", ((iq_rows + id as u32).div_ceil(8), 1, 1), (256, 1, 1), 0, None, &[
+                    Arg::Ptr(self.w[&format!("{p}.indexer.q_proj.weight")].ptr), Arg::Ptr(b.iq.ptr), Arg::U32(iq_rows),
+                    Arg::Ptr(self.w[&format!("{p}.indexer.k_proj.weight")].ptr), Arg::Ptr(raw_slot), Arg::U32(id as u32),
+                    Arg::Ptr(b.u.ptr), Arg::U32(c.hidden as u32),
+                ]).unwrap_or_else(|err| panic!("matvec_pair_bf16: {err}"));
+            }
+            self.k("head_norm_rope_qgk", (nh + nkv) as u32, 128, &[
+                Arg::Ptr(b.qg.ptr), Arg::Ptr(b.q.ptr), Arg::Ptr(b.gate.ptr), Arg::Ptr(self.sv(&format!("{p}.attn_q_norm.weight"))),
+                Arg::Ptr(b.kk.ptr), Arg::Ptr(at.k.ptr + slot), Arg::Ptr(self.sv(&format!("{p}.attn_k_norm.weight"))),
+                Arg::U32(nh as u32), Arg::U32(hd as u32), Arg::F32(eps), Arg::U32(pos as u32), Arg::U32(rd), Arg::F32(th)]);
         }
         // complete blocks get their pooled keys once
         let n = pos + 1;
@@ -929,22 +965,46 @@ impl<'c, 'm> GpuSession<'c, 'm> {
     }
 
     /// Puts expert e of layer l (its gate, up and down slices) at the three device addresses: a DMA copy from the
-    /// pinned RAM tier if it holds the expert, otherwise read from the file and copied from pageable memory.
-    fn fetch_expert(&mut self, l: usize, e: usize, names: &[String; 3], sizes: &[usize], dst: [u64; 3]) {
+    /// pinned RAM tier if it holds the expert, otherwise read from the file into the pinned staging buffer and copied
+    /// on `copy_stream`.
+    fn fetch_expert(&mut self, l: usize, e: usize, slot_idx: usize, names: &[String; 3], sizes: &[usize], dst: [u64; 3]) {
+        let stream = self.copy_stream.raw();
+        let contiguous = dst[1] == dst[0] + sizes[0] as u64 && dst[2] == dst[1] + sizes[1] as u64;
+        let total = sizes[0] + sizes[1] + sizes[2];
         if let Some(&off) = self.ram.at.get(&(l, e)) {
             let src = self.ram.region.as_ref().unwrap().as_slice();
-            if dst[1] == dst[0] + sizes[0] as u64 && dst[2] == dst[1] + sizes[1] as u64 {
-                let total = sizes[0] + sizes[1] + sizes[2];
-                self.upload_pinned_to(dst[0], &src[off..off + total]);
+            if contiguous {
+                self.upload_pinned_on(dst[0], &src[off..off + total], stream);
             } else {
                 let mut o = off;
                 for i in 0..3 {
-                    self.upload_pinned_to(dst[i], &src[o..o + sizes[i]]);
+                    self.upload_pinned_on(dst[i], &src[o..o + sizes[i]], stream);
                     o += sizes[i];
                 }
             }
             self.ram.served += 1;
             self.mark("expert upload (pinned RAM)");
+        } else if let Some(st) = self.staging.as_mut() {
+            let base_off = slot_idx * self.cache.slot_bytes;
+            let part_offs = [0usize, sizes[0], sizes[0] + sizes[1]];
+            // Read in file-offset order (`ffn_down_exps` @ part 2, `ffn_gate_exps` @ part 0, `ffn_up_exps` @ part 1).
+            {
+                let buf = &mut st.as_mut_slice()[base_off..base_off + total];
+                for &i in &[2usize, 0, 1] {
+                    self.m.expert_into(&names[i], e, &mut buf[part_offs[i]..part_offs[i] + sizes[i]]);
+                }
+            }
+            self.mark("expert read (file)");
+            let src = &self.staging.as_ref().unwrap().as_slice()[base_off..base_off + total];
+            if contiguous {
+                self.upload_pinned_on(dst[0], src, stream);
+            } else {
+                for i in 0..3 {
+                    self.upload_pinned_on(dst[i], &src[part_offs[i]..part_offs[i] + sizes[i]], stream);
+                }
+            }
+            self.ram.drive += 1;
+            self.mark("expert upload (pageable)");
         } else {
             let slices: Vec<Vec<u8>> = names.iter().map(|n| self.m.expert(n, e).1).collect();
             self.mark("expert read (file)");
@@ -960,11 +1020,30 @@ impl<'c, 'm> GpuSession<'c, 'm> {
         let c = &self.m.cfg;
         let p = format!("blk.{l}");
         let h = c.hidden;
+        let ff = c.expert_ff;
+        let sff = c.shared_ff;
+        let is_flint = c.arch == "flint";
+        let sh_g_name = format!("{p}.ffn_gate_shexp.weight");
+        let sh_u_name = format!("{p}.ffn_up_shexp.weight");
         self.mark("mixers, norms, hc glue, ple");
         self.mv(&format!("{p}.ffn_gate_inp.weight"), self.b.u.ptr, self.b.rl.ptr);
         let mut lb = vec![0u8; c.n_expert * 4];
         self.download(self.b.rl.ptr, &mut lb);
-        let is_flint = c.arch == "flint";
+        // Launch Qwen's shared expert on stream 0 immediately so the GPU SMs compute it while the CPU runs `route`
+        // and `copy_stream` DMAs any missing routed experts.
+        let sh_launched_early = !is_flint && self.prof.is_none();
+        if sh_launched_early {
+            let k = c.n_expert_used;
+            let sh_eg = self.b.eg.ptr + (2 * k * ff * 4) as u64;
+            let sh_eu = self.b.eu.ptr + (k * ff * 4) as u64;
+            let sh_act = self.b.act.ptr + (k * ff * 4) as u64;
+            let sh_out = self.b.eo.ptr + (k * h * 4) as u64;
+            self.mv(&sh_g_name, self.b.u.ptr, sh_eg);
+            self.mv(&sh_u_name, self.b.u.ptr, sh_eu);
+            self.k1("swiglu", sff, &[Arg::Ptr(sh_eg), Arg::Ptr(sh_eu), Arg::Ptr(sh_act), Arg::U32(sff as u32)]);
+            self.mv(&format!("{p}.ffn_down_shexp.weight"), sh_act, sh_out);
+            self.mv(&format!("{p}.ffn_gate_inp_shexp.weight"), self.b.u.ptr, self.b.sgl.ptr);
+        }
         let top = if is_flint {
             route_sigmoid(&floats(&lb), c.n_expert_used)
         } else {
@@ -976,9 +1055,6 @@ impl<'c, 'm> GpuSession<'c, 'm> {
         }
         self.rec_host(format!("layer{l}.route_idx"), &top.iter().map(|&(e, _)| e as f32).collect::<Vec<_>>());
         self.rec_host(format!("layer{l}.route_w"), &top.iter().map(|&(_, w)| w as f32).collect::<Vec<_>>());
-        if !is_flint {
-            self.b.my.zero().unwrap();
-        }
         let names = [format!("{p}.ffn_gate_exps.weight"), format!("{p}.ffn_up_exps.weight"), format!("{p}.ffn_down_exps.weight")];
         let infos: Vec<TensorInfo> = names.iter().map(|n| self.expert_info(n)).collect();
         let sizes: Vec<usize> = names.iter().map(|n| {
@@ -987,12 +1063,13 @@ impl<'c, 'm> GpuSession<'c, 'm> {
         }).collect();
         // where each expert's three slices are on the device this time
         let mut at: Vec<[u64; 3]> = Vec::with_capacity(top.len());
+        let mut layer_misses = 0usize;
         if self.cache.slots > 0 {
             self.cache.clock += 1;
             for &(e, _) in &top {
                 self.cache.touch((l, e)); // protect this token's resident experts from its own misses
             }
-            for &(e, _) in &top {
+            for (i, &(e, _)) in top.iter().enumerate() {
                 let slot = match self.cache.touch((l, e)) {
                     Some(s) => {
                         self.cache.hits += 1;
@@ -1000,10 +1077,11 @@ impl<'c, 'm> GpuSession<'c, 'm> {
                     }
                     None => {
                         self.cache.misses += 1;
+                        layer_misses += 1;
                         let s = self.cache.victim();
                         let base = self.cache.arena.as_ref().unwrap().ptr + (s * self.cache.slot_bytes) as u64;
                         let dst = [base, base + sizes[0] as u64, base + (sizes[0] + sizes[1]) as u64];
-                        self.fetch_expert(l, e, &names, &sizes, dst);
+                        self.fetch_expert(l, e, i, &names, &sizes, dst);
                         self.cache.owner[s] = Some((l, e));
                         self.cache.map.insert((l, e), s);
                         self.cache.stamp[s] = self.cache.clock;
@@ -1018,22 +1096,22 @@ impl<'c, 'm> GpuSession<'c, 'm> {
             // no cache: each routed expert into its own row of the scratch buffers, every time
             let stride = (self.b.wg.bytes / c.n_expert_used) as u64;
             for (i, &(e, _)) in top.iter().enumerate() {
+                layer_misses += 1;
                 let dst = [self.b.wg.ptr + i as u64 * stride, self.b.wu.ptr + i as u64 * stride,
                            self.b.wd.ptr + i as u64 * stride];
-                self.fetch_expert(l, e, &names, &sizes, dst);
+                self.fetch_expert(l, e, i, &names, &sizes, dst);
                 at.push(dst);
             }
+        }
+        if layer_misses > 0 {
+            self.copy_stream.synchronize().unwrap();
         }
         // one table per layer - every expert's gate, up and down address, then the weights (and scales for NVFP4) -
         // and one launch per projection for all of them (with gate+up fused, and Flint's shared expert gate+up fused in too)
         let n = top.len();
-        let ff = c.expert_ff;
-        let sff = c.shared_ff;
         let fuse_shexp = is_flint && sff == 2 * ff && infos[0].ty == infos[1].ty && infos[0].dims == infos[1].dims;
         let n_gu = if fuse_shexp { n + 2 } else { n };
         let mut tab = Vec::with_capacity(n_gu * 40);
-        let sh_g_name = format!("{p}.ffn_gate_shexp.weight");
-        let sh_u_name = format!("{p}.ffn_up_shexp.weight");
         for part in 0..2 {
             for a in &at {
                 tab.extend_from_slice(&a[part].to_le_bytes());
@@ -1106,30 +1184,31 @@ impl<'c, 'm> GpuSession<'c, 'm> {
             self.k1("swiglu", n * ff, &[Arg::Ptr(b.eg.ptr), Arg::Ptr(eu_ptr), Arg::Ptr(b.act.ptr), Arg::U32((n * ff) as u32)]);
         }
         batch(&infos[2], down_tab_off, n, b.act.ptr, ff, b.eo.ptr, h);
-        if !is_flint {
-            self.k1("axpy_many", h, &[Arg::Ptr(b.my.ptr), Arg::Ptr(b.eo.ptr), Arg::Ptr(b.tab.ptr + w_off),
-                                      Arg::U32(h as u32), Arg::U32(n as u32)]);
-        }
         self.mark("routed expert matvecs");
         let b = &self.b;
-        let sh_act_ptr = if fuse_shexp {
-            b.act.ptr + (n * ff * 4) as u64
-        } else {
-            self.mv(&sh_g_name, b.u.ptr, b.eg.ptr);
-            self.mv(&sh_u_name, b.u.ptr, b.eu.ptr);
-            self.k1("swiglu", sff, &[Arg::Ptr(b.eg.ptr), Arg::Ptr(b.eu.ptr), Arg::Ptr(b.act.ptr), Arg::U32(sff as u32)]);
-            b.act.ptr
-        };
         let sh_out_ptr = b.eo.ptr + (n * h * 4) as u64;
-        self.mv(&format!("{p}.ffn_down_shexp.weight"), sh_act_ptr, if is_flint { sh_out_ptr } else { b.eo.ptr });
+        if !sh_launched_early {
+            let sh_act_ptr = if fuse_shexp {
+                b.act.ptr + (n * ff * 4) as u64
+            } else {
+                self.mv(&sh_g_name, b.u.ptr, b.eg.ptr);
+                self.mv(&sh_u_name, b.u.ptr, b.eu.ptr);
+                self.k1("swiglu", sff, &[Arg::Ptr(b.eg.ptr), Arg::Ptr(b.eu.ptr), Arg::Ptr(b.act.ptr), Arg::U32(sff as u32)]);
+                b.act.ptr
+            };
+            self.mv(&format!("{p}.ffn_down_shexp.weight"), sh_act_ptr, sh_out_ptr);
+            if !is_flint {
+                self.mv(&format!("{p}.ffn_gate_inp_shexp.weight"), b.u.ptr, b.sgl.ptr);
+            }
+        }
         if is_flint {
             self.k1("moe_combine_flint", h, &[
                 Arg::Ptr(b.y.ptr), Arg::Ptr(b.eo.ptr), Arg::Ptr(b.tab.ptr + w_off),
                 Arg::Ptr(b.tab.ptr + ds_off), Arg::Ptr(sh_out_ptr), Arg::U32(h as u32), Arg::U32(n as u32)]);
         } else {
-            self.mv(&format!("{p}.ffn_gate_inp_shexp.weight"), b.u.ptr, b.sgl.ptr);
-            self.k1("axpy_sigmoid", h, &[Arg::Ptr(b.my.ptr), Arg::Ptr(b.eo.ptr), Arg::Ptr(b.sgl.ptr), Arg::U32(h as u32)]);
-            self.k1("copy", h, &[Arg::Ptr(b.y.ptr), Arg::Ptr(b.my.ptr), Arg::U32(h as u32)]);
+            self.k1("moe_combine_qwen", h, &[
+                Arg::Ptr(b.y.ptr), Arg::Ptr(b.eo.ptr), Arg::Ptr(b.tab.ptr + w_off),
+                Arg::Ptr(sh_out_ptr), Arg::Ptr(b.sgl.ptr), Arg::U32(h as u32), Arg::U32(n as u32)]);
         }
         self.mark("shared expert + combine");
     }

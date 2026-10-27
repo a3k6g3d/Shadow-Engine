@@ -52,6 +52,11 @@ them changes the prompt; the fixture records the ids, so it stays valid as a fix
   (`crates/shadow-bench`) are in (0.1.7-0.1.11). Shadow's own 8-launch noise floor is measured in
   `bench/floor-2026-10-27`: **median 0.8%, p90 2.0%, worst 3.6%** at **10.20 tok/s** `decode_warm` (`--ram-tier-gib 30`),
   lowest available RAM 9.6 GiB, 0 answer differences across 48 turns.
+- **Stage 5 (`0.1.12`)**: Register-immediate `iq4nl_val`, `Fast<Q4K/Q5K/Q6K/IQ4XS>` kernels, fused forward-pass kernels
+  (`hc_down_inject_bf16`, `hc_write_rmsnorm_groups`, `moe_combine_qwen`, `matvec_pair_bf16`, `l2norm_qk_heads`,
+  `head_norm_rope_qgk`), and `copy_stream` DMA + pinned file-miss staging + early shared-expert overlap cut GPU compute
+  from 52.5 to 31.6 ms/token (`-40%`) and raised 8-launch `decode_warm` from **10.20 tok/s to 15.34 tok/s (`+50.4%`)**
+  (`bench/stage5-kernels-2026-10-27`, floor `0.3%` median / `1.3%` p90 / `1.7%` worst, single-prompt decode `16.95 tok/s`).
 - Cleanup done (0.1.4): `shadow-abi`, `include/shadow/c/abi.h`, `shadow-host/src/ffi.rs` and `protocol.rs` are
   removed. Still owed: copy the model under `J:\\Shadow\\models\\` and record its SHA-256 (the plan
   says the model file is the only input; it is still read from `J:\Strata-work\models\swift15\IQ3_S\`).
@@ -112,8 +117,7 @@ the user said to use it if more space is needed).
 Q2_0 has no independent fixture; the GGUF has no MTP tensors (speculative decoding needs another draft: quantize the
 checkpoint's own MTP layer, or prompt-lookup drafting); a prompt other than the one 12-token sentence has not been
 compared stream by stream apart from the 2,600-token one above; sampling (temperature, top-p) is not implemented
-(greedy only); `chat.rs` refuses `tools` definitions (needed before `shadow-eval run` can run `tools/shadow_harness.py`
-against `shadow-serve`); vision is out of scope until asked for.
+(greedy only); vision is out of scope until asked for.
 
 ## The user
 
