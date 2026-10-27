@@ -905,7 +905,7 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
           </div>
           <div class="mon-stat-big">
             <span class="mon-big-val" id="cpu-proc-val">0.0%</span>
-            <span class="mon-big-unit">Process (<span id="cpu-proc-cores">0.0</span> cores used)</span>
+            <span class="mon-big-unit">Process (<span id="cpu-proc-cores">0.0</span> cores • Sys: <span id="cpu-sys-val">0.0%</span>)</span>
           </div>
           <div class="progress-bar-wrap">
             <div class="progress-bar" id="cpu-bar" style="width: 0%;"></div>
@@ -1422,7 +1422,20 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
       pollTelemetry();
     }
 
-    // Telemetry Polling
+    // Telemetry Polling Safe Setters
+    function setTxt(id, val) {
+      const el = document.getElementById(id);
+      if (el) el.textContent = val;
+    }
+    function setHTML(id, val) {
+      const el = document.getElementById(id);
+      if (el) el.innerHTML = val;
+    }
+    function setWidth(id, val) {
+      const el = document.getElementById(id);
+      if (el) el.style.width = val;
+    }
+
     function formatBytes(b) {
       if (!b || b <= 0) return '0 B';
       const gib = b / (1024 * 1024 * 1024);
@@ -1451,79 +1464,85 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
           gpuHeaderPill.innerHTML = `GPU: <strong>${d.gpu.utilization_percent.toFixed(0)}%</strong> • VRAM: <strong>${usedG}/${totalG} GiB</strong>`;
         }
 
-        // Process Monitor View
+        // Process Monitor View - CPU
         if (d.cpu) {
-          document.getElementById('cpu-proc-val').textContent = d.cpu.process_percent.toFixed(1) + '%';
-          document.getElementById('cpu-proc-cores').textContent = d.cpu.process_cores_used.toFixed(1);
-          document.getElementById('cpu-sys-val').textContent = d.cpu.system_percent.toFixed(1) + '%';
-          document.getElementById('cpu-proc-txt').textContent = d.cpu.process_percent.toFixed(1) + '%';
-          document.getElementById('cpu-sys-txt').textContent = d.cpu.system_percent.toFixed(1) + '%';
-          document.getElementById('cpu-cores-used-txt').textContent = `${d.cpu.process_cores_used.toFixed(1)} / ${d.cpu.logical_cores}`;
-          document.getElementById('cpu-cores-txt').textContent = d.cpu.logical_cores;
-          document.getElementById('cpu-cores-badge').textContent = d.cpu.logical_cores + ' Cores';
-          document.getElementById('cpu-bar').style.width = Math.min(d.cpu.process_percent * 2, 100) + '%';
+          setTxt('cpu-proc-val', d.cpu.process_percent.toFixed(1) + '%');
+          setTxt('cpu-proc-cores', d.cpu.process_cores_used.toFixed(1));
+          setTxt('cpu-sys-val', d.cpu.system_percent.toFixed(1) + '%');
+          setTxt('cpu-proc-txt', d.cpu.process_percent.toFixed(1) + '%');
+          setTxt('cpu-sys-txt', d.cpu.system_percent.toFixed(1) + '%');
+          setTxt('cpu-cores-used-txt', `${d.cpu.process_cores_used.toFixed(1)} / ${d.cpu.logical_cores}`);
+          setTxt('cpu-cores-txt', d.cpu.logical_cores);
+          setTxt('cpu-cores-badge', d.cpu.logical_cores + ' Cores');
+          setWidth('cpu-bar', Math.min(d.cpu.process_percent * 2, 100) + '%');
         }
 
+        // GPU & VRAM
         if (d.gpu) {
           const usedG = (d.gpu.vram_used_bytes / (1024**3)).toFixed(2);
           const totalG = (d.gpu.vram_total_bytes / (1024**3)).toFixed(1);
           const freeG = (d.gpu.vram_free_bytes / (1024**3)).toFixed(2);
-          document.getElementById('gpu-device-badge').textContent = d.gpu.name || 'NVIDIA GPU';
-          document.getElementById('gpu-util-val').textContent = d.gpu.utilization_percent.toFixed(1) + '%';
-          document.getElementById('gpu-util-txt').textContent = d.gpu.utilization_percent.toFixed(1) + '%';
-          document.getElementById('gpu-mem-txt').textContent = d.gpu.memory_controller_percent.toFixed(1) + '%';
-          document.getElementById('gpu-temp-txt').textContent = d.gpu.temperature_c > 0 ? `${d.gpu.temperature_c} °C` : 'N/A';
-          document.getElementById('vram-used-val').textContent = usedG;
-          document.getElementById('vram-total-val').textContent = totalG + ' GiB';
-          document.getElementById('vram-used-total-txt').textContent = `${usedG} / ${totalG} GiB`;
-          document.getElementById('vram-free-txt').textContent = freeG + ' GiB';
-          document.getElementById('vram-slots-txt').textContent = d.gpu.expert_cache_slots + ' slots';
-          document.getElementById('vram-hit-rate-txt').textContent = d.gpu.expert_cache_hit_rate.toFixed(1) + '%';
-          document.getElementById('gpu-bar').style.width = Math.min(d.gpu.utilization_percent, 100) + '%';
+          setTxt('gpu-device-badge', d.gpu.name || 'NVIDIA GPU');
+          setTxt('gpu-util-val', d.gpu.utilization_percent.toFixed(1) + '%');
+          setTxt('gpu-util-txt', d.gpu.utilization_percent.toFixed(1) + '%');
+          setTxt('gpu-mem-txt', d.gpu.memory_controller_percent.toFixed(1) + '%');
+          setTxt('gpu-temp-txt', d.gpu.temperature_c > 0 ? `${d.gpu.temperature_c} °C` : 'N/A');
+          setTxt('vram-used-val', usedG);
+          setTxt('vram-total-val', totalG + ' GiB');
+          setTxt('vram-used-total-txt', `${usedG} / ${totalG} GiB`);
+          setTxt('vram-free-txt', freeG + ' GiB');
+          setTxt('vram-slots-txt', d.gpu.expert_cache_slots + ' slots');
+          setTxt('vram-hit-rate-txt', d.gpu.expert_cache_hit_rate.toFixed(1) + '%');
+          setWidth('gpu-bar', Math.min(d.gpu.utilization_percent, 100) + '%');
 
           // Tier 1 stats
-          document.getElementById('tier1-slots').textContent = d.gpu.expert_cache_slots;
-          document.getElementById('tier1-hits').textContent = d.gpu.expert_cache_hits.toLocaleString();
-          document.getElementById('tier1-misses').textContent = d.gpu.expert_cache_misses.toLocaleString();
+          setTxt('tier1-slots', d.gpu.expert_cache_slots);
+          setTxt('tier1-hits', d.gpu.expert_cache_hits.toLocaleString());
+          setTxt('tier1-misses', d.gpu.expert_cache_misses.toLocaleString());
         }
 
+        // RAM
         if (d.ram) {
           const usedG = (d.ram.system_used_bytes / (1024**3)).toFixed(1);
           const totalG = (d.ram.system_total_bytes / (1024**3)).toFixed(1);
           const availG = (d.ram.system_available_bytes / (1024**3)).toFixed(1);
-          document.getElementById('ram-used-val').textContent = usedG;
-          document.getElementById('ram-total-val').textContent = totalG + ' GiB';
-          document.getElementById('ram-avail-txt').textContent = availG + ' GiB';
-          document.getElementById('ram-load-badge').textContent = d.ram.system_load_percent + '% Load';
-          document.getElementById('ram-proc-ws-txt').textContent = formatBytes(d.ram.process_working_set_bytes);
-          document.getElementById('ram-pinned-txt').textContent = formatBytes(d.ram.pinned_tier_bytes);
+          setTxt('ram-used-val', usedG);
+          setTxt('ram-total-val', totalG + ' GiB');
+          setTxt('ram-avail-txt', availG + ' GiB');
+          setTxt('ram-load-badge', d.ram.system_load_percent + '% Load');
+          setTxt('ram-proc-ws-txt', formatBytes(d.ram.process_working_set_bytes));
+          setTxt('ram-pinned-txt', formatBytes(d.ram.pinned_tier_bytes));
           const pct = d.ram.system_total_bytes > 0 ? (d.ram.system_used_bytes / d.ram.system_total_bytes) * 100 : 0;
-          document.getElementById('ram-bar').style.width = Math.min(pct, 100) + '%';
+          setWidth('ram-bar', Math.min(pct, 100) + '%');
 
           // Tier 2 stats
-          document.getElementById('tier2-cap').textContent = formatBytes(d.ram.pinned_tier_bytes);
-          document.getElementById('tier2-experts').textContent = d.ram.pinned_tier_experts;
-          document.getElementById('tier2-hits').textContent = d.ram.ram_served_hits.toLocaleString();
-          document.getElementById('tier3-reads').textContent = d.ram.file_served_misses.toLocaleString();
+          setTxt('tier2-cap', formatBytes(d.ram.pinned_tier_bytes));
+          setTxt('tier2-experts', d.ram.pinned_tier_experts);
+          setTxt('tier2-hits', d.ram.ram_served_hits.toLocaleString());
+          setTxt('tier3-reads', d.ram.file_served_misses.toLocaleString());
         }
 
+        // Engine & Process
         if (d.process) {
-          document.getElementById('engine-pid-badge').textContent = 'PID: ' + d.process.pid;
-          document.getElementById('engine-speed-val').textContent = d.process.tok_per_sec.toFixed(1);
+          setTxt('engine-pid-badge', 'PID: ' + d.process.pid);
+          setTxt('engine-speed-val', d.process.tok_per_sec.toFixed(1));
           if (d.process.model) {
             const parts = d.process.model.split(/[\\/]/);
-            document.getElementById('engine-model-txt').textContent = parts[parts.length - 1];
-            document.getElementById('engine-model-txt').title = d.process.model;
+            setTxt('engine-model-txt', parts[parts.length - 1]);
+            const mEl = document.getElementById('engine-model-txt');
+            if (mEl) mEl.title = d.process.model;
           }
           const up = d.process.uptime_s;
           const mins = Math.floor(up / 60);
           const secs = Math.floor(up % 60);
-          document.getElementById('engine-uptime-txt').textContent = `${mins}m ${secs}s`;
-          document.getElementById('engine-requests-txt').textContent = d.process.requests.toLocaleString();
-          document.getElementById('engine-tokens-txt').textContent = d.process.completion_tokens.toLocaleString();
-          document.getElementById('engine-queue-txt').textContent = d.process.queued;
+          setTxt('engine-uptime-txt', `${mins}m ${secs}s`);
+          setTxt('engine-requests-txt', d.process.requests.toLocaleString());
+          setTxt('engine-tokens-txt', d.process.completion_tokens.toLocaleString());
+          setTxt('engine-queue-txt', d.process.queued);
         }
-      } catch (_) {}
+      } catch (err) {
+        console.error('telemetry poll error:', err);
+      }
     }
 
     pollTelemetry();
