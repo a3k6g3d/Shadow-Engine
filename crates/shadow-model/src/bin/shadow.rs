@@ -34,6 +34,9 @@ fn main() -> ExitCode {
     if args.first().map(String::as_str) == Some("stats") && args.len() >= 3 {
         return stats(&PathBuf::from(&args[1]), &args[2..]);
     }
+    if args.first().map(String::as_str) == Some("generate") && args.len() >= 3 {
+        return generate(&PathBuf::from(&args[1]), &args[2], &args[3..]);
+    }
     if args.first().map(String::as_str) != Some("inspect") || args.len() < 2 {
         eprintln!("usage: shadow inspect MODEL.gguf [--tensors] [--kv]\n       shadow kv MODEL.gguf KEY");
         return ExitCode::from(2);
@@ -49,6 +52,73 @@ fn main() -> ExitCode {
         }
     };
     inspect(&g, all_tensors, all_kv);
+    ExitCode::SUCCESS
+}
+
+/// Greedy decoding with the stage 1 CPU reference.  `-n N` tokens (default 8); `--chat` wraps the prompt in the chat
+/// template (thinking off).  Slow by design: it is the yardstick, not the engine.
+fn generate(path: &std::path::Path, prompt: &str, rest: &[String]) -> ExitCode {
+    use shadow_model::chat::{render, Message, Options, Role};
+    use shadow_model::forward::{check_layout, Model, Session};
+    use shadow_model::tokenizer::Tokenizer;
+    use std::io::Write;
+    let n_new: usize = rest.iter().position(|a| a == "-n").and_then(|i| rest.get(i + 1)).and_then(|v| v.parse().ok())
+        .unwrap_or(8);
+    let chat = rest.iter().any(|a| a == "--chat");
+    let g = match Gguf::open(path) {
+        Ok(g) => g,
+        Err(e) => {
+            eprintln!("shadow generate: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let tok = Tokenizer::from_gguf(&g).expect("tokenizer");
+    let t0 = std::time::Instant::now();
+    let model = match Model::load(g) {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!("shadow generate: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    if let Err(e) = check_layout(&model.g, &model.cfg) {
+        eprintln!("shadow generate: {e}");
+        return ExitCode::FAILURE;
+    }
+    eprintln!("loaded {:.2} GiB of dense weights in {:.1} s", model.dense_bytes() as f64 / GIB, t0.elapsed().as_secs_f64());
+    let text = if chat {
+        let o = Options { thinking: Some(false), ..Options::default() };
+        render(&[Message::new(Role::User, prompt)], &o).expect("template")
+    } else {
+        prompt.to_string()
+    };
+    let ids = tok.encode(&text, chat);
+    eprintln!("prompt: {} tokens {:?}", ids.len(), &ids[..ids.len().min(16)]);
+    let mut s = Session::new(&model);
+    let t1 = std::time::Instant::now();
+    let mut logits = Vec::new();
+    for &id in &ids {
+        logits = s.step(id);
+    }
+    eprintln!("prompt read in {:.1} s ({:.2} s/token)", t1.elapsed().as_secs_f64(),
+              t1.elapsed().as_secs_f64() / ids.len() as f64);
+    print!("{text}");
+    let _ = std::io::stdout().flush();
+    let mut out = Vec::new();
+    let t2 = std::time::Instant::now();
+    for _ in 0..n_new {
+        let next = logits.iter().enumerate().max_by(|a, b| a.1.partial_cmp(b.1).unwrap()).map(|(i, _)| i as u32).unwrap();
+        out.push(next);
+        print!("{}", String::from_utf8_lossy(&tok.decode_bytes(&[next])));
+        let _ = std::io::stdout().flush();
+        if Some(next) == tok.eos {
+            break;
+        }
+        logits = s.step(next);
+    }
+    println!();
+    eprintln!("generated {} tokens {:?} in {:.1} s ({:.2} s/token)", out.len(), out, t2.elapsed().as_secs_f64(),
+              t2.elapsed().as_secs_f64() / out.len().max(1) as f64);
     ExitCode::SUCCESS
 }
 

@@ -40,9 +40,10 @@ Notation: `H = 2560` hidden, `C = 4` hyper-connection streams, `CH = 10240`, `T`
 ## Weight conventions in this file
 
 - **Norm weights are stored with the +1 already folded in.** Qwen3-Next's RMSNorm is zero-centred (`x * (1 + w)`,
-  `w` initialised to zeros) [ref], but every RMSNorm weight in the file sits around 1 (`attn_q_norm` mean 1.28,
-  `hc_attn_norm` 0.94, `ssm_norm` 0.97, `indexer.*_norm` 0.96) [file]. So the forward pass multiplies by `w` as
-  stored. [open: confirm on one tensor against the BF16 checkpoint]
+  `w` initialised to zeros) [ref]; llama.cpp's converter adds 1 to every `*norm.weight` except the DeltaNet's gated
+  norm (`linear_attn.norm`, which is not zero-centred) [converter], and every RMSNorm weight in the file sits around 1
+  (`attn_q_norm` mean 1.28, `hc_attn_norm` 0.94, `ssm_norm` 0.97, `indexer.*_norm` 0.96) [file]. So the forward pass
+  multiplies by `w` as stored.
 - **`ssm_a` is stored as `A = -exp(A_log)`**: every value is negative (−158.0 to −0.028) [file].
 - **`blk.1.ple_norm_key` and `blk.1.ple_norm_query` are identical**, value for value [file]. Either the checkpoint ties
   them or the conversion copied one into the other. [open]
@@ -99,12 +100,12 @@ agrees]
 Tensors: `attn_qkv [2560, 10240]` Q6_K, `attn_gate [2560, 6144]` Q4_K (`z`), `ssm_beta [2560, 48]`, `ssm_alpha [2560, 48]`
 BF16, `ssm_conv1d [4, 10240]` F32, `ssm_a [48]`, `ssm_dt.bias [48]`, `ssm_norm [128]`, `ssm_out [6144, 2560]` IQ4_XS [file].
 ```
-qkv  = attn_qkv · u                                 # [10240] = q 2048 | k 2048 | v 6144   [open: the order]
+qkv  = attn_qkv · u                                 # [10240] = q 2048 | k 2048 | v 6144
 z    = attn_gate · u                                # [6144]
-b    = ssm_beta · u;  a = ssm_alpha · u             # [48] each                             [open: which is which]
+b    = ssm_beta · u;  a = ssm_alpha · u             # [48] each (beta from in_proj_b, alpha from in_proj_a)
 qkv  = silu( causal_conv1d(qkv, ssm_conv1d, kernel 4, depthwise, state = the previous 3 inputs) )
 q, k = l2norm per head (eps 1e-6), 16 heads x 128;  q = q / sqrt(128)
-q, k = repeat_interleave to 48 heads (each key head serves 3 value heads)
+value head h uses key head  h % 16                # NOT h / 3: see "value heads are tiled" below
 beta = sigmoid(b);  gdecay = exp( A * softplus(a + dt_bias) )        # A = ssm_a, already negative
 for each value head h (state S_h is 128 x 128, k-index by v-index):
     S_h = S_h * gdecay_h
@@ -114,6 +115,13 @@ for each value head h (state S_h is 128 x 128, k-index by v-index):
 o    = rmsnorm(o_h, per head 128) * ssm_norm * sigmoid(z_h)          # output_gate_type = sigmoid  [ref config]
 y    = ssm_out · o                                  # [H]
 ```
+**The value heads are stored tiled, not grouped** [file, by the converter's convention; found the hard way]. The
+reference groups them (`repeat_interleave`: value head `k*3 + v` belongs to key head `k`); llama.cpp's converter
+(`_LinearAttentionVReorderBase`) permutes every per-value-head tensor - the v part of `attn_qkv` and of the conv, `z`,
+`ssm_beta`, `ssm_alpha`, `ssm_a`, `ssm_dt.bias` and the columns of `ssm_out` - to tiled order (`v*16 + k`), because
+ggml's broadcast tiles. So in this file value head `h` pairs with key head `h % 16`. With `h / 3` the model still says
+"Paris" after "The capital of France is" and then falls apart within ~30 tokens; that is how it was found.
+
 State per J layer: 48 x 128 x 128 f32 = **3 MiB**, plus the conv state 3 x 10240. Fixed, whatever the context.
 
 ### K: gated attention with the indexer (12 layers)
@@ -184,8 +192,8 @@ logits = output · u                                  # no further norm: the fil
 | # | question | how |
 |---|---|---|
 | 1 | ~~Q2_0's code-to-value map~~ settled: `(q - 1) * d`, from upstream; a fixture would still be better | a mainline ggml build, or a gguf package that has Q2_0 |
-| 2 | norm weights: +1 folded in, or stored as-is | compare one `attn_q_norm` against the BF16 checkpoint: one HTTP range read of a safetensors header and one tensor |
-| 3 | `attn_qkv` order (q,k,v grouped or per-head interleaved) and `ssm_alpha` vs `ssm_beta` | the reference's `fix_query_key_value_ordering` plus one layer's output against the checkpoint |
+| 2 | ~~norm weights~~ settled: +1 folded in (converter convention, values near 1) | - |
+| 3 | ~~`attn_qkv` order, alpha vs beta~~ settled: q, k, v grouped; value heads tiled; beta = b, alpha = a (converter) | - |
 | 4 | PLE hashing details (multiplier per position, per head, negative mod) | the reference's `Qwen4ExpTextNGramEmbedding`, read line by line before stage 1 writes it |
 | 5 | `ple_norm_key == ple_norm_query` here, though upstream's converter reads two source tensors | the checkpoint: identical there too, or a conversion slip in this file |
 | 6 | indexer `k_norm`: LayerNorm or RMSNorm | the reference |
