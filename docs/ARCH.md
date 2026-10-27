@@ -139,17 +139,22 @@ q, k = rope on the first 64 of 256 dims, NeoX halves, theta 1e7, text position p
 attn = softmax( q k^T / sqrt(256) + mask ) v        # GQA 12:1
 o    = attn * sigmoid(gate);  y = attn_output · o
 ```
-**The indexer only matters past 2,048 tokens.** It keeps `budget / ratio = 512` blocks of 4 keys, plus the
-incomplete tail block, so with 2,048 or fewer visible keys every key is kept and the mask is plain causal [ref]. Stage 1
-can therefore be exact without it on prompts under 2,048 tokens. Above that:
+**The indexer only changes anything past 2,051 tokens.** It keeps `budget / ratio = 512` blocks of 4 positions, plus the
+incomplete tail, so with at most 512 complete blocks (up to 2,051 visible positions) every position is attended to [ref].
+Exactly, for the query at position i (n = i + 1 visible positions, nb = n / 4 complete blocks) [ref, read from the
+library's `Qwen4ExpTextQSAIndexer`; implemented in `forward.rs`]:
 ```
-iq   = indexer.q_proj · u (4 x 128), q_norm, partial rope;  ik = indexer.k_proj · u (128), cached per position
-for complete blocks of 4 visible keys: kb = k_norm( mean(ik over the block) ), rope at the block's first position
-score(block) = sum over the 4 heads of relu(iq_h · kb) / sqrt(128)
-keep the top 512 blocks + the tail; mask everything else
+iq   = indexer.q_proj . u  -> 4 heads x 128;  each head: RMSNorm(q_norm), then RoPE on its first 64 dims at position i
+ik   = indexer.k_proj . u  -> 128, the RAW key (no norm, no rope), kept for every position
+block b (positions 4b .. 4b+3, complete): kb = RoPE_64( RMSNorm(k_norm, mean of the 4 raw keys), at position 4b )
+score(b) = ( sum over the 4 heads of relu(iq_h . kb) ) / sqrt(128)
+if nb > 512: attend to the 512 highest-scoring blocks (all 4 of their positions) plus the tail positions 4*nb .. i
+else:        attend to everything
 ```
-[open: whether `k_norm` is a LayerNorm or an RMSNorm here (`k_layernorm` in the reference); the file has a weight but
-no bias]
+The current position is in the tail only when n is not a multiple of 4; otherwise it sits in a complete block that may
+not be selected, and then it does not attend to itself. `k_norm` and `q_norm` are the same zero-centred RMSNorm as every
+other (stored +1; ARCH.md question 6 settled). Ties between block scores are broken by the lower block index here; the
+library's `topk` does not promise an order.
 
 ### MoE (48 layers)
 Tensors: `ffn_gate_inp [2560, 512]` F32 (router), `ffn_gate_exps` / `ffn_up_exps [2560, 640, 512]`,
@@ -199,7 +204,7 @@ logits = output · u                                  # no further norm: the fil
 | 3 | ~~`attn_qkv` order, alpha vs beta~~ settled: q, k, v grouped; value heads tiled; beta = b, alpha = a (converter) | - |
 | 4 | ~~PLE hashing details~~ settled: the library's multipliers (`_build_layer_multipliers`) equal the checkpoint's and the GGUF's `ple.layer_multipliers`, as do the head vocab sizes and offsets; `remainder` is the non-negative one (`rem_euclid`); the n-gram table is 128 shards of 2,500,012 rows, row r in shard r / 2,500,012 | - |
 | 5 | ~~`ple_norm_key == ple_norm_query`~~ settled: no, they differ (max 0.054) in the checkpoint and in the file, and each file tensor equals its checkpoint tensor + 1 exactly | - |
-| 6 | indexer `k_norm`: LayerNorm or RMSNorm | the reference |
+| 6 | ~~indexer `k_norm`: LayerNorm or RMSNorm~~ settled: RMSNorm, zero-centred like the rest | - |
 | 7 | MTP for speculative decoding | the base model's MTP layer is in the checkpoint, not in this GGUF; quantize it ourselves, or use prompt-lookup drafting first |
 
 ## The fixture, without 360 GB

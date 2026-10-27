@@ -109,6 +109,8 @@ class GgufSource:
         self.calls = 0
 
     def dump(self, name, rows=None, expert=None):
+        if rows is not None and len(rows) > 1000:       # Windows limits a command line to ~32 KB
+            return torch.cat([self.dump(name, rows=rows[i:i + 1000]) for i in range(0, len(rows), 1000)])
         out = self.tmp / "t.f32"
         cmd = [self.exe, "dump", self.model, name, str(out)]
         if rows is not None:
@@ -217,20 +219,25 @@ class LazyExperts(nn.Module):
         self.have = {}
         self.picked = None
 
+    GROUP = 48
+
     def forward(self, hidden_states, top_k_index, top_k_weights):
         need = sorted(set(top_k_index.flatten().tolist()))
         self.picked = (top_k_index.clone(), top_k_weights.clone())
-        miss = [e for e in need if e not in self.have]
-        if miss:
-            self.have.update(self.src.experts(self.layer, miss))
-        remap = {e: i for i, e in enumerate(need)}
-        small = type(self.cfg)(**{**self.cfg.to_dict(), "num_experts": len(need)})
-        ex = M.Qwen4ExpTextExperts(small)
-        ex.gate_up_proj = nn.Parameter(torch.stack([self.have[e][0] for e in need]), requires_grad=False)
-        ex.down_proj = nn.Parameter(torch.stack([self.have[e][1] for e in need]), requires_grad=False)
-        idx = torch.tensor([[remap[e] for e in row] for row in top_k_index.tolist()], dtype=top_k_index.dtype)
-        out = ex(hidden_states, idx, top_k_weights)
-        self.have.clear()          # a layer runs once per fixture: do not keep gigabytes of float32 experts around
+        out = torch.zeros_like(hidden_states)
+        for g in range(0, len(need), self.GROUP):
+            group = need[g:g + self.GROUP]
+            have = self.src.experts(self.layer, group)
+            local = {e: i for i, e in enumerate(group)}
+            small = type(self.cfg)(**{**self.cfg.to_dict(), "num_experts": len(group),
+                                      "num_experts_per_tok": min(self.cfg.num_experts_per_tok, len(group))})
+            ex = M.Qwen4ExpTextExperts(small)
+            ex.gate_up_proj = nn.Parameter(torch.stack([have[e][0] for e in group]), requires_grad=False)
+            ex.down_proj = nn.Parameter(torch.stack([have[e][1] for e in group]), requires_grad=False)
+            idx = torch.tensor([[local.get(e, len(group)) for e in row] for row in top_k_index.tolist()],
+                               dtype=top_k_index.dtype)
+            out += ex(hidden_states, idx, top_k_weights)
+            del have, ex
         return out
 
 
@@ -253,6 +260,9 @@ def main() -> None:
     ap.add_argument("--weights", choices=["checkpoint", "gguf"], default="checkpoint")
     ap.add_argument("--out")
     ap.add_argument("--prompt", default=PROMPT)
+    ap.add_argument("--prompt-file", nargs="+", help="tokenize these files, concatenated, instead of --prompt")
+    ap.add_argument("--tokens", type=int, help="keep only the first N token ids of the prompt")
+    ap.add_argument("--positions", help="comma-separated positions: write only those rows of every stream (long prompts)")
     ap.add_argument("--shadow", default=str(ROOT / "target" / "release" / "shadow.exe"))
     a = ap.parse_args()
     out = pathlib.Path(a.out or ROOT / "eval" / "fixtures" / ("reference" if a.weights == "checkpoint" else "reference_gguf"))
@@ -260,8 +270,16 @@ def main() -> None:
     torch.set_grad_enabled(False)
 
     tok = AutoTokenizer.from_pretrained(HF_DIR)
+    if a.prompt_file:
+        a.prompt = "\n\n".join(pathlib.Path(f).read_text(encoding="utf-8") for f in a.prompt_file)
     ids = tok(a.prompt, add_special_tokens=False)["input_ids"]
-    print(f"prompt {a.prompt!r}: {len(ids)} tokens {ids}")
+    if a.tokens:
+        assert len(ids) >= a.tokens, f"the prompt has only {len(ids)} tokens"
+        ids = ids[: a.tokens]
+        a.prompt = tok.decode(ids)
+    keep = [int(x) for x in a.positions.split(",")] if a.positions else None
+    assert keep is None or all(0 <= k < len(ids) for k in keep), "a kept position is outside the prompt"
+    print(f"prompt {a.prompt[:80]!r}...: {len(ids)} tokens {ids[:16]}...")
     ck = Checkpoint(REPO, cache="I:/shadow-ref")
     src = CheckpointSource(ck) if a.weights == "checkpoint" else GgufSource(a.shadow, GGUF)
 
@@ -304,7 +322,8 @@ def main() -> None:
     def grab(name):
         def hook(_m, _i, o):
             o = o[0] if isinstance(o, tuple) else o
-            cap[name] = o.detach().float().reshape(o.shape[1], -1).clone()
+            o = o.detach().float().reshape(o.shape[1], -1)
+            cap[name] = (o[keep] if keep is not None else o).clone()
         return hook
 
     for l, layer in enumerate(model.layers):
@@ -318,18 +337,36 @@ def main() -> None:
         layer.mlp_hyper_connection.register_forward_hook(grab(f"layer{l}.mlp_hc_u"))
     model.hyper_connection_mixer.register_forward_hook(grab("final_u"))
 
+    def grab_selected(name, width):
+        def hook(_m, _i, mask):
+            # the indexer's additive mask [1, 1, T, KV]: 0 where the key is attended to
+            sel = (mask == 0) if mask.dtype != torch.bool else mask
+            rows = sel[0, 0]
+            rows = rows[keep] if keep is not None else rows
+            out = torch.full((rows.shape[0], width), -1.0)
+            for i in range(rows.shape[0]):
+                idx = torch.nonzero(rows[i]).flatten().float()
+                out[i, : idx.numel()] = idx
+            cap[name] = out
+        return hook
+
+    for l, layer in enumerate(model.layers):
+        if layer.layer_type != "linear_attention":
+            ix = layer.self_attn.indexer
+            layer.self_attn.indexer.register_forward_hook(grab_selected(f"layer{l}.selected", ix.token_budget + ix.compress_ratio - 1))
+
     inputs_embeds = src.embed(ids)[None].float()
-    cap["embed"] = inputs_embeds[0].clone()
+    cap["embed"] = (inputs_embeds[0][keep] if keep is not None else inputs_embeds[0]).clone()
     res = model(inputs_embeds=inputs_embeds, ple_input_ids=torch.tensor([ids]), use_cache=False)
-    assert torch.equal(res.last_hidden_state[0], cap["final_u"])
+    assert torch.equal((res.last_hidden_state[0][keep] if keep is not None else res.last_hidden_state[0]), cap["final_u"])
     for l, layer in enumerate(model.layers):
         idx, w = layer.mlp.experts.picked
-        cap[f"layer{l}.route_idx"] = idx.float()
-        cap[f"layer{l}.route_w"] = w.float()
+        cap[f"layer{l}.route_idx"] = (idx[keep] if keep is not None else idx).float()
+        cap[f"layer{l}.route_w"] = (w[keep] if keep is not None else w).float()
 
     # ---- write
     out.mkdir(parents=True, exist_ok=True)
-    manifest = {"prompt": a.prompt, "ids": ids, "layers": a.layers, "repo": REPO, "weights": a.weights,
+    manifest = {"prompt": a.prompt, "ids": ids, "positions": keep, "layers": a.layers, "repo": REPO, "weights": a.weights,
                 "transformers": transformers.__version__, "torch": torch.__version__, "dtype": "float32",
                 "note": ("reference run on the BF16 checkpoint widened to float32" if a.weights == "checkpoint" else
                          "reference run on Shadow's own GGUF, dequantized by `shadow dump` and mapped back"),

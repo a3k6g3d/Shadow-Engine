@@ -81,3 +81,22 @@ fn the_gpu_backend_matches_it_too() {
     let Some(r) = run_on("reference_gguf", &gpu) else { return };
     assert_exact(&r, "gpu", 5e-3);
 }
+
+/// The sparse indexer (positions past 2,051, where more than 512 blocks are complete): a 2,600-token prompt through
+/// layers 0-3 on Shadow's own weights, against the reference at the positions kept in
+/// eval/fixtures/reference_gguf_long (written by `make_reference_fixture.py --positions ...`; see docs/HANDOFF.md).
+/// Layer 3 is the first attention layer.  Strict: the attended positions must be the reference's, and every stream must
+/// match.  Shadow runs all 2,600 tokens, so this takes minutes on the CPU; run it with `-- --ignored`.
+#[test]
+#[ignore = "minutes: 2,600 tokens through 4 layers"]
+fn the_sparse_indexer_matches_the_reference() {
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../eval/fixtures/reference_gguf_long");
+    if !dir.join("manifest.json").is_file() {
+        return eprintln!("SKIPPED, not passed: no long fixture (docs/HANDOFF.md says how to make it)");
+    }
+    let Some(r) = run("reference_gguf_long") else { return };
+    shadow::reference::print(&r);
+    let sel = r.selections.iter().find(|(n, _)| n == "layer3").expect("layer 3 selection");
+    assert!(sel.1.iter().all(|&d| d == 0), "layer 3 attends to different positions than the reference: {:?}", sel.1);
+    assert_exact(&r, "cpu, long prompt", 1e-3);
+}

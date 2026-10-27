@@ -14,6 +14,8 @@ use std::path::Path;
 pub struct Fixture {
     pub prompt: String,
     pub ids: Vec<u32>,
+    /// With `Some`, the fixture holds only these positions' rows of every stream (long prompts); otherwise all of them.
+    pub positions: Option<Vec<usize>>,
     pub layers: usize,
     /// name -> (shape, values)
     pub tensors: BTreeMap<String, (Vec<usize>, Vec<f32>)>,
@@ -40,6 +42,7 @@ impl Fixture {
         Ok(Fixture {
             prompt: m.get("prompt").and_then(J::as_str).unwrap_or("").to_string(),
             ids,
+            positions: m.get("positions").and_then(J::as_arr).map(|a| a.iter().map(|v| v.as_f64().unwrap() as usize).collect()),
             layers: m.get("layers").and_then(J::as_f64).ok_or("no layers")? as usize,
             tensors,
             order,
@@ -72,6 +75,9 @@ impl Row {
 
 pub struct Report {
     pub rows: Vec<Row>,
+    /// (layer name, per kept position: how many attended positions differ between Shadow's sparse selection and the
+    /// reference's, counted both ways)
+    pub selections: Vec<(String, Vec<usize>)>,
     /// (layer name, per token: how many of the 10 routed experts Shadow shares with the reference)
     pub routes: Vec<(String, Vec<usize>)>,
 }
@@ -87,16 +93,32 @@ pub fn compare(model: &Model, be: &dyn Backend, fx: &Fixture) -> Report {
     }
     let trace = s.trace.take().unwrap();
     let t = fx.ids.len();
+    let pos: Vec<usize> = fx.positions.clone().unwrap_or_else(|| (0..t).collect());
+    let np = pos.len();
     let mut rows = Vec::new();
     let mut routes = Vec::new();
+    let mut selections = Vec::new();
     for name in &fx.order {
         let (shape, want) = &fx.tensors[name];
-        let Some(got) = trace.get(name) else { continue };
-        let dim = want.len() / t;
-        assert_eq!(got.len(), want.len(), "{name}: shadow {} values, reference {} (shape {shape:?})", got.len(), want.len());
+        let Some(all) = trace.get(name) else { continue };
+        let dim = want.len() / np;
+        assert_eq!(all.len(), t * dim, "{name}: shadow {} values, expected {} (reference shape {shape:?})", all.len(), t * dim);
+        // Shadow's rows at the fixture's positions
+        let got: Vec<f32> = pos.iter().flat_map(|&p| all[p * dim..(p + 1) * dim].iter().copied()).collect();
+        if name.ends_with(".selected") {
+            let diff = (0..np)
+                .map(|i| {
+                    let set = |v: &[f32]| -> std::collections::BTreeSet<i64> { v.iter().filter(|&&x| x >= 0.0).map(|&x| x as i64).collect() };
+                    let (a, b) = (set(&got[i * dim..(i + 1) * dim]), set(&want[i * dim..(i + 1) * dim]));
+                    a.symmetric_difference(&b).count()
+                })
+                .collect();
+            selections.push((name.trim_end_matches(".selected").to_string(), diff));
+            continue;
+        }
         if name.ends_with(".route_idx") {
             let k = dim;
-            let shared = (0..t)
+            let shared = (0..np)
                 .map(|i| got[i * k..(i + 1) * k].iter().filter(|g| want[i * k..(i + 1) * k].contains(g)).count())
                 .collect();
             routes.push((name.trim_end_matches(".route_idx").to_string(), shared));
@@ -106,7 +128,7 @@ pub fn compare(model: &Model, be: &dyn Backend, fx: &Fixture) -> Report {
             continue;
         }
         let (mut cos, mut rel, mut max_abs) = (Vec::new(), Vec::new(), 0f64);
-        for i in 0..t {
+        for i in 0..np {
             let (a, b) = (&got[i * dim..(i + 1) * dim], &want[i * dim..(i + 1) * dim]);
             let (mut ab, mut aa, mut bb, mut dd) = (0f64, 0f64, 0f64, 0f64);
             for (&x, &y) in a.iter().zip(b) {
@@ -122,7 +144,7 @@ pub fn compare(model: &Model, be: &dyn Backend, fx: &Fixture) -> Report {
         }
         rows.push(Row { name: name.clone(), dim, cos, rel, max_abs });
     }
-    Report { rows, routes }
+    Report { rows, selections, routes }
 }
 
 pub fn print(r: &Report) {
@@ -130,6 +152,9 @@ pub fn print(r: &Report) {
     for row in &r.rows {
         println!("{:<22} {:>6} {:>10.5} {:>10.5} {:>10.4} {:>10.4}", row.name, row.dim, row.cos_min(), row.cos_mean(),
                  row.rel_max(), row.max_abs);
+    }
+    for (name, diff) in &r.selections {
+        println!("{name}: attended positions that differ from the reference's sparse selection, per kept position: {diff:?}");
     }
     for (name, shared) in &r.routes {
         println!("{name}: routed experts shared with the reference, per token: {shared:?} (of 10)");

@@ -14,7 +14,8 @@ use crate::quant::dequantize;
 use std::collections::HashMap;
 use std::fs::File;
 
-pub const MAX_POSITIONS: usize = 2048;
+/// The longest sequence a session takes: the KV cache is f32, 48 KiB per position over the 12 attention layers.
+pub const MAX_POSITIONS: usize = 32768;
 
 /// The shapes, from the file's key-values (ARCH.md, "Shapes").
 #[derive(Debug, Clone)]
@@ -47,6 +48,12 @@ pub struct Config {
     pub ple_multipliers: Vec<i64>,
     pub ple_vocab: Vec<i64>,
     pub ple_offsets: Vec<i64>,
+    /// The sparse indexer of the attention layers: heads, head width, token budget, and per layer the compression
+    /// ratio (positions per pooled block; 0 for a layer without an indexer).
+    pub idx_heads: usize,
+    pub idx_dim: usize,
+    pub idx_budget: usize,
+    pub compress: Vec<usize>,
 }
 
 impl Config {
@@ -99,6 +106,10 @@ impl Config {
             ple_multipliers: ints("ple.layer_multipliers")?,
             ple_vocab: ints("ple.head_vocab_sizes")?,
             ple_offsets: ints("ple.head_offsets")?,
+            idx_heads: u("attention.indexer.head_count")?,
+            idx_dim: u("attention.indexer.key_length")?,
+            idx_budget: u("attention.indexer.top_k")?,
+            compress: ints("attention.compress_ratios")?.into_iter().map(|v| v as usize).collect(),
         })
     }
 
@@ -221,6 +232,23 @@ struct DeltaState {
 struct AttnCache {
     k: Vec<f32>, // positions x kv_heads x head_dim
     v: Vec<f32>,
+    /// The indexer's raw keys, one per position (idx_dim each), before any norm or rotation.
+    idx_raw: Vec<f32>,
+    /// The pooled, normalized, rotated key of every COMPLETE block of `compress` positions (idx_dim each).  A block's key
+    /// depends only on its own positions, so it is computed once, when the block completes.
+    blocks: Vec<f32>,
+}
+
+/// NeoX-style rotary embedding of the first `dims` entries of `x` at position `pos`.
+fn rope_apply(x: &mut [f32], pos: f64, dims: usize, theta: f64) {
+    let half = dims / 2;
+    for i in 0..half {
+        let f = pos / theta.powf(2.0 * i as f64 / dims as f64);
+        let (cs, sn) = (f.cos(), f.sin());
+        let (a, b) = (x[i] as f64, x[i + half] as f64);
+        x[i] = (a * cs - b * sn) as f32;
+        x[i + half] = (b * cs + a * sn) as f32;
+    }
 }
 
 pub struct Model {
@@ -315,7 +343,7 @@ impl<'m> Session<'m> {
             s: vec![0f32; c.ssm_v_heads * c.ssm_head_dim * c.ssm_head_dim],
             conv: vec![0f32; (c.conv_k - 1) * ch],
         })).collect();
-        let attn = (0..c.n_layer).map(|l| c.is_attention(l).then(|| AttnCache { k: vec![], v: vec![] })).collect();
+        let attn = (0..c.n_layer).map(|l| c.is_attention(l).then(|| AttnCache { k: vec![], v: vec![], idx_raw: vec![], blocks: vec![] })).collect();
         let ple_conv = vec![0f32; (c.ple_conv_k - 1) * c.ple_ngram * c.streams * c.hidden];
         Session { m, be, delta, attn, ple_conv, tokens: vec![], trace: None, stop_after: None }
     }
@@ -342,7 +370,7 @@ impl<'m> Session<'m> {
 
     /// Feeds one token and returns the logits for the next.
     pub fn step(&mut self, token: u32) -> Vec<f32> {
-        assert!(self.tokens.len() < MAX_POSITIONS, "the indexer is not implemented: at most {MAX_POSITIONS} positions");
+        assert!(self.tokens.len() < MAX_POSITIONS, "at most {MAX_POSITIONS} positions");
         self.tokens.push(token);
         let m = self.m;
         let c = &m.cfg;
@@ -496,18 +524,12 @@ impl<'m> Session<'m> {
         let qg = self.mv(&format!("{p}.attn_q.weight"), u);
         let k = self.mv(&format!("{p}.attn_k.weight"), u);
         let v = self.mv(&format!("{p}.attn_v.weight"), u);
+        let iq = self.mv(&format!("{p}.indexer.q_proj.weight"), u);
+        let ik = self.mv(&format!("{p}.indexer.k_proj.weight"), u);
         let (qn, kn) = (m.vec(&format!("{p}.attn_q_norm.weight")), m.vec(&format!("{p}.attn_k_norm.weight")));
+        let (iqn, ikn) = (m.vec(&format!("{p}.indexer.q_norm.weight")), m.vec(&format!("{p}.indexer.k_norm.weight")));
         let pos = (self.tokens.len() - 1) as f64;
-        let rope = |x: &mut [f32]| {
-            let half = c.rope_dims / 2;
-            for i in 0..half {
-                let f = pos / c.rope_theta.powf(2.0 * i as f64 / c.rope_dims as f64);
-                let (cs, sn) = (f.cos(), f.sin());
-                let (a, b) = (x[i] as f64, x[i + half] as f64);
-                x[i] = (a * cs - b * sn) as f32;
-                x[i + half] = (b * cs + a * sn) as f32;
-            }
-        };
+        let rope = |x: &mut [f32]| rope_apply(x, pos, c.rope_dims, c.rope_theta);
         let mut q = vec![0f32; nh * hd];
         let mut gate = vec![0f32; nh * hd];
         for h in 0..nh {
@@ -516,6 +538,7 @@ impl<'m> Session<'m> {
             q[h * hd..(h + 1) * hd].copy_from_slice(&qh);
             gate[h * hd..(h + 1) * hd].copy_from_slice(&qg[h * 2 * hd + hd..(h + 1) * 2 * hd]);
         }
+        let want_trace = self.trace.is_some();
         let cache = self.attn[l].as_mut().unwrap();
         for h in 0..nkv {
             let mut kh = rmsnorm(&k[h * hd..(h + 1) * hd], &kn, c.eps);
@@ -524,13 +547,63 @@ impl<'m> Session<'m> {
         }
         cache.v.extend_from_slice(&v);
         let n = cache.k.len() / (nkv * hd);
+
+        // ---- the sparse indexer (ARCH.md): positions are grouped in blocks of `ratio`; each COMPLETE block is scored
+        // against the query by its pooled key; the best `budget / ratio` blocks plus the incomplete tail are attended to.
+        // With at most that many complete blocks, everything is attended to.
+        let (ratio, id) = (c.compress[l].max(1), c.idx_dim);
+        cache.idx_raw.extend_from_slice(&ik);
+        let nb = n / ratio;
+        while cache.blocks.len() / id < nb {
+            let b = cache.blocks.len() / id;
+            let mut pooled = vec![0f32; id];
+            for r in 0..ratio {
+                for (d, x) in pooled.iter_mut().zip(&cache.idx_raw[(b * ratio + r) * id..(b * ratio + r + 1) * id]) {
+                    *d += x;
+                }
+            }
+            pooled.iter_mut().for_each(|x| *x /= ratio as f32);
+            let mut key = rmsnorm(&pooled, &ikn, c.eps);
+            rope_apply(&mut key, (b * ratio) as f64, c.rope_dims, c.rope_theta);
+            cache.blocks.extend(key);
+        }
+        let keep_blocks = c.idx_budget / ratio;
+        let selected: Option<Vec<usize>> = (nb > keep_blocks).then(|| {
+            let qs: Vec<Vec<f32>> = (0..c.idx_heads)
+                .map(|h| {
+                    let mut x = rmsnorm(&iq[h * id..(h + 1) * id], &iqn, c.eps);
+                    rope(&mut x);
+                    x
+                })
+                .collect();
+            let norm = (id as f32).sqrt();
+            let mut scored: Vec<(f32, usize)> = (0..nb)
+                .map(|b| {
+                    let kb = &cache.blocks[b * id..(b + 1) * id];
+                    let s: f32 = qs
+                        .iter()
+                        .map(|q| (q.iter().zip(kb).map(|(&a, &b)| a as f64 * b as f64).sum::<f64>() as f32).max(0.0))
+                        .sum();
+                    (s / norm, b)
+                })
+                .collect();
+            scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap().then(a.1.cmp(&b.1)));
+            let mut toks: Vec<usize> =
+                scored[..keep_blocks].iter().flat_map(|&(_, b)| b * ratio..(b + 1) * ratio).collect();
+            toks.extend(nb * ratio..n);
+            toks.sort_unstable();
+            toks
+        });
+        let toks: Vec<usize> = selected.unwrap_or_else(|| (0..n).collect());
+
         let mut o = vec![0f32; nh * hd];
         let scale = 1.0 / (hd as f64).sqrt();
         for h in 0..nh {
             let g = h / (nh / nkv);
             let qh = &q[h * hd..(h + 1) * hd];
-            let scores: Vec<f64> = (0..n)
-                .map(|t| {
+            let scores: Vec<f64> = toks
+                .iter()
+                .map(|&t| {
                     let kt = &cache.k[(t * nkv + g) * hd..(t * nkv + g + 1) * hd];
                     qh.iter().zip(kt).map(|(&a, &b)| a as f64 * b as f64).sum::<f64>() * scale
                 })
@@ -539,9 +612,17 @@ impl<'m> Session<'m> {
             let ex: Vec<f64> = scores.iter().map(|s| (s - mx).exp()).collect();
             let z: f64 = ex.iter().sum();
             for j in 0..hd {
-                let acc: f64 = ex.iter().enumerate().map(|(t, &e)| e * cache.v[(t * nkv + g) * hd + j] as f64).sum();
+                let acc: f64 = ex.iter().zip(&toks).map(|(&e, &t)| e * cache.v[(t * nkv + g) * hd + j] as f64).sum();
                 o[h * hd + j] = (acc / z) as f32 * sigmoid(gate[h * hd + j]);
             }
+        }
+        if want_trace {
+            // the attended positions, ascending, in a row of fixed width (budget + the longest possible tail), -1 padded
+            let mut row = vec![-1f32; c.idx_budget + ratio - 1];
+            for (r, &t) in row.iter_mut().zip(&toks) {
+                *r = t as f32;
+            }
+            self.rec(format!("layer{l}.selected"), &row);
         }
         self.mv(&format!("{p}.attn_output.weight"), &o)
     }
