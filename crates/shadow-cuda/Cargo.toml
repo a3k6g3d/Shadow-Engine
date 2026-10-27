@@ -1,0 +1,14 @@
+[package]
+name = "shadow-cuda"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# The CUDA driver API and NVRTC, bound by hand and loaded from nvcuda.dll / nvrtc64_*.dll at run time
+# (docs/SHADOW_PLAN.md).  No dependencies: the surface is ~45 functions, and a mirror plus a drift test is the rule.
+
+[dependencies]
+
+[dev-dependencies]
+# the f16/bf16 reference the prelude's conversions are tested against
+shadow-model = { path = "../shadow-model" }

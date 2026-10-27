@@ -54,15 +54,13 @@ fn inspect(g: &Gguf, all_tensors: bool, all_kv: bool) {
     }
     let arch = g.get("general.architecture").and_then(Value::as_str).unwrap_or("?").to_string();
 
-    println!("\n== key-values ({} total; arrays shortened)", g.kv.len());
+    // Every key, each shortened by `brief` (arrays print their length and first items, long strings their start).
+    // `--kv` prints the arrays whole.
+    println!("\n== key-values ({} total; arch {arch})", g.kv.len());
     for (k, v) in &g.kv {
-        let tokenizer_bulk = k.starts_with("tokenizer.ggml.") && v.as_array().is_some();
-        if all_kv || k.starts_with(&format!("{arch}.")) || k.starts_with("general.") || k.starts_with("split.")
-            || (k.starts_with("tokenizer.") && !tokenizer_bulk && k != "tokenizer.chat_template")
-        {
-            println!("  {k} = {}", v.brief());
-        } else if tokenizer_bulk || k == "tokenizer.chat_template" {
-            println!("  {k} = {}", v.brief());
+        match (all_kv, v.as_array()) {
+            (true, Some(a)) => println!("  {k} = {:?}", a.iter().map(Value::brief).collect::<Vec<_>>()),
+            _ => println!("  {k} = {}", v.brief()),
         }
     }
 

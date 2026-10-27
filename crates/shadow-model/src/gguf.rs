@@ -301,8 +301,10 @@ impl R<'_> {
     }
 }
 
+type ShardHeader = (Shard, BTreeMap<String, Value>, Vec<TensorInfo>);
+
 /// One shard's header: its key-values and its tensors, offsets made absolute.
-fn read_shard(path: &Path, index: usize) -> Result<(Shard, BTreeMap<String, Value>, Vec<TensorInfo>), Error> {
+fn read_shard(path: &Path, index: usize) -> Result<ShardHeader, Error> {
     let f = File::open(path).map_err(|e| Error::Io(path.to_path_buf(), e))?;
     let file_len = f.metadata().map_err(|e| Error::Io(path.to_path_buf(), e))?.len();
     let mut r = R { r: BufReader::with_capacity(1 << 20, f), path };

@@ -2,3 +2,4 @@
 //! forward pass as the stages land.  Nothing in here reads Strata's formats; the GGUF is the only input.
 
 pub mod gguf;
+pub mod half;
