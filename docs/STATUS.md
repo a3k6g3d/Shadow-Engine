@@ -33,15 +33,20 @@ The CPU forward pass (`forward.rs`, written from ARCH.md) against the reference,
   shared expert, and the final read. The GPU backend passes the same test.
 - `crates/shadow/tests/reference.rs` holds those comparisons.
 - **All 48 layers** (the same comparison with no download: the GGUF is the source; 8,396 `shadow dump` calls, 14 min,
-  48 MB of fixture kept on `I:\shadow-refixtureseference_gguf48`, regenerate with
+  48 MB of fixture kept on `I:\shadow-refixtures
+eference_gguf48`, regenerate with
   `make_reference_fixture.py --layers 48 --weights gguf`): **243 streams, minimum cosine 1.00000, relative error
   0.0000, max |diff| 1e-4, and the router picks the same 10 experts at every token of all 48 layers** - on the CPU
   backend and on the GPU backend. That covers all 36 DeltaNet and 12 attention layers and every quant type.
 
-Known gap: attention was only exercised below 2,048 positions, where the sparse indexer keeps every key. Past that the
-indexer selects blocks and is **not implemented** (`forward.rs` refuses more than 2,048 positions). Also untested:
-a different prompt (one prompt, 12 tokens, so far) and decoding many tokens (the DeltaNet and KV state across steps is
-exercised only by the 41-token greedy runs, which are correct but not compared stream by stream).
+**The sparse indexer is gated too** (`eval/fixtures/reference_gguf_long`): a 2,600-token prompt through layers 0-3,
+compared at 12 positions around where selection starts (position 2,051, the first with more than 512 complete blocks).
+At positions 2,051 to 2,599 the reference drops 4 to 552 of the visible positions in layer 3; **Shadow attends to
+exactly the same positions at all 12 kept positions** (0 differing), every stream has cosine 1.00000 and the routing
+is 10/10, on the GPU backend (150 s). Positions up to 2,050, where the indexer keeps everything, match as before.
+
+Known gaps: one prompt family (this plan's own text and a 12-token sentence); decoding many tokens is only checked by
+greedy runs, not stream by stream; no sampling (greedy only).
 
 ## Stage 2: begun
 
@@ -55,7 +60,7 @@ exercised only by the 41-token greedy runs, which are correct but not compared s
 
 1. **Q2_0** (9 down-projections) has no independent reference tool (gguf-py lacks it); it follows upstream ggml's
    definition and is checked by hand and by the end-to-end match above, which runs through it.
-2. **The sparse indexer** (positions > 2,048): not implemented.
+2. ~~The sparse indexer~~: implemented and gated (see Stage 1).
 3. **Speculative decoding's draft**: the GGUF has no MTP tensors (ARCH.md, question 7).
 4. **Stage 3** (VRAM / pinned RAM / drive tiers) and everything speed-related has not started; the plan's floor
    protocol applies from there.

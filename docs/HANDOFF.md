@@ -18,35 +18,21 @@ Crates: `shadow-model` (GGUF reader, tokenizer, NFC, chat template, dequant, the
 
 ## Where things stand
 
-HEAD is `7db46c9` on `main`, **nothing is pushed**. Proven (details in STATUS.md): tokenizer, NFC and chat template
+HEAD is a few commits past `7db46c9` on `main`, **nothing is pushed**. Proven (details in STATUS.md): tokenizer, NFC and chat template
 identical to the checkpoint's; the CPU forward pass equals the published `transformers` reference on Shadow's own
 weights for **all 48 layers** (cosine 1.00000, identical routing) on CPU and GPU, and agrees with the BF16 weights at
 cosine >= 0.994 per layer; greedy decoding answers correctly; the GPU matvec backend runs 0.40 s/token vs 2.35.
 
-### In flight: the sparse indexer gate (do this first)
+### The sparse indexer: done and gated
 
-The indexer is **implemented but not gated** (commit `7db46c9`). The gate is a 2,600-token fixture whose positions
-2,051+ make layer 3 select blocks. Its generation was running in the background when this was written; the output
-folder is `eval/fixtures/reference_gguf_long`. If that folder has a `manifest.json`, skip to step 2.
-
-1. Generate it (about 10-15 minutes, ~30 GiB cap, needs no download, `target/release/shadow.exe` built first):
-   ```powershell
-   cd J:\Shadow
-   cargo build --release -p shadow
-   & .\tools\run_capped.ps1 -CapGiB 30 -Out run.txt -Exe 'J:\Shadow\.venv-ref\Scripts\python.exe' -Arguments '-u J:\Shadow\tools\make_reference_fixture.py --layers 4 --weights gguf --prompt-file J:\Shadow\docs\SHADOW_PLAN.md J:\Shadow\docs\ARCH.md J:\Shadow\docs\STATUS.md --tokens 2600 --positions 5,1000,2047,2050,2051,2052,2053,2054,2055,2056,2400,2599 --out J:\Shadow\eval\fixtures\reference_gguf_long'
-   ```
-   (If the docs have changed, the prompt text changes; that is fine, the fixture records the ids. If a file has fewer
-   than 2,600 tokens in total the script says so.) Its first attempt failed on an expert-group size, now fixed.
-2. Compare: `target\release\shadow.exe compare <model.gguf> eval\fixtures\reference_gguf_long`. Expected: every stream
-   cosine 1.00000 and routing 10/10 at the kept positions, and `layer3: attended positions that differ ...` all **0**.
-   Then `cargo test --release -p shadow --test reference -- --ignored` (minutes) is the same as a test.
-3. If the selection differs by whole blocks (multiples of 4) at a few positions, suspect a score tie or the f32
-   summation order of the block scores (Shadow sums the dot in f64 and rounds to f32; the library uses an f32 matmul);
-   if it differs everywhere, the semantics in ARCH.md ("The indexer only changes anything past 2,051 tokens") or the
-   RoPE position of a block key (its first position, `4b`) is wrong. The reference code is in
-   `.venv-ref\Lib\site-packages\transformers\models\qwen4_exp\modeling_qwen4_exp.py` (`Qwen4ExpTextQSAIndexer`).
-4. When green, commit the fixture (check `git show HEAD:path | cmp - path` for the `.bin`), update STATUS.md (the known
-   gap) and remove the "not gated" wording.
+Implemented in `forward.rs` and held to the reference by `eval/fixtures/reference_gguf_long` (2,600 tokens, layers 0-3,
+12 kept positions): Shadow attends to exactly the reference's positions, every stream cosine 1.00000, routing 10/10, on
+the GPU backend (150 s). The CPU backend run and `cargo test --release -p shadow --test reference -- --ignored`
+(minutes) are the same comparison; regenerate the fixture with the command in `tools/make_reference_fixture.py`'s
+docstring plus `--prompt-file J:\Shadow\docs\SHADOW_PLAN.md J:\Shadow\docs\ARCH.md J:\Shadow\docs\STATUS.md --tokens
+2600 --positions 5,1000,2047,2050,2051,2052,2053,2054,2055,2056,2400,2599 --out evalixtureseference_gguf_long`
+(~10 minutes, `--weights gguf`, no download, capped at 30 GiB). Note that the prompt is made of the docs, so editing
+them changes the prompt; the fixture records the ids, so it stays valid as a fixture.
 
 ### Then, in the plan's order
 
