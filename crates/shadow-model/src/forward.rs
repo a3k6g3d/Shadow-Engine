@@ -345,6 +345,7 @@ pub struct Model {
     pub cfg: Config,
     files: Vec<File>,
     dense: HashMap<String, Vec<u8>>,
+    ple_cache: std::sync::RwLock<HashMap<i64, Vec<f32>>>,
 }
 
 impl Model {
@@ -362,7 +363,7 @@ impl Model {
             read_at(&files[t.shard], &mut b, t.offset).map_err(|e| format!("{}: {e}", t.name))?;
             dense.insert(t.name.clone(), b);
         }
-        Ok(Model { g, cfg, files, dense })
+        Ok(Model { g, cfg, files, dense, ple_cache: std::sync::RwLock::new(HashMap::new()) })
     }
 
     /// The companion `.scale` f32 multiplier of a 2-D tensor (1.0 when the model has no `.scale` tensor).
@@ -433,8 +434,13 @@ impl Model {
         read_at(&self.files[t.shard], out, t.offset + (e * per) as u64).unwrap();
     }
 
-    /// One row of the n-gram table (ple_head_dim weights).
+    /// One row of the n-gram table (ple_head_dim weights), cached in RAM.
     pub fn ple_row(&self, row: i64) -> Vec<f32> {
+        if let Ok(c) = self.ple_cache.read() {
+            if let Some(v) = c.get(&row) {
+                return v.clone();
+            }
+        }
         let t = self.g.tensor("per_layer_token_embd.weight").unwrap();
         let (be, bb) = t.ty.block().unwrap();
         let rb = (t.dims[0] / be * bb) as usize;
@@ -442,6 +448,11 @@ impl Model {
         read_at(&self.files[t.shard], &mut b, t.offset + row as u64 * rb as u64).unwrap();
         let mut y = vec![0f32; t.dims[0] as usize];
         dequantize(t.ty, &b, &mut y).unwrap();
+        if let Ok(mut c) = self.ple_cache.write() {
+            if c.len() < 65536 {
+                c.insert(row, y.clone());
+            }
+        }
         y
     }
 }
@@ -1026,6 +1037,10 @@ pub fn ple_rows(c: &Config, tokens: &[u32]) -> Vec<i64> {
 pub trait Stepper {
     /// Feeds one token; the logits for the next, or nothing when stopped early.
     fn step(&mut self, token: u32) -> Vec<f32>;
+    /// Feeds one token without producing logits (prefill phase for prompt tokens before the last).
+    fn step_prefill(&mut self, token: u32) {
+        self.step(token);
+    }
     /// Start recording the named streams (see `Session::trace`).
     fn start_trace(&mut self);
     fn take_trace(&mut self) -> Option<std::collections::BTreeMap<String, Vec<f32>>>;

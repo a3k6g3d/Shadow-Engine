@@ -5,6 +5,7 @@
 //! Not yet: sampling (greedy only), images.
 
 pub mod engine;
+pub mod ui;
 
 use bytes::Bytes;
 use engine::{Event, Status};
@@ -73,6 +74,7 @@ fn error(status: StatusCode, msg: &str) -> Response<Body> {
 async fn handle(req: Request<Incoming>, app: Arc<App>) -> Result<Response<Body>, Infallible> {
     let path = req.uri().path().to_string();
     Ok(match (req.method(), path.as_str()) {
+        (&Method::GET, "/") | (&Method::GET, "/index.html") => ui::index_response(),
         (&Method::GET, "/health") => {
             let s = app.status.lock().unwrap().clone();
             match s.state {
@@ -488,5 +490,12 @@ mod tests {
         assert_eq!(m[1].tool_calls.len(), 1);
         assert_eq!(m[1].tool_calls[0].name, "read_file");
         assert_eq!(m[1].tool_calls[0].arguments, vec![("path".into(), "foo.py".into()), ("start".into(), "1".into()), ("end".into(), "8".into())]);
+    }
+
+    #[test]
+    fn serves_index_html() {
+        let resp = ui::index_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(resp.headers().get("content-type").unwrap(), "text/html; charset=utf-8");
     }
 }

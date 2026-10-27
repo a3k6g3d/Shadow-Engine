@@ -29,6 +29,20 @@ The plan is in [docs/SHADOW_PLAN.md](docs/SHADOW_PLAN.md), rewritten 2026-10-26.
 That rule is not a formality and it has killed more ideas than any reviewer. That floor was measured on Strata;
 Shadow measures its own once it can run a session (stage 4), and until then Strata's is the working figure.
 
+## Server & Web UI
+
+Shadow runs a built-in OpenAI-compatible HTTP server and embedded web chat UI:
+
+```text
+shadow serve <path-to-gguf> [--port 8081] [--host 127.0.0.1] [--ram-tier-gib 30]
+```
+
+* **Web Chat UI**: Visit `http://127.0.0.1:8081/` in any browser for the built-in dark-mode chat interface with real-time SSE streaming, collapsible `<think>` reasoning blocks, and live performance metrics (tok/s, VRAM, and tier stats).
+* **API Endpoints**:
+  * `POST /v1/chat/completions`: OpenAI-compatible streaming and non-streaming chat completions.
+  * `GET /v1/status`: Live throughput, queue status, and memory tier breakdown.
+  * `GET /v1/models`, `/health`, `/metrics` (Prometheus).
+
 ## Layout
 
     crates/          the Rust side, including shadow-eval, the yardstick

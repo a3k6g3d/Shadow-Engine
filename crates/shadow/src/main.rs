@@ -310,8 +310,11 @@ fn generate(path: &std::path::Path, prompt: &str, rest: &[String]) -> ExitCode {
     };
     let t1 = std::time::Instant::now();
     let mut logits = Vec::new();
-    for &id in &ids {
-        logits = s.step(id);
+    if let Some((&last, pfx)) = ids.split_last() {
+        for &id in pfx {
+            s.step_prefill(id);
+        }
+        logits = s.step(last);
     }
     eprintln!("prompt read in {:.1} s ({:.3} s/token)", t1.elapsed().as_secs_f64(),
               t1.elapsed().as_secs_f64() / ids.len() as f64);

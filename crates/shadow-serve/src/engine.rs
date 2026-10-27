@@ -180,8 +180,12 @@ fn answer(arch: &str, req: &Request, tok: &Tokenizer, sess: &mut GpuSession, las
         sess.reset();
         0
     };
-    for &id in &ids[cached..] {
-        *last_logits = sess.step(id);
+    let unread = &ids[cached..];
+    if let Some((&last, pfx)) = unread.split_last() {
+        for &id in pfx {
+            sess.step_prefill(id);
+        }
+        *last_logits = sess.step(last);
     }
     let prompt_ms = t0.elapsed().as_secs_f64() * 1e3;
 

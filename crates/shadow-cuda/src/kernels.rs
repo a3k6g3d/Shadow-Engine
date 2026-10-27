@@ -117,6 +117,14 @@ pub const PAIR_KERNELS: &[(&str, &str)] = &[
     ("F32", "matvec_pair_f32"),
 ];
 
+/// (type of the first matrix, type of the second, entry): pairs of different quant types sharing `x`.  The first
+/// matrix's row count must be a multiple of 8 so no 8-row block mixes the two decoders.
+pub const PAIR2_KERNELS: &[(&str, &str, &str)] = &[
+    ("Q6_K", "Q4_K", "matvec_pair_q6_k_q4_k"),
+    ("Q4_K", "IQ4_XS", "matvec_pair_q4_k_iq4_xs"),
+    ("IQ4_XS", "Q6_K", "matvec_pair_iq4_xs_q6_k"),
+];
+
 const fn batch(name: &'static str) -> Entry {
     Entry { name, params: MATVEC_BATCH }
 }
@@ -188,6 +196,7 @@ pub const FILES: &[File] = &[
             pair("matvec_pair_iq4_nl"), pair("matvec_pair_iq4_xs"), pair("matvec_pair_nvfp4"),
             pair("matvec_pair_q2_0"), pair("matvec_pair_iq2_s"), pair("matvec_pair_iq3_xxs"),
             pair("matvec_pair_iq3_s"), pair("matvec_pair_f32"),
+            pair("matvec_pair_q6_k_q4_k"), pair("matvec_pair_q4_k_iq4_xs"), pair("matvec_pair_iq4_xs_q6_k"),
         ],
     },
     File {

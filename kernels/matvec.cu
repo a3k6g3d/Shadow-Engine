@@ -280,6 +280,28 @@ static __device__ __forceinline__ void matvec_pair_fast_rows(const u8* w0, float
     if (lane == 0) y[row] = acc;
 }
 
+// Two matrices of different quant types sharing x: rows 0..r0 decode as Q0, rows r0..r0+r1 as Q1.  With r0 % 8 == 0
+// every 8-row block is one type, so no block mixes decoders.
+template <typename Q0, typename Q1>
+static __device__ __forceinline__ void matvec_pair2_fast_rows(const u8* w0, float* y0, unsigned int r0,
+                                                              const u8* w1, float* y1, unsigned int r1,
+                                                              const float* x, unsigned int cols) {
+    unsigned int row = blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32, lane = threadIdx.x % 32;
+    float acc = 0.0f;
+    if (row < r0) {
+        const u8* r = w0 + (u64) row * (cols / Q0::QK) * Q0::BYTES;
+        for (unsigned int c = lane; c < cols / 8; c += 32) acc += Fast<Q0>::dot8(r, c * 8, x + c * 8);
+        for (int off = 16; off > 0; off >>= 1) acc += __shfl_down_sync(0xffffffffu, acc, off);
+        if (lane == 0) y0[row] = acc;
+    } else if (row < r0 + r1) {
+        row -= r0;
+        const u8* r = w1 + (u64) row * (cols / Q1::QK) * Q1::BYTES;
+        for (unsigned int c = lane; c < cols / 8; c += 32) acc += Fast<Q1>::dot8(r, c * 8, x + c * 8);
+        for (int off = 16; off > 0; off >>= 1) acc += __shfl_down_sync(0xffffffffu, acc, off);
+        if (lane == 0) y1[row] = acc;
+    }
+}
+
 // Several matrices of one shape at once (one token's routed experts): blockIdx.y = n picks matrix wtab[n], input
 // x + n * xs and output y + n * ys.  Launch: block = 256 threads (8 rows), grid = (ceil(rows / 8), matrices).
 template <typename Q>
@@ -398,6 +420,9 @@ extern "C" __global__ void matvec_pair_q2_0(const u8* w0, float* y0, unsigned in
 extern "C" __global__ void matvec_pair_iq2_s(const u8* w0, float* y0, unsigned int r0, const u8* w1, float* y1, unsigned int r1, const float* x, unsigned int cols) { matvec_pair_fast_rows<IQ2S>(w0, y0, r0, w1, y1, r1, x, cols); }
 extern "C" __global__ void matvec_pair_iq3_xxs(const u8* w0, float* y0, unsigned int r0, const u8* w1, float* y1, unsigned int r1, const float* x, unsigned int cols) { matvec_pair_fast_rows<IQ3XXS>(w0, y0, r0, w1, y1, r1, x, cols); }
 extern "C" __global__ void matvec_pair_iq3_s(const u8* w0, float* y0, unsigned int r0, const u8* w1, float* y1, unsigned int r1, const float* x, unsigned int cols) { matvec_pair_fast_rows<IQ3S>(w0, y0, r0, w1, y1, r1, x, cols); }
+extern "C" __global__ void matvec_pair_q6_k_q4_k(const u8* w0, float* y0, unsigned int r0, const u8* w1, float* y1, unsigned int r1, const float* x, unsigned int cols) { matvec_pair2_fast_rows<Q6K, Q4K>(w0, y0, r0, w1, y1, r1, x, cols); }
+extern "C" __global__ void matvec_pair_q4_k_iq4_xs(const u8* w0, float* y0, unsigned int r0, const u8* w1, float* y1, unsigned int r1, const float* x, unsigned int cols) { matvec_pair2_fast_rows<Q4K, IQ4XS>(w0, y0, r0, w1, y1, r1, x, cols); }
+extern "C" __global__ void matvec_pair_iq4_xs_q6_k(const u8* w0, float* y0, unsigned int r0, const u8* w1, float* y1, unsigned int r1, const float* x, unsigned int cols) { matvec_pair2_fast_rows<IQ4XS, Q6K>(w0, y0, r0, w1, y1, r1, x, cols); }
 extern "C" __global__ void matvec_pair_f32(const u8* w0, float* y0, unsigned int r0,
                                            const u8* w1, float* y1, unsigned int r1,
                                            const float* x, unsigned int cols) {

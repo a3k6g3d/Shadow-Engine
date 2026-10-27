@@ -84,6 +84,7 @@ table! {
     cuStreamCreate: fn(*mut H, c_uint) = ["cuStreamCreate"];
     cuStreamDestroy: fn(H) = ["cuStreamDestroy_v2"];
     cuStreamSynchronize: fn(H) = ["cuStreamSynchronize"];
+    cuStreamWaitEvent: fn(H, H, c_uint) = ["cuStreamWaitEvent"];
     cuEventCreate: fn(*mut H, c_uint) = ["cuEventCreate"];
     cuEventDestroy: fn(H) = ["cuEventDestroy_v2"];
     cuEventRecord: fn(H, H) = ["cuEventRecord"];
@@ -217,6 +218,11 @@ impl Context {
         call!(self.api, cuEventCreate(&mut e, 0))?;
         Ok(Event { ctx: self, event: e })
     }
+
+    pub fn stream_wait_event(&self, stream: *mut std::ffi::c_void, event: &Event) -> Result<(), CudaError> {
+        self.bind()?;
+        call!(self.api, cuStreamWaitEvent(stream, event.event, 0))
+    }
 }
 
 impl Drop for Context {
@@ -320,6 +326,10 @@ impl Stream<'_> {
     pub fn synchronize(&self) -> Result<(), CudaError> {
         self.ctx.bind()?;
         call!(self.ctx.api, cuStreamSynchronize(self.stream))
+    }
+
+    pub fn wait_event(&self, event: &Event) -> Result<(), CudaError> {
+        self.ctx.stream_wait_event(self.stream, event)
     }
 }
 

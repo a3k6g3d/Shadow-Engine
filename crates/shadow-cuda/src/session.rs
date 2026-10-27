@@ -12,8 +12,8 @@
 //! holding one expert's gate, up and down slices; a miss reads the slices from the file and uploads them into the
 //! least recently used slot.  The experts the current token routes to are never the victims of its own misses.
 
-use crate::driver::{Context, DeviceBuffer, Stream};
-use crate::kernels::{file, Arg, Program, FAST_KERNELS, PAIR_KERNELS, QUANT_KERNELS};
+use crate::driver::{Context, DeviceBuffer, Event, Stream};
+use crate::kernels::{file, Arg, Program, FAST_KERNELS, PAIR2_KERNELS, PAIR_KERNELS, QUANT_KERNELS};
 use crate::pinned::PinnedRegion;
 use shadow_model::forward::{ple_rows, route, route_sigmoid, Model, Stepper};
 use shadow_model::gguf::TensorInfo;
@@ -153,6 +153,8 @@ pub struct GpuSession<'c, 'm> {
     cache: ExpertCache<'c>,
     ram: RamTier<'c>,
     copy_stream: Stream<'c>,
+    #[allow(dead_code)]
+    copy_event: Event<'c>,
     staging: Option<PinnedRegion<'c>>,
     /// How often each (layer, expert) was routed to by this session (`--record-routing` saves it).
     pub routing: RoutingCounts,
@@ -357,7 +359,7 @@ impl<'c> RamTier<'c> {
 }
 
 /// VRAM left free for everything else when the expert cache sizes itself (the desktop, the driver, other programs).
-pub const VRAM_RESERVE: usize = 1024 << 20;
+pub const VRAM_RESERVE: usize = 384 << 20;
 
 fn f32s(v: &[f32]) -> Vec<u8> {
     v.iter().flat_map(|x| x.to_le_bytes()).collect()
@@ -561,28 +563,24 @@ impl<'c, 'm> GpuSession<'c, 'm> {
         let mut vram_pinned: Vec<(usize, usize, u64)> = Vec::new();
         let mut vram_pinned_slots: Vec<(usize, usize, usize)> = Vec::new();
         let mut next_in_layer: Vec<usize> = layer_range.iter().map(|r| r.start).collect();
-        // When a sizable RAM tier is present and per-layer VRAM slots are active, pin the hottest ~half of each
-        // layer's VRAM slots permanently in VRAM (keeping at least 2 * n_expert_used LRU slots per layer) and exclude
-        // them from `RamTier` so `RamTier` covers ~1,200 additional experts without duplicating VRAM-pinned ones.
+        // When a sizable RAM tier is present and per-layer VRAM slots are active, pin the hottest slots permanently in
+        // VRAM (keeping `margin` LRU slots per layer for transient misses) and exclude them from `RamTier` so `RamTier`
+        // covers ~1,800+ additional experts without duplicating VRAM-pinned ones.
         if slots > 0 && per_layer_mode && ram_bytes >= (4usize << 30) {
+            let margin = (c.n_expert_used + 2).max(12);
             let mut pin_end = vec![0usize; c.n_layer];
             for l in 0..c.n_layer {
                 let len = layer_range[l].len();
-                let n_pin = (len / 2).min(len.saturating_sub(2 * c.n_expert_used));
+                let n_pin = len.saturating_sub(margin);
                 pin_end[l] = layer_range[l].start + n_pin;
                 evict_range[l] = pin_end[l]..layer_range[l].end;
             }
-            let mut pinned_bytes = 0usize;
             for &(l, ep) in &order {
                 if !c.is_moe(l) || next_in_layer[l] >= pin_end[l] {
                     continue;
                 }
-                if pinned_bytes + l_bytes[l] > ram_bytes {
-                    break;
-                }
                 let s = next_in_layer[l];
                 next_in_layer[l] += 1;
-                pinned_bytes += l_bytes[l];
                 vram_pinned.push((l, ep, slot_offset[s]));
                 vram_pinned_slots.push((l, ep, s));
             }
@@ -636,6 +634,7 @@ impl<'c, 'm> GpuSession<'c, 'm> {
             ctx.synchronize().map_err(e)?;
         }
         let copy_stream = ctx.stream().map_err(e)?;
+        let copy_event = ctx.event().map_err(e)?;
         let staging = if slot_bytes > 0 && c.n_expert_used > 0 {
             Some(PinnedRegion::new(ctx, c.n_expert_used * slot_bytes)?)
         } else {
@@ -643,7 +642,7 @@ impl<'c, 'm> GpuSession<'c, 'm> {
         };
         Ok(GpuSession {
             ctx, m, mvp, fw, w, v, b, delta, attn, ple_state, tokens: vec![], cap, trace: None, stop_after: None,
-            resident_bytes, expert_uploads: 0, cache, ram, copy_stream, staging,
+            resident_bytes, expert_uploads: 0, cache, ram, copy_stream, copy_event, staging,
             routing: RoutingCounts::new(c.n_layer, c.n_expert),
             prof: std::env::var("SHADOW_PROFILE").is_ok_and(|v| v == "1")
                 .then(|| Prof { last: std::time::Instant::now(), phases: vec![] }),
@@ -753,21 +752,40 @@ impl<'c, 'm> GpuSession<'c, 'm> {
         }
     }
 
-    /// Fuses y0 = W0 x and y1 = W1 x into a single launch when W0 and W1 share the same quant type, column count,
-    /// unit scale, and 8-row alignment; falls back to two `mv` launches otherwise.
+    /// Fuses y0 = W0 x and y1 = W1 x into a single launch when W0 and W1 share the column count, unit scale and 8-row
+    /// alignment - same quant type (`PAIR_KERNELS`) or a listed pair of types (`PAIR2_KERNELS`); two `mv` otherwise.
     fn mv_pair(&self, name0: &str, y0: u64, name1: &str, y1: u64, x: u64) {
         let (t0, b0) = self.m.dense(name0);
         let (t1, b1) = self.m.dense(name1);
         let ty = t0.ty.name();
         let (qk, qb) = t0.ty.block().unwrap();
+        let (qk1, qb1) = t1.ty.block().unwrap();
         let r0 = b0.len() / (t0.dims[0] / qk * qb) as usize;
-        let r1 = b1.len() / (t1.dims[0] / qk * qb) as usize;
+        let r1 = b1.len() / (t1.dims[0] / qk1 * qb1) as usize;
+        let ty1 = t1.ty.name();
+        let fast_ok = |t: &TensorInfo| matches!(t.ty.name().as_str(), "BF16" | "F32") || t.dims[0].is_multiple_of(8);
+        if t0.ty != t1.ty && t0.dims[0] == t1.dims[0] && r0.is_multiple_of(8) && t0.dims[0].is_multiple_of(8)
+            && self.m.scale(name0) == 1.0 && self.m.scale(name1) == 1.0
+        {
+            if let Some(&(_, _, entry)) = PAIR2_KERNELS.iter().find(|q| q.0 == ty && q.1 == ty1) {
+                let w0 = self.w.get(name0).unwrap_or_else(|| panic!("{name0} is not resident")).ptr;
+                let w1 = self.w.get(name1).unwrap_or_else(|| panic!("{name1} is not resident")).ptr;
+                unsafe {
+                    self.mvp.launch(entry, (((r0 + r1) as u32).div_ceil(8), 1, 1), (256, 1, 1), 0, None,
+                                    &[Arg::Ptr(w0), Arg::Ptr(y0), Arg::U32(r0 as u32),
+                                      Arg::Ptr(w1), Arg::Ptr(y1), Arg::U32(r1 as u32),
+                                      Arg::Ptr(x), Arg::U32(t0.dims[0] as u32)])
+                }
+                .unwrap_or_else(|err| panic!("{name0}+{name1}: {err}"));
+                return;
+            }
+        }
         if t0.ty == t1.ty
             && t0.dims[0] == t1.dims[0]
             && r0.is_multiple_of(8)
             && self.m.scale(name0) == 1.0
             && self.m.scale(name1) == 1.0
-            && (matches!(ty.as_str(), "BF16" | "F32") || t0.dims[0].is_multiple_of(8))
+            && fast_ok(t0)
         {
             if let Some(&(_, entry)) = PAIR_KERNELS.iter().find(|q| q.0 == ty) {
                 let w0 = self.w.get(name0).unwrap_or_else(|| panic!("{name0} is not resident")).ptr;
@@ -835,8 +853,16 @@ impl<'c, 'm> GpuSession<'c, 'm> {
 
     // -------------------------------------------------------------------------------------------- the forward pass
     pub fn step(&mut self, token: u32) -> Vec<f32> {
+        self.step_opt(token, true)
+    }
+
+    pub fn step_prefill(&mut self, token: u32) {
+        self.step_opt(token, false);
+    }
+
+    pub fn step_opt(&mut self, token: u32, with_logits: bool) -> Vec<f32> {
         if self.m.cfg.arch == "flint" {
-            return self.step_flint(token);
+            return self.step_flint_opt(token, with_logits);
         }
         assert!(self.tokens.len() < self.cap, "this session was made for {} positions", self.cap);
         self.tokens.push(token);
@@ -896,6 +922,9 @@ impl<'c, 'm> GpuSession<'c, 'm> {
             }
             self.rec(format!("layer{l}.out"), self.b.r.ptr, h * cs);
         }
+        if !with_logits {
+            return vec![];
+        }
         self.hc_read("output_hc", false, rn_ready);
         self.rec("final_u".into(), self.b.u.ptr, h);
         self.mv("output.weight", self.b.u.ptr, self.b.logits.ptr);
@@ -905,7 +934,7 @@ impl<'c, 'm> GpuSession<'c, 'm> {
         floats(&out)
     }
 
-    fn step_flint(&mut self, token: u32) -> Vec<f32> {
+    fn step_flint_opt(&mut self, token: u32, with_logits: bool) -> Vec<f32> {
         assert!(self.tokens.len() < self.cap, "this session was made for {} positions", self.cap);
         self.tokens.push(token);
         self.routing.tokens += 1;
@@ -967,6 +996,9 @@ impl<'c, 'm> GpuSession<'c, 'm> {
                                                  Arg::Ptr(self.sv("output_norm.weight")),
                                                  Arg::Ptr(self.b.u.ptr), Arg::U32(h as u32), Arg::F32(c.eps)]);
             }
+        }
+        if !with_logits {
+            return vec![];
         }
         if self.trace.is_some() {
             self.k("rmsnorm_groups", 1, 256, &[Arg::Ptr(self.b.r.ptr), Arg::Ptr(self.sv("output_norm.weight")),
@@ -1467,6 +1499,9 @@ impl<'c, 'm> GpuSession<'c, 'm> {
 impl Stepper for GpuSession<'_, '_> {
     fn step(&mut self, token: u32) -> Vec<f32> {
         GpuSession::step(self, token)
+    }
+    fn step_prefill(&mut self, token: u32) {
+        GpuSession::step_prefill(self, token);
     }
     fn start_trace(&mut self) {
         self.trace = Some(BTreeMap::new());
