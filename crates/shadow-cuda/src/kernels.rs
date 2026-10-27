@@ -52,6 +52,16 @@ pub const PRELUDE: &str = include_str!("../../../kernels/prelude.cuh");
 
 const UNARY: &[P] = &[P::ConstPtr, P::Ptr, P::U32];
 
+/// The grid-free dequant types: (entry point, ggml type name, weights per block, bytes per block).
+pub const DEQUANT: &[(&str, &str, u32, u32)] = &[
+    ("dequant_q4_k", "Q4_K", 256, 144),
+    ("dequant_q5_k", "Q5_K", 256, 176),
+    ("dequant_q6_k", "Q6_K", 256, 210),
+    ("dequant_iq4_nl", "IQ4_NL", 32, 18),
+    ("dequant_iq4_xs", "IQ4_XS", 256, 136),
+    ("dequant_q2_0", "Q2_0", 64, 18),
+];
+
 pub const FILES: &[File] = &[
     File {
         file: "vector_add.cu",
@@ -66,6 +76,19 @@ pub const FILES: &[File] = &[
             Entry { name: "bf16_to_f32_all", params: UNARY },
             Entry { name: "f32_to_f16_all", params: UNARY },
             Entry { name: "f32_to_bf16_all", params: UNARY },
+        ],
+    },
+    File {
+        file: "dequant.cu",
+        source: include_str!("../../../kernels/dequant.cu"),
+        entries: &[
+            Entry { name: "dequant_q4_k", params: UNARY },
+            Entry { name: "dequant_q5_k", params: UNARY },
+            Entry { name: "dequant_q6_k", params: UNARY },
+            Entry { name: "dequant_iq4_nl", params: UNARY },
+            Entry { name: "dequant_iq4_xs", params: UNARY },
+            Entry { name: "dequant_q2_0", params: UNARY },
+            Entry { name: "dequant_bf16", params: UNARY },
         ],
     },
 ];
