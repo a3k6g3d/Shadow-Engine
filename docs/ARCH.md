@@ -45,8 +45,11 @@ Notation: `H = 2560` hidden, `C = 4` hyper-connection streams, `CH = 10240`, `T`
   (`attn_q_norm` mean 1.28, `hc_attn_norm` 0.94, `ssm_norm` 0.97, `indexer.*_norm` 0.96) [file]. So the forward pass
   multiplies by `w` as stored.
 - **`ssm_a` is stored as `A = -exp(A_log)`**: every value is negative (−158.0 to −0.028) [file].
-- **`blk.1.ple_norm_key` and `blk.1.ple_norm_query` are identical**, value for value [file]. Either the checkpoint ties
-  them or the conversion copied one into the other. [open]
+- **`blk.1.ple_norm_key` and `ple_norm_query` are different tensors**, as in the checkpoint. (An earlier version of this
+  file said they were identical: that came from `shadow stats` printing the same min, mean, max and first six values for
+  both - the vectors differ in some elements, by at most 0.054.) Each equals the checkpoint's tensor of the same
+  name **exactly** once the stored +1 is taken off, which also settles the +1 convention for these norms by measurement.
+  [file, checkpoint]
 - **Type 42 is upstream ggml's `GGML_TYPE_Q2_0`** (ggml.h, with NVFP4 = 40 and Q1_0 = 41, all newer than the first
   type table here): 64 weights per block, an f16 scale `d` and 16 bytes of 2-bit codes, 18 bytes = 2.25 bits per
   weight, which is exactly what the offsets gave. 9 of the 48 `ffn_down_exps` use it (blk 1, 8, 10, 12, 13, 20, 21,
@@ -192,10 +195,10 @@ logits = output · u                                  # no further norm: the fil
 | # | question | how |
 |---|---|---|
 | 1 | ~~Q2_0's code-to-value map~~ settled: `(q - 1) * d`, from upstream; a fixture would still be better | a mainline ggml build, or a gguf package that has Q2_0 |
-| 2 | ~~norm weights~~ settled: +1 folded in (converter convention, values near 1) | - |
+| 2 | ~~norm weights~~ settled: +1 folded in, measured: the PLE norms in the file equal the checkpoint's + 1 exactly | - |
 | 3 | ~~`attn_qkv` order, alpha vs beta~~ settled: q, k, v grouped; value heads tiled; beta = b, alpha = a (converter) | - |
-| 4 | PLE hashing details (multiplier per position, per head, negative mod) | the reference's `Qwen4ExpTextNGramEmbedding`, read line by line before stage 1 writes it |
-| 5 | `ple_norm_key == ple_norm_query` here, though upstream's converter reads two source tensors | the checkpoint: identical there too, or a conversion slip in this file |
+| 4 | ~~PLE hashing details~~ settled: the library's multipliers (`_build_layer_multipliers`) equal the checkpoint's and the GGUF's `ple.layer_multipliers`, as do the head vocab sizes and offsets; `remainder` is the non-negative one (`rem_euclid`); the n-gram table is 128 shards of 2,500,012 rows, row r in shard r / 2,500,012 | - |
+| 5 | ~~`ple_norm_key == ple_norm_query`~~ settled: no, they differ (max 0.054) in the checkpoint and in the file, and each file tensor equals its checkpoint tensor + 1 exactly | - |
 | 6 | indexer `k_norm`: LayerNorm or RMSNorm | the reference |
 | 7 | MTP for speculative decoding | the base model's MTP layer is in the checkpoint, not in this GGUF; quantize it ourselves, or use prompt-lookup drafting first |
 
