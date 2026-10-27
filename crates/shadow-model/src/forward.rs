@@ -763,6 +763,10 @@ pub trait Stepper {
     fn take_trace(&mut self) -> Option<std::collections::BTreeMap<String, Vec<f32>>>;
     /// Stop each step after layer n-1.
     fn set_stop_after(&mut self, n: Option<usize>);
+    /// A line about how it ran (caches, uploads), for the command line.
+    fn report(&self) -> String {
+        String::new()
+    }
 }
 
 impl Stepper for Session<'_> {

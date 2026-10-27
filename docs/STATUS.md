@@ -72,8 +72,20 @@ greedy runs, not stream by stream; no sampling (greedy only).
    definition and is checked by hand and by the end-to-end match above, which runs through it.
 2. ~~The sparse indexer~~: implemented and gated (see Stage 1).
 3. **Speculative decoding's draft**: the GGUF has no MTP tensors (ARCH.md, question 7).
-4. **Stage 3** (VRAM / pinned RAM / drive tiers) and everything speed-related has not started; the plan's floor
-   protocol applies from there.
+4. **Stage 3** has its first tier only: the VRAM expert cache (see Stage 3 below). Pinned RAM (with the 4 GiB rule in
+   code) and the drive through the ring have not started; the plan's floor protocol applies from there.
+
+## Stage 3: the VRAM expert cache, gated for correctness; speed unmeasured
+
+- `GpuSession` keeps routed experts in one VRAM arena of 2.54 MiB slots (gate + up + down), LRU, the current token's
+  experts never evicted by its own misses. It takes the free VRAM less `VRAM_RESERVE` (1.5 GiB) by default;
+  `shadow generate --gpu --expert-cache-gib G` sets it (`0`: no cache).
+- **Gate (2026-10-27):** `tests/reference.rs` (4 passed), `shadow compare ... reference_gguf48 --gpu` (all 48 layers,
+  cosine 1.000, routing 10/10 everywhere) and the long-prompt GPU indexer test pass with the cache on. Greedy
+  "What is 17 times 23?" (`--chat`, 24 tokens) gives **identical token ids** with no cache, 2 GiB and auto (4.57 GiB,
+  1,842 slots).
+- **One run each, not the protocol** (no 8 interleaved runs): 0.371 s/token without the cache, 0.215 at 2 GiB (45.5%
+  hits), 0.176 at 4.57 GiB (61.3% hits). Indicative only until stage 4's bench measures it against a floor.
 
 ## Things that went wrong, so they are not repeated
 

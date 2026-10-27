@@ -240,15 +240,17 @@ fn generate(path: &std::path::Path, prompt: &str, rest: &[String]) -> ExitCode {
     let t_up = std::time::Instant::now();
     let mut s: Box<dyn Stepper + '_> = match (&ctx, &backend) {
         (Some(c), None) => {
-            let gs = match shadow_cuda::session::GpuSession::new(c, &model, gpu_capacity(ids.len() + n_new)) {
+            let cache = rest.iter().position(|a| a == "--expert-cache-gib").and_then(|i| rest.get(i + 1))
+                .and_then(|v| v.parse::<f64>().ok()).map(|g| (g * GIB) as usize);
+            let gs = match shadow_cuda::session::GpuSession::with_cache(c, &model, gpu_capacity(ids.len() + n_new), cache) {
                 Ok(s) => s,
                 Err(e) => {
                     eprintln!("shadow generate: --gpu: {e}");
                     return ExitCode::FAILURE;
                 }
             };
-            eprintln!("GPU session: {:.2} GiB of weights resident in {:.1} s", gs.resident_bytes as f64 / GIB,
-                      t_up.elapsed().as_secs_f64());
+            eprintln!("GPU session: {:.2} GiB of weights resident in {:.1} s; {}", gs.resident_bytes as f64 / GIB,
+                      t_up.elapsed().as_secs_f64(), gs.report());
             Box::new(gs)
         }
         (_, Some(b)) => Box::new(Session::new(&model, b)),
@@ -261,6 +263,9 @@ fn generate(path: &std::path::Path, prompt: &str, rest: &[String]) -> ExitCode {
     }
     eprintln!("prompt read in {:.1} s ({:.3} s/token)", t1.elapsed().as_secs_f64(),
               t1.elapsed().as_secs_f64() / ids.len() as f64);
+    if !s.report().is_empty() {
+        eprintln!("after the prompt: {}", s.report());
+    }
     print!("{text}");
     let _ = std::io::stdout().flush();
     let mut out = Vec::new();
@@ -278,6 +283,9 @@ fn generate(path: &std::path::Path, prompt: &str, rest: &[String]) -> ExitCode {
     println!();
     eprintln!("generated {} tokens {:?} in {:.1} s ({:.3} s/token)", out.len(), out, t2.elapsed().as_secs_f64(),
               t2.elapsed().as_secs_f64() / out.len().max(1) as f64);
+    if !s.report().is_empty() {
+        eprintln!("at the end: {}", s.report());
+    }
     ExitCode::SUCCESS
 }
 

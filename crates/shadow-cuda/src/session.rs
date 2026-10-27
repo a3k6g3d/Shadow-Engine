@@ -6,8 +6,11 @@
 //! every DeltaNet state, every KV cache with the indexer's keys, and the n-gram conv state.  Still on the host, because
 //! each is a small decision or a read the next stage replaces: the token's embedding row and its n-gram rows (read and
 //! dequantized on the CPU, then uploaded: 10 KiB each), the router's top-10 (512 logits come down), the indexer's
-//! top-512 blocks past 2,051 positions (its scores come down), and the routed experts, uploaded per use until stage 3's
-//! tiers keep them resident.
+//! top-512 blocks past 2,051 positions (its scores come down), and the routed experts' first use.
+//!
+//! The routed experts live in a VRAM cache (stage 3's first tier, docs/SHADOW_PLAN.md): one arena of equal slots, each
+//! holding one expert's gate, up and down slices; a miss reads the slices from the file and uploads them into the
+//! least recently used slot.  The experts the current token routes to are never the victims of its own misses.
 
 use crate::driver::{Context, DeviceBuffer};
 use crate::kernels::{file, Arg, Program, QUANT_KERNELS};
@@ -22,6 +25,40 @@ struct Attn<'c> {
     raw: DeviceBuffer<'c>,
     blocks: DeviceBuffer<'c>,
     nblocks: usize,
+}
+
+/// Routed experts resident in VRAM: `slots` equal slots of `slot_bytes`, each one expert's [gate | up | down] slices.
+struct ExpertCache<'c> {
+    arena: Option<DeviceBuffer<'c>>,
+    slot_bytes: usize,
+    slots: usize,
+    map: HashMap<(usize, usize), usize>,
+    owner: Vec<Option<(usize, usize)>>,
+    stamp: Vec<u64>,
+    clock: u64,
+    hits: u64,
+    misses: u64,
+}
+
+impl ExpertCache<'_> {
+    /// The slot of (layer, expert) if resident, marked as used now.
+    fn touch(&mut self, key: (usize, usize)) -> Option<usize> {
+        let s = *self.map.get(&key)?;
+        self.stamp[s] = self.clock;
+        Some(s)
+    }
+
+    /// A slot for a new expert: a free one, else the least recently used one not used by the current token.
+    fn victim(&mut self) -> usize {
+        let s = (0..self.slots)
+            .filter(|&i| self.owner[i].is_none() || self.stamp[i] < self.clock)
+            .min_by_key(|&i| (self.owner[i].is_some(), self.stamp[i]))
+            .expect("the cache has fewer slots than one token routes to");
+        if let Some(old) = self.owner[s].take() {
+            self.map.remove(&old);
+        }
+        s
+    }
 }
 
 /// Scratch vectors, one per intermediate the forward pass names.
@@ -96,7 +133,11 @@ pub struct GpuSession<'c, 'm> {
     /// Bytes of weights uploaded to the device at the start, and expert slices uploaded per use since.
     pub resident_bytes: usize,
     pub expert_uploads: usize,
+    cache: ExpertCache<'c>,
 }
+
+/// VRAM left free for everything else when the expert cache sizes itself (the desktop, the driver, other programs).
+pub const VRAM_RESERVE: usize = 1536 << 20;
 
 fn f32s(v: &[f32]) -> Vec<u8> {
     v.iter().flat_map(|x| x.to_le_bytes()).collect()
@@ -112,8 +153,15 @@ fn is_small(name: &str) -> bool {
 }
 
 impl<'c, 'm> GpuSession<'c, 'm> {
-    /// Uploads the dense weights and allocates every state for sequences of up to `cap` positions.
+    /// Uploads the dense weights and allocates every state for sequences of up to `cap` positions; the expert cache
+    /// takes the VRAM left over, less `VRAM_RESERVE`.
     pub fn new(ctx: &'c Context, m: &'m Model, cap: usize) -> Result<GpuSession<'c, 'm>, String> {
+        Self::with_cache(ctx, m, cap, None)
+    }
+
+    /// As `new`, with the expert cache's size in bytes (`Some(0)`: no cache, every expert uploaded per use).
+    pub fn with_cache(ctx: &'c Context, m: &'m Model, cap: usize, cache_bytes: Option<usize>)
+                      -> Result<GpuSession<'c, 'm>, String> {
         let c = &m.cfg;
         let e = |x: crate::driver::CudaError| x.to_string();
         let mvp = Program::load(ctx, file("matvec.cu").ok_or("matvec.cu")?)?;
@@ -188,10 +236,57 @@ impl<'c, 'm> GpuSession<'c, 'm> {
         }
         let mut ple_state = a((c.ple_conv_k - 1) * c.ple_ngram * ch)?;
         ple_state.zero().map_err(e)?;
+
+        // the expert cache: slots as big as the largest expert (gate + up + down) of any layer
+        let per = |name: String| m.g.tensor(&name).map(|t| (t.nbytes() / t.dims[2]) as usize).unwrap_or(0);
+        let slot_bytes = (0..c.n_layer)
+            .map(|l| per(format!("blk.{l}.ffn_gate_exps.weight")) + per(format!("blk.{l}.ffn_up_exps.weight"))
+                + per(format!("blk.{l}.ffn_down_exps.weight")))
+            .max()
+            .unwrap_or(0)
+            .next_multiple_of(256);
+        let budget = match cache_bytes {
+            Some(b) => b,
+            None => ctx.mem_info().map_err(e)?.0.saturating_sub(VRAM_RESERVE),
+        };
+        let mut slots = if slot_bytes == 0 { 0 } else { budget / slot_bytes };
+        if slots > 0 && slots < c.n_expert_used {
+            slots = 0; // too small to hold one token's experts: no cache rather than a thrashing one
+        }
+        let mut arena = None;
+        while slots > 0 {
+            match ctx.alloc(slots * slot_bytes) {
+                Ok(buf) => {
+                    arena = Some(buf);
+                    break;
+                }
+                Err(_) => slots = slots * 7 / 8, // the free figure is a moment's; settle for what the driver gives
+            }
+        }
+        if slots < c.n_expert_used {
+            arena = None;
+            slots = 0;
+        }
+        let cache = ExpertCache {
+            arena, slot_bytes, slots, map: HashMap::new(), owner: vec![None; slots], stamp: vec![0; slots], clock: 0,
+            hits: 0, misses: 0,
+        };
         Ok(GpuSession {
             ctx, m, mvp, fw, w, v, b, delta, attn, ple_state, tokens: vec![], cap, trace: None, stop_after: None,
-            resident_bytes, expert_uploads: 0,
+            resident_bytes, expert_uploads: 0, cache,
         })
+    }
+
+    /// (slots, bytes per slot, hits, misses) of the expert cache.
+    pub fn cache_stats(&self) -> (usize, usize, u64, u64) {
+        (self.cache.slots, self.cache.slot_bytes, self.cache.hits, self.cache.misses)
+    }
+
+    /// One expert's slice of a fused `[in, out, n_expert]` tensor: its info as a 2-D matrix, without reading it.
+    fn expert_info(&self, name: &str) -> TensorInfo {
+        let mut t = self.m.g.tensor(name).unwrap_or_else(|| panic!("no tensor {name}")).clone();
+        t.dims = vec![t.dims[0], t.dims[1]];
+        t
     }
 
     // -------------------------------------------------------------------------------------------- launch helpers
@@ -463,21 +558,66 @@ impl<'c, 'm> GpuSession<'c, 'm> {
         self.rec_host(format!("layer{l}.route_idx"), &top.iter().map(|&(e, _)| e as f32).collect::<Vec<_>>());
         self.rec_host(format!("layer{l}.route_w"), &top.iter().map(|&(_, w)| w as f32).collect::<Vec<_>>());
         self.b.my.zero().unwrap();
+        let names = [format!("{p}.ffn_gate_exps.weight"), format!("{p}.ffn_up_exps.weight"), format!("{p}.ffn_down_exps.weight")];
+        let infos: Vec<TensorInfo> = names.iter().map(|n| self.expert_info(n)).collect();
+        let sizes: Vec<usize> = names.iter().map(|n| {
+            let t = self.m.g.tensor(n).unwrap();
+            (t.nbytes() / t.dims[2]) as usize
+        }).collect();
+        // where each expert's three slices are on the device this time
+        let mut at: Vec<[u64; 3]> = Vec::with_capacity(top.len());
+        if self.cache.slots > 0 {
+            self.cache.clock += 1;
+            for &(e, _) in &top {
+                self.cache.touch((l, e)); // protect this token's resident experts from its own misses
+            }
+            for &(e, _) in &top {
+                let slot = match self.cache.touch((l, e)) {
+                    Some(s) => {
+                        self.cache.hits += 1;
+                        s
+                    }
+                    None => {
+                        self.cache.misses += 1;
+                        let s = self.cache.victim();
+                        let base = self.cache.arena.as_ref().unwrap().ptr + (s * self.cache.slot_bytes) as u64;
+                        let mut off = 0u64;
+                        for (name, &size) in names.iter().zip(&sizes) {
+                            let (_, bytes) = self.m.expert(name, e);
+                            self.upload_to(base + off, &bytes);
+                            off += size as u64;
+                        }
+                        self.expert_uploads += 3;
+                        self.cache.owner[s] = Some((l, e));
+                        self.cache.map.insert((l, e), s);
+                        self.cache.stamp[s] = self.cache.clock;
+                        s
+                    }
+                };
+                let base = self.cache.arena.as_ref().unwrap().ptr + (slot * self.cache.slot_bytes) as u64;
+                at.push([base, base + sizes[0] as u64, base + (sizes[0] + sizes[1]) as u64]);
+            }
+        }
         let b = &self.b;
-        for &(e, wgt) in &top {
-            let (tg, bg) = self.m.expert(&format!("{p}.ffn_gate_exps.weight"), e);
-            let (tu, bu) = self.m.expert(&format!("{p}.ffn_up_exps.weight"), e);
-            let (td, bd) = self.m.expert(&format!("{p}.ffn_down_exps.weight"), e);
-            self.upload_to(b.wg.ptr, &bg);
-            self.upload_to(b.wu.ptr, &bu);
-            self.upload_to(b.wd.ptr, &bd);
-            self.matvec(&tg, b.wg.ptr, tg.dims[1] as usize, b.u.ptr, b.eg.ptr);
-            self.matvec(&tu, b.wu.ptr, tu.dims[1] as usize, b.u.ptr, b.eu.ptr);
+        for (i, &(e, wgt)) in top.iter().enumerate() {
+            let [pg, pu, pd] = if self.cache.slots > 0 {
+                at[i]
+            } else {
+                // no cache: through the scratch buffers, every time
+                for (name, buf) in names.iter().zip([&b.wg, &b.wu, &b.wd]) {
+                    let (_, bytes) = self.m.expert(name, e);
+                    self.upload_to(buf.ptr, &bytes);
+                }
+                self.expert_uploads += 3;
+                [b.wg.ptr, b.wu.ptr, b.wd.ptr]
+            };
+            let (tg, tu, td) = (&infos[0], &infos[1], &infos[2]);
+            self.matvec(tg, pg, tg.dims[1] as usize, b.u.ptr, b.eg.ptr);
+            self.matvec(tu, pu, tu.dims[1] as usize, b.u.ptr, b.eu.ptr);
             self.k1("swiglu", c.expert_ff, &[Arg::Ptr(b.eg.ptr), Arg::Ptr(b.eu.ptr), Arg::Ptr(b.act.ptr), Arg::U32(c.expert_ff as u32)]);
-            self.matvec(&td, b.wd.ptr, td.dims[1] as usize, b.act.ptr, b.eo.ptr);
+            self.matvec(td, pd, td.dims[1] as usize, b.act.ptr, b.eo.ptr);
             self.k1("axpy", h, &[Arg::Ptr(b.my.ptr), Arg::Ptr(b.eo.ptr), Arg::U32(h as u32), Arg::F32(wgt as f32)]);
         }
-        self.expert_uploads += 3 * top.len();
         self.mv(&format!("{p}.ffn_gate_shexp.weight"), b.u.ptr, b.eg.ptr);
         self.mv(&format!("{p}.ffn_up_shexp.weight"), b.u.ptr, b.eu.ptr);
         self.k1("swiglu", c.expert_ff, &[Arg::Ptr(b.eg.ptr), Arg::Ptr(b.eu.ptr), Arg::Ptr(b.act.ptr), Arg::U32(c.expert_ff as u32)]);
@@ -524,5 +664,11 @@ impl Stepper for GpuSession<'_, '_> {
     }
     fn set_stop_after(&mut self, n: Option<usize>) {
         self.stop_after = n;
+    }
+    fn report(&self) -> String {
+        let (slots, bytes, hits, misses) = self.cache_stats();
+        format!("expert cache: {slots} slots x {:.2} MiB = {:.2} GiB; {hits} hits, {misses} misses ({:.1}% hits); {} slice uploads",
+                bytes as f64 / (1u64 << 20) as f64, (slots * bytes) as f64 / (1u64 << 30) as f64,
+                100.0 * hits as f64 / (hits + misses).max(1) as f64, self.expert_uploads)
     }
 }
