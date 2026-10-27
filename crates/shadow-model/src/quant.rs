@@ -133,6 +133,13 @@ fn q2_0(b: &[u8], y: &mut [f32]) {
 /// NVFP4 (upstream ggml, `dequantize_row_nvfp4`): 4 unsigned E4M3 scales (bias 7, halved for the doubled E2M1 table),
 /// then 4 sub-blocks of 8 bytes each (64 weights total); in each 8-byte sub-block the 8 low nibbles are weights 0..8
 /// and the 8 high nibbles are weights 8..16.
+fn q8_0(b: &[u8], y: &mut [f32]) {
+    let d = f16_at(b, 0);
+    for i in 0..32 {
+        y[i] = d * (b[2 + i] as i8 as f32);
+    }
+}
+
 fn nvfp4(b: &[u8], y: &mut [f32]) {
     const KVALUES: [i8; 16] = [0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12];
     for g in 0..4 {
@@ -202,6 +209,7 @@ pub fn dequantize(ty: GgmlType, data: &[u8], out: &mut [f32]) -> Result<(), Stri
         "IQ4_XS" => iq4_xs,
         "NVFP4" => nvfp4,
         "Q2_0" => q2_0,
+        "Q8_0" => q8_0,
         _ => return Err(format!("{name}: dequantization not implemented")),
     };
     for (b, y) in data.chunks_exact(bytes).zip(out.chunks_exact_mut(block)) {

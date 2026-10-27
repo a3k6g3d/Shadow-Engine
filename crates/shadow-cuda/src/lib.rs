@@ -6,6 +6,7 @@ pub mod backend;
 pub mod driver;
 pub mod dylib;
 pub mod kernels;
+pub mod mtp;
 pub mod nvrtc;
 pub mod pinned;
 pub mod session;

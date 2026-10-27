@@ -66,7 +66,7 @@ impl Backend for GpuBackend<'_> {
         let w_ptr = match key {
             Some(k) if resident.contains_key(k) => resident[k].ptr,
             Some(k) if self.resident_bytes.get() + bytes.len() <= self.budget => {
-                let mut b = self.ctx.alloc(bytes.len()).expect("weight allocation");
+                let b = self.ctx.alloc(bytes.len()).expect("weight allocation");
                 b.upload(bytes).expect("weight upload");
                 self.resident_bytes.set(self.resident_bytes.get() + bytes.len());
                 self.uploads.set(self.uploads.get() + 1);

@@ -86,6 +86,13 @@ struct IQ4XS {
     }
 };
 
+struct Q80 {
+    static const unsigned int QK = 32, BYTES = 34;
+    static __device__ __forceinline__ float at(const u8* b, unsigned int e) {
+        return __fmul_rn(qf16(b), (float) (signed char) b[2 + e]);
+    }
+};
+
 struct Q20 {
     static const unsigned int QK = 64, BYTES = 18;
     static __device__ __forceinline__ float at(const u8* b, unsigned int e) {

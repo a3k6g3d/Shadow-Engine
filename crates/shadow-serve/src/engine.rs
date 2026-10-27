@@ -69,6 +69,7 @@ pub struct Status {
     pub ram_tier_bytes: usize,
     pub ram_served: u64,
     pub file_served: u64,
+    pub mtp_active: bool,
 }
 
 pub struct Config {
@@ -131,6 +132,7 @@ fn run(cfg: Config, rx: std::sync::mpsc::Receiver<Request>, status: &Mutex<Statu
         s.ram_tier_bytes = ram_bytes;
         s.ram_served = ram_serv;
         s.file_served = file_serv;
+        s.mtp_active = sess.mtp.is_some();
         eprintln!("shadow serve: ready in {:.1} s; {}", s.load_secs, s.report);
     }
     let mut last_logits: Vec<f32> = Vec::new();
@@ -230,6 +232,7 @@ fn answer(arch: &str, req: &Request, tok: &Tokenizer, sess: &mut GpuSession, las
     let mut utf8 = Utf8 { pending: Vec::new() };
     let mut n = 0;
     let mut finish = "length";
+    let has_mtp = sess.mtp.is_some();
     while n < req.max_tokens {
         let next = argmax(last_logits);
         if tok.is_eog(next) || stops.contains(&next) {
@@ -256,7 +259,38 @@ fn answer(arch: &str, req: &Request, tok: &Tokenizer, sess: &mut GpuSession, las
                 }
             }
         }
-        *last_logits = sess.step(next);
+        if has_mtp && n < req.max_tokens {
+            let draft = sess.step_draft(next).ok();
+            *last_logits = sess.step(next);
+            if let Some(cand) = draft {
+                let verified = argmax(last_logits);
+                if verified == cand && !tok.is_eog(cand) && !stops.contains(&cand) {
+                    n += 1;
+                    if Some(cand) == think_end && reasoning {
+                        reasoning = false;
+                    } else {
+                        let mut piece = utf8.push(&tok.decode_bytes(&[cand]));
+                        if !reasoning && first_content {
+                            piece = piece.trim_start().to_string();
+                        }
+                        if !piece.is_empty() {
+                            let ev = if reasoning { Event::Reasoning(piece) } else {
+                                first_content = false;
+                                Event::Content(piece)
+                            };
+                            if req.tx.send(ev).is_err() {
+                                finish = "cancelled";
+                                *last_logits = sess.step(cand);
+                                break;
+                            }
+                        }
+                    }
+                    *last_logits = sess.step(cand);
+                }
+            }
+        } else {
+            *last_logits = sess.step(next);
+        }
     }
     Ok(Stats {
         prompt_tokens: ids.len(),

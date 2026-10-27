@@ -15,6 +15,7 @@ extern "C" __global__ void dequant_iq4_nl(const u8* blocks, float* out, unsigned
 extern "C" __global__ void dequant_iq4_xs(const u8* blocks, float* out, unsigned int n_blocks) { dequant_block<IQ4XS>(blocks, out); }
 extern "C" __global__ void dequant_nvfp4(const u8* blocks, float* out, unsigned int n_blocks) { dequant_block<NVFP4>(blocks, out); }
 extern "C" __global__ void dequant_q2_0(const u8* blocks, float* out, unsigned int n_blocks) { dequant_block<Q20>(blocks, out); }
+extern "C" __global__ void dequant_q8_0(const u8* blocks, float* out, unsigned int n_blocks) { dequant_block<Q80>(blocks, out); }
 extern "C" __global__ void dequant_iq2_s(const u8* blocks, float* out, unsigned int n_blocks) { dequant_block<IQ2S>(blocks, out); }
 extern "C" __global__ void dequant_iq3_xxs(const u8* blocks, float* out, unsigned int n_blocks) { dequant_block<IQ3XXS>(blocks, out); }
 extern "C" __global__ void dequant_iq3_s(const u8* blocks, float* out, unsigned int n_blocks) { dequant_block<IQ3S>(blocks, out); }

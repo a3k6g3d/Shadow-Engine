@@ -334,7 +334,8 @@ impl TelemetryService {
                 "prompt_tokens": s.prompt_tokens,
                 "cached_tokens": s.cached_tokens,
                 "completion_tokens": s.completion_tokens,
-                "requests": s.requests
+                "requests": s.requests,
+                "mtp_active": s.mtp_active
             }
         })
     }

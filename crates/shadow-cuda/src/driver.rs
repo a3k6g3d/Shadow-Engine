@@ -241,7 +241,7 @@ pub struct DeviceBuffer<'c> {
 }
 
 impl DeviceBuffer<'_> {
-    pub fn upload(&mut self, src: &[u8]) -> Result<(), CudaError> {
+    pub fn upload(&self, src: &[u8]) -> Result<(), CudaError> {
         assert!(src.len() <= self.bytes, "upload of {} bytes into a {}-byte buffer", src.len(), self.bytes);
         self.ctx.bind()?;
         call!(self.ctx.api, cuMemcpyHtoD(self.ptr, src.as_ptr() as *const c_void, src.len()))

@@ -998,6 +998,7 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
             <div class="stat-row"><span>Uptime</span><strong id="engine-uptime-txt">--</strong></div>
             <div class="stat-row"><span>Total Requests</span><strong id="engine-requests-txt">0</strong></div>
             <div class="stat-row"><span>Tokens Generated</span><strong id="engine-tokens-txt">0</strong></div>
+            <div class="stat-row"><span>Speculative Decoding</span><strong id="engine-mtp-txt" style="color:var(--success);">Active (MTP Tuned Head)</strong></div>
             <div class="stat-row"><span>Queued Requests</span><strong id="engine-queue-txt">0</strong></div>
           </div>
         </div>
@@ -1590,6 +1591,7 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
           setTxt('engine-uptime-txt', `${mins}m ${secs}s`);
           setTxt('engine-requests-txt', d.process.requests.toLocaleString());
           setTxt('engine-tokens-txt', d.process.completion_tokens.toLocaleString());
+          setTxt('engine-mtp-txt', d.process.mtp_active ? 'Active (MTP Speculative)' : 'Disabled');
           setTxt('engine-queue-txt', d.process.queued);
         }
       } catch (err) {

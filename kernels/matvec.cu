@@ -23,6 +23,7 @@ extern "C" __global__ void matvec_iq4_nl(const u8* w, const float* x, float* y, 
 extern "C" __global__ void matvec_iq4_xs(const u8* w, const float* x, float* y, unsigned int rows, unsigned int cols) { matvec_rows<IQ4XS>(w, x, y, rows, cols); }
 extern "C" __global__ void matvec_nvfp4(const u8* w, const float* x, float* y, unsigned int rows, unsigned int cols) { matvec_rows<NVFP4>(w, x, y, rows, cols); }
 extern "C" __global__ void matvec_q2_0(const u8* w, const float* x, float* y, unsigned int rows, unsigned int cols) { matvec_rows<Q20>(w, x, y, rows, cols); }
+extern "C" __global__ void matvec_q8_0(const u8* w, const float* x, float* y, unsigned int rows, unsigned int cols) { matvec_rows<Q80>(w, x, y, rows, cols); }
 extern "C" __global__ void matvec_iq2_s(const u8* w, const float* x, float* y, unsigned int rows, unsigned int cols) { matvec_rows<IQ2S>(w, x, y, rows, cols); }
 extern "C" __global__ void matvec_iq3_xxs(const u8* w, const float* x, float* y, unsigned int rows, unsigned int cols) { matvec_rows<IQ3XXS>(w, x, y, rows, cols); }
 extern "C" __global__ void matvec_iq3_s(const u8* w, const float* x, float* y, unsigned int rows, unsigned int cols) { matvec_rows<IQ3S>(w, x, y, rows, cols); }
@@ -166,6 +167,17 @@ template <> struct Fast<Q20> {
             s += __fmul_rn((float) ((int) q - 1), d) * x[k];
         }
         return s;
+    }
+};
+
+template <> struct Fast<Q80> {
+    static __device__ __forceinline__ float dot8(const u8* r, unsigned int i, const float* x) {
+        const u8* b = r + (i / 32) * 34;
+        float d = qf16(b), s = 0.0f;
+        const signed char* q = (const signed char*) (b + 2 + (i % 32));
+#pragma unroll
+        for (unsigned int k = 0; k < 8; k++) s += (float) q[k] * x[k];
+        return __fmul_rn(d, s);
     }
 };
 
@@ -357,6 +369,8 @@ extern "C" __global__ void matvec_qkv_nvfp4(const u8* wq, float sq, float* yq, u
 extern "C" __global__ void matvec_batch_nvfp4(const u64* wtab, const float* x, unsigned int xs, float* y, unsigned int ys, unsigned int rows, unsigned int cols) { matvec_batch_rows<NVFP4>(wtab, x, xs, y, ys, rows, cols); }
 extern "C" __global__ void matvec_fast_q2_0(const u8* w, const float* x, float* y, unsigned int rows, unsigned int cols) { matvec_fast_rows<Q20>(w, x, y, rows, cols); }
 extern "C" __global__ void matvec_batch_q2_0(const u64* wtab, const float* x, unsigned int xs, float* y, unsigned int ys, unsigned int rows, unsigned int cols) { matvec_batch_rows<Q20>(wtab, x, xs, y, ys, rows, cols); }
+extern "C" __global__ void matvec_fast_q8_0(const u8* w, const float* x, float* y, unsigned int rows, unsigned int cols) { matvec_fast_rows<Q80>(w, x, y, rows, cols); }
+extern "C" __global__ void matvec_batch_q8_0(const u64* wtab, const float* x, unsigned int xs, float* y, unsigned int ys, unsigned int rows, unsigned int cols) { matvec_batch_rows<Q80>(wtab, x, xs, y, ys, rows, cols); }
 extern "C" __global__ void matvec_fast_iq2_s(const u8* w, const float* x, float* y, unsigned int rows, unsigned int cols) { matvec_fast_rows<IQ2S>(w, x, y, rows, cols); }
 extern "C" __global__ void matvec_batch_iq2_s(const u64* wtab, const float* x, unsigned int xs, float* y, unsigned int ys, unsigned int rows, unsigned int cols) { matvec_batch_rows<IQ2S>(wtab, x, xs, y, ys, rows, cols); }
 extern "C" __global__ void matvec_fast_iq3_xxs(const u8* w, const float* x, float* y, unsigned int rows, unsigned int cols) { matvec_fast_rows<IQ3XXS>(w, x, y, rows, cols); }
@@ -417,6 +431,7 @@ extern "C" __global__ void matvec_pair_iq4_nl(const u8* w0, float* y0, unsigned 
 extern "C" __global__ void matvec_pair_iq4_xs(const u8* w0, float* y0, unsigned int r0, const u8* w1, float* y1, unsigned int r1, const float* x, unsigned int cols) { matvec_pair_fast_rows<IQ4XS>(w0, y0, r0, w1, y1, r1, x, cols); }
 extern "C" __global__ void matvec_pair_nvfp4(const u8* w0, float* y0, unsigned int r0, const u8* w1, float* y1, unsigned int r1, const float* x, unsigned int cols) { matvec_pair_fast_rows<NVFP4>(w0, y0, r0, w1, y1, r1, x, cols); }
 extern "C" __global__ void matvec_pair_q2_0(const u8* w0, float* y0, unsigned int r0, const u8* w1, float* y1, unsigned int r1, const float* x, unsigned int cols) { matvec_pair_fast_rows<Q20>(w0, y0, r0, w1, y1, r1, x, cols); }
+extern "C" __global__ void matvec_pair_q8_0(const u8* w0, float* y0, unsigned int r0, const u8* w1, float* y1, unsigned int r1, const float* x, unsigned int cols) { matvec_pair_fast_rows<Q80>(w0, y0, r0, w1, y1, r1, x, cols); }
 extern "C" __global__ void matvec_pair_iq2_s(const u8* w0, float* y0, unsigned int r0, const u8* w1, float* y1, unsigned int r1, const float* x, unsigned int cols) { matvec_pair_fast_rows<IQ2S>(w0, y0, r0, w1, y1, r1, x, cols); }
 extern "C" __global__ void matvec_pair_iq3_xxs(const u8* w0, float* y0, unsigned int r0, const u8* w1, float* y1, unsigned int r1, const float* x, unsigned int cols) { matvec_pair_fast_rows<IQ3XXS>(w0, y0, r0, w1, y1, r1, x, cols); }
 extern "C" __global__ void matvec_pair_iq3_s(const u8* w0, float* y0, unsigned int r0, const u8* w1, float* y1, unsigned int r1, const float* x, unsigned int cols) { matvec_pair_fast_rows<IQ3S>(w0, y0, r0, w1, y1, r1, x, cols); }

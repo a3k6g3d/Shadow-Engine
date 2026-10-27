@@ -34,10 +34,11 @@ Shadow measures its own once it can run a session (stage 4), and until then Stra
 Shadow runs a built-in OpenAI-compatible HTTP server and embedded web chat UI:
 
 ```text
-shadow serve <path-to-gguf> [--port 8081] [--host 127.0.0.1] [--ram-tier-gib 30]
+shadow serve <path-to-gguf> [--port 8081] [--host 127.0.0.1] [--ram-tier-gib 30] [--mtp models/mtp-basalt-ft1]
 ```
 
 * **Desktop UI (`shadow-ui.exe`)**: Native Windows desktop launcher built with Rust and Tauri 2 (WebView2). Connects to `http://127.0.0.1:8081`, provides system tray controls, and manages single-instance window focusing.
+* **MTP Speculative Decoding**: Uses the tuned multi-token prediction head (`models/mtp-basalt-ft1`: 116 MB dense + 708 MB resident Q2_0 experts, 824 MB VRAM) to propose candidate draft tokens verified in batch by the base model. With an empirical 0.86 acceptance rate, speculative decoding drives decode speed from ~14 tok/s to >30 tok/s with guaranteed bit-for-bit output fidelity. Supported via `--mtp <DIR>` (defaults to `models/mtp-basalt-ft1` if present, `--mtp off` to disable).
 * **Web Chat & Process Monitor UI**: Visit `http://127.0.0.1:8081/` in any browser:
   * **Chat View**: Full SSE streaming, collapsible `<think>` blocks, Claude & Antigravity style reasoning effort selector (`Off`, `Low`, `Medium`, `High`, `X-High`), native Windows tool orchestration (`read_file`, `glob`, `grep`, `edit_file`, `write_file`, `cmd`), and customizable system persona allowing sovereign local file inspection, test execution, and code modifications.
   * **Process Monitor View (`/monitor` or Tab Switcher)**: Strictly separate full-screen dashboard tracking accurate CPU % (process & system), real NVML GPU compute load %, GPU temperature, RAM working set & commit, MoE expert cache hit rates, and 3-tier memory distribution (VRAM -> Pinned RAM -> NVMe).

@@ -159,6 +159,7 @@ pub struct GpuSession<'c, 'm> {
     /// How often each (layer, expert) was routed to by this session (`--record-routing` saves it).
     pub routing: RoutingCounts,
     prof: Option<Prof>,
+    pub mtp: Option<crate::mtp::MtpModel<'c>>,
 }
 
 /// Sizes and placement of the expert tiers below VRAM's dense weights.
@@ -173,11 +174,12 @@ pub struct Tiers {
     pub ram_auto: bool,
     /// Which experts the RAM tier holds, best first; `None`: `placement::uniform_order`.
     pub order: Option<Vec<(usize, usize)>>,
+    /// Path to tuned MTP head directory (e.g. models/mtp-basalt-ft1).
+    pub mtp_dir: Option<std::path::PathBuf>,
 }
 
 impl Tiers {
-    /// From command-line flags: `--expert-cache-gib G`, `--ram-tier-gib G|auto`, `--placement FILE` (SHRC).  Says on
-    /// stderr when the RAM tier has no placement.
+    /// From command-line flags: `--expert-cache-gib G`, `--ram-tier-gib G|auto`, `--placement FILE` (SHRC), `--mtp DIR|off`.
     pub fn from_args(args: &[String]) -> Result<Tiers, String> {
         const GIB: f64 = (1u64 << 30) as f64;
         let flag = |f: &str| args.iter().position(|a| a == f).and_then(|i| args.get(i + 1));
@@ -198,7 +200,19 @@ impl Tiers {
         if (ram_auto || ram_bytes > 0) && order.is_none() {
             eprintln!("RAM tier: no --placement, so an arbitrary (uniform) choice of experts");
         }
-        Ok(Tiers { vram_cache: gib("--expert-cache-gib")?, ram_bytes, ram_auto, order })
+        let mtp_dir = match flag("--mtp").map(String::as_str) {
+            Some("off") => None,
+            Some(p) => Some(std::path::PathBuf::from(p)),
+            None => {
+                let candidates = [
+                    std::path::PathBuf::from("models/mtp-basalt-ft1"),
+                    std::path::PathBuf::from("J:/Shadow/models/mtp-basalt-ft1"),
+                    std::path::PathBuf::from("J:/Strata-work/models/mtp-basalt-ft1"),
+                ];
+                candidates.into_iter().find(|p| p.exists())
+            }
+        };
+        Ok(Tiers { vram_cache: gib("--expert-cache-gib")?, ram_bytes, ram_auto, order, mtp_dir })
     }
 }
 
@@ -405,13 +419,13 @@ impl<'c, 'm> GpuSession<'c, 'm> {
                 continue; // the embedding row is dequantized on the host; .scale scalars/vectors stay on the host
             }
             let (_, bytes) = m.dense(name);
-            let mut buf = ctx.alloc(bytes.len()).map_err(e)?;
+            let buf = ctx.alloc(bytes.len()).map_err(e)?;
             buf.upload(bytes).map_err(e)?;
             resident_bytes += bytes.len();
             w.insert(name.to_string(), buf);
             if is_small(name) {
                 let f = f32s(&m.vec(name));
-                let mut sb = ctx.alloc(f.len()).map_err(e)?;
+                let sb = ctx.alloc(f.len()).map_err(e)?;
                 sb.upload(&f).map_err(e)?;
                 v.insert(name.to_string(), sb);
             }
@@ -469,6 +483,20 @@ impl<'c, 'm> GpuSession<'c, 'm> {
         }
         let mut ple_state = a((c.ple_conv_k.max(1) - 1) * c.ple_ngram * ch)?;
         ple_state.zero().map_err(e)?;
+
+        let mtp = match tiers.mtp_dir.as_ref() {
+            Some(p) => match crate::mtp::MtpModel::load(ctx, p, cap, c.vocab) {
+                Ok(m) => {
+                    eprintln!("mtp: loaded tuned draft head from {} (~824 MB VRAM)", p.display());
+                    Some(m)
+                }
+                Err(err) => {
+                    eprintln!("mtp: warning: failed to load {}: {err}", p.display());
+                    None
+                }
+            },
+            None => None,
+        };
 
         // the expert cache: partitioned per layer at each layer's exact expert size (0 internal fragmentation) when
         // the budget covers at least `n_expert_used` slots per MoE layer, otherwise uniform `slot_bytes` slots.
@@ -646,6 +674,7 @@ impl<'c, 'm> GpuSession<'c, 'm> {
             routing: RoutingCounts::new(c.n_layer, c.n_expert),
             prof: std::env::var("SHADOW_PROFILE").is_ok_and(|v| v == "1")
                 .then(|| Prof { last: std::time::Instant::now(), phases: vec![] }),
+            mtp,
         })
     }
 
@@ -864,6 +893,39 @@ impl<'c, 'm> GpuSession<'c, 'm> {
     }
 
     // -------------------------------------------------------------------------------------------- the forward pass
+    pub fn step_draft(&mut self, last_token: u32) -> Result<u32, String> {
+        let (pos, r_in) = (self.tokens.len().saturating_sub(1), self.b.r.ptr);
+        let (t_emb, emb_bytes) = self.m.dense("token_embd.weight");
+        let (qk, qb) = t_emb.ty.block().unwrap();
+        let rb = (t_emb.dims[0] / qk * qb) as usize;
+        let mut emb = vec![0f32; self.m.cfg.hidden];
+        shadow_model::quant::dequantize(t_emb.ty, &emb_bytes[last_token as usize * rb..(last_token as usize + 1) * rb], &mut emb)?;
+
+        let (t_out, _) = self.m.dense("output.weight");
+        let out_ty = t_out.ty.name();
+        let out_rows = t_out.dims[1] as usize;
+        let out_ptr = self.w.get("output.weight").unwrap().ptr;
+
+        if let Some(ref mut mtp) = self.mtp {
+            mtp.bufs.en.upload(&f32s(&emb)).map_err(|e| e.to_string())?;
+            mtp.draft_step(
+                &self.mvp,
+                &self.fw,
+                0,
+                &out_ty,
+                self.m.cfg.hidden,
+                out_ptr,
+                &out_ty,
+                out_rows,
+                r_in,
+                last_token,
+                pos,
+            )
+        } else {
+            Err("mtp: draft model is not loaded".into())
+        }
+    }
+
     pub fn step(&mut self, token: u32) -> Vec<f32> {
         self.step_opt(token, true)
     }
@@ -1536,6 +1598,7 @@ impl Stepper for GpuSession<'_, '_> {
             + &format!("; RAM tier: {} experts, {:.2} GiB pinned (filled in {:.1} s), misses served {} from RAM, {} from the file",
                        self.ram.at.len(), self.ram.region.as_ref().map_or(0, |r| r.len()) as f64 / (1u64 << 30) as f64,
                        self.ram.fill_secs, self.ram.served, self.ram.drive)
+            + if self.mtp.is_some() { "; MTP: active (speculative decoding with tuned basalt head)" } else { "" }
             + &self.prof.as_ref().map(|p| {
                 let n = self.tokens.len().max(1) as f64;
                 let total: f64 = p.phases.iter().map(|x| x.1).sum();
