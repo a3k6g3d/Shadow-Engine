@@ -101,6 +101,7 @@ fn check_chat_fixture(fixture_name: &str, f_render: fn(&[Message], &Options) -> 
         o.effort = match opts.get("reasoning_effort").and_then(J::as_str) {
             Some("medium") => Effort::Medium,
             Some("low") => Effort::Low,
+            Some("high") => Effort::High,
             _ => Effort::XHigh,
         };
         o.add_generation_prompt = !matches!(c.get("name").unwrap().as_str(), Some("no generation prompt"));

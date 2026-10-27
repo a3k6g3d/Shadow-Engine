@@ -667,6 +667,18 @@ impl<'c, 'm> GpuSession<'c, 'm> {
         (self.cache.slots, self.cache.slot_bytes, self.cache.hits, self.cache.misses)
     }
 
+    pub fn gpu_name(&self) -> &str {
+        &self.ctx.name
+    }
+
+    pub fn mem_info(&self) -> (usize, usize) {
+        self.ctx.mem_info().unwrap_or((0, 0))
+    }
+
+    pub fn ram_tier_stats(&self) -> (usize, usize, u64, u64) {
+        (self.ram.at.len(), self.ram.region.as_ref().map_or(0, |r| r.len()), self.ram.served, self.ram.drive)
+    }
+
     /// The tokens this session has read, in order: its state is exactly the state after them.
     pub fn tokens(&self) -> &[u32] {
         &self.tokens

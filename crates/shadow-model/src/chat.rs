@@ -44,6 +44,7 @@ impl Message {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Effort {
     XHigh,
+    High,
     Medium,
     Low,
 }
@@ -77,6 +78,8 @@ impl Default for Options {
 
 const XHIGH: &str = "Reasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, \
 consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.";
+const HIGH: &str = "Reasoning effort is set to high. Think thoroughly through the problem, explore alternative solutions, \
+and verify your reasoning before concluding.";
 const LOW: &str = "Reasoning effort is set to low. Keep your thinking brief and focused, moving directly to the conclusion \
 without unnecessary elaboration.";
 const QWEN_TOOLS_SUFFIX: &str = "\n</tools>\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n\
@@ -102,6 +105,7 @@ pub fn render(messages: &[Message], o: &Options) -> Result<String, String> {
     let instructions = if thinking_on {
         match o.effort {
             Effort::XHigh => XHIGH,
+            Effort::High => HIGH,
             Effort::Low => LOW,
             Effort::Medium => "",
         }

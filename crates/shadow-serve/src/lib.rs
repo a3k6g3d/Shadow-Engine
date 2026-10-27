@@ -5,6 +5,7 @@
 //! Not yet: sampling (greedy only), images.
 
 pub mod engine;
+pub mod telemetry;
 pub mod ui;
 
 use bytes::Bytes;
@@ -25,6 +26,7 @@ struct App {
     started: std::time::Instant,
     /// Requests handed to the engine (the engine counts the ones it finished: the difference is the queue).
     sent: std::sync::atomic::AtomicU64,
+    telemetry: telemetry::TelemetryService,
 }
 
 pub struct ServeConfig {
@@ -36,8 +38,13 @@ pub struct ServeConfig {
 pub fn run(cfg: ServeConfig) -> Result<(), String> {
     let status = Arc::new(Mutex::new(Status { state: "loading", ..Status::default() }));
     let tx = engine::start(cfg.engine, status.clone());
-    let app = Arc::new(App { engine: Mutex::new(tx), status, started: std::time::Instant::now(),
-                             sent: std::sync::atomic::AtomicU64::new(0) });
+    let app = Arc::new(App {
+        engine: Mutex::new(tx),
+        status,
+        started: std::time::Instant::now(),
+        sent: std::sync::atomic::AtomicU64::new(0),
+        telemetry: telemetry::TelemetryService::new(),
+    });
     let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().map_err(|e| e.to_string())?;
     rt.block_on(async move {
         let listener = tokio::net::TcpListener::bind(cfg.addr).await.map_err(|e| format!("{}: {e}", cfg.addr))?;
@@ -75,6 +82,14 @@ async fn handle(req: Request<Incoming>, app: Arc<App>) -> Result<Response<Body>,
     let path = req.uri().path().to_string();
     Ok(match (req.method(), path.as_str()) {
         (&Method::GET, "/") | (&Method::GET, "/index.html") => ui::index_response(),
+        (&Method::GET, "/monitor") | (&Method::GET, "/monitor.html") => ui::monitor_response(),
+        (&Method::GET, "/v1/telemetry") | (&Method::GET, "/telemetry") => {
+            let s = app.status.lock().unwrap().clone();
+            let queued = app.sent.load(std::sync::atomic::Ordering::SeqCst).saturating_sub(s.finished);
+            let uptime = app.started.elapsed().as_secs_f64();
+            let snap = app.telemetry.snapshot(&s, uptime, queued);
+            json_resp(StatusCode::OK, &snap)
+        }
         (&Method::GET, "/health") => {
             let s = app.status.lock().unwrap().clone();
             match s.state {
@@ -312,11 +327,19 @@ pub fn parse_chat(body: &Value) -> Result<(Vec<Message>, Options, usize, bool), 
             opts.thinking = Some(t);
         }
     }
-    opts.effort = match body.get("reasoning_effort").and_then(Value::as_str) {
-        Some("low") => Effort::Low,
-        Some("medium") => Effort::Medium,
-        _ => Effort::XHigh,
-    };
+    if let Some(effort_str) = body.get("reasoning_effort").and_then(Value::as_str) {
+        if effort_str == "off" || effort_str == "none" {
+            opts.thinking = Some(false);
+        } else {
+            opts.effort = match effort_str {
+                "low" => Effort::Low,
+                "medium" => Effort::Medium,
+                "high" => Effort::High,
+                "xhigh" | "x-high" | "extra_high" => Effort::XHigh,
+                _ => Effort::XHigh,
+            };
+        }
+    }
     let max_tokens = body.get("max_completion_tokens").or_else(|| body.get("max_tokens")).and_then(Value::as_u64)
         .unwrap_or(1024) as usize;
     let stream = body.get("stream").and_then(Value::as_bool).unwrap_or(false);

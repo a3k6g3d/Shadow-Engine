@@ -59,6 +59,16 @@ pub struct Status {
     pub session_tokens: usize,
     pub report: String,
     pub load_secs: f64,
+    pub gpu_name: String,
+    pub vram_free: usize,
+    pub vram_total: usize,
+    pub vram_slots: usize,
+    pub vram_hits: u64,
+    pub vram_misses: u64,
+    pub ram_tier_experts: usize,
+    pub ram_tier_bytes: usize,
+    pub ram_served: u64,
+    pub file_served: u64,
 }
 
 pub struct Config {
@@ -104,10 +114,23 @@ fn run(cfg: Config, rx: std::sync::mpsc::Receiver<Request>, status: &Mutex<Statu
     let stops: Vec<u32> = [tok.eos, im_end].into_iter().flatten().collect();
     {
         use shadow_model::forward::Stepper;
+        let (v_free, v_total) = sess.mem_info();
+        let (slots, _, hits, misses) = sess.cache_stats();
+        let (ram_exp, ram_bytes, ram_serv, file_serv) = sess.ram_tier_stats();
         let mut s = status.lock().unwrap();
         s.state = "ready";
         s.load_secs = t0.elapsed().as_secs_f64();
         s.report = sess.report();
+        s.gpu_name = sess.gpu_name().to_string();
+        s.vram_free = v_free;
+        s.vram_total = v_total;
+        s.vram_slots = slots;
+        s.vram_hits = hits;
+        s.vram_misses = misses;
+        s.ram_tier_experts = ram_exp;
+        s.ram_tier_bytes = ram_bytes;
+        s.ram_served = ram_serv;
+        s.file_served = file_serv;
         eprintln!("shadow serve: ready in {:.1} s; {}", s.load_secs, s.report);
     }
     let mut last_logits: Vec<f32> = Vec::new();
@@ -122,6 +145,18 @@ fn run(cfg: Config, rx: std::sync::mpsc::Receiver<Request>, status: &Mutex<Statu
             use shadow_model::forward::Stepper;
             s.report = sess.report();
         }
+        let (v_free, v_total) = sess.mem_info();
+        let (slots, _, hits, misses) = sess.cache_stats();
+        let (ram_exp, ram_bytes, ram_serv, file_serv) = sess.ram_tier_stats();
+        s.vram_free = v_free;
+        s.vram_total = v_total;
+        s.vram_slots = slots;
+        s.vram_hits = hits;
+        s.vram_misses = misses;
+        s.ram_tier_experts = ram_exp;
+        s.ram_tier_bytes = ram_bytes;
+        s.ram_served = ram_serv;
+        s.file_served = file_serv;
         match r {
             Ok(st) => {
                 s.requests += 1;
