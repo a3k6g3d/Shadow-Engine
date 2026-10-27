@@ -1,243 +1,279 @@
-# The Rust engine: the plan
+# Shadow: the plan
 
-Written 2026-10-25. [RUST_HOST.md](RUST_HOST.md) decided the split (2026-10-14), [RUST_ENGINE.md](RUST_ENGINE.md)
-set the order of the hybrid work and it was walked (M1–M8, branch `rust-host-0.1.45`), and
-[RUST_ENGINE_NEXT.md](RUST_ENGINE_NEXT.md) is what was left of *that*. This document is the plan for the thing the
-previous three stop short of: **an engine that is mainly Rust**, running the model this PC is built around, fast and
-well optimised, with the harness as it stands today.
+Rewritten 2026-10-26. The plan this replaces (in git history before this commit) kept Strata's C++ engine and
+rewrote around it: "Rust never compiles a kernel, it calls one." That is withdrawn. **Shadow is now its own engine,
+start to finish**: a Rust host, CUDA kernels we write ourselves and compile at runtime with **NVRTC**, loaded and
+launched through the **CUDA driver API**, and nothing from Strata at build time or at run time.
 
 It is the plan I would run. It is not a promise of speed, and the first section says why.
 
-## What "fast" means here, given what has already been measured
+## What changed, and what did not
 
-The single most useful result in the whole hybrid effort is this one: **the bound is below the program.** One C++
-process, 4 threads, queue depth 256: ~155k reads/s. 16 threads at depth 1024: ~111k. Two processes ~112k total. Four
-processes ~113k total. More processes, each with its own reaping thread, never add up to more than one — so **no
-language at the top of the stack can beat this drive** (Sandisk Optimus 5100 500 GB NVMe), and pushing harder lowers
-the total, which is the usual sign of a saturated drive.
+| | before | now |
+|---|---|---|
+| the kernels | Strata's 63 `.cu` files, called through the C ABI seam | ours, CUDA C++ source in this repo, compiled by NVRTC when the engine starts |
+| the GPU interface | the engine's, behind `include/shadow/c/abi.h` | the CUDA driver API (`nvcuda.dll`), hand-bound, loaded at run time |
+| the model math | Strata's | ours, written from a spec this repo owns (`docs/ARCH.md`, stage 0) |
+| the engine process | `strata --serve`, driven over its line protocol | `shadow`, one process |
+| the build | needed the C++ engine built beside it | `cargo build`. No nvcc, no CMake, no CUDA toolkit at build time |
+| Strata | the engine | **not used**: no source, no binary, no tool, no file format, no oracle run |
 
-So Rust does not buy speed on the I/O path, and the hybrid run already proved it: the Rust reader came in at parity,
-−1.7% at the round median, inside the noise floor. **Rust buys the safety of the async tier and the scheduling layer —
-and the speed comes from scheduling, not from the language.** Everything in the plan below is a scheduling or a memory
-win, and the language is what makes them expressible without data races.
+What did **not** change: the measurement protocol, the RAM safety rule, the hardware, the model file, and the
+finding that the drive is the bound. All four are below.
 
-The measurement protocol is not negotiable, and it is in `BENCH_NOISE.md`: the floor is **10.1% median, 27.0% p90,
-51.9% worst**. A change must clear that, on ≥8 runs, interleaved, `decode_warm`, paired turn-by-turn, or it is
-reported as a tie and not written up as a win.
+**Why NVRTC and not nvcc, cuTile Rust or a bindings crate.** NVRTC compiles CUDA C++ from a string inside the
+running process, so the kernels ship as source in the binary and are compiled for whatever GPU is present. It runs
+natively on Windows, so the completion-port I/O ring and large pages stay as they are. cuTile Rust
+(NVlabs/cutile-rs, now NVIDIA/cuda-rust) was looked at the same day and set aside for now: Linux only, alpha, and it
+has no path for codebook quants like IQ3_S. If cuda-rust gains Windows and a SIMT path that fits, a kernel can move
+over one at a time. Nothing below depends on that.
 
-## What we are running, from the file itself
+## What "fast" means here, from what has already been measured
+
+**The bound is below the program.** One process, 4 threads, queue depth 256: ~155k reads/s from the Sandisk
+Optimus 5100. More threads or more processes never add up to more than that, so **no engine, in any language, beats
+this drive** on the NVMe tier. Shadow's ceiling is the same as Strata's. What Shadow buys is a system we own end to
+end, safe by construction where Rust can make it so, and scheduling we can change.
+
+The reference figure, measured on this PC on 2026-10-26 with Strata 0.1.45 at the shipped config (36 GiB pinned,
+`--spec 4`, `STRATA_STAGE_AUDIT=1` on): **41.75 tok/s median agent decode**, n = 10 turns, 2 runs. It is context,
+not a gate. Shadow is not benched against Strata, because benching against it means running it. Shadow is benched
+against its own earlier stages and its own noise floor.
+
+**Expect to be slow for a long time.** A scalar CPU forward pass is seconds per token. The first GPU path will be well
+under 10 tok/s. Most of Strata's speed is in the memory tiers, speculative decoding and launch-overhead work, and
+those come in stages 3 to 5. Say this at the start so nobody reads stage 2 as a regression.
+
+## The machine
+
+| | |
+|---|---|
+| GPU | GeForce RTX 5070, **12 GiB** (12,227 MiB), compute capability **12.0** (`sm_120`) |
+| RAM | 63.8 GiB. Windows plus the desktop take ~10 GiB, so ~50 GiB is usable |
+| drive | Sandisk Optimus 5100 500 GB NVMe, ~155k direct 4 KiB-aligned reads/s at best |
+| CPU | AVX-512 F/BW/VL/VNNI/VBMI present |
+| OS | Windows 11 Pro for Workstations |
+| CUDA at run time | `nvcuda.dll` (the driver), `nvrtc64_130_0.dll` + `nvrtc-builtins64_134.dll` (CUDA 13.4, `bin\x64`) |
+
+## The model, from the file itself
 
 `J:\Strata-work\models\swift15\IQ3_S\...-00001-of-00002.gguf` + `-00002-of-00002.gguf`, 41.77 + 36.04 GB,
-1,224 tensors, 77.80 GiB of tensor data. Parsed from the GGUF key-value section and from the tensor offsets —
-every number below is measured off the file, none of it is taken from the filename.
+1,224 tensors, 77.80 GiB of tensor data. Every number here was read from the GGUF key-value section and the tensor
+offsets, not from the filename. The file sits in Strata's working folder, but it is a GGUF model file, not a Strata
+artifact. Moving it under `J:\Shadow\models\` is a copy, not a dependency.
 
 | | |
 |---|---|
 | architecture | `qwen4exp`, `general.size_label 512x56B`, quantized by ISTA DASLab, `file_type 26` |
-| layers | **48 blocks: 36 recurrent (J) + 12 full-attention (K)**, `full_attention_interval 4` — every 4th is K |
-| attention | 24 heads, **2 KV heads** → GQA 12:1, head/key length 256 |
+| layers | **48 blocks: 36 recurrent (J) + 12 full-attention (K)**, `full_attention_interval 4`, so K is `layer % 4 == 3` |
+| attention | 24 heads, **2 KV heads** (GQA 12:1), head and key length 256 |
 | hidden / MLP | 2,560; **512 routed experts at 640** intermediate; SSM inner 6,144, state 128, groups 16, conv 4 |
 | context | **262,144** native; no yarn keys in this file |
 | vocab | 248,320, `pre=qwen35`, model `gpt2`; chat template 9,993 bytes, ChatML **with** a system role |
-| per-layer, measured | J: **1.032 GiB/layer** (37.14 GiB over 36) — K: **1.086 GiB/layer** (13.03 GiB over 12) |
+| per layer, measured | J: **1.032 GiB/layer** (37.14 GiB over 36). K: **1.086 GiB/layer** (13.03 GiB over 12) |
 | per layer, split | routed experts 0.961 GiB (J) / 1.020 GiB (K); attention 0.041; shared expert 0.020 |
-| embeddings | `per_layer_token_embd` **26.82 GiB** — 35% of the model, and it is not in any layer |
+| embeddings | `per_layer_token_embd` **26.82 GiB**: 35% of the model, and in no layer |
 
-**The table this section had before was measured on a different file** —
-`Qwen3.8-flash-next-swift15-abliterated-iq3s.GGUF`, 20.06 GiB, 40 shards, 256 experts, vocab 151,664, which is not
-on this PC. Its rows were off by 2-21x on every geometry line, and its arithmetic did not close either: 4x144 MiB
-+ 11x576 MiB is 6.87 GiB, not 11.16, and 256x3x512x2048x3.0625 bits is 294 MiB per layer, not 48.
+What this means for 12 GiB of VRAM: attention plus shared experts are ~2.9 GiB across all 48 layers and always
+resident. KV, the token embedding, the output head and scratch come next, and stage 0 measures each. Whatever is
+left is the expert cache. The ~49 GiB of routed experts live across VRAM, pinned RAM and the drive, and that split
+is the engine.
 
-**The tier is 36 GiB, not 11.25** — `J:\Strata-work\strata.json`, the config this session is actually running on,
-says `--resident-budget-gib 36`, and the plan's own Phase 2 table benched 36/40/44/45.5 GiB at
-10.7/13.2/15.5/17.1 tok/s. So the recomputed placement answer is short and it is this: **the whole 36-layer J
-chain is 37.14 GiB and does not quite fit in 36.** It fits in 40 — the next rung the table already has a number
-for, 13.2 tok/s against 10.7. Resident set = the entire J chain at a 40 GiB budget; the 12 K-layers and the
-26.82 GiB embedding stream.
+## The protocol, which is not negotiable
 
-Phase 0 settles it, and **Phase 0 cannot be run from inside this session** — running the existing engine
-cold/warm/pinned restarts the host, and the host is what is answering. It runs from a separate process, or by
-hand. Three arms plus the cold baseline, ≥8 runs, interleaved, `decode_warm`, paired turn-by-turn, judged
-against the 10.1% floor:
+From `BENCH_NOISE.md`: **≥ 8 runs per arm, interleaved** (never blocked), **`decode_warm`** (drop each run's first
+pass), **paired turn by turn**, and report **median, p90 and worst**. A change that does not clear the floor is a
+**tie** and is written up as a tie.
 
-| arm | placement |
+The floor in `BENCH_NOISE.md`, **10.1% median, 27.0% p90, 51.9% worst**, was measured on Strata. Shadow measures
+its own the first time it can run a session (stage 4), with the same method: one configuration, 8 interleaved
+launches, the pairwise spread at each turn. Until then, the Strata floor is the working figure.
+
+**The RAM rule, from experience.** The pinned tier cannot be paged out. Free RAM once fell to 0.4 GiB and the PC froze
+hard. Shadow enforces this in code, not in a doc: **it refuses to start a pinned tier that leaves less than 4 GiB
+available**, it re-checks after every allocation, and there is no flag that lowers the floor below 4. (The 2 GiB
+setting's +10% is on record as unsafe; it cost a hard hang.)
+
+## The stack
+
+**`crates/shadow-cuda`**: the driver API and NVRTC, bound by hand.
+- Loaded with `LoadLibraryW` / `GetProcAddress` at run time, so a machine without a GPU still builds and still runs
+  the CPU reference. Driver entry points are resolved by their versioned names (`cuMemAlloc_v2` and so on).
+- The surface is small, about 40 functions:
+  - context: `cuInit`, `cuDeviceGet`, `cuDeviceGetAttribute`, `cuDevicePrimaryCtxRetain`, `cuCtxSetCurrent`, `cuMemGetInfo`
+  - modules: `cuModuleLoadData`, `cuModuleGetFunction`, `cuLaunchKernel`
+  - memory: `cuMemAlloc`, `cuMemFree`, `cuMemcpyHtoDAsync`, `cuMemcpyDtoHAsync`, `cuMemsetD8Async`, `cuMemHostRegister`, `cuMemHostUnregister`
+  - streams and events: `cuStreamCreate`, `cuStreamSynchronize`, `cuEventCreate`, `cuEventRecord`, `cuEventQuery`, `cuEventElapsedTime`
+  - graphs, later: `cuStreamBeginCapture`, `cuStreamEndCapture`, `cuGraphInstantiate`, `cuGraphLaunch`
+  - NVRTC: `nvrtcVersion`, `nvrtcCreateProgram`, `nvrtcCompileProgram`, `nvrtcGetProgramLog`, `nvrtcGetCUBIN`, `nvrtcGetPTX`, `nvrtcDestroyProgram`
+- Safe wrappers own their resources. `DeviceBuffer<T>` frees on drop. A pinned host region is
+  `shadow-host::Buffer` (already page-aligned, already large-page capable) registered with `cuMemHostRegister`, and
+  unregistered before the `Buffer` can drop. Launch is an `unsafe fn` whose argument list is checked against a
+  per-kernel signature (below).
+- **No bindgen and no bindings crate.** The same rule as the old seam: a hand-written mirror plus a drift test. The
+  test reads the kernel sources as text, pulls out every `extern "C" __global__` signature, and asserts each matches
+  its Rust declaration. That is the pattern `shadow-abi/src/header.rs` already uses, pointed at our own `.cu` files.
+
+**`kernels/*.cu`**: CUDA C++ source, compiled in-process.
+- Pulled into the binary with `include_str!`, so there is one file per kernel family and the binary carries its
+  kernels.
+- **Self-contained:** no `#include` of toolkit headers, because a user's PC has the NVRTC DLLs but not the CUDA
+  headers. f16 and bf16 conversion goes through inline PTX (`cvt`) in one small header of our own, prepended to
+  every program.
+- Compile options are fixed and recorded: `--gpu-architecture=sm_<cc>` from the device, `--std=c++17`,
+  `-default-device`, **no `--use_fast_math`** (parity matters more than the last few percent; add it per kernel
+  later, measured, if ever), and `-lineinfo` in debug builds.
+- **Ask for CUBIN, not PTX** (`nvrtcGetCUBIN`), so the driver does no second JIT pass. PTX is the fallback only for a
+  device newer than this NVRTC knows about.
+- **Cache:** `%LOCALAPPDATA%\shadow\kernels\<sha256 of source + options + NVRTC version + arch>.cubin`. The first
+  start compiles, which takes seconds and is measured and logged. Every later start loads the cache. A compile error
+  is fatal and prints NVRTC's log in full.
+- Redistribution: `nvrtc64_*.dll` and `nvrtc-builtins64_*.dll` are expected to be on the CUDA EULA's redistributable
+  list. **Check that clause before shipping a release**; until then the engine finds them in the installed toolkit.
+
+**`crates/shadow-model`**: GGUF, tokenizer, the forward pass.
+- A GGUF reader of our own: header, key-values, tensor table, offsets. Weights are read through the I/O ring, never
+  memory-mapped, so the tier decides where each byte lives.
+- Dequantization for every type in the file: IQ3_S for the routed experts, plus whatever stage 0 finds the other
+  1,224 tensors use. Each one is written twice, once in Rust as the reference and once as a kernel, and the two are
+  tested against each other.
+- A tokenizer of our own: byte-level BPE from the GGUF's vocab and merges, with the `qwen35` pre-tokenizer split
+  written by hand rather than as a regex with look-ahead. The chat template is hard-coded ChatML with a system role,
+  not a Jinja engine. Only the parts of the 9,993-byte template that requests actually use are implemented, and each
+  is tested.
+
+**`crates/shadow-cpu`**: the RAM tier's experts.
+- IQ3_S expert matrix-vector products in Rust with `std::arch` AVX-512 (VNNI, VBMI), whose target features are
+  stable in Rust 1.89. Detection happens at run time, with a scalar fallback that is also the test oracle.
+- This is the ~52 ms of a ~115 ms decode window that was measured in the old engine: the single largest piece, and
+  plain Rust.
+
+**`crates/shadow-host`**, kept: the I/O ring (completion port, `FILE_FLAG_OVERLAPPED`, 4 issuing threads),
+`Buffer`, the per-drive scheduler thread, placement, the router's bookkeeping and the transient-window rules. They
+were written against an interface, and that interface stays.
+
+**`crates/shadow-serve`**: HTTP. **hyper** + **serde_json**, declared in `Cargo.toml` with the reason, as decided
+2026-10-26. Streaming `/v1/chat/completions` and `/health` are required; `/v1/models`, `/v1/status`, `/metrics` and
+`/props` should exist. The answers are shaped as the old plan recorded them, because the existing clients read those
+shapes.
+
+**Retired**, kept in git and not deleted in this step: `crates/shadow-abi`, `include/shadow/c/abi.h`,
+`shadow-host/src/ffi.rs` (the DLL the C++ engine loaded) and `shadow-host/src/protocol.rs` (the GEN/T/DONE line
+protocol). They are the join to an engine that is no longer in the plan. They are removed in their own commit once
+stage 2 runs without them.
+
+## The oracle: how we know the math is right without Strata
+
+This is the hardest problem in the plan, so it gets settled first. A forward pass that is subtly wrong still
+produces fluent text, and quantization alone guarantees that no two implementations agree bit for bit. In order of
+preference:
+
+1. **llama.cpp**, if it loads `qwen4exp`. Its DLLs are already in `bin/` (they serve the memory embeddings). This
+   costs half a day to find out. If it loads the model, dump logits for a fixed prompt set once, freeze them as
+   fixtures, and compare top-1 token and logit distance. That is an outside reference that is not Strata.
+2. **The public reference implementation of the architecture** (the modeling code published with the model family),
+   read to write `docs/ARCH.md`, and run on CPU only if the weights it needs can be made from this file.
+3. **Self-consistency plus perplexity**, if neither is available. The scalar Rust reference is written straight
+   from `ARCH.md`, every kernel is tested against it, and the whole thing must reach a perplexity under a fixed bound
+   on a frozen text, with sensible greedy output on the frozen eval prompts. This is weaker: it catches most bugs and
+   cannot prove the last few. The writeup says so.
+
+Whichever applies, the fixtures are generated once, checked in under `eval/fixtures/`, and never regenerated
+silently. `eval/cases.jsonl` stays frozen, as before.
+
+## The stages
+
+Each stage ends with something that produces tokens, and each has one gate. A stage is not done until its gate is
+green on this PC.
+
+### Stage 0: the spec, the file, the tools
+- `docs/ARCH.md`: every operation of one J block, one K block, the PLE path, the router, the shared expert and the
+  head, written as math with tensor names and shapes taken from the GGUF. Every open question is listed as one.
+- The GGUF reader and a `shadow inspect` command that prints the tensor table, the quant type per tensor, and the
+  VRAM math above with real numbers.
+- `shadow-cuda`: bindings, the NVRTC compile and cache, and one trivial kernel (`vector_add`) compiled, launched and
+  checked on the 5070.
+- The tokenizer.
+- The oracle decision, with its fixtures.
+
+**Gate:** `shadow inspect` accounts for all 1,224 tensors and 77.80 GiB. The tokenizer reproduces the fixture token
+ids exactly. `vector_add` passes from a cold cache and from a warm one. The kernel-signature drift test is green.
+
+### Stage 1: the CPU reference forward pass
+- Scalar Rust, f32 accumulation, every layer, one token at a time, every weight dequantized on the fly from the
+  file through the ring. It is slow on purpose; it is the yardstick everything after it is measured against.
+- KV for the 12 K layers and the recurrent state for the 36 J layers, kept in RAM.
+
+**Gate:** the oracle comparison from the section above passes. Greedy decoding of the frozen prompts is identical
+across two runs.
+
+### Stage 2: the GPU dense path
+- NVRTC kernels for norms, RoPE, attention (with int8 KV), the J-layer recurrence and conv, the router, the shared
+  expert, the combine step and the head. Routed experts: an IQ3_S matrix-vector kernel for the ones in VRAM, and
+  the stage 1 CPU path for the rest.
+- One stream, no graphs yet. Simple first.
+
+**Gate:** every kernel matches its Rust reference within a tolerance written next to the test. Whole-model logits
+match stage 1 to the same top-1 token on every fixture position, with the maximum logit distance recorded.
+
+### Stage 3: the tiers
+- VRAM expert cache, pinned RAM tier (AVX-512 experts in `shadow-cpu`), NVMe tier through the ring. A placement
+  profile in **our own format**, learned from Shadow's own routing traces (Strata's `STRP` profiles are not read).
+- The 26.82 GiB per-layer embedding streams from the drive. Pinning it is an arm to measure later, not a default.
+- The 4 GiB RAM rule, enforced.
+
+**Gate:** where an expert was served from (VRAM, RAM or drive) does not change the answer: the same top-1 tokens on
+the fixtures for every forced placement. A RAM-headroom test lowers available memory artificially and proves the
+engine refuses rather than pins. A long run's minimum free RAM is logged.
+
+### Stage 4: the server and the floor
+- `shadow-serve` on the engine in-process. The harness (`tools/shadow_harness.py`) and `shadow-eval` point at it.
+- A bench of our own, `shadow-bench`, implementing `BENCH_NOISE.md`: interleaving, `decode_warm`, turn-by-turn
+  pairing, median/p90/worst, the full launch line recorded byte for byte, and RAM and GPU state sampled during the run.
+- **Measure Shadow's own noise floor.**
+
+**Gate:** `shadow-eval` passes against the frozen `eval/cases.jsonl`. Shadow's floor is measured and written into
+`BENCH_NOISE.md` beside Strata's.
+
+### Stage 5: speed, one lever at a time, each against the floor
+In the order the old engine's measurements say they pay:
+
+| lever | why, from what was measured before |
 |---|---|
-| cold | nothing resident — the floor itself, so the others mean something |
-| A | 36 GiB, the current config — the incumbent |
-| B | 40 GiB, the whole J chain resident — what the recomputed geometry says it should be |
-| C | 40 GiB, embedding resident, all 48 layers streamed — the other half of the same question |
+| more experts in pinned RAM | ~0.7 tok/s per GiB on the old engine (36/40/44/45.5 GiB → 10.7/13.2/15.5/17.1) |
+| speculative decoding | draft acceptance was the strongest single factor in decode speed (+0.44 within an arm) |
+| CUDA graphs for the decode step | ~48 layers × ~10 kernels is ~500 launches per token without them |
+| prefill GEMM | tensor-core kernels (`mma.sync` through inline PTX, via NVRTC) for prompt processing |
+| huge pages for the pinned tier | already built in `shadow-host` (`SHADOW_HUGE_PAGES=1`); it needs the lock-pages privilege this PC lacks |
+| the expert cache's eviction | adaptive swaps were measured but confounded by the cold region; re-measure here |
 
-The J-layers are still the reason this model is fast — a fixed-size state per layer regardless of context — but
-the old state figure (8 x 256 x 256 x 4 = 2 MiB) was computed from the old table's geometry and needs measuring
-against `ssm.inner_size 6144` / `state_size 128` before anyone quotes it again.
+The draft model for speculative decoding has to come from somewhere that is not Strata. Strata's MTP draft
+(`mtp-basalt-ft1`) is a Strata artifact. Options: an MTP head inside the GGUF, if stage 0 finds one; a small
+same-vocab model; or prompt-lookup drafting, which needs no model. Settle it in stage 0's open questions.
 
-The quant is what it is — **don't requant**. It was measured: that recipe came from a 40-candidate sweep, and
-`Q3_K_S` is 10.7 GB and 13 tok/s. The two files on this PC are that quant; the 20 GiB one is not.
+Every lever is an arm: ≥ 8 interleaved runs against the configuration without it, judged against Shadow's floor.
+A tie is written up as a tie.
 
-## The plan
+## What has to be true before stage 0 starts
 
-### Phase 0 — the floor, before any Rust
-Build nothing. Run the existing C++ engine cold, warm, and pinned, and write the numbers down. **Rust must beat the
-floor, not the previous Rust.**
-
-### Phase 1 — keep the C++ hot path, rewrite around it
-Don't rewrite the kernels. **Rewrite around them.** The 63 `.cu` files stay C++ — Rust never compiles a kernel, it
-calls one. The already-built seam (`STRATA_ABI_VERSION 1`, hand-written `extern "C"`, no bindgen, no cxx, both
-directions parsed by the drift test) is the join and it is **not to be redesigned**; it has been walked eight times.
-
-What goes Rust first, in this order, because each item is independently shippable and independently gated:
-
-1. **The scheduler** — the async tier, the ring, the reaper. `tokio`'s `spawn_blocking`, one ring per drive, not per
-   core. This is where the lifetime rules the hybrid work pinned with `compile_fail` doctests actually pay:
-   *"a reference into a slot cannot live across a layer advance"*, and a lease kept past its window is refused with
-   `BadSlot`.
-
-   **Built (the scheduler half; `crates/shadow-host/src/scheduler.rs`), and one word of the plan did not survive
-   contact with the type:** not `spawn_blocking`, **one dedicated OS thread per drive**. A blocking-pool thread is
-   not a thread, it is whichever thread the pool happens to lend, so it cannot hold a per-drive ring — the ring is
-   `!Send` and a `!Send` type cannot be *moved* onto a thread, only built on one. So the ring is built on its own
-   thread and stays there, and what crosses is only the handle (a channel sender and a wake) plus the request
-   message, both of which the compile-time pins in `lib.rs` already say are `Send`/`Sync`.  Cost, said plainly: two
-   allocations per request (the channel's node, the oneshot's cell) and a map lookup per completion, all of it on
-   the way *to* the ring's hot path, which is untouched.  `spawn_blocking` would have cost the same and been a
-   smaller lie about the plan; the thread is here because the type forces it, not because it is nicer.
-2. **The placement policy** — which 15 layers get RAM, which experts get touched twice per token, which are dead.
-   A policy is pure and testable; a policy in C++ is a policy you can't change at runtime.
-3. **The router's bookkeeping** — the counters, the hysteresis, the eviction. Not the score itself: that's a kernel.
-4. **The API surface** — the OpenAI-compatible HTTP layer, the session state, the harness loop.
-
-   **Decided (2026-10-26), because this is the first item that needs a network stack and the workspace has been
-   dependency-free on purpose:** take **hyper** (axum if it wants a router, hyper if not) and **serde_json**, and
-   *declare* them in `Cargo.toml` with the reason, the way the tokio line does. A hand-rolled HTTP/1.1 parser is the
-   wrong place to save dependencies — `shadow-eval` hand-rolls its JSON because a yardstick must not break on an
-   unrelated `cargo update`, which is not an argument about a server that has to speak SSE to a browser.
-   Scope, and it is deliberately small: **streaming `/v1/chat/completions` on a separate port**, nothing else.
-   **Gate:** it matches the Python server's output at temperature 0, and `tools/strata_bench.py` runs against it
-   unchanged. **MCP, Discord, vision and the conversation store stay in Python.**
-
-   **The route list, checked against the tool rather than guessed (2026-10-26).**  Pointing the bench at this server
-   means `--url`, and the tool asks six paths, which are *not* all equal — the difference is what happens to the run
-   when one answers nothing:
-
-   * `POST /v1/chat/completions` — the measurement itself.
-   * `GET /health` — **hard**, and the plan used to leave it out.  `is_strata()` (line 725) is the only one of the six
-     whose failure ends the run: under `--url` a server it does not recognise is `return 2`, "No Strata server answers
-     at …", before a single token is generated.  And it is not a status code, it is a *field* — `h.get("service") ==
-     "strata"`.  A Rust server that answers `/health` with `{}` fails the gate exactly as hard as one that 404s it.
-   * `GET /v1/status`, `/metrics`, `/props`, `/v1/models` — **tolerated**, and the plan used to list two of these as
-     needed.  Each is read as `try_json(...) or {}` inside `collect_machine`, so a missing one blanks a row of the
-     machine block and the run finishes.  They are the report, not the gate: `/metrics` alone feeds eight fields
-     (`hardware_static`, `engine`, `totals`, `requests_kept`, `requests`, …), so answering them is what makes the
-     Rust number comparable with a Strata row in the same table — but the bench does not *require* them.
-
-   So the honest cut is two routes that must work and four that should.  The shape of `/health`'s answer is the part
-   that cannot be inferred from the status code, so it is written here — the Python server's answer, verbatim
-   (`server.py:5578`): `{"status": "ok", "max_context": …, "model": …, "images": …, "api_key": …, "loaded": …,
-   "service": "strata"}`.  Only `service` is read by the bench, but that is the field the gate turns on, so copy the
-   whole answer from there rather than inventing a field.
-
-**Gate:** the seam's drift test green both directions on the merged tree, both arms, and the skip path run too.
-
-**Ran (2026-10-26, the merged tree at `c73018c`): all three clauses, and the arms ran as arms.** Both directions
-green — `shadow-abi`'s side (the header read as text, against the Rust mirror) and `shadow-host`'s side (`host_exports`,
-the calls Rust exports) — and the skip path run too, on the same tree with `STRATA_FACADE_DIR` unset, where both seam
-tests say so out loud and pass. Then both arms for real, `STRATA_FACADE_DIR` pointed at each in turn: the CUDA arm and
-the CPU arm, each loading **its own** `strata_facade.dll` by absolute path (the test prints which one it loaded, which
-is how this is known and not assumed), and the vertical slice — one expert off a file through the Rust ring — crossing
-the seam on both. The full workspace suite is green on both arms: **83** tests, 0 failed, 0 ignored — 73 from the two
-seam crates plus 10 from `shadow-eval`; the 93 this paragraph first said had counted `shadow-eval` twice, and the
-recount is 83 on both arms. One run of the full workspace suite exited 1 with every test printing `ok`; it did not
-reproduce in the 13 runs after it, so it is recorded as a one-off and not explained.
-
-### Phase 2 — the things that can actually make it faster
-These are the levers with a measured number behind them, in the order they measured, from `SPEED_BRANCH.md`:
-
-| lever | measured |
-|---|---|
-| more of the model in pinned RAM | **~0.7 tok/s per GiB** (36/40/44/45.5 GiB → 10.7/13.2/15.5/17.1) — the biggest one, and it is a RAM budget, not code |
-| closing programs | ~14 GiB held by other programs on that PC — worth more than any setting |
-| `--vram-reserve-mib 640` | +5% (the desktop idles at 567 MiB; +150 expert slots) |
-| expert cache on | **−34.2% decode with it off** — the one result in the line that is not marginal |
-| LTO, arch 120-real, tests off | tie |
-| `--pool-workers` 4/6, `--kv q4_0` with freed VRAM | tie |
-| router look-ahead | tried and reverted — NVMe wait did not shrink, CPU work grew |
-| batched DMA | +1.1% — inside the floor, reported as such |
-
-Of a ~115 ms decode window: **~52 ms the CPU running RAM-tier experts, ~26 ms waiting on the NVMe tier, ~11 ms
-waiting for the GPU.** So 52 ms is the biggest single piece, and it is the piece Rust can actually move — the
-RAM tier's experts are run by CPU code, not by a kernel.
-
-### Phase 3 — the fringe ideas, and what each is worth
-Pulled from outside, each one stated with its cost and its honest ceiling, because most of them are small:
-
-- **`io_uring`** (the Linux async I/O interface) — **the one genuinely worth doing.** It is the only way to get real
-  async submission depth to the drive without a thread per read, and it is the reason the scheduler goes Rust first.
-  On Windows the equivalent is **`IoCompleteCompletion` + `FILE_FLAG_OVERLAPPED` with a single completion port** —
-  already the shape of the existing ring, so the port is the work, not the idea. Ceiling: the drive is already the
-  bound, so this buys **shape** (fewer threads, no reaper contention) rather than throughput.
-- **Huge pages for the pinned tier** — 2 MiB pages for the 11.25 GiB RAM tier means ~6,400 page-table entries instead
-  of ~2.9 million. The pinned tier cannot be paged out, so this is pure TLB. Cheap, and Windows has
-  `VirtualAlloc(MEM_LARGE_PAGES)`. Worth trying first because it is a day.
-- **Prefetch the first expert of the next layer during the current layer's compute** — this is the look-ahead that
-  was *tried and reverted* in C++ (NVMe wait didn't shrink, CPU work grew). Re-test it in Rust **only** if the
-  scheduler rewrite lands first, because the C++ version couldn't overlap it with anything.
-- **Speculative decoding** — the model is 8 active experts of 256, so per-token compute is already tiny; the win
-  would be in the ~26 ms of NVMe wait. A small draft model is the standard trick; the fringe version is **self-draft
-  with the shared expert alone** (the shared expert is always active, always in VRAM, and its 5120-intermediate MLP
-  is already resident — you get a free cheap prediction head). Untested here; the honest expected value is small
-  because verification cost is per-layer and you'd pay it 84 times.
-- **KV quantisation at long context** — `--kv q4_0` measured a tie at the depths tested, but at 128K the 48 K-layers'
-  KV is the thing that stops fitting. It becomes a real lever only at context lengths this PC hasn't been benched at.
-- **`mlock` everything** — the pinned tier already can't be paged; the rest of the 11.25 GiB can. Cheap insurance
-  against the "free RAM hit 0.4 GiB and froze the PC" failure mode.
-- **`MAP_HUGETLB` / `VirtualAlloc` for the GGUF itself** — the 40 shards are read via the ring today; a single
-  memory-mapped view with page-fault-driven loading would let the OS do the placement. It fights the pinned tier,
-  so it's an either/or, not an addition.
-
-**Explicitly not on the list:** a Rust kernel, a Rust CUDA bindings crate, a new default for anything, and any speed
-claim that hasn't cleared the floor. All four are the existing plan's rules and they stand.
-
-### Phase 4 — the harness
-The current harness (`tools/shadow_harness.py`) suffices, with three changes, none of them a rewrite:
-
-1. **It must run against the new engine through the same OpenAI endpoint**, so the only thing that changes is the
-   server URL. It already takes it from `J:\Strata-work\strata.json`.
-2. **The guard's no-read list and protected paths must cover the new engine's source tree** — the harness runs with
-   no approval gate, so those lists are the only thing enforcing the boundary. They are loaded from `strata.json`
-   (50 blocked, 8 protected).
-3. **Add a probe that runs the same task on both engines and diffs the answers.** The existing output-fingerprint
-   tooling does this job at the byte level (it was 10 match / 0 mismatch across a fingerprint arm and three bench
-   launches); the harness version would do it at the task level, which is the one that catches a wrong-but-plausible
-   answer.
-
-The harness's job on the new engine is **the same job it does today**: prove the answer is the same one the C++
-engine gives, before anything is called a win.
-
-## What has to be true before any of this starts
-
-- **N1 first** — the stale `stage_idx_` reset is the only real bug in the existing list and it is in today's C++.
-  Fix it, gate it on `expert_parity` plus the audit run (4,980 pool reads, 0 buffer refills under them), and only
-  then move the layer under it.
-- **N5, the merge forward, before the trees drift further.** `rust-host/`, `include/strata/c/abi.h`,
-  `src/facade/abi.cpp`, `tools/output_fingerprint.py` are tracked on `speed-work-0.1.43`; `speed-work-0.1.45` carries
-  none of them and the Rust branch grew off 0.1.45 and is now 725 commits deep. A plan that starts on a third tree
-  is a plan that merges three ways.
-- **Decide N2** — rail the lifetime types into the hot path now, or freeze them as tests. The plan says pick one;
-  doing both is the failure mode. My choice: **freeze them as tests** for the C++ hot path, and **wire them in for
-  free** on the Rust side, because in Rust they're the language's own rules and cost nothing.
-- **Decide what the engine is for.** If the answer is "run this model on this PC as fast as it will go", the honest
-  answer is that the C++ engine is already at the drive's bound and the Rust engine is a **reliability and
-  maintainability** project with a scheduling upside — which is a completely good reason, and it's better to say so
-  at the start than to discover it at the end.
+- **This document is the plan.** `README.md` still says "the kernels stay C++" and "Rust never compiles a kernel".
+  Update it in the same change, or the next session will follow the README.
+- **The license line stays honest.** Shadow is MIT, keeps Strata's notice for what came across (the measurements,
+  the plan's history, the harness), and copies no Strata source. Writing the kernels from `ARCH.md` rather than from
+  Strata's `.cu` files is what keeps that true. Reading MIT code is allowed, but the rule here is independence, not
+  only licensing.
+- **The model file is the only input.** Copy it under `J:\Shadow\models\`, record its SHA-256, and stop reading
+  `J:\Strata-work` for anything.
 
 ## The honest shape of it
 
-**The shell is ours** — `desktop/` is 100% ours, `rust-host/` is 100% ours, the web app is 68% ours since it landed
-(it started as upstream's), `tools/` and `serve/` are a fifth ours, and the engine is 1% ours.
+This is a bigger project than the one it replaces. The old plan wrapped a working engine. This one has to make the
+model produce a correct token before it produces a fast one, and stages 0 to 2 are mostly correctness work with
+nothing to show on a speed chart. The ceiling is the same drive: when Shadow is done, it should be about as fast as
+Strata on this PC, not faster, and anything above that has to clear the floor like everything else.
 
-That is the actual argument for this plan. Not speed — the drive is the bound and the numbers say so. It's that the
-one layer everything else sits on is the one layer we don't own, and the plan's first three sections are the parts
-where not owning it has started to cost: the lifetime rules that need `compile_fail` doctests to hold, the bug that
-can only be fixed by a decision about the default path, the merge that's 725 commits deep.
+What it buys is the thing the old plan's last section admitted it lacked: **the engine is ours.** Every kernel is
+source we wrote, compiled by a library that ships with the driver, launched by a host whose safety rules are the
+language's. Nothing else in the stack needs the C++ toolchain, and nothing runs that we cannot read and change.
 
-The first phase costs nothing and tells you whether the rest is worth funding. Start there.
+Start with stage 0, and settle the oracle first.

@@ -9,28 +9,30 @@ which were written by us on a Strata checkout.
 
 ## What it is
 
-The plan is in [docs/SHADOW_PLAN.md](docs/SHADOW_PLAN.md). The short version, since it is a short version of a
-plan that has already been walked once:
+The plan is in [docs/SHADOW_PLAN.md](docs/SHADOW_PLAN.md), rewritten 2026-10-26. The short version:
 
-- **The drive is the bound, not the language.** One process, 4 threads, queue depth 256: ~155k reads/s. Two
-  processes ~112k total. Four ~113k. No language at the top of the stack beats this, and the Rust reader in the
-  previous round came in at parity, −1.7% at the median, inside the noise floor.
-- **So Rust buys the safety of the async tier and the scheduling layer**, and the speed comes from scheduling —
-  52 ms of a ~115 ms decode window is the CPU running RAM-tier experts, which is CPU code and not a kernel.
-- **The kernels stay C++.** Rust never compiles a kernel, it calls one, through
-  [include/shadow/c/abi.h](include/shadow/c/abi.h) — hand-written, no bindgen, no cxx, and the crate's test suite
-  parses the file and asserts the version constant matches its own.
+- **Shadow is its own engine, start to finish.** A Rust host, CUDA kernels we write ourselves, and nothing from
+  Strata at build time or at run time: no source, no binary, no tool, no file format. The only input is the GGUF.
+- **The kernels are CUDA C++ source in this repo, compiled at run time by NVRTC** for whatever GPU is present, cached
+  as CUBIN, and launched through the CUDA driver API (`nvcuda.dll`), hand-bound with no bindgen and no bindings
+  crate. `cargo build` is the whole build: no nvcc, no CMake, no CUDA toolkit needed to compile Shadow.
+- **The drive is the bound, not the language.** One process, 4 threads, queue depth 256: ~155k reads/s, and more
+  threads or processes never add up to more. Shadow's ceiling on this PC is the same as any engine's. What it buys
+  is an engine we own, safe by construction where Rust can make it so, with scheduling we can change.
+- **Correctness before speed.** The stages each end in tokens: a scalar CPU reference first, the GPU dense path
+  checked against it, then the memory tiers, the server, and only then speed, one lever at a time.
 
 ## The floor
 
 [docs/BENCH_NOISE.md](docs/BENCH_NOISE.md): **10.1% median, 27.0% p90, 51.9% worst.** A change must clear that, on
 ≥8 runs, interleaved, `decode_warm`, paired turn-by-turn — or it is reported as a tie and not written up as a win.
-That rule is not a formality and it has killed more ideas than any reviewer.
+That rule is not a formality and it has killed more ideas than any reviewer. That floor was measured on Strata;
+Shadow measures its own once it can run a session (stage 4), and until then Strata's is the working figure.
 
 ## Layout
 
     crates/          the Rust side, including shadow-eval, the yardstick
-    include/shadow/  the seam's contract (C ABI, hand-written)
+    include/shadow/  the old seam's contract (C ABI) - retired with the C++ engine, removed once stage 2 runs
     docs/            the plan, and the measurements it is built on
     tools/           the harness and shadow_memory.py, both Python for now
     bin/ models/     the embedder the memory tool drives
