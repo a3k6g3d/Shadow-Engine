@@ -173,6 +173,23 @@ fn matvec(m: &Mat, x: &[f32]) -> Vec<f32> {
     y
 }
 
+/// Where the matrix-vector products run.  Everything else in the forward pass is small and stays on the CPU.
+pub trait Backend {
+    /// y = W x for a matrix as stored (ggml `[cols, rows]`, whole rows contiguous).  `key` names a tensor whose bytes
+    /// never change, so a backend may keep them (a GPU keeps the dense weights resident); `None` is a one-off, such as
+    /// one expert's slice.
+    fn matvec(&self, t: &TensorInfo, bytes: &[u8], key: Option<&str>, x: &[f32]) -> Vec<f32>;
+}
+
+/// The reference: every row dequantized and dotted in f64, rows split over the CPU's threads.
+pub struct CpuBackend;
+
+impl Backend for CpuBackend {
+    fn matvec(&self, t: &TensorInfo, bytes: &[u8], _key: Option<&str>, x: &[f32]) -> Vec<f32> {
+        matvec(&Mat { t, bytes }, x)
+    }
+}
+
 fn rmsnorm(x: &[f32], w: &[f32], eps: f32) -> Vec<f32> {
     let ms = x.iter().map(|&v| v as f64 * v as f64).sum::<f64>() / x.len() as f64;
     let r = 1.0 / (ms + eps as f64).sqrt();
@@ -276,6 +293,7 @@ impl Model {
 /// The running state of one sequence: every layer's recurrent state or KV cache, and the token history.
 pub struct Session<'m> {
     m: &'m Model,
+    be: &'m dyn Backend,
     delta: Vec<Option<DeltaState>>,
     attn: Vec<Option<AttnCache>>,
     ple_conv: Vec<f32>, // the last (conv_k - 1) * ngram inputs, oldest first
@@ -283,7 +301,7 @@ pub struct Session<'m> {
 }
 
 impl<'m> Session<'m> {
-    pub fn new(m: &'m Model) -> Session<'m> {
+    pub fn new(m: &'m Model, be: &'m dyn Backend) -> Session<'m> {
         let c = &m.cfg;
         let ch = c.ssm_k_heads * c.ssm_head_dim * 2 + c.ssm_v_heads * c.ssm_head_dim;
         let delta = (0..c.n_layer).map(|l| (!c.is_attention(l)).then(|| DeltaState {
@@ -292,7 +310,13 @@ impl<'m> Session<'m> {
         })).collect();
         let attn = (0..c.n_layer).map(|l| c.is_attention(l).then(|| AttnCache { k: vec![], v: vec![] })).collect();
         let ple_conv = vec![0f32; (c.ple_conv_k - 1) * c.ple_ngram * c.streams * c.hidden];
-        Session { m, delta, attn, ple_conv, tokens: vec![] }
+        Session { m, be, delta, attn, ple_conv, tokens: vec![] }
+    }
+
+    /// y = W x for a dense tensor, through the backend.
+    fn mv(&self, name: &str, x: &[f32]) -> Vec<f32> {
+        let mt = self.m.mat(name);
+        self.be.matvec(mt.t, mt.bytes, Some(name), x)
     }
 
     pub fn len(&self) -> usize {
@@ -333,7 +357,7 @@ impl<'m> Session<'m> {
             hc_write(&mut r, &g, &y, h);
         }
         let (u, _) = self.hc_read(&r, "output_hc", false);
-        matvec(&m.mat("output.weight"), &u)
+        self.mv("output.weight", &u)
     }
 
     /// A hyper-connection read: the sublayer's input and, with `inject`, the per-stream gains.
@@ -342,8 +366,8 @@ impl<'m> Session<'m> {
         let c = &m.cfg;
         let (h, cs) = (c.hidden, c.streams);
         let rn = rmsnorm_groups(r, &m.vec(&format!("{p}_norm.weight")), h, c.eps);
-        let down: Vec<f32> = matvec(&m.mat(&format!("{p}_down.weight")), &rn).iter().map(|&v| silu(v / cs as f32)).collect();
-        let mix: Vec<f32> = matvec(&m.mat(&format!("{p}_up.weight")), &down).iter().map(|&v| sigmoid(v)).collect();
+        let down: Vec<f32> = self.mv(&format!("{p}_down.weight"), &rn).iter().map(|&v| silu(v / cs as f32)).collect();
+        let mix: Vec<f32> = self.mv(&format!("{p}_up.weight"), &down).iter().map(|&v| sigmoid(v)).collect();
         let mut u = vec![0f32; h];
         for s in 0..cs {
             for i in 0..h {
@@ -352,7 +376,7 @@ impl<'m> Session<'m> {
         }
         u.iter_mut().for_each(|v| *v /= cs as f32);
         let g = if inject {
-            matvec(&m.mat(&format!("{p}_inject.weight")), &rn).iter().map(|&v| 2.0 * sigmoid(v / cs as f32)).collect()
+            self.mv(&format!("{p}_inject.weight"), &rn).iter().map(|&v| 2.0 * sigmoid(v / cs as f32)).collect()
         } else {
             vec![]
         };
@@ -366,10 +390,10 @@ impl<'m> Session<'m> {
         let (kh, vh, d) = (c.ssm_k_heads, c.ssm_v_heads, c.ssm_head_dim);
         let (kd, vd) = (kh * d, vh * d);
         let ch = 2 * kd + vd;
-        let qkv = matvec(&m.mat(&format!("{p}.attn_qkv.weight")), u);
-        let z = matvec(&m.mat(&format!("{p}.attn_gate.weight")), u);
-        let b = matvec(&m.mat(&format!("{p}.ssm_beta.weight")), u);
-        let a = matvec(&m.mat(&format!("{p}.ssm_alpha.weight")), u);
+        let qkv = self.mv(&format!("{p}.attn_qkv.weight"), u);
+        let z = self.mv(&format!("{p}.attn_gate.weight"), u);
+        let b = self.mv(&format!("{p}.ssm_beta.weight"), u);
+        let a = self.mv(&format!("{p}.ssm_alpha.weight"), u);
         let conv_w = m.vec(&format!("{p}.ssm_conv1d.weight")); // ch x conv_k, tap k multiplies x[t - (conv_k-1) + k]
         let st = self.delta[l].as_mut().unwrap();
         let k = c.conv_k;
@@ -435,7 +459,7 @@ impl<'m> Session<'m> {
                 oh[j] = normed[j] * sigmoid(z[hd * d + j]);
             }
         }
-        matvec(&m.mat(&format!("{p}.ssm_out.weight")), &o)
+        self.mv(&format!("{p}.ssm_out.weight"), &o)
     }
 
     fn attention(&mut self, l: usize, u: &[f32]) -> Vec<f32> {
@@ -443,9 +467,9 @@ impl<'m> Session<'m> {
         let c = &m.cfg;
         let p = format!("blk.{l}");
         let (nh, nkv, hd) = (c.n_head, c.n_kv_head, c.head_dim);
-        let qg = matvec(&m.mat(&format!("{p}.attn_q.weight")), u);
-        let k = matvec(&m.mat(&format!("{p}.attn_k.weight")), u);
-        let v = matvec(&m.mat(&format!("{p}.attn_v.weight")), u);
+        let qg = self.mv(&format!("{p}.attn_q.weight"), u);
+        let k = self.mv(&format!("{p}.attn_k.weight"), u);
+        let v = self.mv(&format!("{p}.attn_v.weight"), u);
         let (qn, kn) = (m.vec(&format!("{p}.attn_q_norm.weight")), m.vec(&format!("{p}.attn_k_norm.weight")));
         let pos = (self.tokens.len() - 1) as f64;
         let rope = |x: &mut [f32]| {
@@ -493,14 +517,14 @@ impl<'m> Session<'m> {
                 o[h * hd + j] = (acc / z) as f32 * sigmoid(gate[h * hd + j]);
             }
         }
-        matvec(&m.mat(&format!("{p}.attn_output.weight")), &o)
+        self.mv(&format!("{p}.attn_output.weight"), &o)
     }
 
     fn moe(&self, l: usize, u: &[f32]) -> Vec<f32> {
         let m = self.m;
         let c = &m.cfg;
         let p = format!("blk.{l}");
-        let logits = matvec(&m.mat(&format!("{p}.ffn_gate_inp.weight")), u);
+        let logits = self.mv(&format!("{p}.ffn_gate_inp.weight"), u);
         let mx = logits.iter().cloned().fold(f32::MIN, f32::max);
         let ex: Vec<f64> = logits.iter().map(|&v| ((v - mx) as f64).exp()).collect();
         let z: f64 = ex.iter().sum();
@@ -515,14 +539,14 @@ impl<'m> Session<'m> {
             let (tg, bg) = m.expert(&format!("{p}.ffn_gate_exps.weight"), e);
             let (tu, bu) = m.expert(&format!("{p}.ffn_up_exps.weight"), e);
             let (td, bd) = m.expert(&format!("{p}.ffn_down_exps.weight"), e);
-            let act = swiglu(matvec(&Mat { t: &tg, bytes: &bg }, u), matvec(&Mat { t: &tu, bytes: &bu }, u));
-            let out = matvec(&Mat { t: &td, bytes: &bd }, &act);
+            let act = swiglu(self.be.matvec(&tg, &bg, None, u), self.be.matvec(&tu, &bu, None, u));
+            let out = self.be.matvec(&td, &bd, None, &act);
             y.iter_mut().zip(&out).for_each(|(a, &b)| *a += w * b as f64);
         }
-        let act = swiglu(matvec(&m.mat(&format!("{p}.ffn_gate_shexp.weight")), u),
-                         matvec(&m.mat(&format!("{p}.ffn_up_shexp.weight")), u));
-        let sh = matvec(&m.mat(&format!("{p}.ffn_down_shexp.weight")), &act);
-        let sg = sigmoid(matvec(&m.mat(&format!("{p}.ffn_gate_inp_shexp.weight")), u)[0]);
+        let act = swiglu(self.mv(&format!("{p}.ffn_gate_shexp.weight"), u),
+                         self.mv(&format!("{p}.ffn_up_shexp.weight"), u));
+        let sh = self.mv(&format!("{p}.ffn_down_shexp.weight"), &act);
+        let sg = sigmoid(self.mv(&format!("{p}.ffn_gate_inp_shexp.weight"), u)[0]);
         y.iter().zip(&sh).map(|(&a, &b)| (a + (sg * b) as f64) as f32).collect()
     }
 
@@ -553,9 +577,9 @@ impl<'m> Session<'m> {
             }
         }
         assert_eq!(e.len(), h, "PLE embedding width");
-        let key = rmsnorm_groups(&matvec(&m.mat(&format!("{p}.ple_key.weight")), &e),
+        let key = rmsnorm_groups(&self.mv(&format!("{p}.ple_key.weight"), &e),
                                  &m.vec(&format!("{p}.ple_norm_key.weight")), h, c.eps);
-        let val = matvec(&m.mat(&format!("{p}.ple_value.weight")), &e);
+        let val = self.mv(&format!("{p}.ple_value.weight"), &e);
         let qry = rmsnorm_groups(r, &m.vec(&format!("{p}.ple_norm_query.weight")), h, c.eps);
         let mut gv = vec![0f32; cs * h];
         for s in 0..cs {

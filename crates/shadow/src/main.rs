@@ -55,16 +55,18 @@ fn main() -> ExitCode {
     ExitCode::SUCCESS
 }
 
-/// Greedy decoding with the stage 1 CPU reference.  `-n N` tokens (default 8); `--chat` wraps the prompt in the chat
-/// template (thinking off).  Slow by design: it is the yardstick, not the engine.
+/// Greedy decoding.  `-n N` tokens (default 8); `--chat` wraps the prompt in the chat template (thinking off);
+/// `--gpu` runs every matrix-vector product on GPU 0 (the dense weights resident in VRAM), the rest on the CPU.
+/// Without it: the stage 1 CPU reference, slow by design.
 fn generate(path: &std::path::Path, prompt: &str, rest: &[String]) -> ExitCode {
     use shadow_model::chat::{render, Message, Options, Role};
-    use shadow_model::forward::{check_layout, Model, Session};
+    use shadow_model::forward::{check_layout, CpuBackend, Model, Session};
     use shadow_model::tokenizer::Tokenizer;
     use std::io::Write;
     let n_new: usize = rest.iter().position(|a| a == "-n").and_then(|i| rest.get(i + 1)).and_then(|v| v.parse().ok())
         .unwrap_or(8);
     let chat = rest.iter().any(|a| a == "--chat");
+    let use_gpu = rest.iter().any(|a| a == "--gpu");
     let g = match Gguf::open(path) {
         Ok(g) => g,
         Err(e) => {
@@ -94,7 +96,37 @@ fn generate(path: &std::path::Path, prompt: &str, rest: &[String]) -> ExitCode {
     };
     let ids = tok.encode(&text, chat);
     eprintln!("prompt: {} tokens {:?}", ids.len(), &ids[..ids.len().min(16)]);
-    let mut s = Session::new(&model);
+    let ctx = if use_gpu {
+        match shadow_cuda::Context::new(0) {
+            Ok(c) => Some(c),
+            Err(e) => {
+                eprintln!("shadow generate: --gpu: {e}");
+                return ExitCode::FAILURE;
+            }
+        }
+    } else {
+        None
+    };
+    let gpu = match &ctx {
+        Some(c) => {
+            let (free, _) = c.mem_info().expect("VRAM");
+            let budget = free.saturating_sub(1 << 30); // leave 1 GiB for scratch, the desktop and the driver
+            eprintln!("GPU: {} - {:.2} GiB free, resident budget {:.2} GiB", c.name, free as f64 / GIB, budget as f64 / GIB);
+            match shadow_cuda::backend::GpuBackend::new(c, budget) {
+                Ok(b) => Some(b),
+                Err(e) => {
+                    eprintln!("shadow generate: --gpu: {e}");
+                    return ExitCode::FAILURE;
+                }
+            }
+        }
+        None => None,
+    };
+    let be: &dyn shadow_model::forward::Backend = match &gpu {
+        Some(g) => g,
+        None => &CpuBackend,
+    };
+    let mut s = Session::new(&model, be);
     let t1 = std::time::Instant::now();
     let mut logits = Vec::new();
     for &id in &ids {
@@ -119,6 +151,9 @@ fn generate(path: &std::path::Path, prompt: &str, rest: &[String]) -> ExitCode {
     println!();
     eprintln!("generated {} tokens {:?} in {:.1} s ({:.2} s/token)", out.len(), out, t2.elapsed().as_secs_f64(),
               t2.elapsed().as_secs_f64() / out.len().max(1) as f64);
+    if let Some(g) = &gpu {
+        eprintln!("GPU: {:.2} GiB of weights resident, {} uploads", g.resident_bytes.get() as f64 / GIB, g.uploads.get());
+    }
     ExitCode::SUCCESS
 }
 

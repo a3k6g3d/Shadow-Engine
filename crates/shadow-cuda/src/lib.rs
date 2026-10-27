@@ -2,6 +2,7 @@
 //! loaded at run time, and the registry of our own kernels, which ship as source and are compiled for whatever GPU is
 //! present.  No bindgen, no bindings crate, no nvcc, no CUDA toolkit at build time.
 
+pub mod backend;
 pub mod driver;
 pub mod dylib;
 pub mod kernels;

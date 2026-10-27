@@ -1,0 +1,11 @@
+[package]
+name = "shadow"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# The `shadow` command line: the model side (shadow-model) and the GPU side (shadow-cuda) together.
+
+[dependencies]
+shadow-model = { path = "../shadow-model" }
+shadow-cuda = { path = "../shadow-cuda" }

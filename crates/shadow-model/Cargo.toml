@@ -9,7 +9,3 @@ license.workspace = true
 # under a `cargo update`.
 
 [dependencies]
-
-[[bin]]
-name = "shadow"
-path = "src/bin/shadow.rs"

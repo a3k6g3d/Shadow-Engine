@@ -2,6 +2,9 @@
 
 Where the plan ([SHADOW_PLAN.md](SHADOW_PLAN.md)) stands. Updated 2026-10-27, after the first overnight run.
 
+The binary is now its own crate: `cargo build --release -p shadow`, then `target/release/shadow.exe` (inspect, kv,
+stats, generate).
+
 ## Stage 0: done, with one gate item open
 
 | item | state | evidence |
@@ -33,6 +36,19 @@ Where the plan ([SHADOW_PLAN.md](SHADOW_PLAN.md)) stands. Updated 2026-10-27, af
   huggingface.co/Qwen/Qwen3.8-Flash-Next), which needs your OK.
 - Limit: at most 2,048 positions (the sparse indexer is not implemented; below 2,048 it keeps every key, so attention
   is exact there).
+
+## Stage 2: begun
+
+- **Every quant type dequantizes on the GPU bit for bit** like the Rust reference (all fixture blocks of 9 types +
+  BF16, 25,600 real Q2_0 blocks), from one decoder per format (`kernels/quants.cuh`).
+- **A reference GPU matvec for all 11 types** (`kernels/matvec.cu`), within 3.2e-8 relative of an f64 CPU dot product
+  on real tensors. Not fast yet: 264 GB/s for Q6_K, 15-23 GB/s for the IQ2_S/IQ3 expert slices.
+- **The forward pass runs its matvecs on the GPU** (`shadow generate ... --gpu`; `Backend` trait in forward.rs,
+  `GpuBackend` in shadow-cuda): 3.78 GiB of dense weights resident in VRAM, experts uploaded per use. Same tokens as
+  the CPU ("17 times 23 is 391."), **0.40 s/token against 2.35** on the CPU. `crates/shadow/tests/backends.rs` holds
+  the two backends to the same top token and logits within 7.3e-6 (of ~16) at every position.
+- What is still on the CPU: the norms, the DeltaNet recurrence, attention, the hyper-connection glue, the MoE routing,
+  and every expert upload (58,361 per 41 tokens). Those are the next kernels, and then the memory tiers (stage 3).
 
 ## What needs you
 
