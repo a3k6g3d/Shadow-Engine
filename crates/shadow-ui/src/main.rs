@@ -1,6 +1,7 @@
 // Shadow desktop window (Tauri 2): native desktop shell for the Shadow web UI.
-// Opens http://127.0.0.1:8081 when ready, displays loading/status splash while starting,
-// keeps a system tray icon, and stores settings in %APPDATA%\Shadow\desktop.json.
+// Automatically starts shadow.exe with the configured model if not already running,
+// opens http://127.0.0.1:8081, displays live loading status, keeps a tray icon,
+// and manages clean shutdown. Config stored in %APPDATA%\Shadow\desktop.json.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use serde::{Deserialize, Serialize};
@@ -18,12 +19,16 @@ use tauri::{AppHandle, Emitter, Manager, RunEvent, WebviewUrl, WebviewWindowBuil
 use tauri_plugin_opener::OpenerExt;
 
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+const DEFAULT_MODEL: &str = r"J:\Strata-work\models\swift15\IQ3_S\Swift-Qwen3.8-Flash-Next-GSQ-RCO-abliterated-IQ3_S-00001-of-00002.gguf";
 
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
 struct Config {
     url: String,
     start_server: bool,
+    model_path: String,
+    shadow_exe: String,
+    extra_flags: String,
     launcher: String,
     console_log: String,
     stop_on_quit: bool,
@@ -33,12 +38,17 @@ struct Config {
 
 impl Default for Config {
     fn default() -> Self {
+        let base = std::env::var("APPDATA").unwrap_or_else(|_| ".".into());
+        let log_path = PathBuf::from(base).join("Shadow").join("shadow-console.log");
         Config {
             url: "http://127.0.0.1:8081".into(),
-            start_server: false,
+            start_server: true,
+            model_path: DEFAULT_MODEL.into(),
+            shadow_exe: String::new(),
+            extra_flags: "--port 8081 --ram-tier-gib 30".into(),
             launcher: String::new(),
-            console_log: String::new(),
-            stop_on_quit: false,
+            console_log: log_path.to_string_lossy().to_string(),
+            stop_on_quit: true,
             close_to_tray: true,
             load_timeout_minutes: 5,
         }
@@ -70,22 +80,26 @@ fn config_path() -> PathBuf {
 }
 
 fn load_config(path: &PathBuf) -> Config {
-    match std::fs::read_to_string(path)
+    let mut c = match std::fs::read_to_string(path)
         .ok()
         .and_then(|t| serde_json::from_str::<Config>(t.trim_start_matches('\u{feff}')).ok())
     {
         Some(c) => c,
-        None => {
-            let c = Config::default();
-            if let Some(dir) = path.parent() {
-                let _ = std::fs::create_dir_all(dir);
-            }
-            if !path.exists() {
-                let _ = std::fs::write(path, serde_json::to_string_pretty(&c).unwrap_or_default());
-            }
-            c
-        }
+        None => Config::default(),
+    };
+    if c.model_path.is_empty() {
+        c.model_path = DEFAULT_MODEL.into();
     }
+    if c.console_log.is_empty() {
+        let base = std::env::var("APPDATA").unwrap_or_else(|_| ".".into());
+        c.console_log = PathBuf::from(base).join("Shadow").join("shadow-console.log").to_string_lossy().to_string();
+    }
+    c.start_server = true;
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let _ = std::fs::write(path, serde_json::to_string_pretty(&c).unwrap_or_default());
+    c
 }
 
 fn log(state: &State, msg: &str) {
@@ -144,34 +158,116 @@ fn probe_path(url: &str, path: &str) -> bool {
     (text.starts_with("HTTP/1.0 200") || text.starts_with("HTTP/1.1 200")) && !text.replace(' ', "").contains("\"state\":\"loading\"")
 }
 
+fn find_shadow_exe(cfg: &Config) -> Option<PathBuf> {
+    if !cfg.shadow_exe.is_empty() && std::path::Path::new(&cfg.shadow_exe).exists() {
+        return Some(PathBuf::from(&cfg.shadow_exe));
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            let candidate = dir.join("shadow.exe");
+            if candidate.exists() {
+                return Some(candidate);
+            }
+        }
+    }
+    for rel in &["shadow.exe", "target/release/shadow.exe", "target/debug/shadow.exe"] {
+        let p = PathBuf::from(rel);
+        if p.exists() {
+            return Some(p);
+        }
+    }
+    None
+}
+
 fn start_server(state: &State) {
     let mut child = state.child.lock().unwrap();
-    if child.is_some() || !state.cfg.start_server || state.cfg.launcher.is_empty() {
+    if child.is_some() || !state.cfg.start_server {
         return;
     }
-    if !std::path::Path::new(&state.cfg.launcher).exists() {
-        log(state, &format!("launcher does not exist: {}", state.cfg.launcher));
+
+    if !state.cfg.launcher.is_empty() && std::path::Path::new(&state.cfg.launcher).exists() {
+        log(state, &format!("using launcher: {}", state.cfg.launcher));
+        match Command::new("powershell.exe")
+            .args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", &state.cfg.launcher])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .creation_flags(CREATE_NO_WINDOW)
+            .spawn()
+        {
+            Ok(c) => {
+                log(state, &format!("started launcher, pid {}", c.id()));
+                state.started_by_us.store(true, Ordering::SeqCst);
+                *child = Some(c);
+            }
+            Err(e) => log(state, &format!("launcher failed: {}", e)),
+        }
         return;
     }
-    match Command::new("powershell.exe")
-        .args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", &state.cfg.launcher])
+
+    let Some(shadow_exe) = find_shadow_exe(&state.cfg) else {
+        log(state, "shadow.exe not found");
+        return;
+    };
+    if !std::path::Path::new(&state.cfg.model_path).exists() {
+        log(state, &format!("model does not exist: {}", state.cfg.model_path));
+        return;
+    }
+
+    if let Some(parent) = PathBuf::from(&state.cfg.console_log).parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+
+    let stdout_cfg = match std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(&state.cfg.console_log)
+    {
+        Ok(f) => Stdio::from(f),
+        Err(_) => Stdio::null(),
+    };
+    let stderr_cfg = match std::fs::OpenOptions::new().append(true).open(&state.cfg.console_log) {
+        Ok(f) => Stdio::from(f),
+        Err(_) => Stdio::null(),
+    };
+
+    let mut args = vec!["serve".to_string(), state.cfg.model_path.clone()];
+    for flag in state.cfg.extra_flags.split_whitespace() {
+        args.push(flag.to_string());
+    }
+
+    log(state, &format!("starting {:?} with args {:?}", shadow_exe, args));
+    match Command::new(&shadow_exe)
+        .args(&args)
         .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stdout(stdout_cfg)
+        .stderr(stderr_cfg)
         .creation_flags(CREATE_NO_WINDOW)
         .spawn()
     {
         Ok(c) => {
-            log(state, &format!("started launcher, pid {}", c.id()));
+            log(state, &format!("started shadow.exe server pid {}", c.id()));
             state.started_by_us.store(true, Ordering::SeqCst);
             *child = Some(c);
         }
-        Err(e) => log(state, &format!("launcher failed: {}", e)),
+        Err(e) => log(state, &format!("failed to start shadow.exe: {e}")),
     }
 }
 
 fn stop_server(state: &State) {
-    *state.child.lock().unwrap() = None;
+    if let Some((addr, _)) = host_port(&state.cfg.url) {
+        if let Ok(mut s) = TcpStream::connect_timeout(
+            &addr.to_socket_addrs().ok().and_then(|mut a| a.next()).unwrap_or_else(|| "127.0.0.1:8081".parse().unwrap()),
+            Duration::from_millis(500),
+        ) {
+            let _ = s.write_all(b"POST /shutdown HTTP/1.0\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n");
+        }
+    }
+    let mut child = state.child.lock().unwrap();
+    if let Some(mut c) = child.take() {
+        let _ = c.kill();
+    }
     state.started_by_us.store(false, Ordering::SeqCst);
 }
 
@@ -290,11 +386,13 @@ fn main() {
                 .build()?;
 
             let show = MenuItem::with_id(app, "show", "Show Shadow", true, None::<&str>)?;
-            let restart = MenuItem::with_id(app, "restart", "Reconnect to Shadow", true, None::<&str>)?;
+            let restart = MenuItem::with_id(app, "restart", "Restart Server", true, None::<&str>)?;
+            let log_item = MenuItem::with_id(app, "log", "Open Console Log", true, None::<&str>)?;
             let settings = MenuItem::with_id(app, "settings", "Open Settings", true, None::<&str>)?;
             let quit = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
-            let sep = PredefinedMenuItem::separator(app)?;
-            let menu = Menu::with_items(app, &[&show, &restart, &sep, &settings, &quit])?;
+            let sep1 = PredefinedMenuItem::separator(app)?;
+            let sep2 = PredefinedMenuItem::separator(app)?;
+            let menu = Menu::with_items(app, &[&show, &restart, &sep1, &log_item, &settings, &sep2, &quit])?;
 
             let mut tray = TrayIconBuilder::new()
                 .tooltip("Shadow")
@@ -305,9 +403,14 @@ fn main() {
                     "restart" => {
                         let app = app.clone();
                         std::thread::spawn(move || {
+                            stop_server(&app.state::<State>());
                             show_window(&app);
                             open_chat(&app);
                         });
+                    }
+                    "log" => {
+                        let state = app.state::<State>();
+                        open_path(app, &state.cfg.console_log);
                     }
                     "settings" => {
                         let state = app.state::<State>();
