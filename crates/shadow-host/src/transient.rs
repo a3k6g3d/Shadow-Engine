@@ -21,7 +21,7 @@
 //! (`WouldBlock`) instead of recycling a slot that is still promised to someone.
 
 use crate::{Buffer, SECTOR};
-use shadow_abi::Status;
+use crate::Status;
 
 /// One staged blob, as its holder knows it.  Copyable on purpose: it is a claim to be checked, not ownership, so
 /// holding one keeps nothing alive - which is exactly why it has to be checked.

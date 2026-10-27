@@ -1,6 +1,0 @@
-[package]
-name = "shadow-abi"
-version.workspace = true
-edition.workspace = true
-
-[dependencies]

@@ -30,7 +30,15 @@ use std::path::Path;
 use tokio::sync::mpsc::{self, error::SendError, error::TryRecvError, UnboundedReceiver};
 use tokio::sync::oneshot;
 
-use crate::ffi::want_ioring;
+/// STRATA_HOST_IORING=1 asks for the I/O ring; it is taken only where this Windows has one, else the completion port.
+fn want_ioring() -> bool {
+    #[cfg(windows)]
+    {
+        std::env::var("STRATA_HOST_IORING").is_ok_and(|v| v == "1") && crate::ioring::RingFile::available()
+    }
+    #[cfg(not(windows))]
+    false
+}
 use crate::{Buffer, Completion, DirectFile, Status, Waker, WAKE_TAG};
 #[cfg(windows)]
 use crate::ioring::{RingFile, RingWaker};

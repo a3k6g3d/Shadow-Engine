@@ -19,10 +19,8 @@
 //! pads.  The C++ reader does the same thing for the same reason (`expert_source.hpp`, the 4 KiB-aligned windows
 //! scattered into blobs).
 
-pub mod ffi;
 pub mod transient;
 pub mod window;
-pub mod protocol;
 pub mod scheduler;
 pub mod placement;
 pub mod router;
@@ -32,7 +30,8 @@ pub mod ioring;
 use std::collections::VecDeque;
 use std::os::raw::c_void;
 use std::path::Path;
-use shadow_abi::{Ring, Status};
+pub mod status;
+pub use status::{Ring, Status};
 
 /// The unit direct access works in: offset, length and buffer address are all multiples of this.
 pub const SECTOR: u64 = 4096;

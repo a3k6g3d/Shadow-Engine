@@ -17,7 +17,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
-use shadow_abi::Status;
+use crate::Status;
 
 /// Where predictions go.  Returns nothing on purpose: a prediction has no way to report back into the compute path.
 pub trait Warm {

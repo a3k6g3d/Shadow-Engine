@@ -14,7 +14,7 @@ the user decided that on 2026-10-26 and cancelled the Strata benchmark plan ("Ph
 
 Crates: `shadow-model` (GGUF reader, tokenizer, NFC, chat template, dequant, the CPU forward pass), `shadow-cuda`
 (driver + NVRTC + kernels registry + `GpuBackend`), `shadow` (the CLI and the reference-comparison code), and the older
-`shadow-host` / `shadow-abi` / `shadow-eval` (I/O ring, retired C seam, the memory yardstick).
+`shadow-host` / `shadow-eval` (I/O ring and tier bookkeeping, the memory yardstick).
 
 ## Where things stand
 
@@ -41,11 +41,10 @@ them changes the prompt; the fixture records the ids, so it stays valid as a fix
   (48 layers and the long prompt). `shadow generate --gpu` uses it; `--gpu-matvec` is the older matvec-only path. What
   is left in stage 2 is speed: fast matvec kernels (the reference ones decode per weight) and CUDA graphs.
 - **Stage 3, the tiers**: the VRAM expert cache and the pinned RAM tier (4 GiB rule in `pinned.rs`) are done and
-  gated (STATUS.md, Stage 3). Left: the drive through `shadow-host`'s ring (needs `shadow-host` off the retired
-  `shadow-abi` first), and an evictable/adaptive RAM tier if the static one proves too rigid. Placement profiles are
+  gated (STATUS.md, Stage 3). Left: the drive through `shadow-host`'s ring (`shadow-host` is free of the retired seam now), and an evictable/adaptive RAM tier if the static one proves too rigid. Placement profiles are
   Shadow's own `SHRC` routing counts (`profiles/`, `--record-routing`).
-- **Stage 2 speed**, now the biggest per-token cost after the tiers: the reference matvec kernels (20% of a token
-  before the RAM tier) and launch overhead (CUDA graphs). `SHADOW_PROFILE=1` prints where a token's time goes.
+- **Stage 2 speed**: batched expert matvecs are in (0.1.3). Left: the mixers/norms/glue (~30 ms/token, 21%) and
+  launch overhead (CUDA graphs). `SHADOW_PROFILE=1` prints where a token's time goes.
 - **Stage 4**: the HTTP server (hyper + serde_json, decided), `shadow-bench`, and Shadow's own noise floor (the
   10.1% / 27.0% / 51.9% in BENCH_NOISE.md is Strata's).
 - Cleanup owed: remove `shadow-abi`, `include/shadow/c/abi.h`, `shadow-host/src/ffi.rs` and `protocol.rs` once

@@ -160,7 +160,9 @@ shapes.
 **Retired**, kept in git and not deleted in this step: `crates/shadow-abi`, `include/shadow/c/abi.h`,
 `shadow-host/src/ffi.rs` (the DLL the C++ engine loaded) and `shadow-host/src/protocol.rs` (the GEN/T/DONE line
 protocol). They are the join to an engine that is no longer in the plan. They are removed in their own commit once
-stage 2 runs without them.
+stage 2 runs without them. **Done 2026-10-27** (version 0.1.4): removed with `shadow-host`'s seam tests, its
+`shadow-hostd` / fake-engine binaries and its facade-finding `build.rs`; `Status` and `Ring` moved into
+`shadow-host/src/status.rs`; `shadow-host` is a plain Rust library.
 
 ## The oracle: how we know the math is right without Strata
 

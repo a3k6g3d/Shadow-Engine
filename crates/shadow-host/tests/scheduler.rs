@@ -53,7 +53,7 @@ async fn several_reads_through_one_handle_answered_by_one_thread() {
         tasks.push(tokio::spawn(async move {
             let buffer = Buffer::alloc(SECTOR as usize, false).expect("cannot allocate an aligned buffer");
             let c = sched.submit(i * SECTOR, buffer, i).await.expect("the read failed");
-            assert_eq!(c.status, shadow_abi::Status::Ok, "task {i}: the read did not complete cleanly");
+            assert_eq!(c.status, shadow_host::Status::Ok, "task {i}: the read did not complete cleanly");
             assert_eq!(c.tag, i, "task {i}: the completion carries the tag of another task");
             assert_eq!(c.bytes as u64, SECTOR, "task {i}: the read came back short");
             let start = (i * SECTOR) as usize;
@@ -86,7 +86,7 @@ async fn the_ring_refuses_an_unaligned_offset_and_hands_the_buffer_back() {
     let buffer = Buffer::alloc(SECTOR as usize, false).expect("cannot allocate an aligned buffer");
     match sched.submit(1, buffer, 7).await {
         Err((status, Some(buffer))) => {
-            assert_ne!(status, shadow_abi::Status::Ok, "a refusal reported success");
+            assert_ne!(status, shadow_host::Status::Ok, "a refusal reported success");
             // Nothing was read, so the buffer is what the caller put in it: still the caller's, still intact.
             assert_eq!(buffer.as_slice().len(), SECTOR as usize, "the refusal handed back the wrong buffer");
             assert!(buffer.as_slice().iter().all(|&b| b == 0), "the refusal came back with bytes in it");
@@ -97,7 +97,7 @@ async fn the_ring_refuses_an_unaligned_offset_and_hands_the_buffer_back() {
     // And the same handle still works afterwards.
     let buffer = Buffer::alloc(SECTOR as usize, false).expect("cannot allocate an aligned buffer");
     let c = sched.submit(0, buffer, 9).await.expect("the handle stopped working after a refusal");
-    assert_eq!(c.status, shadow_abi::Status::Ok, "the read after a refusal did not complete cleanly");
+    assert_eq!(c.status, shadow_host::Status::Ok, "the read after a refusal did not complete cleanly");
     assert_eq!(c.tag, 9, "the read after a refusal answered the wrong tag");
     assert_eq!(c.bytes as u64, SECTOR, "the read after a refusal came back short");
     assert_eq!(c.buffer.as_slice(), &want[..SECTOR as usize], "the read after a refusal changed its bytes");

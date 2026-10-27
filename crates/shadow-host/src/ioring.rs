@@ -14,7 +14,7 @@ use crate::{Buffer, Completion, SECTOR, WAKE_TAG};
 use std::collections::VecDeque;
 use std::os::raw::c_void;
 use std::path::Path;
-use shadow_abi::Status;
+use crate::Status;
 
 type Handle = *mut c_void;
 type HResult = i32;
