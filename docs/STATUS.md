@@ -65,6 +65,19 @@ greedy runs, not stream by stream; no sampling (greedy only).
   expert slices read from the file and uploaded per token, and in the reference matvec kernels (15-23 GB/s on the
   IQ2/IQ3 experts). Both are the next work: stage 3's VRAM/RAM tiers keep experts resident, and fast matvec kernels.
 - Every quant type dequantizes on the GPU bit for bit like the Rust reference (`kernels/quants.cuh`).
+- **Fast matvecs (2026-10-27, `kernels/matvec.cu`)**: `matvec_fast_*` decodes 8 consecutive weights per lane with a
+  block's scale, grid row and sign byte decoded once (each weight computed with the reference's operations; only the
+  f32 summation order differs), and `matvec_batch_*` runs all routed experts of a layer in one launch (blockIdx.y =
+  expert, a device table of addresses). The IQ grid tables moved from `__constant__` to global memory: constant memory
+  serializes a warp whose lanes read different rows, which every IQ decoder does (that alone took the reference
+  IQ2_S kernel from 0.035 to 0.016 ms). `tests/matvec.rs` holds all three kernels to the CPU on real tensors; the
+  dequant kernels stay bit-exact. Per expert matrix, batched vs reference: IQ2_S 3.9x, IQ3_XXS 3.7x, IQ3_S 3.1x,
+  Q2_0 1.9x, IQ4_NL 1.3x. **Not faster: the fast single-matrix kernel on F32 (0.4x), Q2_0/IQ4_NL (~1.0x) and the
+  K-quants** - so single dense matvecs use it only for IQ2_S / IQ3_XXS / IQ3_S / IQ4_XS.
+- **8 interleaved runs per arm**, both with the 24 GiB RAM tier, "What is 17 times 23?", 64 tokens: before (308f74f)
+  median 0.168 s/token, p90 0.169; batched **0.135**, p90 0.138. Paired: median 19.4%, min 17.9%, max 21.3%; identical
+  tokens in all 16 runs. Routed-expert matvec time per token (synchronized profile): 43.8 -> 10.5 ms. Clears Strata's
+  10.1% median floor, not its 27.0% p90 (Shadow's own floor is unmeasured).
 
 ## Open
 

@@ -13,7 +13,7 @@
 //! least recently used slot.  The experts the current token routes to are never the victims of its own misses.
 
 use crate::driver::{Context, DeviceBuffer};
-use crate::kernels::{file, Arg, Program, QUANT_KERNELS};
+use crate::kernels::{file, Arg, Program, FAST_KERNELS, QUANT_KERNELS};
 use crate::pinned::PinnedRegion;
 use shadow_model::forward::{ple_rows, route, Model, Stepper};
 use shadow_model::gguf::TensorInfo;
@@ -113,6 +113,9 @@ struct Bufs<'c> {
     wg: DeviceBuffer<'c>,
     wu: DeviceBuffer<'c>,
     wd: DeviceBuffer<'c>,
+    /// Per layer: the routed experts' gate, up and down addresses (u64 each) and their weights (f32), for the batched
+    /// matvecs and axpy_many.
+    tab: DeviceBuffer<'c>,
     // PLE
     pe: DeviceBuffer<'c>,
     key: DeviceBuffer<'c>,
@@ -293,6 +296,7 @@ impl<'c, 'm> GpuSession<'c, 'm> {
             .max()
             .unwrap_or(0);
         let a = |n: usize| ctx.alloc(n.max(1) * 4).map_err(e);
+        let k = c.n_expert_used;
         let b = Bufs {
             r: a(ch)?, rn: a(ch)?, down: a(c.hc_rank)?, up: a(ch)?, u: a(h)?, gl: a(cs)?, g: a(cs)?, y: a(h)?, e: a(h)?,
             qkv: a(2 * kd + vd)?, x: a(2 * kd + vd)?, z: a(vd)?, beta: a(c.ssm_v_heads)?, alpha: a(c.ssm_v_heads)?,
@@ -300,9 +304,10 @@ impl<'c, 'm> GpuSession<'c, 'm> {
             qg: a(2 * qd)?, q: a(qd)?, gate: a(qd)?, kk: a(kvd)?, vv: a(kvd)?, iq: a(c.idx_heads * id)?,
             iqn: a(c.idx_heads * id)?, ik: a(id)?, ao: a(qd)?, scores: a(cap / ratio + 1)?,
             toks: a(c.idx_budget + ratio)?, scratch: ctx.alloc(c.n_head * cap * 8).map_err(e)?,
-            rl: a(c.n_expert)?, my: a(h)?, eg: a(c.expert_ff)?, eu: a(c.expert_ff)?, act: a(c.expert_ff)?, eo: a(h)?,
-            sgl: a(1)?, wg: ctx.alloc(max_expert).map_err(e)?, wu: ctx.alloc(max_expert).map_err(e)?,
-            wd: ctx.alloc(max_expert).map_err(e)?,
+            // the routed experts' intermediates, one row per routed expert (the shared expert uses the first)
+            rl: a(c.n_expert)?, my: a(h)?, eg: a(k * c.expert_ff)?, eu: a(k * c.expert_ff)?, act: a(k * c.expert_ff)?,
+            eo: a(k * h)?, sgl: a(1)?, wg: ctx.alloc(k * max_expert).map_err(e)?, wu: ctx.alloc(k * max_expert).map_err(e)?,
+            wd: ctx.alloc(k * max_expert).map_err(e)?, tab: ctx.alloc(k * (3 * 8 + 4)).map_err(e)?,
             pe: a(h)?, key: a(ch)?, keyn: a(ch)?, val: a(h)?, qry: a(ch)?, gv: a(ch)?, gvn: a(ch)?,
             logits: a(c.vocab)?,
         };
@@ -411,8 +416,13 @@ impl<'c, 'm> GpuSession<'c, 'm> {
 
     fn matvec(&self, t: &TensorInfo, wptr: u64, rows: usize, x: u64, y: u64) {
         let ty = t.ty.name();
-        let &(_, _, _, _, entry) = QUANT_KERNELS.iter().find(|q| q.0 == ty)
-            .unwrap_or_else(|| panic!("{}: no matvec kernel for {ty}", t.name));
+        // the 8-at-a-time kernel where tests/matvec.rs measured it faster than the reference one (the IQ formats)
+        let fast = matches!(ty.as_str(), "IQ2_S" | "IQ3_XXS" | "IQ3_S" | "IQ4_XS") && t.dims[0].is_multiple_of(8);
+        let entry = if fast {
+            FAST_KERNELS.iter().find(|q| q.0 == ty).unwrap().1
+        } else {
+            QUANT_KERNELS.iter().find(|q| q.0 == ty).unwrap_or_else(|| panic!("{}: no matvec kernel for {ty}", t.name)).4
+        };
         // SAFETY: `rows` whole rows of t.dims[0] weights at wptr; x holds t.dims[0] floats, y `rows`.
         unsafe {
             self.mvp.launch(entry, ((rows as u32).div_ceil(8), 1, 1), (256, 1, 1), 0, None,
@@ -682,7 +692,6 @@ impl<'c, 'm> GpuSession<'c, 'm> {
         }
         self.expert_uploads += 3;
     }
-
     fn moe(&mut self, l: usize) {
         let c = &self.m.cfg;
         let p = format!("blk.{l}");
@@ -734,24 +743,51 @@ impl<'c, 'm> GpuSession<'c, 'm> {
                 at.push([base, base + sizes[0] as u64, base + (sizes[0] + sizes[1]) as u64]);
             }
         }
-        for (i, &(e, wgt)) in top.iter().enumerate() {
-            let [pg, pu, pd] = if self.cache.slots > 0 {
-                at[i]
-            } else {
-                // no cache: through the scratch buffers, every time
-                self.mark("routed expert matvecs");
-                let dst = [self.b.wg.ptr, self.b.wu.ptr, self.b.wd.ptr];
+        if self.cache.slots == 0 {
+            // no cache: each routed expert into its own row of the scratch buffers, every time
+            let stride = (self.b.wg.bytes / c.n_expert_used) as u64;
+            for (i, &(e, _)) in top.iter().enumerate() {
+                let dst = [self.b.wg.ptr + i as u64 * stride, self.b.wu.ptr + i as u64 * stride,
+                           self.b.wd.ptr + i as u64 * stride];
                 self.fetch_expert(l, e, &names, &sizes, dst);
-                dst
-            };
-            let b = &self.b;
-            let (tg, tu, td) = (&infos[0], &infos[1], &infos[2]);
-            self.matvec(tg, pg, tg.dims[1] as usize, b.u.ptr, b.eg.ptr);
-            self.matvec(tu, pu, tu.dims[1] as usize, b.u.ptr, b.eu.ptr);
-            self.k1("swiglu", c.expert_ff, &[Arg::Ptr(b.eg.ptr), Arg::Ptr(b.eu.ptr), Arg::Ptr(b.act.ptr), Arg::U32(c.expert_ff as u32)]);
-            self.matvec(td, pd, td.dims[1] as usize, b.act.ptr, b.eo.ptr);
-            self.k1("axpy", h, &[Arg::Ptr(b.my.ptr), Arg::Ptr(b.eo.ptr), Arg::U32(h as u32), Arg::F32(wgt as f32)]);
+                at.push(dst);
+            }
         }
+        // one table per layer - every expert's gate, up and down address, then the weights - and one launch per
+        // projection for all of them (tests/matvec.rs: 3-4x the per-expert kernels on the IQ formats)
+        let n = top.len();
+        let mut tab = Vec::with_capacity(n * 28);
+        for part in 0..3 {
+            for a in &at {
+                tab.extend_from_slice(&a[part].to_le_bytes());
+            }
+        }
+        for &(_, wgt) in &top {
+            tab.extend_from_slice(&(wgt as f32).to_le_bytes());
+        }
+        self.upload_to(self.b.tab.ptr, &tab);
+        let b = &self.b;
+        let ff = c.expert_ff;
+        let batch = |t: &TensorInfo, part: u64, x: u64, xs: usize, y: u64, ys: usize| {
+            let ty = t.ty.name();
+            let entry = FAST_KERNELS.iter().find(|q| q.0 == ty).unwrap_or_else(|| panic!("{}: no batched kernel", t.name)).2;
+            let (rows, cols) = (t.dims[1] as u32, t.dims[0] as u32);
+            assert_eq!(cols % 8, 0, "{}: the batched kernel needs whole chunks of 8", t.name);
+            // SAFETY: n table entries from tab + part * 8n, each a rows x cols matrix as stored; n inputs of cols floats
+            // (stride xs, or 0 when shared) and n outputs of rows floats (stride ys) inside this session's buffers.
+            unsafe {
+                self.mvp.launch(entry, (rows.div_ceil(8), n as u32, 1), (256, 1, 1), 0, None,
+                                &[Arg::Ptr(b.tab.ptr + part * 8 * n as u64), Arg::Ptr(x), Arg::U32(xs as u32), Arg::Ptr(y),
+                                  Arg::U32(ys as u32), Arg::U32(rows), Arg::U32(cols)])
+            }
+            .unwrap_or_else(|err| panic!("{}: {err}", t.name));
+        };
+        batch(&infos[0], 0, b.u.ptr, 0, b.eg.ptr, ff);
+        batch(&infos[1], 1, b.u.ptr, 0, b.eu.ptr, ff);
+        self.k1("swiglu", n * ff, &[Arg::Ptr(b.eg.ptr), Arg::Ptr(b.eu.ptr), Arg::Ptr(b.act.ptr), Arg::U32((n * ff) as u32)]);
+        batch(&infos[2], 2, b.act.ptr, ff, b.eo.ptr, h);
+        self.k1("axpy_many", h, &[Arg::Ptr(b.my.ptr), Arg::Ptr(b.eo.ptr), Arg::Ptr(b.tab.ptr + 24 * n as u64),
+                                  Arg::U32(h as u32), Arg::U32(n as u32)]);
         self.mark("routed expert matvecs");
         let b = &self.b;
         self.mv(&format!("{p}.ffn_gate_shexp.weight"), b.u.ptr, b.eg.ptr);

@@ -12,7 +12,10 @@ public static class Ws {
 }
 '@
 $t0 = Get-Date
-$p = Start-Process $Exe -ArgumentList $Arguments -PassThru -WindowStyle Hidden -RedirectStandardOutput $Out -RedirectStandardError "$Out.err"
+$sp = @{ FilePath = $Exe; PassThru = $true; WindowStyle = 'Hidden'; RedirectStandardOutput = $Out; RedirectStandardError = "$Out.err" }
+if ($Arguments) { $sp.ArgumentList = $Arguments } # Start-Process refuses an empty -ArgumentList
+$p = Start-Process @sp
+if (-not $p) { "could not start '$Exe' - nothing ran"; exit 1 } # else the watchdog below would loop on nothing forever
 # QUOTA_LIMITS_HARDWS_MIN_DISABLE | QUOTA_LIMITS_HARDWS_MAX_ENABLE
 if (-not [Ws]::SetProcessWorkingSetSizeEx($p.Handle, [UIntPtr]([uint64]256MB), [UIntPtr]([uint64]$CapGiB * 1GB), 0x6)) {
   Stop-Process -Id $p.Id -Force; "cap NOT set - killed, nothing ran uncapped"; exit 1

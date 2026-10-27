@@ -282,6 +282,16 @@ extern "C" __global__ void axpy(float* y, const float* x, unsigned int n, float 
     if (i < n) y[i] += a * x[i];
 }
 
+// y += sum_j w[j] * x[j * n ..], j = 0, 1, ... k-1 in that order: k axpy calls in one launch (the routed experts'
+// outputs, weighted, into the MoE sum), with the same per-element arithmetic as axpy.
+extern "C" __global__ void axpy_many(float* y, const float* x, const float* w, unsigned int n, unsigned int k) {
+    unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    float acc = y[i];
+    for (unsigned int j = 0; j < k; j++) acc += w[j] * x[(u64) j * n + i];
+    y[i] = acc;
+}
+
 // y += sigmoid(gl[0]) * x  (the shared expert's gate, a one-row matvec already in gl)
 extern "C" __global__ void axpy_sigmoid(float* y, const float* x, const float* gl, unsigned int n) {
     unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;

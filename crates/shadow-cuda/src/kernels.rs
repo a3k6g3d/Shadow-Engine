@@ -79,6 +79,29 @@ pub const QUANT_KERNELS: &[(&str, u32, u32, &str, &str)] = &[
     ("F32", 1, 4, "", "matvec_f32"),
 ];
 
+const MATVEC_BATCH: &[P] = &[P::ConstPtr, P::ConstPtr, P::U32, P::Ptr, P::U32, P::U32, P::U32];
+
+/// Per quant type: (ggml type name, fast matvec entry, batched matvec entry) - matvec.cu's 8-weights-at-a-time
+/// kernels.  Same signature as the reference matvec for the first; the second takes a device table of matrix
+/// addresses and input/output strides, one matrix per blockIdx.y.
+pub const FAST_KERNELS: &[(&str, &str, &str)] = &[
+    ("Q4_K", "matvec_fast_q4_k", "matvec_batch_q4_k"),
+    ("Q5_K", "matvec_fast_q5_k", "matvec_batch_q5_k"),
+    ("Q6_K", "matvec_fast_q6_k", "matvec_batch_q6_k"),
+    ("IQ4_NL", "matvec_fast_iq4_nl", "matvec_batch_iq4_nl"),
+    ("IQ4_XS", "matvec_fast_iq4_xs", "matvec_batch_iq4_xs"),
+    ("Q2_0", "matvec_fast_q2_0", "matvec_batch_q2_0"),
+    ("IQ2_S", "matvec_fast_iq2_s", "matvec_batch_iq2_s"),
+    ("IQ3_XXS", "matvec_fast_iq3_xxs", "matvec_batch_iq3_xxs"),
+    ("IQ3_S", "matvec_fast_iq3_s", "matvec_batch_iq3_s"),
+    ("BF16", "matvec_fast_bf16", "matvec_batch_bf16"),
+    ("F32", "matvec_fast_f32", "matvec_batch_f32"),
+];
+
+const fn batch(name: &'static str) -> Entry {
+    Entry { name, params: MATVEC_BATCH }
+}
+
 const fn unary(name: &'static str) -> Entry {
     Entry { name, params: UNARY }
 }
@@ -124,6 +147,13 @@ pub const FILES: &[File] = &[
             matvec("matvec_q4_k"), matvec("matvec_q5_k"), matvec("matvec_q6_k"), matvec("matvec_iq4_nl"),
             matvec("matvec_iq4_xs"), matvec("matvec_q2_0"), matvec("matvec_iq2_s"), matvec("matvec_iq3_xxs"),
             matvec("matvec_iq3_s"), matvec("matvec_bf16"), matvec("matvec_f32"),
+            matvec("matvec_fast_q4_k"), batch("matvec_batch_q4_k"), matvec("matvec_fast_q5_k"), batch("matvec_batch_q5_k"),
+            matvec("matvec_fast_q6_k"), batch("matvec_batch_q6_k"), matvec("matvec_fast_iq4_nl"),
+            batch("matvec_batch_iq4_nl"), matvec("matvec_fast_iq4_xs"), batch("matvec_batch_iq4_xs"),
+            matvec("matvec_fast_q2_0"), batch("matvec_batch_q2_0"), matvec("matvec_fast_iq2_s"),
+            batch("matvec_batch_iq2_s"), matvec("matvec_fast_iq3_xxs"), batch("matvec_batch_iq3_xxs"),
+            matvec("matvec_fast_iq3_s"), batch("matvec_batch_iq3_s"), matvec("matvec_fast_bf16"),
+            batch("matvec_batch_bf16"), matvec("matvec_fast_f32"), batch("matvec_batch_f32"),
         ],
     },
     File {
@@ -150,6 +180,7 @@ pub const FILES: &[File] = &[
             e("index_scores", &[C, C, W, U, U, U]),
             e("swiglu", &[C, C, W, U]),
             e("axpy", &[W, C, U, F]),
+            e("axpy_many", &[W, C, C, U, U]),
             e("axpy_sigmoid", &[W, C, C, U]),
             e("ple_gate", &[C, C, C, W, U]),
             e("ple_conv_step", &[C, W, C, W, U, U, U]),
