@@ -31,6 +31,9 @@ fn main() -> ExitCode {
     if args.first().map(String::as_str) == Some("kv") && args.len() == 3 {
         return kv(&PathBuf::from(&args[1]), &args[2]);
     }
+    if args.first().map(String::as_str) == Some("stats") && args.len() >= 3 {
+        return stats(&PathBuf::from(&args[1]), &args[2..]);
+    }
     if args.first().map(String::as_str) != Some("inspect") || args.len() < 2 {
         eprintln!("usage: shadow inspect MODEL.gguf [--tensors] [--kv]\n       shadow kv MODEL.gguf KEY");
         return ExitCode::from(2);
@@ -74,6 +77,50 @@ fn kv(path: &std::path::Path, key: &str) -> ExitCode {
             eprintln!("shadow kv: no key {key}");
             return ExitCode::FAILURE;
         }
+    }
+    ExitCode::SUCCESS
+}
+
+/// min / mean / max and the first values of float tensors (F32, F16, BF16): for questions like "are the norm weights
+/// stored zero-centred?" that only the numbers answer.
+fn stats(path: &std::path::Path, names: &[String]) -> ExitCode {
+    use shadow_model::half::{bf16_to_f32, f16_to_f32};
+    let g = match Gguf::open(path) {
+        Ok(g) => g,
+        Err(e) => {
+            eprintln!("shadow stats: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    for name in names {
+        let Some(t) = g.tensor(name) else {
+            println!("{name}: no such tensor");
+            continue;
+        };
+        if t.nbytes() > 256 << 20 {
+            println!("{name}: {} bytes, too big to summarise here", t.nbytes());
+            continue;
+        }
+        let b = match g.read_tensor(t) {
+            Ok(b) => b,
+            Err(e) => {
+                println!("{name}: {e}");
+                continue;
+            }
+        };
+        let v: Vec<f32> = match t.ty.name().as_str() {
+            "F32" => b.chunks(4).map(|c| f32::from_le_bytes(c.try_into().unwrap())).collect(),
+            "F16" => b.chunks(2).map(|c| f16_to_f32(u16::from_le_bytes(c.try_into().unwrap()))).collect(),
+            "BF16" => b.chunks(2).map(|c| bf16_to_f32(u16::from_le_bytes(c.try_into().unwrap()))).collect(),
+            ty => {
+                println!("{name}: {ty}, not a float type");
+                continue;
+            }
+        };
+        let (mn, mx) = v.iter().fold((f32::MAX, f32::MIN), |(a, b), &x| (a.min(x), b.max(x)));
+        let mean = v.iter().map(|&x| x as f64).sum::<f64>() / v.len() as f64;
+        let head: Vec<String> = v.iter().take(6).map(|x| format!("{x:.5}")).collect();
+        println!("{name} {} {:?}: min {mn:.5} mean {mean:.5} max {mx:.5}  [{}]", t.ty, t.dims, head.join(", "));
     }
     ExitCode::SUCCESS
 }
