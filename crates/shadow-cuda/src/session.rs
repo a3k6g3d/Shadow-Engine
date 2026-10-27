@@ -164,6 +164,40 @@ pub struct Tiers {
     pub order: Option<Vec<(usize, usize)>>,
 }
 
+impl Tiers {
+    /// From command-line flags: `--expert-cache-gib G`, `--ram-tier-gib G|auto`, `--placement FILE` (SHRC).  Says on
+    /// stderr what `auto` chose and when the RAM tier has no placement.
+    pub fn from_args(args: &[String]) -> Result<Tiers, String> {
+        const GIB: f64 = (1u64 << 30) as f64;
+        let flag = |f: &str| args.iter().position(|a| a == f).and_then(|i| args.get(i + 1));
+        let gib = |f: &str| -> Result<Option<usize>, String> {
+            flag(f).map(|v| v.parse::<f64>().map(|g| (g * GIB) as usize).map_err(|_| format!("{f}: not a number: {v}")))
+                .transpose()
+        };
+        let order = match flag("--placement") {
+            Some(p) => {
+                let rc = RoutingCounts::load(std::path::Path::new(p)).map_err(|e| format!("--placement: {e}"))?;
+                eprintln!("placement: {p}, {} tokens of routing", rc.tokens);
+                Some(rc.ranked())
+            }
+            None => None,
+        };
+        let ram_bytes = match flag("--ram-tier-gib").map(String::as_str) {
+            Some("auto") => {
+                let b = crate::pinned::auto_tier_bytes() as usize;
+                eprintln!("RAM tier: auto = {:.2} GiB ({:.2} GiB available less a {:.0} GiB margin)", b as f64 / GIB,
+                          crate::pinned::available_ram() as f64 / GIB, crate::pinned::AUTO_MARGIN as f64 / GIB);
+                b
+            }
+            _ => gib("--ram-tier-gib")?.unwrap_or(0),
+        };
+        if ram_bytes > 0 && order.is_none() {
+            eprintln!("RAM tier: no --placement, so an arbitrary (uniform) choice of experts");
+        }
+        Ok(Tiers { vram_cache: gib("--expert-cache-gib")?, ram_bytes, order })
+    }
+}
+
 /// Routed experts in pinned RAM (stage 3's second tier): each expert's [gate | up | down] slices packed together,
 /// filled once at the start from the placement order and never evicted.  A VRAM cache miss on one of them is a DMA
 /// copy instead of a file read.
@@ -393,6 +427,33 @@ impl<'c, 'm> GpuSession<'c, 'm> {
     /// (slots, bytes per slot, hits, misses) of the expert cache.
     pub fn cache_stats(&self) -> (usize, usize, u64, u64) {
         (self.cache.slots, self.cache.slot_bytes, self.cache.hits, self.cache.misses)
+    }
+
+    /// The tokens this session has read, in order: its state is exactly the state after them.
+    pub fn tokens(&self) -> &[u32] {
+        &self.tokens
+    }
+
+    /// The positions this session was made for.
+    pub fn capacity(&self) -> usize {
+        self.cap
+    }
+
+    /// Back to the state before any token: every DeltaNet state and conv window, the attention caches (as `new` leaves
+    /// them: zeroed, no complete blocks) and the n-gram conv state zeroed, the token list emptied.  The weights, the
+    /// expert cache and the RAM tier stay.
+    pub fn reset(&mut self) {
+        for (s, conv) in self.delta.iter_mut().flatten() {
+            s.zero().unwrap();
+            conv.zero().unwrap();
+        }
+        for a in self.attn.iter_mut().flatten() {
+            a.k.zero().unwrap();
+            a.v.zero().unwrap();
+            a.nblocks = 0;
+        }
+        self.ple_state.zero().unwrap();
+        self.tokens.clear();
     }
 
     /// One expert's slice of a fused `[in, out, n_expert]` tensor: its info as a 2-D matrix, without reading it.

@@ -1,0 +1,19 @@
+[package]
+name = "shadow-serve"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# The HTTP server (docs/SHADOW_PLAN.md, stage 4): hyper + serde_json, decided 2026-10-26.  hyper-util for the tokio
+# glue, http-body-util for whole and streamed bodies, futures-util to turn the engine's channel into a body stream.
+
+[dependencies]
+shadow-model = { path = "../shadow-model" }
+shadow-cuda = { path = "../shadow-cuda" }
+tokio = { version = "1.54.1", features = ["rt-multi-thread", "net", "sync", "macros", "time"] }
+hyper = { version = "1.11", features = ["server", "http1"] }
+hyper-util = { version = "0.1.21", features = ["tokio"] }
+http-body-util = "0.1.5"
+bytes = "1.12"
+futures-util = { version = "0.3.34", default-features = false }
+serde_json = "1.0.151"

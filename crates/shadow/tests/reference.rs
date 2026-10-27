@@ -117,6 +117,32 @@ fn the_gpu_session_matches_the_reference() {
     assert_exact(&r, "gpu session", 5e-3);
 }
 
+/// `GpuSession::reset` puts the session back exactly: the same session, compared, reset, compared again, must match
+/// the reference both times (a state that survived the reset would move the second run's streams).  This is what the
+/// server relies on to reuse one session across requests.
+#[test]
+fn a_reset_gpu_session_matches_the_reference_again() {
+    let p = std::env::var("SHADOW_MODEL").unwrap_or_else(|_| MODEL.into());
+    if !Path::new(&p).is_file() {
+        return eprintln!("SKIPPED, not passed: no model at {p}");
+    }
+    let Ok(ctx) = shadow_cuda::Context::new(0) else { return eprintln!("SKIPPED, not passed: no CUDA device") };
+    let fx = Fixture::load(&Path::new(env!("CARGO_MANIFEST_DIR")).join("../../eval/fixtures/reference_gguf")).unwrap();
+    let model = Model::load(Gguf::open(Path::new(&p)).unwrap()).unwrap();
+    let mut s = shadow_cuda::session::GpuSession::new(&ctx, &model, 4096).unwrap();
+    let first = shadow::reference::compare_stepper(&mut s, &fx);
+    assert_exact(&first, "gpu session, first run", 5e-3);
+    // something unrelated in between, through all 48 layers, so the reset has state to clear everywhere
+    s.stop_after = None;
+    for t in [9707u32, 11, 1879, 553] {
+        s.step(t);
+    }
+    s.reset();
+    assert!(s.tokens().is_empty());
+    let again = shadow::reference::compare_stepper(&mut s, &fx);
+    assert_exact(&again, "gpu session, after reset", 5e-3);
+}
+
 /// The GPU session's sparse indexer on the 2,600-token prompt (about a minute).
 #[test]
 #[ignore = "about a minute: 2,600 tokens through 4 layers on the GPU"]

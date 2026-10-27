@@ -43,6 +43,9 @@ fn main() -> ExitCode {
     if args.first().map(String::as_str) == Some("generate") && args.len() >= 3 {
         return generate(&PathBuf::from(&args[1]), &args[2], &args[3..]);
     }
+    if args.first().map(String::as_str) == Some("serve") && args.len() >= 2 {
+        return serve(&PathBuf::from(&args[1]), &args[2..]);
+    }
     if args.first().map(String::as_str) != Some("inspect") || args.len() < 2 {
         eprintln!("usage: shadow inspect MODEL.gguf [--tensors] [--kv]\n       shadow kv MODEL.gguf KEY");
         return ExitCode::from(2);
@@ -177,6 +180,40 @@ fn compare(path: &std::path::Path, fixture: &std::path::Path, mode: Mode) -> Exi
     ExitCode::SUCCESS
 }
 
+/// `shadow serve MODEL [--host H] [--port P] [--ctx N] [tier flags]`: the HTTP server (shadow-serve) on the GPU
+/// session.  Port 8081 by default - 8080 is where the user's other server lives.
+fn serve(path: &std::path::Path, rest: &[String]) -> ExitCode {
+    let flag = |f: &str| rest.iter().position(|a| a == f).and_then(|i| rest.get(i + 1));
+    let host = flag("--host").map(String::as_str).unwrap_or("127.0.0.1");
+    let port: u16 = flag("--port").and_then(|v| v.parse().ok()).unwrap_or(8081);
+    let n_ctx: usize = flag("--ctx").and_then(|v| v.parse().ok()).unwrap_or(16384);
+    let addr = match format!("{host}:{port}").parse() {
+        Ok(a) => a,
+        Err(e) => {
+            eprintln!("shadow serve: {host}:{port}: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let tiers = match shadow_cuda::session::Tiers::from_args(rest) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("shadow serve: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let cfg = shadow_serve::ServeConfig {
+        engine: shadow_serve::engine::Config { model: path.to_path_buf(), n_ctx: gpu_capacity(n_ctx), tiers },
+        addr,
+    };
+    match shadow_serve::run(cfg) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("shadow serve: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
 /// Greedy decoding.  `-n N` tokens (default 8); `--chat` wraps the prompt in the chat template (thinking off).
 /// `--gpu` runs the whole forward pass on GPU 0; `--gpu-matvec` only its matrix-vector products; neither: the stage 1
 /// CPU reference, slow by design.
@@ -240,38 +277,13 @@ fn generate(path: &std::path::Path, prompt: &str, rest: &[String]) -> ExitCode {
     let t_up = std::time::Instant::now();
     let mut s: Box<dyn Stepper + '_> = match (&ctx, &backend) {
         (Some(c), None) => {
-            let flag = |f: &str| rest.iter().position(|a| a == f).and_then(|i| rest.get(i + 1));
-            let gib = |f: &str| flag(f).and_then(|v| v.parse::<f64>().ok()).map(|g| (g * GIB) as usize);
-            let order = match flag("--placement") {
-                Some(p) => match shadow_model::placement::RoutingCounts::load(std::path::Path::new(p)) {
-                    Ok(rc) => {
-                        eprintln!("placement: {p}, {} tokens of routing", rc.tokens);
-                        Some(rc.ranked())
-                    }
-                    Err(e) => {
-                        eprintln!("shadow generate: --placement: {e}");
-                        return ExitCode::FAILURE;
-                    }
-                },
-                None => None,
+            let tiers = match shadow_cuda::session::Tiers::from_args(rest) {
+                Ok(t) => t,
+                Err(e) => {
+                    eprintln!("shadow generate: {e}");
+                    return ExitCode::FAILURE;
+                }
             };
-            let tiers = shadow_cuda::session::Tiers {
-                vram_cache: gib("--expert-cache-gib"),
-                ram_bytes: match flag("--ram-tier-gib").map(String::as_str) {
-                    Some("auto") => {
-                        let b = shadow_cuda::pinned::auto_tier_bytes() as usize;
-                        eprintln!("RAM tier: auto = {:.2} GiB ({:.2} GiB available less a {:.0} GiB margin)", b as f64 / GIB,
-                                  shadow_cuda::pinned::available_ram() as f64 / GIB,
-                                  shadow_cuda::pinned::AUTO_MARGIN as f64 / GIB);
-                        b
-                    }
-                    _ => gib("--ram-tier-gib").unwrap_or(0),
-                },
-                order,
-            };
-            if tiers.ram_bytes > 0 && tiers.order.is_none() {
-                eprintln!("RAM tier: no --placement, so an arbitrary (uniform) choice of experts");
-            }
             let gs = match shadow_cuda::session::GpuSession::with_tiers(c, &model, gpu_capacity(ids.len() + n_new), tiers) {
                 Ok(s) => s,
                 Err(e) => {

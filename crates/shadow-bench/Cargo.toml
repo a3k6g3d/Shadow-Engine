@@ -1,0 +1,13 @@
+[package]
+name = "shadow-bench"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# The bench (docs/SHADOW_PLAN.md, stage 4; docs/BENCH_NOISE.md's protocol): launches `shadow serve` per run under
+# tools/run_capped.ps1, drives a fixed conversation over HTTP, and summarises arms turn by turn.  A minimal HTTP/1.1
+# client over std::net is enough for a localhost server; serde_json reads and writes the records.
+
+[dependencies]
+serde_json = "1.0.151"
+shadow-cuda = { path = "../shadow-cuda" }  # pinned::available_ram, for the RAM samples
