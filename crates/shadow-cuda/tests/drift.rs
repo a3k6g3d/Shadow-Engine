@@ -9,6 +9,11 @@ fn kernels_dir() -> std::path::PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join("..").join("kernels")
 }
 
+/// Line endings aside: git may check the files out with CRLF.
+fn same_text(a: &str, b: &str) -> bool {
+    a.replace("\r\n", "\n") == b.replace("\r\n", "\n")
+}
+
 #[test]
 fn every_kernel_file_is_registered() {
     let mut on_disk: Vec<String> = std::fs::read_dir(kernels_dir())
@@ -27,8 +32,11 @@ fn every_kernel_file_is_registered() {
 fn signatures_match_both_ways() {
     for f in FILES {
         let disk = std::fs::read_to_string(kernels_dir().join(f.file)).unwrap();
-        assert_eq!(disk.replace("\r\n", "\n"), f.source.replace("\r\n", "\n"),
-                   "{}: the binary carries a different source than the file (rebuild)", f.file);
+        assert!(same_text(&disk, f.source), "{}: the binary carries a different source than the file (rebuild)", f.file);
+        for h in f.headers {
+            let hd = std::fs::read_to_string(kernels_dir().join(h.file)).unwrap();
+            assert!(same_text(&hd, h.source), "{}: the binary carries a different header than the file (rebuild)", h.file);
+        }
         let parsed = parse_entries(&disk);
         for (name, params) in &parsed {
             let entry = f.entries.iter().find(|e| e.name == name)

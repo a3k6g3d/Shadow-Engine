@@ -41,18 +41,29 @@ pub struct Entry {
     pub params: &'static [P],
 }
 
-/// One `.cu` file: its name under `kernels/`, its source, and its entry points.
+/// One `.cu` file: its name under `kernels/`, its source, the headers it needs (prepended after the prelude, in
+/// order), and its entry points.
 pub struct File {
     pub file: &'static str,
     pub source: &'static str,
+    pub headers: &'static [Header],
     pub entries: &'static [Entry],
+}
+
+/// A `.cuh` under `kernels/` that a file lists; carried in the binary like the files.
+pub struct Header {
+    pub file: &'static str,
+    pub source: &'static str,
 }
 
 pub const PRELUDE: &str = include_str!("../../../kernels/prelude.cuh");
 
+pub const IQ_TABLES: Header = Header { file: "iq_tables.cuh", source: include_str!("../../../kernels/iq_tables.cuh") };
+
 const UNARY: &[P] = &[P::ConstPtr, P::Ptr, P::U32];
 
-/// The grid-free dequant types: (entry point, ggml type name, weights per block, bytes per block).
+/// The dequant kernels: (entry point, ggml type name, weights per block, bytes per block).  BF16 is separate (one
+/// weight per thread, any count).
 pub const DEQUANT: &[(&str, &str, u32, u32)] = &[
     ("dequant_q4_k", "Q4_K", 256, 144),
     ("dequant_q5_k", "Q5_K", 256, 176),
@@ -60,17 +71,22 @@ pub const DEQUANT: &[(&str, &str, u32, u32)] = &[
     ("dequant_iq4_nl", "IQ4_NL", 32, 18),
     ("dequant_iq4_xs", "IQ4_XS", 256, 136),
     ("dequant_q2_0", "Q2_0", 64, 18),
+    ("dequant_iq2_s", "IQ2_S", 256, 82),
+    ("dequant_iq3_xxs", "IQ3_XXS", 256, 98),
+    ("dequant_iq3_s", "IQ3_S", 256, 110),
 ];
 
 pub const FILES: &[File] = &[
     File {
         file: "vector_add.cu",
         source: include_str!("../../../kernels/vector_add.cu"),
+        headers: &[],
         entries: &[Entry { name: "vector_add", params: &[P::ConstPtr, P::ConstPtr, P::Ptr, P::U32] }],
     },
     File {
         file: "convert.cu",
         source: include_str!("../../../kernels/convert.cu"),
+        headers: &[],
         entries: &[
             Entry { name: "f16_to_f32_all", params: UNARY },
             Entry { name: "bf16_to_f32_all", params: UNARY },
@@ -81,6 +97,7 @@ pub const FILES: &[File] = &[
     File {
         file: "dequant.cu",
         source: include_str!("../../../kernels/dequant.cu"),
+        headers: &[],
         entries: &[
             Entry { name: "dequant_q4_k", params: UNARY },
             Entry { name: "dequant_q5_k", params: UNARY },
@@ -91,6 +108,16 @@ pub const FILES: &[File] = &[
             Entry { name: "dequant_bf16", params: UNARY },
         ],
     },
+    File {
+        file: "dequant_iq.cu",
+        source: include_str!("../../../kernels/dequant_iq.cu"),
+        headers: &[IQ_TABLES],
+        entries: &[
+            Entry { name: "dequant_iq2_s", params: UNARY },
+            Entry { name: "dequant_iq3_xxs", params: UNARY },
+            Entry { name: "dequant_iq3_s", params: UNARY },
+        ],
+    },
 ];
 
 pub fn file(name: &str) -> Option<&'static File> {
@@ -99,7 +126,11 @@ pub fn file(name: &str) -> Option<&'static File> {
 
 /// The whole program NVRTC compiles for one file: the prelude, then the file.
 pub fn program_source(f: &File) -> String {
-    format!("{PRELUDE}\n#line 1 \"{}\"\n{}", f.file, f.source)
+    let mut s = String::from(PRELUDE);
+    for h in f.headers {
+        s += &format!("\n#line 1 \"{}\"\n{}", h.file, h.source);
+    }
+    s + &format!("\n#line 1 \"{}\"\n{}", f.file, f.source)
 }
 
 /// One file compiled and loaded on one GPU.

@@ -1,5 +1,5 @@
 //! The GPU dequant kernels against the Rust reference (shadow_model::quant), bit for bit: every block of
-//! eval/fixtures/dequant.txt of the types the kernels cover (themselves checked bit for bit against ggml's reference),
+//! eval/fixtures/dequant.txt of the types the kernels cover (all but F32 and F16, which need no kernel) (themselves checked bit for bit against ggml's reference),
 //! plus Q2_0 on real blocks of the model when it is on this machine.
 
 use shadow_cuda::kernels::{file, Arg, Program, DEQUANT};
@@ -46,7 +46,9 @@ fn gpu_dequant_matches_the_reference_bit_for_bit() {
     if let Err(e) = nvrtc::version() {
         return eprintln!("SKIPPED, not passed: no NVRTC ({e})");
     }
-    let prog = Program::load(&ctx, file("dequant.cu").unwrap()).unwrap();
+    let progs = [Program::load(&ctx, file("dequant.cu").unwrap()).unwrap(),
+                 Program::load(&ctx, file("dequant_iq.cu").unwrap()).unwrap()];
+    let prog_for = |entry: &str| progs.iter().find(|p| p.file.entries.iter().any(|e| e.name == entry)).unwrap();
     let text = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../../eval/fixtures/dequant.txt")).unwrap();
     let lines: Vec<&str> = text.lines().filter(|l| !l.starts_with('#') && !l.is_empty()).collect();
     let mut checked = std::collections::BTreeMap::new();
@@ -60,16 +62,16 @@ fn gpu_dequant_matches_the_reference_bit_for_bit() {
         }
         dequantize(GgmlType::from_id(type_id(ty)), &bytes, &mut cpu).unwrap();
         let got = if ty == "BF16" {
-            gpu(&ctx, &prog, "dequant_bf16", 1, &bytes, 1)
+            gpu(&ctx, prog_for("dequant_bf16"), "dequant_bf16", 1, &bytes, 1)
         } else {
             let d = DEQUANT.iter().find(|d| d.1 == ty).unwrap();
-            gpu(&ctx, &prog, d.0, d.2, &bytes, 1)
+            gpu(&ctx, prog_for(d.0), d.0, d.2, &bytes, 1)
         };
         same(&got, &cpu, &format!("{ty} {} block {}", head[1], head[2]));
         *checked.entry(ty).or_insert(0) += 1;
     }
     eprintln!("fixture blocks checked on the GPU: {checked:?}");
-    assert_eq!(checked.len(), 6, "Q4_K, Q5_K, Q6_K, IQ4_NL, IQ4_XS, BF16");
+    assert_eq!(checked.len(), 9, "every quant type of the model that has fixtures, BF16 included");
 
     // Q2_0: no fixture exists, so against the Rust implementation on real blocks - a whole expert of blk.1's down
     // projection - when the model is here.
@@ -90,6 +92,6 @@ fn gpu_dequant_matches_the_reference_bit_for_bit() {
     f.read_exact(&mut data).unwrap();
     let mut cpu = vec![0f32; n_blocks as usize * 64];
     dequantize(t.ty, &data, &mut cpu).unwrap();
-    same(&gpu(&ctx, &prog, "dequant_q2_0", 64, &data, n_blocks), &cpu, "Q2_0 blk.1 expert 0");
+    same(&gpu(&ctx, prog_for("dequant_q2_0"), "dequant_q2_0", 64, &data, n_blocks), &cpu, "Q2_0 blk.1 expert 0");
     eprintln!("Q2_0: {} real blocks checked", n_blocks);
 }
