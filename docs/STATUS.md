@@ -72,20 +72,39 @@ greedy runs, not stream by stream; no sampling (greedy only).
    definition and is checked by hand and by the end-to-end match above, which runs through it.
 2. ~~The sparse indexer~~: implemented and gated (see Stage 1).
 3. **Speculative decoding's draft**: the GGUF has no MTP tensors (ARCH.md, question 7).
-4. **Stage 3** has its first tier only: the VRAM expert cache (see Stage 3 below). Pinned RAM (with the 4 GiB rule in
-   code) and the drive through the ring have not started; the plan's floor protocol applies from there.
+4. **Stage 3** has two of its three tiers: the VRAM expert cache and the pinned RAM tier with the 4 GiB rule in code
+   (see Stage 3 below). The drive is read with plain blocking `seek_read`, not yet through `shadow-host`'s ring.
 
-## Stage 3: the VRAM expert cache, gated for correctness; speed unmeasured
+## Stage 3: VRAM cache + pinned RAM tier, gated for correctness; one interleaved comparison
 
-- `GpuSession` keeps routed experts in one VRAM arena of 2.54 MiB slots (gate + up + down), LRU, the current token's
-  experts never evicted by its own misses. It takes the free VRAM less `VRAM_RESERVE` (1.5 GiB) by default;
-  `shadow generate --gpu --expert-cache-gib G` sets it (`0`: no cache).
-- **Gate (2026-10-27):** `tests/reference.rs` (4 passed), `shadow compare ... reference_gguf48 --gpu` (all 48 layers,
-  cosine 1.000, routing 10/10 everywhere) and the long-prompt GPU indexer test pass with the cache on. Greedy
-  "What is 17 times 23?" (`--chat`, 24 tokens) gives **identical token ids** with no cache, 2 GiB and auto (4.57 GiB,
-  1,842 slots).
-- **One run each, not the protocol** (no 8 interleaved runs): 0.371 s/token without the cache, 0.215 at 2 GiB (45.5%
-  hits), 0.176 at 4.57 GiB (61.3% hits). Indicative only until stage 4's bench measures it against a floor.
+**Where a token's time went before the RAM tier** (`SHADOW_PROFILE=1`, synchronized at every phase, 86 steps, VRAM
+cache 4.57 GiB): expert reads from the file 43%, expert uploads 19%, routed-expert matvecs 20%, mixers/norms/glue 14%,
+router top-10 on the host 1%. That is why the RAM tier came before moving the router and indexer onto the GPU.
+
+- **VRAM expert cache**: one arena of 2.54 MiB slots (gate + up + down), LRU, the current token's experts never
+  evicted by its own misses; the free VRAM less `VRAM_RESERVE` (1.5 GiB) by default, `--expert-cache-gib G` (`0`: none).
+- **Pinned RAM tier** (`crates/shadow-cuda/src/pinned.rs`, `RamTier` in `session.rs`): `VirtualAlloc` +
+  `cuMemHostRegister`, experts packed, filled once at the start in placement order, never evicted; a VRAM miss on one
+  of them is a DMA copy instead of a file read. `--ram-tier-gib G`, `--placement FILE`.
+- **The 4 GiB rule, in code**: `pinned::RAM_FLOOR` (not configurable). Checked before allocating, after the pages are
+  locked, every GiB while filling, and at the end. `tests/pinned.rs`: refuses when available RAM is artificially low
+  (a fake RAM source, nothing consumed), notices RAM falling after pinning, refuses `available - 2 GiB` on the real
+  machine, and the GPU copies pinned memory back byte for byte. `headroom()` unit test includes the overflow case
+  (`u64::MAX`), which the first version got wrong.
+- **Placement profile, Shadow's own format** (`crates/shadow-model/src/placement.rs`, `SHRC`): per-(layer, expert)
+  routing counts; `--record-routing FILE` merges a run into it. `profiles/routing-6prompts.shrc`: 675 tokens from six
+  chat prompts (code, explanation, history, translation, arithmetic word problem, poem), none of them the evaluation
+  prompts below.
+- **Gate (2026-10-27):** greedy, `--chat`, 48 tokens, two prompts ("What is 17 times 23?" and a South American
+  rivers question): **identical token ids** for drive only (no cache, no RAM tier), RAM + drive, VRAM + RAM + drive,
+  and VRAM + drive. `tests/reference.rs` (with the ignored long-prompt GPU test) passes. Lowest available RAM in a 24 GiB
+  pinned run: 18.1 GiB.
+- **Speed, 8 interleaved runs per arm** (alternating order, "What is 17 times 23?", 64 tokens, generation s/token):
+  VRAM cache only: median 0.217, p90 0.238, worst 0.238. VRAM cache + 24 GiB RAM tier: median **0.171**, p90 0.173,
+  worst 0.173. Paired, B is faster in all 8 pairs: median 20.9%, min 12.2%, max 28.2%. **It clears the median noise floor
+  (10.1%) but not the p90 floor (27.0%), and both are Strata's floor, not Shadow's** (unmeasured until stage 4). Not
+  `decode_warm` (one generation per launch). The 24 GiB fill adds ~20 s at start.
+- Before the RAM tier, single runs: 0.371 s/token without the cache, 0.215 at 2 GiB, 0.176 at 4.57 GiB.
 
 ## Things that went wrong, so they are not repeated
 

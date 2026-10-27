@@ -310,10 +310,24 @@ impl Model {
         let t = self.g.tensor(name).unwrap_or_else(|| panic!("no tensor {name}"));
         let per = (t.nbytes() / t.dims[2]) as usize;
         let mut b = vec![0u8; per];
-        read_at(&self.files[t.shard], &mut b, t.offset + (e * per) as u64).unwrap();
+        self.expert_into(name, e, &mut b);
         let mut one = t.clone();
         one.dims = vec![t.dims[0], t.dims[1]];
         (one, b)
+    }
+
+    /// Bytes of one expert's slice of a fused expert tensor.
+    pub fn expert_bytes(&self, name: &str) -> usize {
+        let t = self.g.tensor(name).unwrap_or_else(|| panic!("no tensor {name}"));
+        (t.nbytes() / t.dims[2]) as usize
+    }
+
+    /// One expert's slice read straight into `out` (exactly `expert_bytes(name)` long), e.g. a pinned tier's slot.
+    pub fn expert_into(&self, name: &str, e: usize, out: &mut [u8]) {
+        let t = self.g.tensor(name).unwrap_or_else(|| panic!("no tensor {name}"));
+        let per = (t.nbytes() / t.dims[2]) as usize;
+        assert_eq!(out.len(), per, "{name}: {} bytes for a {per}-byte expert slice", out.len());
+        read_at(&self.files[t.shard], out, t.offset + (e * per) as u64).unwrap();
     }
 
     /// One row of the n-gram table (ple_head_dim weights).
@@ -766,6 +780,10 @@ pub trait Stepper {
     /// A line about how it ran (caches, uploads), for the command line.
     fn report(&self) -> String {
         String::new()
+    }
+    /// How often each (layer, expert) was routed to, if this stepper records it.
+    fn routing(&self) -> Option<&crate::placement::RoutingCounts> {
+        None
     }
 }
 

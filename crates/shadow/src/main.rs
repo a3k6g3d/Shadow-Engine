@@ -240,9 +240,30 @@ fn generate(path: &std::path::Path, prompt: &str, rest: &[String]) -> ExitCode {
     let t_up = std::time::Instant::now();
     let mut s: Box<dyn Stepper + '_> = match (&ctx, &backend) {
         (Some(c), None) => {
-            let cache = rest.iter().position(|a| a == "--expert-cache-gib").and_then(|i| rest.get(i + 1))
-                .and_then(|v| v.parse::<f64>().ok()).map(|g| (g * GIB) as usize);
-            let gs = match shadow_cuda::session::GpuSession::with_cache(c, &model, gpu_capacity(ids.len() + n_new), cache) {
+            let flag = |f: &str| rest.iter().position(|a| a == f).and_then(|i| rest.get(i + 1));
+            let gib = |f: &str| flag(f).and_then(|v| v.parse::<f64>().ok()).map(|g| (g * GIB) as usize);
+            let order = match flag("--placement") {
+                Some(p) => match shadow_model::placement::RoutingCounts::load(std::path::Path::new(p)) {
+                    Ok(rc) => {
+                        eprintln!("placement: {p}, {} tokens of routing", rc.tokens);
+                        Some(rc.ranked())
+                    }
+                    Err(e) => {
+                        eprintln!("shadow generate: --placement: {e}");
+                        return ExitCode::FAILURE;
+                    }
+                },
+                None => None,
+            };
+            let tiers = shadow_cuda::session::Tiers {
+                vram_cache: gib("--expert-cache-gib"),
+                ram_bytes: gib("--ram-tier-gib").unwrap_or(0),
+                order,
+            };
+            if tiers.ram_bytes > 0 && tiers.order.is_none() {
+                eprintln!("RAM tier: no --placement, so an arbitrary (uniform) choice of experts");
+            }
+            let gs = match shadow_cuda::session::GpuSession::with_tiers(c, &model, gpu_capacity(ids.len() + n_new), tiers) {
                 Ok(s) => s,
                 Err(e) => {
                     eprintln!("shadow generate: --gpu: {e}");
@@ -285,6 +306,28 @@ fn generate(path: &std::path::Path, prompt: &str, rest: &[String]) -> ExitCode {
               t2.elapsed().as_secs_f64() / out.len().max(1) as f64);
     if !s.report().is_empty() {
         eprintln!("at the end: {}", s.report());
+    }
+    if let Some(p) = rest.iter().position(|a| a == "--record-routing").and_then(|i| rest.get(i + 1)) {
+        let Some(rc) = s.routing() else {
+            eprintln!("shadow generate: --record-routing needs --gpu");
+            return ExitCode::FAILURE;
+        };
+        let path = std::path::Path::new(p);
+        let mut all = rc.clone();
+        if path.is_file() {
+            match shadow_model::placement::RoutingCounts::load(path).and_then(|old| all.merge(&old).map(|_| ())) {
+                Ok(()) => {}
+                Err(e) => {
+                    eprintln!("shadow generate: --record-routing: {e}");
+                    return ExitCode::FAILURE;
+                }
+            }
+        }
+        if let Err(e) = all.save(path) {
+            eprintln!("shadow generate: --record-routing: {e}");
+            return ExitCode::FAILURE;
+        }
+        eprintln!("routing: {} tokens added to {p} ({} in all)", rc.tokens, all.tokens);
     }
     ExitCode::SUCCESS
 }

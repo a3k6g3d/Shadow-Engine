@@ -7,6 +7,7 @@ pub mod driver;
 pub mod dylib;
 pub mod kernels;
 pub mod nvrtc;
+pub mod pinned;
 pub mod session;
 pub mod sha256;
 

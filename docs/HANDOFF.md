@@ -40,8 +40,12 @@ them changes the prompt; the fixture records the ids, so it stays valid as a fix
 - **Stage 2 is done for correctness**: `GpuSession` runs the whole forward pass on the GPU and matches the reference
   (48 layers and the long prompt). `shadow generate --gpu` uses it; `--gpu-matvec` is the older matvec-only path. What
   is left in stage 2 is speed: fast matvec kernels (the reference ones decode per weight) and CUDA graphs.
-- **Stage 3, the tiers**: VRAM expert cache, pinned RAM (the 4 GiB headroom rule enforced in code, not in a doc), the
-  drive through `shadow-host`'s ring. Needs a placement profile in Shadow's own format.
+- **Stage 3, the tiers**: the VRAM expert cache and the pinned RAM tier (4 GiB rule in `pinned.rs`) are done and
+  gated (STATUS.md, Stage 3). Left: the drive through `shadow-host`'s ring (needs `shadow-host` off the retired
+  `shadow-abi` first), and an evictable/adaptive RAM tier if the static one proves too rigid. Placement profiles are
+  Shadow's own `SHRC` routing counts (`profiles/`, `--record-routing`).
+- **Stage 2 speed**, now the biggest per-token cost after the tiers: the reference matvec kernels (20% of a token
+  before the RAM tier) and launch overhead (CUDA graphs). `SHADOW_PROFILE=1` prints where a token's time goes.
 - **Stage 4**: the HTTP server (hyper + serde_json, decided), `shadow-bench`, and Shadow's own noise floor (the
   10.1% / 27.0% / 51.9% in BENCH_NOISE.md is Strata's).
 - Cleanup owed: remove `shadow-abi`, `include/shadow/c/abi.h`, `shadow-host/src/ffi.rs` and `protocol.rs` once
@@ -60,6 +64,8 @@ shadow stats    MODEL TENSOR...            # min/mean/max of float tensors (summ
 shadow dump     MODEL TENSOR OUT [--rows a,b | --expert E]   # dequantized f32; prints "ROWS COLS"
 shadow compare  MODEL FIXTURE_DIR [--gpu]  # stream-by-stream against a reference fixture
 shadow generate MODEL "prompt" [-n N] [--chat] [--gpu]
+    [--expert-cache-gib G] [--ram-tier-gib G --placement profiles/routing-6prompts.shrc] [--record-routing FILE]
+    # a RAM tier of G GiB raises the working set by G: give run_capped a cap of G + 8 or more
 ```
 MODEL is `J:/Strata-work/models/swift15/IQ3_S/Swift-Qwen3.8-Flash-Next-GSQ-RCO-abliterated-IQ3_S-00001-of-00002.gguf`
 (`SHADOW_MODEL` overrides it in the tests). Regenerating fixtures: `tools/make_reference_fixture.py`
