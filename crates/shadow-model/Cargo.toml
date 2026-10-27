@@ -9,3 +9,7 @@ license.workspace = true
 # under a `cargo update`.
 
 [dependencies]
+
+[dev-dependencies]
+# the JSON reader the fixture tests use (the yardstick's own, so there is still no outside dependency)
+shadow-eval = { path = "../shadow-eval" }

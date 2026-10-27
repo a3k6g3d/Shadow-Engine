@@ -19,6 +19,7 @@
 //! `unicode_table.rs` (generated); `\s` is Unicode White_Space, which is what `char::is_whitespace` tests.
 
 use crate::gguf::{Gguf, Value};
+use crate::nfc::nfc;
 use crate::unicode_table::RANGES;
 use std::collections::HashMap;
 
@@ -250,7 +251,8 @@ impl Tokenizer {
         }
     }
 
-    /// Text to token ids.  With `special`, special-token strings in the text become their ids (a chat template's
+    /// Text to token ids.  Plain text is NFC-normalized first, as the checkpoint's tokenizer.json does (the GGUF does
+    /// not carry that).  With `special`, special-token strings in the text become their ids (a chat template's
     /// `<|im_start|>`); without it they are tokenized as the plain text they are (a user typing `<|im_start|>`).
     pub fn encode(&self, text: &str, special: bool) -> Vec<u32> {
         let mut out = Vec::new();
@@ -266,7 +268,7 @@ impl Tokenizer {
             let (plain, after) = match hit {
                 Some((p, len, id)) => {
                     let plain = &rest[..p];
-                    for piece in split_qwen35(plain) {
+                    for piece in split_qwen35(&nfc(plain)) {
                         self.bpe(piece, &mut out);
                     }
                     out.push(id);
@@ -275,7 +277,7 @@ impl Tokenizer {
                 }
                 None => (rest, ""),
             };
-            for piece in split_qwen35(plain) {
+            for piece in split_qwen35(&nfc(plain)) {
                 self.bpe(piece, &mut out);
             }
             rest = after;

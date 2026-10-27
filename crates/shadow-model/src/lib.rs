@@ -5,6 +5,8 @@ pub mod chat;
 pub mod forward;
 pub mod gguf;
 pub mod half;
+pub mod nfc;
+pub mod nfc_table;
 pub mod quant;
 pub mod quant_tables;
 pub mod tokenizer;
