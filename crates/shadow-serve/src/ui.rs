@@ -177,9 +177,14 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
     #chat-panel {
       width: 100%;
       height: 100%;
+      min-height: 0;
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
     }
     #messages {
       flex: 1;
+      min-height: 0;
       overflow-y: auto;
       padding: 1.5rem;
       display: flex;
@@ -242,11 +247,47 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
     }
     .think-header {
       font-weight: 600;
-      cursor: pointer;
       display: flex;
       align-items: center;
-      gap: 0.4rem;
+      justify-content: space-between;
       user-select: none;
+      cursor: pointer;
+    }
+    .think-header-left {
+      display: flex;
+      align-items: center;
+      gap: 0.5rem;
+    }
+    .think-spinner {
+      width: 12px;
+      height: 12px;
+      border: 2px solid rgba(196, 181, 253, 0.3);
+      border-top-color: var(--think-text);
+      border-radius: 50%;
+      display: inline-block;
+      animation: spin 0.8s linear infinite;
+    }
+    @keyframes spin {
+      to { transform: rotate(360deg); }
+    }
+    .think-stop-btn {
+      background: rgba(239, 68, 68, 0.15);
+      border: 1px solid rgba(239, 68, 68, 0.4);
+      color: #fca5a5;
+      border-radius: 6px;
+      padding: 0.2rem 0.55rem;
+      font-size: 0.75rem;
+      font-weight: 600;
+      cursor: pointer;
+      display: inline-flex;
+      align-items: center;
+      gap: 0.3rem;
+      transition: all 0.15s ease;
+    }
+    .think-stop-btn:hover {
+      background: rgba(239, 68, 68, 0.35);
+      color: #ffffff;
+      border-color: #ef4444;
     }
     .think-content {
       margin-top: 0.5rem;
@@ -386,15 +427,19 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
       font-weight: 600;
       font-size: 0.9rem;
       cursor: pointer;
-      transition: background 0.15s;
+      transition: all 0.15s ease;
       display: none;
       align-items: center;
       justify-content: center;
       gap: 0.4rem;
       align-self: flex-end;
       height: 48px;
+      box-shadow: 0 0 12px rgba(239, 68, 68, 0.4);
     }
-    .stop-btn:hover { background: #dc2626; }
+    .stop-btn:hover {
+      background: #dc2626;
+      box-shadow: 0 0 16px rgba(239, 68, 68, 0.6);
+    }
 
     /* Bottom Control Bar */
     .controls-bar {
@@ -824,7 +869,7 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
         <div class="input-box">
           <textarea id="prompt-input" rows="1" placeholder="Ask Shadow to inspect files, run tests, or chat... (Shift+Enter for newline)"></textarea>
           <button id="send-btn" class="send-btn">Send</button>
-          <button id="stop-btn" class="stop-btn" onclick="stopGeneration()">
+          <button id="stop-btn" class="stop-btn" onclick="stopGeneration(event)">
             <span>⏹</span> Stop
           </button>
         </div>
@@ -1099,7 +1144,11 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
     let availableTools = [];
     let currentAbortController = null;
 
-    function stopGeneration() {
+    function stopGeneration(e) {
+      if (e) {
+        if (typeof e.stopPropagation === 'function') e.stopPropagation();
+        if (typeof e.preventDefault === 'function') e.preventDefault();
+      }
       if (currentAbortController) {
         currentAbortController.abort();
         currentAbortController = null;
@@ -1111,6 +1160,28 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
       inputEl.focus();
       timingInfo.textContent = 'Generation stopped by user';
     }
+
+    function toggleThinkBlock(el) {
+      const block = el.closest('.think-block');
+      if (!block) return;
+      const content = block.querySelector('.think-content');
+      const chevron = block.querySelector('.think-chevron');
+      if (content.style.display === 'none') {
+        content.style.display = 'block';
+        if (chevron) chevron.textContent = '▼';
+      } else {
+        content.style.display = 'none';
+        if (chevron) chevron.textContent = '▶';
+      }
+    }
+
+    // Global Escape key to instantly halt active generation
+    window.addEventListener('keydown', (e) => {
+      if (e.key === 'Escape' && isGenerating) {
+        e.preventDefault();
+        stopGeneration(e);
+      }
+    });
 
     // Load tool schemas from server
     async function loadTools() {
@@ -1329,7 +1400,17 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
           <div class="avatar">S</div>
           <div class="bubble">
             <div class="think-block" style="display:none;">
-              <div class="think-header">Thinking...</div>
+              <div class="think-header">
+                <div class="think-header-left" onclick="toggleThinkBlock(this)">
+                  <span class="think-spinner"></span>
+                  <span class="think-title">Thinking...</span>
+                  <span class="think-timer" style="opacity:0.75; font-size:0.78rem; font-weight:normal;"></span>
+                  <span class="think-chevron" style="font-size:0.75rem; opacity:0.6; display:none;">▼</span>
+                </div>
+                <button class="think-stop-btn" onclick="stopGeneration(event)" title="Stop thinking">
+                  <span>⏹</span> Stop Thinking
+                </button>
+              </div>
               <div class="think-content"></div>
             </div>
             <div class="msg-content"><span class="cursor-blink"></span></div>
@@ -1344,6 +1425,8 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
 
         let rawContent = '';
         let rawThinking = '';
+        let thinkStart = performance.now();
+        let isThinking = false;
 
         const payloadMessages = [];
         if (currentPersona && currentPersona.trim()) {
@@ -1397,11 +1480,32 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
                   if (!delta) continue;
 
                   if (delta.reasoning_content) {
-                    thinkBlock.style.display = 'block';
+                    if (!isThinking) {
+                      isThinking = true;
+                      thinkStart = performance.now();
+                      thinkBlock.style.display = 'block';
+                    }
                     rawThinking += delta.reasoning_content;
                     thinkContent.textContent = rawThinking;
+                    const elapsed = ((performance.now() - thinkStart) / 1000).toFixed(1);
+                    const timerEl = thinkBlock.querySelector('.think-timer');
+                    if (timerEl) timerEl.textContent = `(${elapsed}s)`;
                   }
                   if (delta.content) {
+                    if (isThinking) {
+                      isThinking = false;
+                      const elapsed = ((performance.now() - thinkStart) / 1000).toFixed(1);
+                      const spinner = thinkBlock.querySelector('.think-spinner');
+                      if (spinner) spinner.style.display = 'none';
+                      const titleEl = thinkBlock.querySelector('.think-title');
+                      if (titleEl) titleEl.textContent = `Thought for ${elapsed}s`;
+                      const timerEl = thinkBlock.querySelector('.think-timer');
+                      if (timerEl) timerEl.textContent = '';
+                      const thinkStopBtn = thinkBlock.querySelector('.think-stop-btn');
+                      if (thinkStopBtn) thinkStopBtn.style.display = 'none';
+                      const chevron = thinkBlock.querySelector('.think-chevron');
+                      if (chevron) chevron.style.display = 'inline-block';
+                    }
                     rawContent += delta.content;
                     msgContent.innerHTML = renderMarkdown(rawContent) + '<span class="cursor-blink"></span>';
                   }
@@ -1409,6 +1513,21 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
                 } catch (_) {}
               }
             }
+          }
+
+          if (isThinking) {
+            isThinking = false;
+            const elapsed = ((performance.now() - thinkStart) / 1000).toFixed(1);
+            const spinner = thinkBlock.querySelector('.think-spinner');
+            if (spinner) spinner.style.display = 'none';
+            const titleEl = thinkBlock.querySelector('.think-title');
+            if (titleEl) titleEl.textContent = `Thought for ${elapsed}s`;
+            const timerEl = thinkBlock.querySelector('.think-timer');
+            if (timerEl) timerEl.textContent = '';
+            const thinkStopBtn = thinkBlock.querySelector('.think-stop-btn');
+            if (thinkStopBtn) thinkStopBtn.style.display = 'none';
+            const chevron = thinkBlock.querySelector('.think-chevron');
+            if (chevron) chevron.style.display = 'inline-block';
           }
 
           msgContent.innerHTML = renderMarkdown(rawContent);
@@ -1450,6 +1569,17 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
           }
         } catch (err) {
           if (err.name === 'AbortError') {
+            if (isThinking) {
+              const elapsed = ((performance.now() - thinkStart) / 1000).toFixed(1);
+              const spinner = thinkBlock.querySelector('.think-spinner');
+              if (spinner) spinner.style.display = 'none';
+              const titleEl = thinkBlock.querySelector('.think-title');
+              if (titleEl) titleEl.textContent = `Stopped thinking after ${elapsed}s`;
+              const timerEl = thinkBlock.querySelector('.think-timer');
+              if (timerEl) timerEl.textContent = '';
+              const thinkStopBtn = thinkBlock.querySelector('.think-stop-btn');
+              if (thinkStopBtn) thinkStopBtn.style.display = 'none';
+            }
             msgContent.innerHTML = renderMarkdown(rawContent);
             const cursor = msgContent.querySelector('.cursor-blink');
             if (cursor) cursor.remove();

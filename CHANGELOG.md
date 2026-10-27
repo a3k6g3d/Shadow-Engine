@@ -2,6 +2,14 @@
 
 All notable changes to Shadow will be documented in this file.
 
+## [0.1.22] — 2026-10-27
+### Fixed
+- **Stop Button Availability During Active Reasoning**:
+  - Added dedicated **`⏹ Stop Thinking`** button directly into the active `.think-header` alongside a live timer and pulsing spinner, allowing users to instantly halt generation while the model is reasoning without having to wait for the thought to complete.
+  - Fixed viewport height chain in Chat view (`#messages { min-height: 0; }` and `#chat-panel { min-height: 0; overflow: hidden; }`), preventing lengthy reasoning streams from expanding `#messages` beyond the viewport ceiling and pushing `#input-pane` (and the lower chat bar Stop button) off the bottom of the screen.
+  - Added global `Escape` key listener (`window.addEventListener('keydown')`) to trigger immediate generation cancellation from anywhere in the window.
+  - Enhanced thought header transition: on thought completion or abort, displays `Thought for Xs` / `Stopped thinking after Xs` with an interactive collapsible accordion (`▼`/`▶`).
+
 ## [0.1.21] — 2026-10-27
 ### Changed
 - **Made MTP Speculative Decoding Strictly Opt-In (`--mtp <DIR>`)**:
