@@ -1,0 +1,9 @@
+{
+  "identifier": "default",
+  "description": "Permissions for Shadow desktop UI window",
+  "windows": ["main"],
+  "permissions": [
+    "core:event:allow-listen",
+    "core:event:allow-unlisten"
+  ]
+}

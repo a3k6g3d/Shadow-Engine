@@ -37,6 +37,7 @@ Shadow runs a built-in OpenAI-compatible HTTP server and embedded web chat UI:
 shadow serve <path-to-gguf> [--port 8081] [--host 127.0.0.1] [--ram-tier-gib 30]
 ```
 
+* **Desktop UI (`shadow-ui.exe`)**: Native Windows desktop launcher built with Rust and Tauri 2 (WebView2). Connects to `http://127.0.0.1:8081`, provides system tray controls, and manages single-instance window focusing.
 * **Web Chat UI**: Visit `http://127.0.0.1:8081/` in any browser for the built-in dark-mode chat interface with real-time SSE streaming, collapsible `<think>` reasoning blocks, and live performance metrics (tok/s, VRAM, and tier stats).
 * **API Endpoints**:
   * `POST /v1/chat/completions`: OpenAI-compatible streaming and non-streaming chat completions.
