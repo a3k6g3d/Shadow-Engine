@@ -285,8 +285,19 @@ impl Model {
         Mat { t, bytes: &self.dense[name] }
     }
 
+    /// A dense tensor as stored: its info and its bytes (held in RAM since `load`).
+    pub fn dense(&self, name: &str) -> (&TensorInfo, &[u8]) {
+        let m = self.mat(name);
+        (m.t, m.bytes)
+    }
+
+    /// The names of every dense tensor (everything but the routed experts and the n-gram table).
+    pub fn dense_names(&self) -> impl Iterator<Item = &str> {
+        self.dense.keys().map(String::as_str)
+    }
+
     /// A small tensor, whole, as f32.
-    fn vec(&self, name: &str) -> Vec<f32> {
+    pub fn vec(&self, name: &str) -> Vec<f32> {
         let m = self.mat(name);
         let n = m.bytes.len() / m.row_bytes() * m.cols();
         let mut y = vec![0f32; n];
@@ -295,7 +306,7 @@ impl Model {
     }
 
     /// One expert's slice of a `[in, out, n_expert]` tensor, read from the file.
-    fn expert(&self, name: &str, e: usize) -> (TensorInfo, Vec<u8>) {
+    pub fn expert(&self, name: &str, e: usize) -> (TensorInfo, Vec<u8>) {
         let t = self.g.tensor(name).unwrap_or_else(|| panic!("no tensor {name}"));
         let per = (t.nbytes() / t.dims[2]) as usize;
         let mut b = vec![0u8; per];
@@ -306,7 +317,7 @@ impl Model {
     }
 
     /// One row of the n-gram table (ple_head_dim weights).
-    fn ple_row(&self, row: i64) -> Vec<f32> {
+    pub fn ple_row(&self, row: i64) -> Vec<f32> {
         let t = self.g.tensor("per_layer_token_embd.weight").unwrap();
         let (be, bb) = t.ty.block().unwrap();
         let rb = (t.dims[0] / be * bb) as usize;
@@ -632,21 +643,14 @@ impl<'m> Session<'m> {
         let c = &m.cfg;
         let p = format!("blk.{l}");
         let logits = self.mv(&format!("{p}.ffn_gate_inp.weight"), u);
-        let mx = logits.iter().cloned().fold(f32::MIN, f32::max);
-        let ex: Vec<f64> = logits.iter().map(|&v| ((v - mx) as f64).exp()).collect();
-        let z: f64 = ex.iter().sum();
-        let mut idx: Vec<usize> = (0..c.n_expert).collect();
-        idx.sort_by(|&a, &b| ex[b].partial_cmp(&ex[a]).unwrap().then(a.cmp(&b)));
-        let top = &idx[..c.n_expert_used];
-        let tz: f64 = top.iter().map(|&e| ex[e] / z).sum();
-        let route_idx: Vec<f32> = top.iter().map(|&e| e as f32).collect();
-        let route_w: Vec<f32> = top.iter().map(|&e| ((ex[e] / z) / tz) as f32).collect();
+        let top = route(&logits, c.n_expert_used);
+        let route_idx: Vec<f32> = top.iter().map(|&(e, _)| e as f32).collect();
+        let route_w: Vec<f32> = top.iter().map(|&(_, w)| w as f32).collect();
         self.rec(format!("layer{l}.route_idx"), &route_idx);
         self.rec(format!("layer{l}.route_w"), &route_w);
         let mut y = vec![0f64; c.hidden];
         let swiglu = |gate: Vec<f32>, up: Vec<f32>| -> Vec<f32> { gate.iter().zip(&up).map(|(&g, &u)| silu(g) * u).collect() };
-        for &e in top {
-            let w = (ex[e] / z) / tz;
+        for &(e, w) in &top {
             let (tg, bg) = m.expert(&format!("{p}.ffn_gate_exps.weight"), e);
             let (tu, bu) = m.expert(&format!("{p}.ffn_up_exps.weight"), e);
             let (td, bd) = m.expert(&format!("{p}.ffn_down_exps.weight"), e);
@@ -667,26 +671,7 @@ impl<'m> Session<'m> {
         let c = &m.cfg;
         let p = format!("blk.{l}");
         let (h, cs) = (c.hidden, c.streams);
-        let n = self.tokens.len();
-        let last_eos = self.tokens.iter().rposition(|&t| t == c.ple_eos);
-        let hist = |s: usize| -> i64 {
-            match n.checked_sub(1 + s) {
-                Some(i) if last_eos.is_none_or(|e| i >= e) => self.tokens[i] as i64,
-                _ => c.ple_eos as i64,
-            }
-        };
-        let mut e = Vec::with_capacity(h);
-        for order in 2..=c.ple_ngram {
-            let mut mixed = hist(0).wrapping_mul(c.ple_multipliers[0]);
-            for s in 1..order {
-                mixed ^= hist(s).wrapping_mul(c.ple_multipliers[s]);
-            }
-            for j in 0..c.ple_heads_per_ngram {
-                let i = (order - 2) * c.ple_heads_per_ngram + j;
-                let row = mixed.rem_euclid(c.ple_vocab[i]) + c.ple_offsets[i];
-                e.extend(m.ple_row(row));
-            }
-        }
+        let e: Vec<f32> = ple_rows(c, &self.tokens).into_iter().flat_map(|row| m.ple_row(row)).collect();
         assert_eq!(e.len(), h, "PLE embedding width");
         let key = rmsnorm_groups(&self.mv(&format!("{p}.ple_key.weight"), &e),
                                  &m.vec(&format!("{p}.ple_norm_key.weight")), h, c.eps);
@@ -726,6 +711,72 @@ fn hc_write(r: &mut [f32], g: &[f32], y: &[f32], h: usize) {
         for i in 0..h {
             r[s * h + i] += gs * y[i];
         }
+    }
+}
+
+/// The router's choice from its logits: the `k` most probable experts, most probable first (lower index first at a
+/// tie), each with its renormalized weight - softmax over all experts, then the top k divided by their sum.
+pub fn route(logits: &[f32], k: usize) -> Vec<(usize, f64)> {
+    let mx = logits.iter().cloned().fold(f32::MIN, f32::max);
+    let ex: Vec<f64> = logits.iter().map(|&v| ((v - mx) as f64).exp()).collect();
+    let z: f64 = ex.iter().sum();
+    let mut idx: Vec<usize> = (0..logits.len()).collect();
+    idx.sort_by(|&a, &b| ex[b].partial_cmp(&ex[a]).unwrap().then(a.cmp(&b)));
+    let top = &idx[..k];
+    let tz: f64 = top.iter().map(|&e| ex[e] / z).sum();
+    top.iter().map(|&e| (e, (ex[e] / z) / tz)).collect()
+}
+
+/// The n-gram table rows the PLE layer reads for the LAST token of `tokens` (ARCH.md, "PLE"): for each n-gram order
+/// and each of its heads, the hash of the last n tokens (EOS before the start and across an EOS) modulo the head's
+/// vocabulary, plus the head's offset.
+pub fn ple_rows(c: &Config, tokens: &[u32]) -> Vec<i64> {
+    let n = tokens.len();
+    let last_eos = tokens.iter().rposition(|&t| t == c.ple_eos);
+    let hist = |s: usize| -> i64 {
+        match n.checked_sub(1 + s) {
+            Some(i) if last_eos.is_none_or(|e| i >= e) => tokens[i] as i64,
+            _ => c.ple_eos as i64,
+        }
+    };
+    let mut rows = Vec::new();
+    for order in 2..=c.ple_ngram {
+        let mut mixed = hist(0).wrapping_mul(c.ple_multipliers[0]);
+        for s in 1..order {
+            mixed ^= hist(s).wrapping_mul(c.ple_multipliers[s]);
+        }
+        for j in 0..c.ple_heads_per_ngram {
+            let i = (order - 2) * c.ple_heads_per_ngram + j;
+            rows.push(mixed.rem_euclid(c.ple_vocab[i]) + c.ple_offsets[i]);
+        }
+    }
+    rows
+}
+
+/// Something that runs the model one token at a time and can record its intermediate streams: the CPU reference
+/// (`Session`) and the GPU session.  The reference comparison drives either.
+pub trait Stepper {
+    /// Feeds one token; the logits for the next, or nothing when stopped early.
+    fn step(&mut self, token: u32) -> Vec<f32>;
+    /// Start recording the named streams (see `Session::trace`).
+    fn start_trace(&mut self);
+    fn take_trace(&mut self) -> Option<std::collections::BTreeMap<String, Vec<f32>>>;
+    /// Stop each step after layer n-1.
+    fn set_stop_after(&mut self, n: Option<usize>);
+}
+
+impl Stepper for Session<'_> {
+    fn step(&mut self, token: u32) -> Vec<f32> {
+        Session::step(self, token)
+    }
+    fn start_trace(&mut self) {
+        self.trace = Some(std::collections::BTreeMap::new());
+    }
+    fn take_trace(&mut self) -> Option<std::collections::BTreeMap<String, Vec<f32>>> {
+        self.trace.take()
+    }
+    fn set_stop_after(&mut self, n: Option<usize>) {
+        self.stop_after = n;
     }
 }
 

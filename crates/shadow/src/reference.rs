@@ -7,7 +7,7 @@
 //! layer that has it.  `compare` reports both, and the test reads the cliff.
 
 use shadow_eval::json::{parse, Value as J};
-use shadow_model::forward::{Backend, Model, Session};
+use shadow_model::forward::{Backend, Model, Session, Stepper};
 use std::collections::BTreeMap;
 use std::path::Path;
 
@@ -85,13 +85,17 @@ pub struct Report {
 /// Runs the fixture's prompt through Shadow's forward pass (stopping after the fixture's last layer) and compares every
 /// stream the fixture holds.
 pub fn compare(model: &Model, be: &dyn Backend, fx: &Fixture) -> Report {
-    let mut s = Session::new(model, be);
-    s.trace = Some(BTreeMap::new());
-    s.stop_after = Some(fx.layers);
+    compare_stepper(&mut Session::new(model, be), fx)
+}
+
+/// The same comparison for any `Stepper` (the CPU session, or the GPU session).
+pub fn compare_stepper(s: &mut dyn Stepper, fx: &Fixture) -> Report {
+    s.start_trace();
+    s.set_stop_after(Some(fx.layers));
     for &id in &fx.ids {
         s.step(id);
     }
-    let trace = s.trace.take().unwrap();
+    let trace = s.take_trace().unwrap();
     let t = fx.ids.len();
     let pos: Vec<usize> = fx.positions.clone().unwrap_or_else(|| (0..t).collect());
     let np = pos.len();
