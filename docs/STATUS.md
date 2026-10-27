@@ -1,66 +1,64 @@
 # Status
 
-Where the plan ([SHADOW_PLAN.md](SHADOW_PLAN.md)) stands. Updated 2026-10-27, after the first overnight run.
+Where the plan ([SHADOW_PLAN.md](SHADOW_PLAN.md)) stands. Updated 2026-10-27.
 
-The binary is now its own crate: `cargo build --release -p shadow`, then `target/release/shadow.exe` (inspect, kv,
-stats, generate).
+Build and run: `cargo build --release -p shadow`, then `target/release/shadow.exe` with `inspect`, `kv`, `stats`, `dump`,
+`generate` (`--chat`, `--gpu`) and `compare`. Any process that loads the model runs under `tools/run_capped.ps1`
+(hard working-set cap, killed below 4 GiB available).
 
-## Stage 0: done, with one gate item open
+## Stage 0: done
 
 | item | state | evidence |
 |---|---|---|
-| `docs/ARCH.md` | written; 6 open questions left, each with how to settle it | from the GGUF, transformers' `qwen4_exp` (Apache-2.0) and the base model's `config.json` |
-| GGUF reader + `shadow inspect` | **gate green**: 1,224 tensors, 77.801 GiB, every size from its type and equal to the offsets | `crates/shadow-model/tests/real_model.rs`, `docs/model-inspect.txt` |
-| `shadow-cuda`: driver API + NVRTC by hand, CUBIN cache | **green on the RTX 5070** (cc 12.0, NVRTC 13.4): `vector_add` cold 20.5 ms compile, warm from cache, exact | `crates/shadow-cuda/tests/gpu.rs` |
-| kernel-signature drift test | **green**, both directions | `crates/shadow-cuda/tests/drift.rs` |
-| f16 / bf16 conversions (GPU prelude) | **bit-exact** against the Rust reference: 2 x 65,536 widenings, 2 x 925,630 narrowings | `crates/shadow-cuda/tests/convert.rs` |
-| tokenizer + chat template | 247,098 / 247,100 vocabulary tokens re-encode to one token; 78 KB of real text round-trips | `real_model.rs`; **gate item open: no fixture ids from an outside tokenizer yet** |
-| the oracle | **decided**: the public reference implementation + the base model's BF16 weights (ARCH.md, "The fixture"). llama.cpp is out (the only build here is Strata's fork; three load attempts failed, `J:\Strata-work\RUN.md`) | |
+| `docs/ARCH.md` | written from the file, the published reference and llama.cpp's converter | |
+| GGUF reader + `shadow inspect` | all 1,224 tensors, 77.801 GiB, every size from its type | `tests/real_model.rs`, `docs/model-inspect.txt` |
+| `shadow-cuda`: driver API + NVRTC by hand, CUBIN cache | green on the RTX 5070 (cc 12.0, NVRTC 13.4) | `crates/shadow-cuda/tests/` |
+| kernel-signature drift test | green, both directions | `tests/drift.rs` |
+| tokenizer | **46 texts (429 ids) identical to the checkpoint's own tokenizer.json**: Latin, CJK, Hangul, emoji, combining marks, contractions, code, special tokens | `eval/fixtures/tokenizer.json`, `tests/tokenizer_fixture.rs` |
+| NFC normalization | the checkpoint's tokenizer normalizes to NFC, the GGUF does not say so; matches Python's unicodedata on 4,000 strings | `nfc.rs`, `tests/nfc_fixture.rs` |
+| chat template | **12 conversations identical to the checkpoint's template** | `eval/fixtures/chat.json` |
+| the oracle | the published `transformers` `qwen4_exp` reference, run on the BF16 checkpoint read by HTTP range requests (`tools/hf_range.py`, cache on `I:\shadow-ref`) | |
 
-## Stage 1: running, not gated
+## Stage 1: done for layers 0-3 (every kind of layer), with one known gap
 
-- **Dequantization for all 12 types the model uses.** 11 are bit-exact against ggml's reference dequantizer on 84
-  real blocks (`eval/fixtures/dequant.txt`, `tests/dequant.rs`). Q2_0 (9 tensors) follows upstream's definition and is
-  sanity-checked only, because no reference tool here implements it.
-- **The CPU reference forward pass** (`crates/shadow-model/src/forward.rs`, `shadow generate`), written from
-  ARCH.md: every layer, f64 accumulation, dense weights in RAM (4.14 GiB), experts and the n-gram table read per use.
-  Peak working set 4.4 GiB, ~2.5 s/token on the CPU. Greedy outputs:
-  - raw "The capital of France is" -> " Paris, which is often located"
-  - chat (template, thinking off) "What is 17 times 23? Answer in one short sentence." -> **"17 times 23 is 391."**
-    then `<|im_end|>`: right answer, clean stop, 41 positions.
-- **The bug that took the night:** the DeltaNet value heads are stored *tiled* (`v*16 + k`), not grouped as in the
-  reference, because llama.cpp's converter reorders them for ggml's broadcast. With the grouped mapping the model
-  still said "Paris" and then fell apart within ~30 tokens. Now in ARCH.md.
-- **Not gated yet.** Coherent text means most of the math is right, not all of it. The stage 1 gate is the fixture
-  from the BF16 reference, and making it needs a download (HTTP range reads of a few safetensors shards from
-  huggingface.co/Qwen/Qwen3.8-Flash-Next), which needs your OK.
-- Limit: at most 2,048 positions (the sparse indexer is not implemented; below 2,048 it keeps every key, so attention
-  is exact there).
+The CPU forward pass (`forward.rs`, written from ARCH.md) against the reference, 12-token prompt:
+
+- **On the BF16 checkpoint** (`eval/fixtures/reference`): every layer's output stream has cosine >= 0.994 with the
+  reference; routing picks 8-10 of the same 10 experts. The weakest stream is the MoE of layers with 2-bit experts
+  (0.92-0.98), which is quantization noise.
+- **On Shadow's own GGUF, dequantized and mapped back into the reference's layout** (`eval/fixtures/reference_gguf`,
+  no quantization difference): **all 23 streams of layers 0-3 have cosine 1.00000, relative error 0.0000, max |diff| <=
+  1e-4, and the router picks the same 10 experts at every token of every layer.** That covers the 4-stream
+  hyper-connections, the DeltaNet (with the tiled value-head order), gated attention, the layer-1 PLE, the MoE with its
+  shared expert, and the final read. The GPU backend passes the same test.
+- `crates/shadow/tests/reference.rs` holds all three comparisons.
+
+Known gap: attention was only exercised below 2,048 positions, where the sparse indexer keeps every key. Past that the
+indexer selects blocks and is **not implemented** (`forward.rs` refuses more than 2,048 positions). A 48-layer run of
+the same comparison (no download needed: the GGUF is the source) was started; its result goes below.
 
 ## Stage 2: begun
 
-- **Every quant type dequantizes on the GPU bit for bit** like the Rust reference (all fixture blocks of 9 types +
-  BF16, 25,600 real Q2_0 blocks), from one decoder per format (`kernels/quants.cuh`).
-- **A reference GPU matvec for all 11 types** (`kernels/matvec.cu`), within 3.2e-8 relative of an f64 CPU dot product
-  on real tensors. Not fast yet: 264 GB/s for Q6_K, 15-23 GB/s for the IQ2_S/IQ3 expert slices.
-- **The forward pass runs its matvecs on the GPU** (`shadow generate ... --gpu`; `Backend` trait in forward.rs,
-  `GpuBackend` in shadow-cuda): 3.78 GiB of dense weights resident in VRAM, experts uploaded per use. Same tokens as
-  the CPU ("17 times 23 is 391."), **0.40 s/token against 2.35** on the CPU. `crates/shadow/tests/backends.rs` holds
-  the two backends to the same top token and logits within 7.3e-6 (of ~16) at every position.
-- What is still on the CPU: the norms, the DeltaNet recurrence, attention, the hyper-connection glue, the MoE routing,
-  and every expert upload (58,361 per 41 tokens). Those are the next kernels, and then the memory tiers (stage 3).
+- Every quant type dequantizes on the GPU bit for bit like the Rust reference (`kernels/quants.cuh`, `dequant.cu`).
+- A reference GPU matvec for all 11 types (`kernels/matvec.cu`), relative error ~3e-8 on real tensors; not fast yet
+  (264 GB/s Q6_K, 15-23 GB/s for the IQ2_S/IQ3 expert slices).
+- `shadow generate --gpu` runs the matrix-vector products on the GPU: same tokens, **0.40 s/token against 2.35** on the CPU.
+- Still on the CPU: norms, the DeltaNet recurrence, attention, routing, and every expert upload.
 
-## What needs you
+## Open
 
-1. **OK to download** the parts of the BF16 checkpoint the first fixture needs (ARCH.md, "The fixture": the
-   safetensors headers, then layers 0-3, the embedding and the head, by range read; a few GB, not 360) - and to install
-   `torch` (CPU) into Python to run the reference once.
-2. `J:\Strata-work\RUN.md` replaces HANDOFF.md's plan: llama-embedding was tried three times, capped, and failed with a
-   tensor read out of bounds in Strata's fork. Nothing to do unless you want that path.
-3. I did not start or stop the Strata server tonight; it was not running when the probes started.
+1. **Q2_0** (9 down-projections) has no independent reference tool (gguf-py lacks it); it follows upstream ggml's
+   definition and is checked by hand and by the end-to-end match above, which runs through it.
+2. **The sparse indexer** (positions > 2,048): not implemented.
+3. **Speculative decoding's draft**: the GGUF has no MTP tensors (ARCH.md, question 7).
+4. **Stage 3** (VRAM / pinned RAM / drive tiers) and everything speed-related has not started; the plan's floor
+   protocol applies from there.
 
-## Safety notes for whoever runs this next
+## Things that went wrong, so they are not repeated
 
-- Any process that maps or reads this model runs under `tools/run_capped.ps1` (hard working-set cap + kill below
-  4 GiB available). Uncapped, llama.cpp's mmap load took available RAM from 55 to 0.73 GiB in 49 s.
-- `shadow generate` itself needs ~4.4 GiB and was run capped at 16 GiB.
+- A claim in ARCH.md that two PLE norm tensors were identical rested on summary statistics and six values; they are
+  different (max 0.054). `shadow stats` summaries do not prove equality; compare the vectors.
+- git's `eval/** text eol=lf` rule rewrote CRLF byte pairs inside a committed `tensors.bin`; `.gitattributes` now marks
+  `eval/fixtures/**/*.bin` binary. After adding any binary fixture: `git show HEAD:path | cmp - path`.
+- Uncapped, llama.cpp's mmap load took available RAM from 55 to 0.73 GiB in 49 s. Always `tools/run_capped.ps1`.
+- `J:\Strata-work\RUN.md` records the three failed llama-embedding runs (HANDOFF.md's route); nothing there is needed.

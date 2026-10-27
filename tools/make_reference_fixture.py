@@ -229,7 +229,9 @@ class LazyExperts(nn.Module):
         ex.gate_up_proj = nn.Parameter(torch.stack([self.have[e][0] for e in need]), requires_grad=False)
         ex.down_proj = nn.Parameter(torch.stack([self.have[e][1] for e in need]), requires_grad=False)
         idx = torch.tensor([[remap[e] for e in row] for row in top_k_index.tolist()], dtype=top_k_index.dtype)
-        return ex(hidden_states, idx, top_k_weights)
+        out = ex(hidden_states, idx, top_k_weights)
+        self.have.clear()          # a layer runs once per fixture: do not keep gigabytes of float32 experts around
+        return out
 
 
 class RowStore(nn.Module):
