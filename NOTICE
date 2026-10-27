@@ -22,6 +22,18 @@ What is carried across from Strata, and what is not:
                           drift test on both sides parses this file by that name.
   tools/shadow_harness.py ours (was tools/pi_harness.py on the Strata checkout).
 
+From other projects, and not from Strata:
+
+  crates/shadow-model/src/quant_tables.rs
+                          the IQ quant formats' lookup tables (grids, sign patterns, IQ4_NL
+                          values) from ggml (MIT, ggml.ai), generated through the gguf Python
+                          package by tools/gen_quant_tables.py. They are the formats' definition.
+  crates/shadow-model/src/unicode_table.rs
+                          Unicode general categories, generated from Python's unicodedata.
+  docs/ARCH.md            written from the GGUF file and from the published reference
+                          implementation (Hugging Face transformers, models/qwen4_exp, Apache-2.0)
+                          and llama.cpp's conversion/qwen4exp.py (MIT). Read, not copied.
+
 No source code from Strata itself has been copied into this project. Strata's engine is
 C++/CUDA/HIP and 1% of it is ours; nothing of it is here. What is here is the plan, the
 measurements, the seam's contract and the harness - all of which were written by us on a

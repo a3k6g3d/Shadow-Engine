@@ -4,5 +4,7 @@
 pub mod chat;
 pub mod gguf;
 pub mod half;
+pub mod quant;
+pub mod quant_tables;
 pub mod tokenizer;
 pub mod unicode_table;
