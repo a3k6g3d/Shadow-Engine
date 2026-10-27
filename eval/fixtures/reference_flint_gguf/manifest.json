@@ -1,0 +1,234 @@
+{
+ "prompt": "The capital of France is Paris. The capital of Germany is",
+ "ids": [
+  630,
+  6963,
+  297,
+  9865,
+  332,
+  12834,
+  13,
+  450,
+  6963,
+  297,
+  10444,
+  332
+ ],
+ "positions": null,
+ "layers": 4,
+ "repo": "RecursiveSI/flint",
+ "weights": "gguf",
+ "torch": "2.11.0+cpu",
+ "dtype": "float32",
+ "note": "Flint reference equations (sglang/flint_sglang/model.py) run on Shadow's GGUF via `shadow dump`",
+ "tensors": [
+  {
+   "name": "embed",
+   "shape": [
+    12,
+    2048
+   ],
+   "offset": 0
+  },
+  {
+   "name": "layer0.attn_hc_u",
+   "shape": [
+    12,
+    2048
+   ],
+   "offset": 98304
+  },
+  {
+   "name": "layer0.mixer",
+   "shape": [
+    12,
+    2048
+   ],
+   "offset": 196608
+  },
+  {
+   "name": "layer0.mlp_hc_u",
+   "shape": [
+    12,
+    2048
+   ],
+   "offset": 294912
+  },
+  {
+   "name": "layer0.moe",
+   "shape": [
+    12,
+    2048
+   ],
+   "offset": 393216
+  },
+  {
+   "name": "layer0.out",
+   "shape": [
+    12,
+    2048
+   ],
+   "offset": 491520
+  },
+  {
+   "name": "layer1.attn_hc_u",
+   "shape": [
+    12,
+    2048
+   ],
+   "offset": 589824
+  },
+  {
+   "name": "layer1.mixer",
+   "shape": [
+    12,
+    2048
+   ],
+   "offset": 688128
+  },
+  {
+   "name": "layer1.mlp_hc_u",
+   "shape": [
+    12,
+    2048
+   ],
+   "offset": 786432
+  },
+  {
+   "name": "layer1.moe",
+   "shape": [
+    12,
+    2048
+   ],
+   "offset": 884736
+  },
+  {
+   "name": "layer1.out",
+   "shape": [
+    12,
+    2048
+   ],
+   "offset": 983040
+  },
+  {
+   "name": "layer2.attn_hc_u",
+   "shape": [
+    12,
+    2048
+   ],
+   "offset": 1081344
+  },
+  {
+   "name": "layer2.mixer",
+   "shape": [
+    12,
+    2048
+   ],
+   "offset": 1179648
+  },
+  {
+   "name": "layer2.mlp_hc_u",
+   "shape": [
+    12,
+    2048
+   ],
+   "offset": 1277952
+  },
+  {
+   "name": "layer2.route_idx",
+   "shape": [
+    12,
+    6
+   ],
+   "offset": 1376256
+  },
+  {
+   "name": "layer2.route_w",
+   "shape": [
+    12,
+    6
+   ],
+   "offset": 1376544
+  },
+  {
+   "name": "layer2.moe",
+   "shape": [
+    12,
+    2048
+   ],
+   "offset": 1376832
+  },
+  {
+   "name": "layer2.out",
+   "shape": [
+    12,
+    2048
+   ],
+   "offset": 1475136
+  },
+  {
+   "name": "layer3.attn_hc_u",
+   "shape": [
+    12,
+    2048
+   ],
+   "offset": 1573440
+  },
+  {
+   "name": "layer3.mixer",
+   "shape": [
+    12,
+    2048
+   ],
+   "offset": 1671744
+  },
+  {
+   "name": "layer3.mlp_hc_u",
+   "shape": [
+    12,
+    2048
+   ],
+   "offset": 1770048
+  },
+  {
+   "name": "layer3.route_idx",
+   "shape": [
+    12,
+    6
+   ],
+   "offset": 1868352
+  },
+  {
+   "name": "layer3.route_w",
+   "shape": [
+    12,
+    6
+   ],
+   "offset": 1868640
+  },
+  {
+   "name": "layer3.moe",
+   "shape": [
+    12,
+    2048
+   ],
+   "offset": 1868928
+  },
+  {
+   "name": "layer3.out",
+   "shape": [
+    12,
+    2048
+   ],
+   "offset": 1967232
+  },
+  {
+   "name": "final_u",
+   "shape": [
+    12,
+    2048
+   ],
+   "offset": 2065536
+  }
+ ]
+}

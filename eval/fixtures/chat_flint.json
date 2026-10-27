@@ -1,0 +1,198 @@
+{
+ "cases": [
+  {
+   "name": "user only",
+   "messages": [
+    {
+     "role": "user",
+     "content": "What is 17 times 23?"
+    }
+   ],
+   "options": {},
+   "text": "<|user|>What is 17 times 23?<|assistant|>"
+  },
+  {
+   "name": "system + user",
+   "messages": [
+    {
+     "role": "system",
+     "content": "Be brief."
+    },
+    {
+     "role": "user",
+     "content": "Hi"
+    }
+   ],
+   "options": {},
+   "text": "<|system|>Be brief.<|user|>Hi<|assistant|>"
+  },
+  {
+   "name": "thinking off",
+   "messages": [
+    {
+     "role": "user",
+     "content": "Hi"
+    }
+   ],
+   "options": {
+    "enable_thinking": false
+   },
+   "text": "<|user|>Hi<|assistant|>"
+  },
+  {
+   "name": "thinking off + system",
+   "messages": [
+    {
+     "role": "system",
+     "content": "Be brief."
+    },
+    {
+     "role": "user",
+     "content": "Hi"
+    }
+   ],
+   "options": {
+    "enable_thinking": false
+   },
+   "text": "<|system|>Be brief.<|user|>Hi<|assistant|>"
+  },
+  {
+   "name": "effort medium",
+   "messages": [
+    {
+     "role": "user",
+     "content": "Hi"
+    }
+   ],
+   "options": {
+    "reasoning_effort": "medium"
+   },
+   "text": "<|user|>Hi<|assistant|>"
+  },
+  {
+   "name": "effort low",
+   "messages": [
+    {
+     "role": "system",
+     "content": "S"
+    },
+    {
+     "role": "user",
+     "content": "Hi"
+    }
+   ],
+   "options": {
+    "reasoning_effort": "low"
+   },
+   "text": "<|system|>S<|user|>Hi<|assistant|>"
+  },
+  {
+   "name": "whitespace trimmed",
+   "messages": [
+    {
+     "role": "user",
+     "content": "  padded \n"
+    }
+   ],
+   "options": {},
+   "text": "<|user|>  padded \n<|assistant|>"
+  },
+  {
+   "name": "multi-turn with reasoning",
+   "messages": [
+    {
+     "role": "user",
+     "content": "2+2?"
+    },
+    {
+     "role": "assistant",
+     "content": "4",
+     "reasoning_content": "two and two"
+    },
+    {
+     "role": "user",
+     "content": "and 3+3?"
+    }
+   ],
+   "options": {},
+   "text": "<|user|>2+2?<|assistant|><think>two and two</think>4<|user|>and 3+3?<|assistant|>"
+  },
+  {
+   "name": "history without reasoning",
+   "messages": [
+    {
+     "role": "user",
+     "content": "a"
+    },
+    {
+     "role": "assistant",
+     "content": "b"
+    },
+    {
+     "role": "user",
+     "content": "c"
+    }
+   ],
+   "options": {},
+   "text": "<|user|>a<|assistant|>b<|user|>c<|assistant|>"
+  },
+  {
+   "name": "preserve_thinking off",
+   "messages": [
+    {
+     "role": "user",
+     "content": "a"
+    },
+    {
+     "role": "assistant",
+     "content": "b",
+     "reasoning_content": "r"
+    },
+    {
+     "role": "user",
+     "content": "c"
+    }
+   ],
+   "options": {
+    "preserve_thinking": false
+   },
+   "text": "<|user|>a<|assistant|><think>r</think>b<|user|>c<|assistant|>"
+  },
+  {
+   "name": "tool results",
+   "messages": [
+    {
+     "role": "user",
+     "content": "go"
+    },
+    {
+     "role": "assistant",
+     "content": "ok"
+    },
+    {
+     "role": "tool",
+     "content": "r1"
+    },
+    {
+     "role": "tool",
+     "content": "r2"
+    }
+   ],
+   "options": {
+    "reasoning_effort": "medium"
+   },
+   "text": "<|user|>go<|assistant|>ok<|observation|><tool_response>r1</tool_response><|observation|><tool_response>r2</tool_response><|assistant|>"
+  },
+  {
+   "name": "no generation prompt",
+   "messages": [
+    {
+     "role": "user",
+     "content": "Hi"
+    }
+   ],
+   "options": {},
+   "text": "<|user|>Hi"
+  }
+ ]
+}

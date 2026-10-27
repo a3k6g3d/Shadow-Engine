@@ -149,6 +149,66 @@ pub fn render(messages: &[Message], o: &Options) -> Result<String, String> {
     Ok(out)
 }
 
+fn flint_text(t: &str) -> String {
+    t.replace('\0', "")
+        .replace("<think>", "")
+        .replace("</think>", "")
+        .replace("<|begin_of_text|>", "&lt;|begin_of_text|&gt;")
+        .replace("<|end_of_text|>", "&lt;|end_of_text|&gt;")
+        .replace("<|system|>", "&lt;|system|&gt;")
+        .replace("<|developer|>", "&lt;|developer|&gt;")
+        .replace("<|user|>", "&lt;|user|&gt;")
+        .replace("<|assistant|>", "&lt;|assistant|&gt;")
+        .replace("<|observation|>", "&lt;|observation|&gt;")
+}
+
+/// Flint's chat template (`RecursiveSI/flint` `chat_template.jinja`).
+pub fn render_flint(messages: &[Message], o: &Options) -> Result<String, String> {
+    if messages.is_empty() {
+        return Err("No messages provided.".into());
+    }
+    let mut out = String::new();
+    for m in messages {
+        match m.role {
+            Role::System => {
+                out += "<|system|>";
+                out += &flint_text(&m.content);
+            }
+            Role::User => {
+                out += "<|user|>";
+                out += &flint_text(&m.content);
+            }
+            Role::Assistant => {
+                out += "<|assistant|>";
+                if let Some(r) = &m.reasoning {
+                    if !r.is_empty() {
+                        out += "<think>";
+                        out += r;
+                        out += "</think>";
+                    }
+                }
+                out += &m.content;
+            }
+            Role::Tool => {
+                out += "<|observation|><tool_response>";
+                out += &flint_text(&m.content);
+                out += "</tool_response>";
+            }
+        }
+    }
+    if o.add_generation_prompt {
+        out += "<|assistant|>";
+    }
+    Ok(out)
+}
+
+pub fn render_for_arch(arch: &str, messages: &[Message], o: &Options) -> Result<String, String> {
+    match arch {
+        "flint" => render_flint(messages, o),
+        _ => render(messages, o),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

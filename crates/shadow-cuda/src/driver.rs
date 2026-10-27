@@ -76,6 +76,7 @@ table! {
     cuMemsetD8: fn(CuDevicePtr, u8, usize) = ["cuMemsetD8_v2"];
     cuMemHostRegister: fn(*mut c_void, usize, c_uint) = ["cuMemHostRegister_v2"];
     cuMemHostUnregister: fn(*mut c_void) = ["cuMemHostUnregister"];
+    cuMemHostGetDevicePointer: fn(*mut CuDevicePtr, *mut c_void, c_uint) = ["cuMemHostGetDevicePointer_v2", "cuMemHostGetDevicePointer"];
     cuModuleLoadData: fn(*mut H, *const c_void) = ["cuModuleLoadData"];
     cuModuleUnload: fn(H) = ["cuModuleUnload"];
     cuModuleGetFunction: fn(*mut H, H, *const c_char) = ["cuModuleGetFunction"];

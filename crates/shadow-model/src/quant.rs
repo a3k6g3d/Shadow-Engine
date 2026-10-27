@@ -130,6 +130,32 @@ fn q2_0(b: &[u8], y: &mut [f32]) {
     }
 }
 
+/// NVFP4 (upstream ggml, `dequantize_row_nvfp4`): 4 unsigned E4M3 scales (bias 7, halved for the doubled E2M1 table),
+/// then 4 sub-blocks of 8 bytes each (64 weights total); in each 8-byte sub-block the 8 low nibbles are weights 0..8
+/// and the 8 high nibbles are weights 8..16.
+fn nvfp4(b: &[u8], y: &mut [f32]) {
+    const KVALUES: [i8; 16] = [0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12];
+    for g in 0..4 {
+        let sb = b[g];
+        let d = if sb == 0 || sb == 0x7f {
+            0.0f32
+        } else {
+            let exp = ((sb >> 3) & 0x0f) as u32;
+            let man = (sb & 0x07) as u32;
+            if exp == 0 {
+                (man as f32) * (1.0 / 1024.0)
+            } else {
+                (8 + man) as f32 * f32::from_bits((116 + exp) << 23)
+            }
+        };
+        let qs = &b[4 + g * 8..4 + (g + 1) * 8];
+        for c in 0..8 {
+            y[g * 16 + c] = d * KVALUES[(qs[c] & 0x0f) as usize] as f32;
+            y[g * 16 + 8 + c] = d * KVALUES[(qs[c] >> 4) as usize] as f32;
+        }
+    }
+}
+
 fn iq4_nl(b: &[u8], y: &mut [f32]) {
     let d = f16_at(b, 0);
     for c in 0..16 {
@@ -174,6 +200,7 @@ pub fn dequantize(ty: GgmlType, data: &[u8], out: &mut [f32]) -> Result<(), Stri
         "IQ3_S" => iq3_s,
         "IQ4_NL" => iq4_nl,
         "IQ4_XS" => iq4_xs,
+        "NVFP4" => nvfp4,
         "Q2_0" => q2_0,
         _ => return Err(format!("{name}: dequantization not implemented")),
     };

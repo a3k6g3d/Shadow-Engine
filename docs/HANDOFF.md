@@ -7,7 +7,9 @@ as math). This file is what is *not* in those: what is in flight, how to run thi
 ## What Shadow is now
 
 A from-scratch Rust engine for `Qwen3.8-Flash-Next` (48 layers: 36 DeltaNet + 12 gated attention, 512-expert MoE,
-4-stream hyper-connections, hashed n-gram memory at layer 1). CUDA kernels are source in `kernels/`, compiled at
+4-stream hyper-connections, hashed n-gram memory at layer 1) and `RecursiveSI/flint` (`Flint-40B-A2.5B-abliterated-NVFP4.gguf`,
+40 layers: 2 dense + 38 128-expert top-6 sigmoid MoE, GQA 32/8 with learned attention sinks, sliding window 513 + YaRN
+on 3/4 layers, `NVFP4` quantization). CUDA kernels are source in `kernels/`, compiled at
 run time by NVRTC through hand-bound driver calls (`crates/shadow-cuda`). **Nothing from Strata** at build or run time:
 the user decided that on 2026-10-26 and cancelled the Strata benchmark plan ("Phase 0"). Strata's folder
 `J:\Strata-work` holds only the model file, which is a plain GGUF. Do not propose Strata shortcuts.

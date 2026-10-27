@@ -160,6 +160,40 @@ router top-10 on the host 1%. That is why the RAM tier came before moving the ro
   - **Lowest available RAM across all 8 launches: 9.6 GiB**; peak GPU memory 10,319-10,422 MiB; **0 answer differences**
     across all 48 turns.
 
+## Second architecture: `RecursiveSI/flint` (`Flint-40B-A2.5B-abliterated-NVFP4.gguf`)
+
+- **Model**: 40 layers (layers 0-1 dense SwiGLU, layers 2-39 128-expert top-6 sigmoid MoE + ungated shared expert),
+  GQA 32/8 x 128 (`c_dim = 2048`), periodic no-RoPE full-attention layers (`(l + 1) % 4 == 0`), sliding-window 513 +
+  YaRN (`beta_fast = 32`, `beta_slow = 1`, `factor = 8`) on RoPE layers, learned per-head `attn_sinks.weight`, and
+  GGUF type `40` (`NVFP4`: 64 weights in 36 bytes = four `ue4m3` sub-block scales + 64 `e2m1` nibbles split low/high 32
+  bytes per 16-weight group, paired with per-tensor `.scale` companions).
+- **What failed first (`CU_MEMHOSTREGISTER_DEVICEMAP` zero-copy PCIe reads for VRAM cache misses, reverted):** mapping
+  the pinned RAM tier into GPU address space and reading cold expert slices directly over PCIe in `matvec_batch_nvfp4`
+  (while freezing the VRAM cache once full) dropped decode speed from **51.2 tok/s (`0.0195 s/token`) to 32.3 tok/s
+  (`0.0309 s/token`)**. Routed-expert matvec time jumped from 4.1 ms to 16.4 ms/token and VRAM cache hit rate fell from
+  68.4% to 51.8%: each warp lane in `Fast<NVFP4>::dot8` gathers 9-byte strided segments across 36-byte blocks (~11 GB/s
+  effective PCIe throughput from partial cacheline TLPs), whereas coalesced `cuMemcpyHtoDAsync` streams 1.69 MiB bulk
+  DMA transfers at ~52 GB/s and LRU replacement adapts the VRAM cache to the active topic.
+- **Proven & gated (`0.1.10`):**
+  - `NVFP4` CPU & GPU dequant (`dequant_nvfp4` bit-exact with CPU; `ue4m3_half` branchless IEEE shift + `e2m1_double`
+    register LUT in `0xc8643210u`), `matvec_fast_nvfp4` (`229.2 GB/s`), `matvec_fast_nvfp4_s` (fused `.scale`),
+    `matvec_qkv_nvfp4` (fused Q+K+V + `.scale`), `matvec_batch_nvfp4` (`290.0 GB/s`): `crates/shadow-model/tests/dequant.rs`,
+    `crates/shadow-cuda/tests/dequant.rs`, `crates/shadow-cuda/tests/matvec.rs`.
+  - Flint pre-tokenizer (`PreTokenizer::Flint`) and `<|role|>` chat template (`render_flint`): **48/48 texts and 12/12
+    chat conversations identical to `RecursiveSI/flint`'s `tokenizer.json` and `chat_template.jinja`**
+    (`eval/fixtures/tokenizer_flint.json`, `eval/fixtures/chat_flint.json`, `tests/tokenizer_fixture.rs`).
+  - **4-layer CPU and GPU reference gate on Shadow's own GGUF weights** (`eval/fixtures/reference_flint_gguf`,
+    `tools/make_reference_fixture_flint.py`, `crates/shadow/tests/reference.rs`): **all 13 streams across layers 0-3
+    (covering both dense layers, MoE layers with shared + routed experts, RoPE + sliding-window + sinks, and no-RoPE
+    full attention at layer 3) have cosine 1.00000, relative error 0.0000, max |diff| <= 2.3e-5, and 6/6 routing match**
+    on both CPU and `GpuSession`.
+  - **Speed optimizations**: sequential `(layer, part, expert)` sort in `RamTier::fill` (cuts 20 GiB fill from 59.8 s to
+    6.7 s warm / 42.3 s cold); fused `16`-slice `matvec_batch_nvfp4` combining 6 routed experts + shared expert gate/up
+    in one launch (`swiglu_scaled` over 4,096 elements); fused `moe_combine_flint`, `head_norm_rope_qk`, and cross-layer
+    `add_rmsnorm1`; coalesced single `cuMemcpyHtoDAsync` per expert miss + startup VRAM cache pre-warming from `RamTier`.
+    On a 128-token chat generation (`--ram-tier-gib 20 --placement profiles/flint-routing.shrc`): **50.0 tok/s prefill
+    (`0.020 s/token`) and 51.2 tok/s decode (`0.0195 s/token`)**.
+
 ## Things that went wrong, so they are not repeated
 
 - A claim in ARCH.md that two PLE norm tensors were identical rested on summary statistics and six values; they are

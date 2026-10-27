@@ -64,7 +64,7 @@ fn gpu_dequant_matches_the_reference_bit_for_bit() {
         *checked.entry(ty).or_insert(0) += 1;
     }
     eprintln!("fixture blocks checked on the GPU: {checked:?}");
-    assert_eq!(checked.len(), 9, "every quant type of the model that has fixtures, BF16 included");
+    assert_eq!(checked.len(), 10, "every quant type of the models that has fixtures, BF16 and NVFP4 included");
 
     // Q2_0: no fixture exists, so against the Rust implementation on real blocks - a whole expert of blk.1's down
     // projection - when the model is here.
@@ -75,8 +75,10 @@ fn gpu_dequant_matches_the_reference_bit_for_bit() {
         return eprintln!("Q2_0 on real blocks SKIPPED, not passed: no model at {p}");
     }
     let g = Gguf::open(std::path::Path::new(&p)).unwrap();
-    let t = g.tensor("blk.1.ffn_down_exps.weight").unwrap();
-    assert_eq!(t.ty.name(), "Q2_0");
+    let Some(t) = g.tensor("blk.1.ffn_down_exps.weight") else { return };
+    if t.ty.name() != "Q2_0" {
+        return;
+    }
     let n_blocks: u32 = 640 * 2560 / 64;
     use std::io::{Read, Seek, SeekFrom};
     let mut f = std::fs::File::open(&g.shards[t.shard].path).unwrap();

@@ -5,8 +5,10 @@
 use shadow_model::gguf::GgmlType;
 use shadow_model::quant::dequantize;
 
-const IDS: &[(&str, u32)] = &[("F32", 0), ("F16", 1), ("Q4_K", 12), ("Q5_K", 13), ("Q6_K", 14), ("IQ3_XXS", 18),
-                              ("IQ4_NL", 20), ("IQ3_S", 21), ("IQ2_S", 22), ("IQ4_XS", 23), ("BF16", 30)];
+const IDS: &[(&str, u32)] = &[
+    ("F32", 0), ("F16", 1), ("Q4_K", 12), ("Q5_K", 13), ("Q6_K", 14), ("IQ3_XXS", 18),
+    ("IQ4_NL", 20), ("IQ3_S", 21), ("IQ2_S", 22), ("IQ4_XS", 23), ("BF16", 30), ("NVFP4", 40),
+];
 
 fn hex(s: &str) -> Vec<u8> {
     (0..s.len()).step_by(2).map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap()).collect()
@@ -35,7 +37,7 @@ fn every_fixture_block_matches_the_reference_bit_for_bit() {
         *per_type.entry(ty_name).or_insert(0) += 1;
     }
     eprintln!("blocks checked per type: {per_type:?}");
-    assert_eq!(per_type.len(), IDS.len(), "every type the model uses (but Q2_0) must have fixtures");
+    assert_eq!(per_type.len(), IDS.len(), "every type the models use (but Q2_0) must have fixtures");
 }
 
 #[test]
@@ -61,6 +63,10 @@ fn q2_0_real_blocks_look_like_their_neighbours() {
         return eprintln!("SKIPPED, not passed: no model at {p}");
     }
     let g = shadow_model::gguf::Gguf::open(std::path::Path::new(&p)).unwrap();
+    let Some(t1) = g.tensor("blk.1.ffn_down_exps.weight") else { return };
+    if t1.ty.name() != "Q2_0" {
+        return;
+    }
     let rms = |name: &str| -> f64 {
         let t = g.tensor(name).unwrap();
         let (block, bytes) = t.ty.block().unwrap();

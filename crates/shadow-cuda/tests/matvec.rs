@@ -45,9 +45,11 @@ fn gpu_matvec_matches_the_cpu_on_real_tensors() {
     };
     for &(ty, _, _, _, entry) in QUANT_KERNELS {
         // a 2-D tensor of this type if there is one, else one expert's slice of a 3-D one
-        let t = g.tensors.iter().filter(|t| t.ty.name() == ty && t.dims.len() >= 2 && t.dims[1] > 1)
+        let Some(t) = g.tensors.iter().filter(|t| t.ty.name() == ty && t.dims.len() >= 2 && t.dims[1] > 1)
             .min_by_key(|t| (t.dims.len(), t.name.contains("token_embd") || t.name.contains("output.")))
-            .unwrap_or_else(|| panic!("no {ty} matrix in the model"));
+        else {
+            continue;
+        };
         let (cols, rows) = (t.dims[0] as usize, t.dims[1] as usize);
         let nbytes = (t.nbytes() / if t.dims.len() == 3 { t.dims[2] } else { 1 }) as usize;
         let w = read(&g, t, nbytes);

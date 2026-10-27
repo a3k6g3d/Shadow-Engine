@@ -79,10 +79,11 @@ pub fn available_ram() -> u64 {
     0
 }
 
-/// A page-locked host region the GPU can DMA from.  Unregistered and freed on drop.
+/// A page-locked host region the GPU can DMA from or read directly via zero-copy device mapping.  Unregistered and freed on drop.
 pub struct PinnedRegion<'c> {
     ctx: &'c Context,
     base: *mut u8,
+    pub dev_ptr: u64,
     len: usize,
     available: fn() -> u64,
 }
@@ -104,14 +105,20 @@ impl<'c> PinnedRegion<'c> {
             if base.is_null() {
                 return Err(format!("VirtualAlloc of {len} bytes failed"));
             }
-            let mut r = PinnedRegion { ctx, base, len: 0, available };
+            let mut r = PinnedRegion { ctx, base, dev_ptr: 0, len: 0, available };
             ctx.bind().map_err(|e| e.to_string())?;
-            // SAFETY: [base, base + len) is the committed allocation just made; flags 0 (this context only).
-            let code = unsafe { (ctx.api.cuMemHostRegister)(base as *mut c_void, len.max(1), 0) };
+            // SAFETY: [base, base + len) is the committed allocation just made; CU_MEMHOSTREGISTER_DEVICEMAP = 0x02.
+            let code = unsafe { (ctx.api.cuMemHostRegister)(base as *mut c_void, len.max(1), 0x02) };
             if code != 0 {
                 return Err(format!("cuMemHostRegister of {len} bytes failed ({code})")); // r frees it
             }
             r.len = len;
+            let mut dptr = 0u64;
+            let dcode = unsafe { (ctx.api.cuMemHostGetDevicePointer)(&mut dptr, base as *mut c_void, 0) };
+            if dcode != 0 {
+                return Err(format!("cuMemHostGetDevicePointer failed ({dcode})"));
+            }
+            r.dev_ptr = dptr;
             r.check_floor()?; // the pages are locked now: what is left?
             Ok(r)
         }

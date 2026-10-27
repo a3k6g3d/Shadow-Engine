@@ -64,6 +64,19 @@ extern "C" __global__ void rmsnorm_groups(const float* x, const float* w, float*
     rmsnorm_one(x + (u64) g * group, w + (u64) g * group, y + (u64) g * group, group, eps);
 }
 
+// r[i] += y[i], then u = rmsnorm(r, w, eps) in one block of 256 threads
+extern "C" __global__ void add_rmsnorm1(float* r, const float* y, const float* w, float* u, unsigned int n, float eps) {
+    double ss = 0.0;
+    for (unsigned int i = threadIdx.x; i < n; i += blockDim.x) {
+        float v = r[i] + y[i];
+        r[i] = v;
+        ss += (double) v * (double) v;
+    }
+    double ms = block_sum(ss) / (double) n;
+    double scale = 1.0 / sqrt(ms + (double) eps);
+    for (unsigned int i = threadIdx.x; i < n; i += blockDim.x) u[i] = (float) ((double) r[i] * scale) * w[i];
+}
+
 // x = silu(x / div)
 extern "C" __global__ void silu_div(float* x, unsigned int n, float div) {
     unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -107,6 +120,12 @@ extern "C" __global__ void add(float* a, const float* b, unsigned int n) {
 extern "C" __global__ void copy(float* dst, const float* src, unsigned int n) {
     unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) dst[i] = src[i];
+}
+
+// x[i] *= s
+extern "C" __global__ void scale_vec(float* x, unsigned int n, float s) {
+    unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) x[i] *= s;
 }
 
 // ------------------------------------------------------------------------------------------------ DeltaNet
@@ -189,6 +208,20 @@ extern "C" __global__ void head_norm_rope(const float* in, unsigned int in_strid
     rope_one(y, pos, rope_dims, theta);
 }
 
+// Blocks 0..nh-1 normalize+RoPE query heads (qg -> q, with wq); blocks nh..nh+nkv-1 normalize+RoPE key heads (kk -> kc, with wk).
+extern "C" __global__ void head_norm_rope_qk(const float* qg, float* q, const float* wq,
+                                             const float* kk, float* kc, const float* wk,
+                                             unsigned int nh, unsigned int d, float eps,
+                                             unsigned int pos, unsigned int rope_dims, float theta) {
+    unsigned int b = blockIdx.x;
+    const float* x = b < nh ? (qg + (u64) b * d) : (kk + (u64) (b - nh) * d);
+    float* y = b < nh ? (q + (u64) b * d) : (kc + (u64) (b - nh) * d);
+    const float* w = b < nh ? wq : wk;
+    rmsnorm_one(x, w, y, d, eps);
+    __syncthreads();
+    rope_one(y, pos, rope_dims, theta);
+}
+
 // gate[h*hd + j] = qg[h*2*hd + hd + j]: the gate half of each query head
 extern "C" __global__ void split_gate(const float* qg, float* gate, unsigned int heads, unsigned int hd) {
     unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -235,6 +268,46 @@ extern "C" __global__ void attention_heads(const float* q, const float* kc, cons
     }
 }
 
+// Softmax attention of each query head over positions start_pos .. start_pos + ntok, GQA, with a learned per-head
+// sink logit included in the softmax max and denominator (zero value contribution) and no output gate (Flint).
+extern "C" __global__ void attention_sinks_heads(const float* q, const float* kc, const float* vc,
+                                                 const float* sinks, unsigned int start_pos, unsigned int ntok,
+                                                 float* o, double* scratch, unsigned int stride,
+                                                 unsigned int nkv, unsigned int hd, unsigned int group) {
+    unsigned int h = blockIdx.x, g = h / group;
+    const float* qh = q + (u64) h * hd;
+    double* sc = scratch + (u64) h * stride;
+    double scale = 1.0 / sqrt((double) hd);
+    double sink = (double) sinks[h];
+    double mx = sink;
+    for (unsigned int t = threadIdx.x; t < ntok; t += blockDim.x) {
+        unsigned int p = start_pos + t;
+        const float* kt = kc + ((u64) p * nkv + g) * hd;
+        double s = 0.0;
+        for (unsigned int i = 0; i < hd; ++i) s += (double) qh[i] * (double) kt[i];
+        s *= scale;
+        sc[t] = s;
+        mx = fmax(mx, s);
+    }
+    mx = block_max(mx);
+    double z = 0.0;
+    for (unsigned int t = threadIdx.x; t < ntok; t += blockDim.x) {
+        double e = exp(sc[t] - mx);
+        sc[t] = e;
+        z += e;
+    }
+    z = block_sum(z) + exp(sink - mx);
+    __syncthreads();
+    for (unsigned int j = threadIdx.x; j < hd; j += blockDim.x) {
+        double acc = 0.0;
+        for (unsigned int t = 0; t < ntok; ++t) {
+            unsigned int p = start_pos + t;
+            acc += sc[t] * (double) vc[((u64) p * nkv + g) * hd + j];
+        }
+        o[h * hd + j] = (float) (acc / z);
+    }
+}
+
 // The indexer's key for complete block b: the mean of its `ratio` raw keys (summed in order, then divided), RMSNorm
 // with w, RoPE at the block's first position.  One block of 128 threads.
 extern "C" __global__ void pool_block(const float* raw, float* blocks, const float* w, unsigned int b,
@@ -276,6 +349,15 @@ extern "C" __global__ void swiglu(const float* g, const float* u, float* out, un
     if (i < n) out[i] = siluf_ref(g[i]) * u[i];
 }
 
+// out[j*ff + c] = silu(g[j*ff + c] * gs[j]) * (u[j*ff + c] * us[j]) for expert j in 0..k, channel c in 0..ff
+extern "C" __global__ void swiglu_scaled(const float* g, const float* u, const float* gs, const float* us,
+                                         float* out, unsigned int ff, unsigned int k) {
+    unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= ff * k) return;
+    unsigned int j = i / ff;
+    out[i] = siluf_ref(g[i] * gs[j]) * (u[i] * us[j]);
+}
+
 // y += a * x
 extern "C" __global__ void axpy(float* y, const float* x, unsigned int n, float a) {
     unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -290,6 +372,26 @@ extern "C" __global__ void axpy_many(float* y, const float* x, const float* w, u
     float acc = y[i];
     for (unsigned int j = 0; j < k; j++) acc += w[j] * x[(u64) j * n + i];
     y[i] = acc;
+}
+
+// y += sum_j w[j] * (x[j * n ..] * s[j]), j = 0, 1, ... k-1 in that order (with per-expert tensor scale s[j])
+extern "C" __global__ void axpy_many_scaled(float* y, const float* x, const float* w, const float* s,
+                                            unsigned int n, unsigned int k) {
+    unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    float acc = y[i];
+    for (unsigned int j = 0; j < k; j++) acc += w[j] * (x[(u64) j * n + i] * s[j]);
+    y[i] = acc;
+}
+
+// y[i] = (sum_j w[j] * (eo[j * n + i] * s[j])) + sh_eo[i]: zeroes, accumulates routed experts, adds shared expert
+extern "C" __global__ void moe_combine_flint(float* y, const float* eo, const float* w, const float* s,
+                                             const float* sh_eo, unsigned int n, unsigned int k) {
+    unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    float acc = 0.0f;
+    for (unsigned int j = 0; j < k; j++) acc += w[j] * (eo[(u64) j * n + i] * s[j]);
+    y[i] = acc + sh_eo[i];
 }
 
 // y += sigmoid(gl[0]) * x  (the shared expert's gate, a one-row matvec already in gl)

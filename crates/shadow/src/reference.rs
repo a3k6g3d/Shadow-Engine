@@ -78,8 +78,8 @@ pub struct Report {
     /// (layer name, per kept position: how many attended positions differ between Shadow's sparse selection and the
     /// reference's, counted both ways)
     pub selections: Vec<(String, Vec<usize>)>,
-    /// (layer name, per token: how many of the 10 routed experts Shadow shares with the reference)
-    pub routes: Vec<(String, Vec<usize>)>,
+    /// (layer name, k, per token: how many of the k routed experts Shadow shares with the reference)
+    pub routes: Vec<(String, usize, Vec<usize>)>,
 }
 
 /// Runs the fixture's prompt through Shadow's forward pass (stopping after the fixture's last layer) and compares every
@@ -125,7 +125,7 @@ pub fn compare_stepper(s: &mut dyn Stepper, fx: &Fixture) -> Report {
             let shared = (0..np)
                 .map(|i| got[i * k..(i + 1) * k].iter().filter(|g| want[i * k..(i + 1) * k].contains(g)).count())
                 .collect();
-            routes.push((name.trim_end_matches(".route_idx").to_string(), shared));
+            routes.push((name.trim_end_matches(".route_idx").to_string(), k, shared));
             continue;
         }
         if name.ends_with(".route_w") {
@@ -160,8 +160,8 @@ pub fn print(r: &Report) {
     for (name, diff) in &r.selections {
         println!("{name}: attended positions that differ from the reference's sparse selection, per kept position: {diff:?}");
     }
-    for (name, shared) in &r.routes {
-        println!("{name}: routed experts shared with the reference, per token: {shared:?} (of 10)");
+    for (name, k, shared) in &r.routes {
+        println!("{name}: routed experts shared with the reference, per token: {shared:?} (of {k})");
         if let Some(row) = r.rows.iter().find(|x| x.name == format!("{name}.moe")) {
             let c: Vec<String> = row.cos.iter().map(|v| format!("{v:.3}")).collect();
             println!("{name}.moe cosine per token:                                     [{}]", c.join(", "));

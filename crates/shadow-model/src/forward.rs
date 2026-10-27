@@ -20,6 +20,7 @@ pub const MAX_POSITIONS: usize = 32768;
 /// The shapes, from the file's key-values (ARCH.md, "Shapes").
 #[derive(Debug, Clone)]
 pub struct Config {
+    pub arch: String,
     pub n_layer: usize,
     pub hidden: usize,
     pub streams: usize,
@@ -34,6 +35,13 @@ pub struct Config {
     pub n_expert: usize,
     pub n_expert_used: usize,
     pub expert_ff: usize,
+    pub leading_dense_layers: usize,
+    pub dense_ff: usize,
+    pub shared_ff: usize,
+    pub gating_func: u32,
+    pub sliding_window: usize,
+    pub rope_pattern: Vec<bool>,
+    pub sliding_pattern: Vec<bool>,
     pub ssm_k_heads: usize,
     pub ssm_v_heads: usize,
     pub ssm_head_dim: usize,
@@ -58,7 +66,16 @@ pub struct Config {
 
 impl Config {
     pub fn from_gguf(g: &Gguf) -> Result<Config, String> {
+        let arch = g.get("general.architecture").and_then(Value::as_str).unwrap_or("qwen35next").to_string();
         let u = |k: &str| g.arch_key(k).and_then(Value::as_u64).map(|v| v as usize).ok_or(format!("missing {k}"));
+        let bools = |k: &str| -> Result<Vec<bool>, String> {
+            g.arch_key(k).and_then(Value::as_array).ok_or(format!("missing {k}"))?.iter()
+                .map(|v| match *v {
+                    Value::Bool(b) => Ok(b),
+                    _ => Err(format!("{k}: not booleans")),
+                })
+                .collect()
+        };
         let ints = |k: &str| -> Result<Vec<i64>, String> {
             g.arch_key(k).and_then(Value::as_array).ok_or(format!("missing {k}"))?.iter()
                 .map(|v| match *v {
@@ -70,15 +87,64 @@ impl Config {
                 })
                 .collect()
         };
+        let n_layer = u("block_count")?;
         let hidden = u("embedding_length")?;
+        let head_dim = u("attention.key_length")?;
+        if arch == "flint" {
+            let expert_ff = u("expert_feed_forward_length")?;
+            return Ok(Config {
+                arch,
+                n_layer,
+                hidden,
+                streams: 1,
+                hc_rank: 0,
+                vocab: g.tensor("output.weight").map(|t| t.dims[1] as usize).ok_or("no output.weight")?,
+                eps: g.arch_key("attention.layer_norm_rms_epsilon").and_then(Value::as_f64).unwrap_or(1e-6) as f32,
+                n_head: u("attention.head_count")?,
+                n_kv_head: u("attention.head_count_kv")?,
+                head_dim,
+                rope_dims: head_dim,
+                rope_theta: g.arch_key("rope.freq_base").and_then(Value::as_f64).unwrap_or(10000.0),
+                n_expert: u("expert_count")?,
+                n_expert_used: u("expert_used_count")?,
+                expert_ff,
+                leading_dense_layers: u("leading_dense_block_count").unwrap_or(0),
+                dense_ff: u("feed_forward_length").unwrap_or(0),
+                shared_ff: u("expert_shared_feed_forward_length").unwrap_or(expert_ff),
+                gating_func: u("expert_gating_func").unwrap_or(2) as u32,
+                sliding_window: u("attention.sliding_window").unwrap_or(0),
+                rope_pattern: bools("attention.rope_pattern").unwrap_or_else(|_| vec![true; n_layer]),
+                sliding_pattern: bools("attention.sliding_window_pattern").unwrap_or_else(|_| vec![false; n_layer]),
+                ssm_k_heads: 0,
+                ssm_v_heads: 0,
+                ssm_head_dim: 0,
+                conv_k: 1,
+                attn_interval: 1,
+                ple_layer: usize::MAX,
+                ple_ngram: 0,
+                ple_heads_per_ngram: 0,
+                ple_head_dim: 0,
+                ple_conv_k: 1,
+                ple_eos: 0,
+                ple_multipliers: vec![],
+                ple_vocab: vec![],
+                ple_offsets: vec![],
+                idx_heads: 0,
+                idx_dim: 0,
+                idx_budget: 0,
+                compress: vec![0; n_layer],
+            });
+        }
         let ple_layers = ints("ple.layers")?;
         if ple_layers.len() != 1 {
             return Err(format!("ple.layers {ple_layers:?}: one PLE layer is implemented"));
         }
         let ssm_v_heads = u("ssm.time_step_rank")?;
         let ssm_inner = u("ssm.inner_size")?;
+        let expert_ff = u("expert_feed_forward_length")?;
         Ok(Config {
-            n_layer: u("block_count")?,
+            arch,
+            n_layer,
             hidden,
             streams: u("hyper_connection.count")?,
             hc_rank: u("hyper_connection.low_rank")?,
@@ -86,12 +152,19 @@ impl Config {
             eps: g.arch_key("attention.layer_norm_rms_epsilon").and_then(Value::as_f64).unwrap_or(1e-6) as f32,
             n_head: u("attention.head_count")?,
             n_kv_head: u("attention.head_count_kv")?,
-            head_dim: u("attention.key_length")?,
+            head_dim,
             rope_dims: u("rope.dimension_count")?,
             rope_theta: g.arch_key("rope.freq_base").and_then(Value::as_f64).unwrap_or(1e7),
             n_expert: u("expert_count")?,
             n_expert_used: u("expert_used_count")?,
-            expert_ff: u("expert_feed_forward_length")?,
+            expert_ff,
+            leading_dense_layers: 0,
+            dense_ff: 0,
+            shared_ff: expert_ff,
+            gating_func: 0,
+            sliding_window: 0,
+            rope_pattern: vec![true; n_layer],
+            sliding_pattern: vec![false; n_layer],
             ssm_k_heads: u("ssm.group_count")?,
             ssm_v_heads,
             ssm_head_dim: ssm_inner / ssm_v_heads,
@@ -113,8 +186,24 @@ impl Config {
         })
     }
 
+    pub fn is_flint(&self) -> bool {
+        self.arch == "flint"
+    }
+
     pub fn is_attention(&self, l: usize) -> bool {
         l % self.attn_interval == self.attn_interval - 1
+    }
+
+    pub fn is_moe(&self, l: usize) -> bool {
+        l >= self.leading_dense_layers
+    }
+
+    pub fn uses_rope(&self, l: usize) -> bool {
+        self.rope_pattern.get(l).copied().unwrap_or(true)
+    }
+
+    pub fn is_sliding(&self, l: usize) -> bool {
+        self.sliding_pattern.get(l).copied().unwrap_or(false) && self.sliding_window > 0
     }
 }
 
@@ -266,7 +355,7 @@ impl Model {
             .collect::<Result<Vec<_>, _>>()?;
         let mut dense = HashMap::new();
         for t in &g.tensors {
-            if t.name.contains("_exps") || t.name == "per_layer_token_embd.weight" {
+            if (t.name.contains("_exps") && t.name.ends_with(".weight")) || t.name == "per_layer_token_embd.weight" {
                 continue;
             }
             let mut b = vec![0u8; t.nbytes() as usize];
@@ -274,6 +363,20 @@ impl Model {
             dense.insert(t.name.clone(), b);
         }
         Ok(Model { g, cfg, files, dense })
+    }
+
+    /// The companion `.scale` f32 multiplier of a 2-D tensor (1.0 when the model has no `.scale` tensor).
+    pub fn scale(&self, weight_name: &str) -> f32 {
+        let Some(stem) = weight_name.strip_suffix(".weight") else { return 1.0 };
+        let Some(b) = self.dense.get(&format!("{stem}.scale")) else { return 1.0 };
+        f32::from_le_bytes(b[..4].try_into().unwrap())
+    }
+
+    /// The companion `.scale[e]` f32 multiplier of expert `e` in a 3-D `*_exps.weight` tensor (1.0 if none).
+    pub fn expert_scale(&self, weight_name: &str, e: usize) -> f32 {
+        let Some(stem) = weight_name.strip_suffix(".weight") else { return 1.0 };
+        let Some(b) = self.dense.get(&format!("{stem}.scale")) else { return 1.0 };
+        f32::from_le_bytes(b[e * 4..(e + 1) * 4].try_into().unwrap())
     }
 
     pub fn dense_bytes(&self) -> usize {
@@ -379,10 +482,26 @@ impl<'m> Session<'m> {
         }
     }
 
-    /// y = W x for a dense tensor, through the backend.
+    /// y = W x for a dense tensor, through the backend, multiplied by its companion `.scale` if present.
     fn mv(&self, name: &str, x: &[f32]) -> Vec<f32> {
         let mt = self.m.mat(name);
-        self.be.matvec(mt.t, mt.bytes, Some(name), x)
+        let mut y = self.be.matvec(mt.t, mt.bytes, Some(name), x);
+        let s = self.m.scale(name);
+        if s != 1.0 {
+            y.iter_mut().for_each(|v| *v *= s);
+        }
+        y
+    }
+
+    /// y = W_e x for expert `e` of a 3-D expert tensor, multiplied by its companion `.scale[e]` if present.
+    fn mv_expert(&self, name: &str, e: usize, x: &[f32]) -> Vec<f32> {
+        let (t, b) = self.m.expert(name, e);
+        let mut y = self.be.matvec(&t, &b, None, x);
+        let s = self.m.expert_scale(name, e);
+        if s != 1.0 {
+            y.iter_mut().for_each(|v| *v *= s);
+        }
+        y
     }
 
     pub fn len(&self) -> usize {
@@ -410,6 +529,10 @@ impl<'m> Session<'m> {
         };
         let mut r: Vec<f32> = (0..cs).flat_map(|_| emb.iter().copied()).collect();
         self.rec("embed".into(), &emb);
+
+        if c.is_flint() {
+            return self.step_flint(r);
+        }
 
         for l in 0..c.n_layer {
             if self.stop_after == Some(l) {
@@ -718,6 +841,126 @@ impl<'m> Session<'m> {
         self.ple_conv[(hist_len - 1) * ch..].copy_from_slice(&gvn);
         out
     }
+
+    fn step_flint(&mut self, mut x: Vec<f32>) -> Vec<f32> {
+        let m = self.m;
+        let c = &m.cfg;
+        for l in 0..c.n_layer {
+            if self.stop_after == Some(l) {
+                let u = rmsnorm(&x, &m.vec("output_norm.weight"), c.eps);
+                self.rec("final_u".into(), &u);
+                return vec![];
+            }
+            let u = rmsnorm(&x, &m.vec(&format!("blk.{l}.attn_norm.weight")), c.eps);
+            self.rec(format!("layer{l}.attn_hc_u"), &u);
+            let y = self.attention_flint(l, &u);
+            self.rec(format!("layer{l}.mixer"), &y);
+            x.iter_mut().zip(&y).for_each(|(a, b)| *a += b);
+
+            let u = rmsnorm(&x, &m.vec(&format!("blk.{l}.ffn_norm.weight")), c.eps);
+            self.rec(format!("layer{l}.mlp_hc_u"), &u);
+            let y = if c.is_moe(l) { self.moe_flint(l, &u) } else { self.mlp_flint(l, &u) };
+            self.rec(format!("layer{l}.moe"), &y);
+            x.iter_mut().zip(&y).for_each(|(a, b)| *a += b);
+            self.rec(format!("layer{l}.out"), &x);
+        }
+        let u = rmsnorm(&x, &m.vec("output_norm.weight"), c.eps);
+        self.rec("final_u".into(), &u);
+        self.mv("output.weight", &u)
+    }
+
+    fn attention_flint(&mut self, l: usize, u: &[f32]) -> Vec<f32> {
+        let m = self.m;
+        let c = &m.cfg;
+        let p = format!("blk.{l}");
+        let (nh, nkv, hd) = (c.n_head, c.n_kv_head, c.head_dim);
+        let q_raw = self.mv(&format!("{p}.attn_q.weight"), u);
+        let k_raw = self.mv(&format!("{p}.attn_k.weight"), u);
+        let v = self.mv(&format!("{p}.attn_v.weight"), u);
+        let (qn, kn) = (m.vec(&format!("{p}.attn_q_norm.weight")), m.vec(&format!("{p}.attn_k_norm.weight")));
+        let sinks = m.vec(&format!("{p}.attn_sinks.weight"));
+        let pos = (self.tokens.len() - 1) as f64;
+        let use_rope = c.uses_rope(l);
+        let mut q = vec![0f32; nh * hd];
+        for h in 0..nh {
+            let mut qh = rmsnorm(&q_raw[h * hd..(h + 1) * hd], &qn, c.eps);
+            if use_rope {
+                rope_apply(&mut qh, pos, c.rope_dims, c.rope_theta);
+            }
+            q[h * hd..(h + 1) * hd].copy_from_slice(&qh);
+        }
+        let cache = self.attn[l].as_mut().unwrap();
+        for h in 0..nkv {
+            let mut kh = rmsnorm(&k_raw[h * hd..(h + 1) * hd], &kn, c.eps);
+            if use_rope {
+                rope_apply(&mut kh, pos, c.rope_dims, c.rope_theta);
+            }
+            cache.k.extend(kh);
+        }
+        cache.v.extend_from_slice(&v);
+        let n = cache.k.len() / (nkv * hd);
+        let start = if c.is_sliding(l) { n.saturating_sub(c.sliding_window) } else { 0 };
+        let toks: Vec<usize> = (start..n).collect();
+
+        let mut o = vec![0f32; nh * hd];
+        let scale = 1.0 / (hd as f64).sqrt();
+        for h in 0..nh {
+            let g = h / (nh / nkv);
+            let qh = &q[h * hd..(h + 1) * hd];
+            let scores: Vec<f64> = toks
+                .iter()
+                .map(|&t| {
+                    let kt = &cache.k[(t * nkv + g) * hd..(t * nkv + g + 1) * hd];
+                    qh.iter().zip(kt).map(|(&a, &b)| a as f64 * b as f64).sum::<f64>() * scale
+                })
+                .collect();
+            let sink = sinks[h] as f64;
+            let mx = scores.iter().cloned().fold(sink, f64::max);
+            let ex: Vec<f64> = scores.iter().map(|s| (s - mx).exp()).collect();
+            let z: f64 = ex.iter().sum::<f64>() + (sink - mx).exp();
+            for j in 0..hd {
+                let acc: f64 = ex.iter().zip(&toks).map(|(&e, &t)| e * cache.v[(t * nkv + g) * hd + j] as f64).sum();
+                o[h * hd + j] = (acc / z) as f32;
+            }
+        }
+        self.mv(&format!("{p}.attn_output.weight"), &o)
+    }
+
+    fn mlp_flint(&self, l: usize, u: &[f32]) -> Vec<f32> {
+        let p = format!("blk.{l}");
+        let gate = self.mv(&format!("{p}.ffn_gate.weight"), u);
+        let up = self.mv(&format!("{p}.ffn_up.weight"), u);
+        let act: Vec<f32> = gate.iter().zip(&up).map(|(&g, &u)| silu(g) * u).collect();
+        self.mv(&format!("{p}.ffn_down.weight"), &act)
+    }
+
+    fn moe_flint(&mut self, l: usize, u: &[f32]) -> Vec<f32> {
+        let c = &self.m.cfg;
+        let p = format!("blk.{l}");
+        let logits = self.mv(&format!("{p}.ffn_gate_inp.weight"), u);
+        let top = route_sigmoid(&logits, c.n_expert_used);
+        let route_idx: Vec<f32> = top.iter().map(|&(e, _)| e as f32).collect();
+        let route_w: Vec<f32> = top.iter().map(|&(_, w)| w as f32).collect();
+        self.rec(format!("layer{l}.route_idx"), &route_idx);
+        self.rec(format!("layer{l}.route_w"), &route_w);
+        let mut y = vec![0f64; c.hidden];
+        let swiglu = |gate: Vec<f32>, up: Vec<f32>| -> Vec<f32> {
+            gate.iter().zip(&up).map(|(&g, &u)| silu(g) * u).collect()
+        };
+        for &(e, w) in &top {
+            let gate = self.mv_expert(&format!("{p}.ffn_gate_exps.weight"), e, u);
+            let up = self.mv_expert(&format!("{p}.ffn_up_exps.weight"), e, u);
+            let act = swiglu(gate, up);
+            let out = self.mv_expert(&format!("{p}.ffn_down_exps.weight"), e, &act);
+            y.iter_mut().zip(&out).for_each(|(a, &b)| *a += w * b as f64);
+        }
+        let act = swiglu(
+            self.mv(&format!("{p}.ffn_gate_shexp.weight"), u),
+            self.mv(&format!("{p}.ffn_up_shexp.weight"), u),
+        );
+        let sh = self.mv(&format!("{p}.ffn_down_shexp.weight"), &act);
+        y.iter().zip(&sh).map(|(&a, &b)| (a + b as f64) as f32).collect()
+    }
 }
 
 fn hc_write(r: &mut [f32], g: &[f32], y: &[f32], h: usize) {
@@ -739,6 +982,17 @@ pub fn route(logits: &[f32], k: usize) -> Vec<(usize, f64)> {
     let top = &idx[..k];
     let tz: f64 = top.iter().map(|&e| ex[e] / z).sum();
     top.iter().map(|&e| (e, (ex[e] / z) / tz)).collect()
+}
+
+/// Sigmoid top-k routing (`expert_gating_func = 2`, Flint): sigmoid(logits) in f32, top `k` chosen, renormalized by
+/// `sum(top) + 1e-20`.
+pub fn route_sigmoid(logits: &[f32], k: usize) -> Vec<(usize, f64)> {
+    let sc: Vec<f32> = logits.iter().map(|&v| sigmoid(v)).collect();
+    let mut idx: Vec<usize> = (0..logits.len()).collect();
+    idx.sort_by(|&a, &b| sc[b].partial_cmp(&sc[a]).unwrap().then(a.cmp(&b)));
+    let top = &idx[..k];
+    let tz: f64 = top.iter().map(|&e| sc[e] as f64).sum::<f64>() + 1e-20;
+    top.iter().map(|&e| (e, sc[e] as f64 / tz)).collect()
 }
 
 /// The n-gram table rows the PLE layer reads for the LAST token of `tokens` (ARCH.md, "PLE"): for each n-gram order
@@ -812,7 +1066,16 @@ pub fn check_layout(g: &Gguf, c: &Config) -> Result<(), String> {
         }
     }
     for l in 0..c.n_layer {
-        let need: &[&str] = if c.is_attention(l) {
+        let need: &[&str] = if c.is_flint() {
+            if c.is_moe(l) {
+                &["attn_norm", "attn_q", "attn_k", "attn_v", "attn_output", "attn_q_norm", "attn_k_norm", "attn_sinks",
+                  "ffn_norm", "ffn_gate_inp", "ffn_gate_exps", "ffn_up_exps", "ffn_down_exps", "ffn_gate_shexp",
+                  "ffn_up_shexp", "ffn_down_shexp"]
+            } else {
+                &["attn_norm", "attn_q", "attn_k", "attn_v", "attn_output", "attn_q_norm", "attn_k_norm", "attn_sinks",
+                  "ffn_norm", "ffn_gate", "ffn_up", "ffn_down"]
+            }
+        } else if c.is_attention(l) {
             &["attn_q", "attn_k", "attn_v", "attn_output", "attn_q_norm", "attn_k_norm"]
         } else {
             &["attn_qkv", "attn_gate", "ssm_beta", "ssm_alpha", "ssm_conv1d", "ssm_out", "ssm_norm"]

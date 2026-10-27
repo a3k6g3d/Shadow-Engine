@@ -6,7 +6,7 @@
 //! only (the plan's open item); a request's sampling parameters are accepted and not used, and `/props` says so.
 
 use shadow_cuda::session::{GpuSession, Tiers};
-use shadow_model::chat::{render, Message, Options};
+use shadow_model::chat::{render_for_arch, Message, Options};
 use shadow_model::forward::{check_layout, Model};
 use shadow_model::gguf::Gguf;
 use shadow_model::tokenizer::Tokenizer;
@@ -97,9 +97,10 @@ fn run(cfg: Config, rx: std::sync::mpsc::Receiver<Request>, status: &Mutex<Statu
     let model = Model::load(g)?;
     check_layout(&model.g, &model.cfg)?;
     let ctx = shadow_cuda::Context::new(0).map_err(|e| format!("GPU: {e}"))?;
+    let arch = model.cfg.arch.clone();
     let mut sess = GpuSession::with_tiers(&ctx, &model, cfg.n_ctx, cfg.tiers)?;
     let im_end = tok.id("<|im_end|>");
-    let think_end = tok.id("</think>");
+    let think_end = tok.id("</think>").or_else(|| tok.id("<|/thought|>"));
     let stops: Vec<u32> = [tok.eos, im_end].into_iter().flatten().collect();
     {
         use shadow_model::forward::Stepper;
@@ -112,7 +113,7 @@ fn run(cfg: Config, rx: std::sync::mpsc::Receiver<Request>, status: &Mutex<Statu
     let mut last_logits: Vec<f32> = Vec::new();
     while let Ok(req) = rx.recv() {
         status.lock().unwrap().busy = true;
-        let r = answer(&req, &tok, &mut sess, &mut last_logits, &stops, think_end);
+        let r = answer(&arch, &req, &tok, &mut sess, &mut last_logits, &stops, think_end);
         let mut s = status.lock().unwrap();
         s.busy = false;
         s.finished += 1;
@@ -162,9 +163,9 @@ fn argmax(v: &[f32]) -> u32 {
     v.iter().enumerate().max_by(|a, b| a.1.partial_cmp(b.1).unwrap()).map(|(i, _)| i as u32).unwrap()
 }
 
-fn answer(req: &Request, tok: &Tokenizer, sess: &mut GpuSession, last_logits: &mut Vec<f32>, stops: &[u32],
+fn answer(arch: &str, req: &Request, tok: &Tokenizer, sess: &mut GpuSession, last_logits: &mut Vec<f32>, stops: &[u32],
           think_end: Option<u32>) -> Result<Stats, String> {
-    let text = render(&req.messages, &req.opts)?;
+    let text = render_for_arch(arch, &req.messages, &req.opts)?;
     let ids = tok.encode(&text, true);
     if ids.len() + req.max_tokens > sess.capacity() {
         return Err(format!("{} prompt tokens + {} max_tokens exceed the context of {} positions", ids.len(),
@@ -185,14 +186,14 @@ fn answer(req: &Request, tok: &Tokenizer, sess: &mut GpuSession, last_logits: &m
     let prompt_ms = t0.elapsed().as_secs_f64() * 1e3;
 
     let t1 = Instant::now();
-    let mut reasoning = text.ends_with("<think>\n"); // thinking on: the reply opens inside the think block
+    let mut reasoning = text.ends_with("<think>\n") || text.ends_with("<|thought|>\n"); // thinking on: opens inside think block
     let mut first_content = true;
     let mut utf8 = Utf8 { pending: Vec::new() };
     let mut n = 0;
     let mut finish = "length";
     while n < req.max_tokens {
         let next = argmax(last_logits);
-        if stops.contains(&next) {
+        if tok.is_eog(next) || stops.contains(&next) {
             finish = "stop";
             break;
         }

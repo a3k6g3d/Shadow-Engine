@@ -90,14 +90,23 @@ fn dump(path: &std::path::Path, name: &str, out: &std::path::Path, rest: &[Strin
     let row_bytes = cols / qk * qb;
     // (first byte, byte count) of each chunk to read, in order
     let flag = |f: &str| rest.iter().position(|a| a == f).and_then(|i| rest.get(i + 1));
+    let expert_idx: Option<usize> = flag("--expert").map(|e| e.parse::<usize>().expect("expert index"));
     let chunks: Vec<(u64, u64)> = if let Some(r) = flag("--rows") {
         r.split(',').map(|x| (x.parse::<u64>().expect("row index") * row_bytes, row_bytes)).collect()
-    } else if let Some(e) = flag("--expert") {
+    } else if let Some(e) = expert_idx {
         let per = t.nbytes() / t.dims[2];
-        vec![(e.parse::<u64>().expect("expert index") * per, per)]
+        vec![(e as u64 * per, per)]
     } else {
         vec![(0, t.nbytes())]
     };
+    let scale: f32 = name.strip_suffix(".weight")
+        .and_then(|p| g.tensor(&format!("{p}.scale")))
+        .map(|st| {
+            let b = g.read_tensor(st).expect("read .scale");
+            let idx = expert_idx.unwrap_or(0);
+            f32::from_le_bytes(b[idx * 4..(idx + 1) * 4].try_into().unwrap())
+        })
+        .unwrap_or(1.0);
     let mut f = std::fs::File::open(&g.shards[t.shard].path).expect("open shard");
     let mut o = std::io::BufWriter::new(std::fs::File::create(out).expect("create output"));
     let mut rows = 0u64;
@@ -108,7 +117,8 @@ fn dump(path: &std::path::Path, name: &str, out: &std::path::Path, rest: &[Strin
         let mut y = vec![0f32; (len / qb * qk) as usize];
         dequantize(t.ty, &buf, &mut y).expect("dequantize");
         for v in &y {
-            o.write_all(&v.to_le_bytes()).unwrap();
+            let sv = *v * scale;
+            o.write_all(&sv.to_le_bytes()).unwrap();
         }
         rows += len / row_bytes;
     }
@@ -218,7 +228,7 @@ fn serve(path: &std::path::Path, rest: &[String]) -> ExitCode {
 /// `--gpu` runs the whole forward pass on GPU 0; `--gpu-matvec` only its matrix-vector products; neither: the stage 1
 /// CPU reference, slow by design.
 fn generate(path: &std::path::Path, prompt: &str, rest: &[String]) -> ExitCode {
-    use shadow_model::chat::{render, Message, Options, Role};
+    use shadow_model::chat::{render_for_arch, Message, Options, Role};
     use shadow_model::forward::{check_layout, CpuBackend, Model, Session, Stepper};
     use shadow_model::tokenizer::Tokenizer;
     use std::io::Write;
@@ -249,7 +259,7 @@ fn generate(path: &std::path::Path, prompt: &str, rest: &[String]) -> ExitCode {
     eprintln!("loaded {:.2} GiB of dense weights in {:.1} s", model.dense_bytes() as f64 / GIB, t0.elapsed().as_secs_f64());
     let text = if chat {
         let o = Options { thinking: Some(false), ..Options::default() };
-        render(&[Message::new(Role::User, prompt)], &o).expect("template")
+        render_for_arch(&model.cfg.arch, &[Message::new(Role::User, prompt)], &o).expect("template")
     } else {
         prompt.to_string()
     };
@@ -317,7 +327,7 @@ fn generate(path: &std::path::Path, prompt: &str, rest: &[String]) -> ExitCode {
         out.push(next);
         print!("{}", String::from_utf8_lossy(&tok.decode_bytes(&[next])));
         let _ = std::io::stdout().flush();
-        if Some(next) == tok.eos {
+        if tok.is_eog(next) {
             break;
         }
         logits = s.step(next);
