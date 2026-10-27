@@ -14,7 +14,7 @@ static __device__ __forceinline__ float iq4nl_val(unsigned int q) {
     return (float) b;
 }
 
-static __device__ __forceinline__ float qf16(const u8* b) { return f16_to_f32((u16) b[0] | ((u16) b[1] << 8)); }
+static __device__ __forceinline__ float qf16(const u8* b) { return f16_to_f32(*(const u16*) b); }
 
 static __device__ __forceinline__ float qsign(float v, unsigned int bit) { return (bit & 1) ? -v : v; }
 
@@ -154,13 +154,13 @@ struct IQ3S {
 struct BF16 {
     static const unsigned int QK = 1, BYTES = 2;
     static __device__ __forceinline__ float at(const u8* b, unsigned int) {
-        return bf16_to_f32((u16) b[0] | ((u16) b[1] << 8));
+        return bf16_to_f32(*(const u16*) b);
     }
 };
 
 struct F32 {
     static const unsigned int QK = 1, BYTES = 4;
     static __device__ __forceinline__ float at(const u8* b, unsigned int) {
-        return __uint_as_float((u32) b[0] | ((u32) b[1] << 8) | ((u32) b[2] << 16) | ((u32) b[3] << 24));
+        return *(const float*) b;
     }
 };

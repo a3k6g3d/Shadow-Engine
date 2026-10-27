@@ -52,11 +52,17 @@ them changes the prompt; the fixture records the ids, so it stays valid as a fix
   (`crates/shadow-bench`) are in (0.1.7-0.1.11). Shadow's own 8-launch noise floor is measured in
   `bench/floor-2026-10-27`: **median 0.8%, p90 2.0%, worst 3.6%** at **10.20 tok/s** `decode_warm` (`--ram-tier-gib 30`),
   lowest available RAM 9.6 GiB, 0 answer differences across 48 turns.
-- **Stage 5 (`0.1.12`)**: Register-immediate `iq4nl_val`, `Fast<Q4K/Q5K/Q6K/IQ4XS>` kernels, fused forward-pass kernels
-  (`hc_down_inject_bf16`, `hc_write_rmsnorm_groups`, `moe_combine_qwen`, `matvec_pair_bf16`, `l2norm_qk_heads`,
-  `head_norm_rope_qgk`), and `copy_stream` DMA + pinned file-miss staging + early shared-expert overlap cut GPU compute
-  from 52.5 to 31.6 ms/token (`-40%`) and raised 8-launch `decode_warm` from **10.20 tok/s to 15.34 tok/s (`+50.4%`)**
-  (`bench/stage5-kernels-2026-10-27`, floor `0.3%` median / `1.3%` p90 / `1.7%` worst, single-prompt decode `16.95 tok/s`).
+- **Stage 5 (`0.1.12`-`0.1.13`)**:
+  - `0.1.12`: Register-immediate `iq4nl_val`, `Fast<Q4K/Q5K/Q6K/IQ4XS>` kernels, fused forward-pass kernels
+    (`hc_down_inject_bf16`, `hc_write_rmsnorm_groups`, `moe_combine_qwen`, `matvec_pair_bf16`, `l2norm_qk_heads`,
+    `head_norm_rope_qgk`), and `copy_stream` DMA + pinned file-miss staging + early shared-expert overlap cut GPU compute
+    from 52.5 to 31.6 ms/token (`-40%`) and raised 8-launch `decode_warm` from **10.20 tok/s to 15.34 tok/s (`+50.4%`)**
+    (`bench/stage5-kernels-2026-10-27`).
+  - `0.1.13`: Aligned `u16`/`u32`/`float` loads across `quants.cuh` + `matvec.cu`, general `matvec_pair_*` (`mv_pair`),
+    per-layer exact-size VRAM `ExpertCache` (`1,831 -> 2,654` slots, `5.07 GiB`), exclusive VRAM-pinned hot experts (`16,989`
+    unique experts across `VRAM U RAM`, startup `45 s -> 32 s`), and `RamTier`'s Clock promotion ring raised 8-launch
+    `decode_warm` to **16.92 tok/s (`+65.9%` over baseline, `+10.3%` over `0.1.12`)** (`bench/stage5-tiers-2026-10-27`,
+    floor `0.8%` median / `2.3%` p90 / `3.3%` worst, single-prompt decode `18.5 tok/s`).
 - Cleanup done (0.1.4): `shadow-abi`, `include/shadow/c/abi.h`, `shadow-host/src/ffi.rs` and `protocol.rs` are
   removed. Still owed: copy the model under `J:\\Shadow\\models\\` and record its SHA-256 (the plan
   says the model file is the only input; it is still read from `J:\Strata-work\models\swift15\IQ3_S\`).

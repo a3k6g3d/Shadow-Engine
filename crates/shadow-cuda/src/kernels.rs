@@ -81,6 +81,7 @@ pub const QUANT_KERNELS: &[(&str, u32, u32, &str, &str)] = &[
 ];
 
 const MATVEC_BATCH: &[P] = &[P::ConstPtr, P::ConstPtr, P::U32, P::Ptr, P::U32, P::U32, P::U32];
+const MATVEC_PAIR: &[P] = &[P::ConstPtr, P::Ptr, P::U32, P::ConstPtr, P::Ptr, P::U32, P::ConstPtr, P::U32];
 
 /// Per quant type: (ggml type name, fast matvec entry, batched matvec entry) - matvec.cu's 8-weights-at-a-time
 /// kernels.  Same signature as the reference matvec for the first; the second takes a device table of matrix
@@ -100,8 +101,28 @@ pub const FAST_KERNELS: &[(&str, &str, &str)] = &[
     ("F32", "matvec_fast_f32", "matvec_batch_f32"),
 ];
 
+/// Per quant type: (ggml type name, paired matvec entry) for two matrices sharing input `x`.
+pub const PAIR_KERNELS: &[(&str, &str)] = &[
+    ("Q4_K", "matvec_pair_q4_k"),
+    ("Q5_K", "matvec_pair_q5_k"),
+    ("Q6_K", "matvec_pair_q6_k"),
+    ("IQ4_NL", "matvec_pair_iq4_nl"),
+    ("IQ4_XS", "matvec_pair_iq4_xs"),
+    ("NVFP4", "matvec_pair_nvfp4"),
+    ("Q2_0", "matvec_pair_q2_0"),
+    ("IQ2_S", "matvec_pair_iq2_s"),
+    ("IQ3_XXS", "matvec_pair_iq3_xxs"),
+    ("IQ3_S", "matvec_pair_iq3_s"),
+    ("BF16", "matvec_pair_bf16"),
+    ("F32", "matvec_pair_f32"),
+];
+
 const fn batch(name: &'static str) -> Entry {
     Entry { name, params: MATVEC_BATCH }
+}
+
+const fn pair(name: &'static str) -> Entry {
+    Entry { name, params: MATVEC_PAIR }
 }
 
 const fn unary(name: &'static str) -> Entry {
@@ -163,6 +184,10 @@ pub const FILES: &[File] = &[
             e("matvec_pair_bf16", &[C, W, U, C, W, U, C, U]),
             e("hc_down_inject_bf16", &[C, W, U, C, W, U, C, U, F]),
             matvec("matvec_fast_f32"), batch("matvec_batch_f32"),
+            pair("matvec_pair_q4_k"), pair("matvec_pair_q5_k"), pair("matvec_pair_q6_k"),
+            pair("matvec_pair_iq4_nl"), pair("matvec_pair_iq4_xs"), pair("matvec_pair_nvfp4"),
+            pair("matvec_pair_q2_0"), pair("matvec_pair_iq2_s"), pair("matvec_pair_iq3_xxs"),
+            pair("matvec_pair_iq3_s"), pair("matvec_pair_f32"),
         ],
     },
     File {

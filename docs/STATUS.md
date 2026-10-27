@@ -208,6 +208,42 @@ router top-10 on the host 1%. That is why the RAM tier came before moving the ro
     - **Lowest available RAM: 12.9 GiB** (up from 9.6 GiB); peak GPU memory 10,012-10,019 MiB (down from 10,422 MiB);
       **0 answer differences** across all 48 turns.
 
+## Stage 5 (`0.1.13`): aligned word loads, per-layer exact-size VRAM cache + exclusive VRAM pinning, `RamTier` Clock ring, and `matvec_pair_*`
+
+- **Aligned word loads in `kernels/quants.cuh` and `kernels/matvec.cu`:**
+  - Replaced 1-byte `ld.global.u8` loads in `qf16`, `BF16::at`, `F32::at`, `Fast<Q4K>`, `Fast<Q5K>`, `Fast<Q6K>`, `Fast<IQ4NL>`,
+    `Fast<IQ4XS>`, `Fast<Q20>`, `Fast<IQ3XXS>`, and `Fast<IQ3S>` with aligned `*(const u16*)`, `*(const u32*)`, and
+    `*(const float*)` loads (`crates/shadow-cuda/tests/dequant.rs` bit-exact; `crates/shadow-cuda/tests/matvec.rs`):
+    - `F32` (`matvec_f32`): **360 -> 788.8 GB/s** (`983.4 GB/s` batch)
+    - `BF16` (`matvec_bf16`): **455.5 -> 482.8 GB/s** (`652.9 GB/s` batch)
+    - `Q6_K`: **309.4 -> 360.8 GB/s** (`381.6 GB/s` batch)
+    - `Q5_K`: **244.7 -> 312.9 GB/s** (`328.9 GB/s` batch)
+    - `Q4_K`: **215.6 -> 252.1 GB/s** (`275.0 GB/s` batch)
+    - `IQ4_NL` batch: **213.1 -> 236.3 GB/s** (`3.2x`)
+    - `IQ4_XS` batch: **212.1 -> 238.3 GB/s** (`4.0x`)
+    - `IQ3_S` batch: **180.6 GB/s** (`3.8x`); `IQ3_XXS` batch: **160.8 GB/s** (`3.9x`)
+- **General `matvec_pair_*` fusion (`PAIR_KERNELS` in `crates/shadow-cuda/src/kernels.rs`, `mv_pair` in `session.rs`):**
+  - Fuses any two projections sharing input `x` (`ffn_gate_inp` + `ffn_gate_inp_shexp` in `F32`, `ffn_gate_shexp` + `ffn_up_shexp`,
+    `attn_qkv` + `attn_gate`, `attn_k` + `attn_v`, and `ple_key` + `ple_value`) when they share quant type and column count,
+    eliminating ~110-145 kernel launches per token and halving input vector reads.
+- **Per-layer exact-size VRAM `ExpertCache` + exclusive VRAM-pinned hot experts + `RamTier` Clock promotion ring (`session.rs`):**
+  - Partitioned `ExpertCache` per layer at each layer's exact expert size (`1.44` / `1.88` / `2.08` / `2.54 MiB`, `0` internal
+    fragmentation) and lowered `VRAM_RESERVE` to `1024 MiB`, raising VRAM capacity from **1,831 slots (`4.54 GiB`) to 2,654
+    slots (`5.07 GiB`, `+44.9%`)**.
+  - Pinned the hottest ~half of each layer's VRAM slots (`~1,175` experts) permanently in VRAM (`evict_range[l]`), loaded
+    directly into VRAM during `RamTier::fill` (cutting session startup from **45 s to 32 s**, `-28.9%`), and excluded them from
+    `RamTier` so the 30 GiB `RamTier` covers **`+1,200` additional unique experts** (`16,989` unique experts across `VRAM U RAM`
+    instead of `15,789`).
+  - Added an exact-size Clock-replaced promotion ring (`promote_slot`) at the cold tail of `RamTier` (`128` slots) so file-tier
+    misses are read directly into pinned `RamTier` and retained across turns.
+- **Gated & benchmarked (`bench/stage5-tiers-2026-10-27`):**
+  - Passed `cargo test -p shadow --test reference` (`7/7`) and 48-layer GPU comparison (`1.00000` cosine, `10/10` routing).
+  - Over **8 launches x 5 warm turns** (`--ctx 8192 --ram-tier-gib 30 --placement profiles/routing-6prompts.shrc`):
+    - **`decode_warm` median: 16.92 tok/s** (up from `15.34 tok/s` in `0.1.12`, **`+10.3%`**, and **`+65.9%` (`1.659x`)** over
+      the `10.20 tok/s` baseline; p90 `16.62`, worst `16.62`, best `17.02 tok/s`; single-prompt decode `18.5 tok/s` / `0.054 s/token`).
+    - **Within-arm noise floor: median 0.8%, p90 2.3%, worst 3.3%**; lowest available RAM `8.7 GiB`; peak GPU `10,628-10,696 MiB`;
+      **0 answer differences** across all 48 turns.
+
 ## Second architecture: `RecursiveSI/flint` (`Flint-40B-A2.5B-abliterated-NVFP4.gguf`)
 
 - **Model**: 40 layers (layers 0-1 dense SwiGLU, layers 2-39 128-expert top-6 sigmoid MoE + ungated shared expert),

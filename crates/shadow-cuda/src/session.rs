@@ -13,7 +13,7 @@
 //! least recently used slot.  The experts the current token routes to are never the victims of its own misses.
 
 use crate::driver::{Context, DeviceBuffer, Stream};
-use crate::kernels::{file, Arg, Program, FAST_KERNELS, QUANT_KERNELS};
+use crate::kernels::{file, Arg, Program, FAST_KERNELS, PAIR_KERNELS, QUANT_KERNELS};
 use crate::pinned::PinnedRegion;
 use shadow_model::forward::{ple_rows, route, route_sigmoid, Model, Stepper};
 use shadow_model::gguf::TensorInfo;
@@ -29,10 +29,16 @@ struct Attn<'c> {
     nblocks: usize,
 }
 
-/// Routed experts resident in VRAM: `slots` equal slots of `slot_bytes`, each one expert's [gate | up | down] slices.
+/// Routed experts resident in VRAM: either partitioned per layer at each layer's exact expert size (0 wasted padding
+/// across mixed-quant layers) or shared `slots` of `slot_bytes` when the budget is too small to give every layer its
+/// minimum slots.
 struct ExpertCache<'c> {
     arena: Option<DeviceBuffer<'c>>,
+    slot_offset: Vec<u64>,
+    layer_range: Vec<std::ops::Range<usize>>,
+    evict_range: Vec<std::ops::Range<usize>>,
     slot_bytes: usize,
+    arena_bytes: usize,
     slots: usize,
     map: HashMap<(usize, usize), usize>,
     owner: Vec<Option<(usize, usize)>>,
@@ -50,9 +56,11 @@ impl ExpertCache<'_> {
         Some(s)
     }
 
-    /// A slot for a new expert: a free one, else the least recently used one not used by the current token.
-    fn victim(&mut self) -> usize {
-        let s = (0..self.slots)
+    /// A slot in layer `l` for a new expert: a free one, else the least recently used evictable slot not used by the
+    /// current token.
+    fn victim(&mut self, l: usize) -> usize {
+        let r = self.evict_range[l].clone();
+        let s = r
             .filter(|&i| self.owner[i].is_none() || self.stamp[i] < self.clock)
             .min_by_key(|&i| (self.owner[i].is_some(), self.stamp[i]))
             .expect("the cache has fewer slots than one token routes to");
@@ -192,12 +200,18 @@ impl Tiers {
     }
 }
 
-/// Routed experts in pinned RAM (stage 3's second tier): each expert's [gate | up | down] slices packed together,
-/// filled once at the start from the placement order and never evicted.  A VRAM cache miss on one of them is a DMA
-/// copy instead of a file read.
+/// Routed experts in pinned RAM (stage 3's second tier): each expert's [gate | up | down] slices packed together at
+/// their exact layer size, filled at the start from the placement order.  The cold tail slots form an exact-size
+/// Clock-replaced promotion ring so any out-of-profile expert read from the file is retained in pinned RAM.
 struct RamTier<'c> {
     region: Option<PinnedRegion<'c>>,
     at: HashMap<(usize, usize), usize>,
+    ring_by_off: HashMap<usize, usize>,
+    ring_offs: Vec<usize>,
+    ring_sizes: Vec<usize>,
+    ring_owner: Vec<Option<(usize, usize)>>,
+    ring_ref: Vec<bool>,
+    ring_hand: usize,
     /// Misses served from this tier, and from the file.
     served: u64,
     drive: u64,
@@ -205,8 +219,13 @@ struct RamTier<'c> {
 }
 
 impl<'c> RamTier<'c> {
-    fn fill(ctx: &'c Context, m: &Model, bytes: usize, order: Option<Vec<(usize, usize)>>) -> Result<RamTier<'c>, String> {
-        let mut t = RamTier { region: None, at: HashMap::new(), served: 0, drive: 0, fill_secs: 0.0 };
+    fn fill(ctx: &'c Context, m: &Model, bytes: usize, order: Option<Vec<(usize, usize)>>,
+            vram_pinned: &[(usize, usize, u64)], arena_ptr: u64) -> Result<RamTier<'c>, String> {
+        let mut t = RamTier {
+            region: None, at: HashMap::new(), ring_by_off: HashMap::new(), ring_offs: Vec::new(),
+            ring_sizes: Vec::new(), ring_owner: Vec::new(), ring_ref: Vec::new(), ring_hand: 0,
+            served: 0, drive: 0, fill_secs: 0.0,
+        };
         if bytes == 0 {
             return Ok(t);
         }
@@ -214,10 +233,11 @@ impl<'c> RamTier<'c> {
         let order = order.unwrap_or_else(|| uniform_order(c.n_layer, c.n_expert));
         let names = |l: usize| ["ffn_gate_exps", "ffn_up_exps", "ffn_down_exps"].map(|r| format!("blk.{l}.{r}.weight"));
         let size = |l: usize| names(l).iter().map(|n| m.expert_bytes(n)).sum::<usize>().next_multiple_of(256);
+        let pinned_set: std::collections::HashSet<(usize, usize)> = vram_pinned.iter().map(|&(l, e, _)| (l, e)).collect();
         let mut chosen = Vec::new();
         let mut total = 0usize;
         for &(l, e) in &order {
-            if !c.is_moe(l) {
+            if !c.is_moe(l) || pinned_set.contains(&(l, e)) {
                 continue;
             }
             let s = size(l);
@@ -225,17 +245,64 @@ impl<'c> RamTier<'c> {
                 break;
             }
             t.at.insert((l, e), total);
-            chosen.push((l, e, total));
+            chosen.push((l, e, total, s));
             total += s;
         }
         if chosen.is_empty() {
             return Ok(t);
         }
+        let ring_count = (chosen.len() / 8).min(1536);
+        let ring_start_idx = chosen.len().saturating_sub(ring_count);
+        for &(l, e, off, s) in &chosen[ring_start_idx..] {
+            let idx = t.ring_offs.len();
+            t.ring_by_off.insert(off, idx);
+            t.ring_offs.push(off);
+            t.ring_sizes.push(s);
+            t.ring_owner.push(Some((l, e)));
+            t.ring_ref.push(false);
+        }
         let t0 = std::time::Instant::now();
         let mut region = PinnedRegion::new(ctx, total)?;
+        let e_err = |x: crate::driver::CudaError| x.to_string();
+        // First pass: if VRAM has exclusively pinned hot experts, stream them sequentially through `region` into VRAM.
+        if !vram_pinned.is_empty() && arena_ptr != 0 {
+            let mut v_chosen = Vec::with_capacity(vram_pinned.len());
+            let mut v_off = 0usize;
+            for &(l, ep, slot_off) in vram_pinned {
+                let s = size(l);
+                if v_off + s <= total {
+                    v_chosen.push((l, ep, v_off, slot_off));
+                    v_off += s;
+                }
+            }
+            let mut v_reads = Vec::with_capacity(v_chosen.len() * 3);
+            for &(l, ep, r_off, _) in &v_chosen {
+                let mut o = r_off;
+                for (part, n) in names(l).iter().enumerate() {
+                    let nb = m.expert_bytes(n);
+                    v_reads.push((l, part, ep, o, nb));
+                    o += nb;
+                }
+            }
+            v_reads.sort_unstable_by_key(|&(l, part, ep, _, _)| (l, part, ep));
+            for (l, part, ep, o, nb) in v_reads {
+                m.expert_into(&names(l)[part], ep, &mut region.as_mut_slice()[o..o + nb]);
+            }
+            ctx.bind().map_err(e_err)?;
+            let src = region.as_slice();
+            for (l, _ep, r_off, slot_off) in v_chosen {
+                let tot: usize = names(l).iter().map(|n| m.expert_bytes(n)).sum();
+                let r = unsafe {
+                    (ctx.api.cuMemcpyHtoDAsync)(arena_ptr + slot_off, src[r_off..r_off + tot].as_ptr() as *const std::ffi::c_void,
+                                                tot, std::ptr::null_mut())
+                };
+                assert_eq!(r, 0, "cuMemcpyHtoDAsync vram_pinned failed ({r})");
+            }
+            ctx.synchronize().map_err(e_err)?;
+        }
         // Sort the reads by (layer, tensor, expert) so file I/O is strictly sequential regardless of placement order.
         let mut reads: Vec<(usize, usize, usize, usize, usize)> = Vec::with_capacity(chosen.len() * 3);
-        for (l, e, off) in chosen {
+        for (l, e, off, _) in chosen {
             let mut o = off;
             for (part, n) in names(l).iter().enumerate() {
                 let n_bytes = m.expert_bytes(n);
@@ -259,10 +326,38 @@ impl<'c> RamTier<'c> {
         t.region = Some(region);
         Ok(t)
     }
+
+    /// Picks a Clock victim slot in the tail promotion ring whose byte size matches `req_size`, evicting its old owner.
+    fn promote_slot(&mut self, key: (usize, usize), req_size: usize) -> Option<usize> {
+        let len = self.ring_offs.len();
+        if len == 0 {
+            return None;
+        }
+        for _ in 0..(2 * len) {
+            let h = self.ring_hand;
+            self.ring_hand = (h + 1) % len;
+            if self.ring_sizes[h] != req_size {
+                continue;
+            }
+            if self.ring_ref[h] {
+                self.ring_ref[h] = false;
+                continue;
+            }
+            if let Some(old) = self.ring_owner[h].take() {
+                self.at.remove(&old);
+            }
+            let off = self.ring_offs[h];
+            self.ring_owner[h] = Some(key);
+            self.ring_ref[h] = true;
+            self.at.insert(key, off);
+            return Some(off);
+        }
+        None
+    }
 }
 
 /// VRAM left free for everything else when the expert cache sizes itself (the desktop, the driver, other programs).
-pub const VRAM_RESERVE: usize = 1536 << 20;
+pub const VRAM_RESERVE: usize = 1024 << 20;
 
 fn f32s(v: &[f32]) -> Vec<u8> {
     v.iter().flat_map(|x| x.to_le_bytes()).collect()
@@ -336,7 +431,8 @@ impl<'c, 'm> GpuSession<'c, 'm> {
         let a = |n: usize| ctx.alloc(n.max(1) * 4).map_err(e);
         let k = c.n_expert_used;
         let max_ff = ((k + 2) * c.expert_ff).max(c.dense_ff).max(c.shared_ff);
-        let b = Bufs {
+        let scratch_exp = if cache_bytes == Some(0) { (k * max_expert).max(4) } else { 4 };
+        let mut b = Bufs {
             r: a(ch)?, rn: a(ch)?, down: a(c.hc_rank)?, up: a(ch)?, u: a(h)?, g: a(cs)?, y: a(h)?, e: a(h)?,
             qkv: a(2 * kd + vd)?, x: a(2 * kd + vd)?, z: a(vd)?, beta: a(c.ssm_v_heads)?, alpha: a(c.ssm_v_heads)?,
             o: a(vd)?,
@@ -345,8 +441,8 @@ impl<'c, 'm> GpuSession<'c, 'm> {
             toks: a(c.idx_budget + ratio)?, scratch: ctx.alloc(c.n_head * cap * 8).map_err(e)?,
             // the routed experts' intermediates, one row per routed expert (eg holds 2*max_ff when gate+up batch together)
             rl: a(c.n_expert)?, eg: a(2 * max_ff)?, eu: a(max_ff)?, act: a(max_ff)?,
-            eo: a((k + 1).max(1) * h)?, sgl: a(1)?, wg: ctx.alloc(k * max_expert).map_err(e)?, wu: ctx.alloc(k * max_expert).map_err(e)?,
-            wd: ctx.alloc(k * max_expert).map_err(e)?, tab: ctx.alloc((k + 2).max(1) * (3 * 8 + 4 * 4)).map_err(e)?,
+            eo: a((k + 1).max(1) * h)?, sgl: a(1)?, wg: ctx.alloc(scratch_exp).map_err(e)?, wu: ctx.alloc(scratch_exp).map_err(e)?,
+            wd: ctx.alloc(scratch_exp).map_err(e)?, tab: ctx.alloc((k + 2).max(1) * (3 * 8 + 4 * 4)).map_err(e)?,
             pe: a(h)?, key: a(ch)?, keyn: a(ch)?, val: a(h)?, qry: a(ch)?, gv: a(ch)?, gvn: a(ch)?,
             logits: a(c.vocab)?,
         };
@@ -372,37 +468,84 @@ impl<'c, 'm> GpuSession<'c, 'm> {
         let mut ple_state = a((c.ple_conv_k.max(1) - 1) * c.ple_ngram * ch)?;
         ple_state.zero().map_err(e)?;
 
-        // the expert cache: slots as big as the largest expert (gate + up + down) of any layer
+        // the expert cache: partitioned per layer at each layer's exact expert size (0 internal fragmentation) when
+        // the budget covers at least `n_expert_used` slots per MoE layer, otherwise uniform `slot_bytes` slots.
         let per = |name: String| m.g.tensor(&name).map(|t| (t.nbytes() / t.dims[2]) as usize).unwrap_or(0);
-        let slot_bytes = (0..c.n_layer)
-            .map(|l| per(format!("blk.{l}.ffn_gate_exps.weight")) + per(format!("blk.{l}.ffn_up_exps.weight"))
-                + per(format!("blk.{l}.ffn_down_exps.weight")))
-            .max()
-            .unwrap_or(0)
-            .next_multiple_of(256);
-        let budget = match cache_bytes {
+        let l_bytes: Vec<usize> = (0..c.n_layer)
+            .map(|l| (per(format!("blk.{l}.ffn_gate_exps.weight")) + per(format!("blk.{l}.ffn_up_exps.weight"))
+                + per(format!("blk.{l}.ffn_down_exps.weight"))).next_multiple_of(256))
+            .collect();
+        let slot_bytes = l_bytes.iter().copied().max().unwrap_or(0);
+        let min_per_layer: usize = (0..c.n_layer).filter(|&l| c.is_moe(l)).map(|l| c.n_expert_used * l_bytes[l]).sum();
+        let mut budget = match cache_bytes {
             Some(b) => b,
             None => ctx.mem_info().map_err(e)?.0.saturating_sub(VRAM_RESERVE),
         };
-        let mut slots = budget.checked_div(slot_bytes).unwrap_or(0);
-        if slots > 0 && slots < c.n_expert_used {
-            slots = 0; // too small to hold one token's experts: no cache rather than a thrashing one
-        }
+        let order = tiers.order.clone().unwrap_or_else(|| uniform_order(c.n_layer, c.n_expert));
         let mut arena = None;
-        while slots > 0 {
-            match ctx.alloc(slots * slot_bytes) {
+        let mut slot_offset = Vec::new();
+        let mut layer_range = vec![0..0; c.n_layer];
+        let mut arena_bytes = 0usize;
+        let mut slots = 0usize;
+        while budget >= slot_bytes.max(1) * c.n_expert_used.max(1) {
+            slot_offset.clear();
+            layer_range = vec![0..0; c.n_layer];
+            if min_per_layer > 0 && budget >= min_per_layer {
+                let mut l_slots = vec![0usize; c.n_layer];
+                let mut used = 0usize;
+                for l in 0..c.n_layer {
+                    if c.is_moe(l) {
+                        l_slots[l] = c.n_expert_used;
+                        used += c.n_expert_used * l_bytes[l];
+                    }
+                }
+                for &(l, _) in &order {
+                    if c.is_moe(l) && l_slots[l] < c.n_expert && used + l_bytes[l] <= budget {
+                        l_slots[l] += 1;
+                        used += l_bytes[l];
+                    }
+                }
+                let mut cur_s = 0usize;
+                let mut cur_off = 0u64;
+                for l in 0..c.n_layer {
+                    let n_s = l_slots[l];
+                    layer_range[l] = cur_s..cur_s + n_s;
+                    for _ in 0..n_s {
+                        slot_offset.push(cur_off);
+                        cur_off += l_bytes[l] as u64;
+                    }
+                    cur_s += n_s;
+                }
+                arena_bytes = cur_off as usize;
+                slots = cur_s;
+            } else {
+                slots = budget / slot_bytes;
+                arena_bytes = slots * slot_bytes;
+                for s in 0..slots {
+                    slot_offset.push((s * slot_bytes) as u64);
+                }
+                layer_range = vec![0..slots; c.n_layer];
+            }
+            match ctx.alloc(arena_bytes) {
                 Ok(buf) => {
                     arena = Some(buf);
                     break;
                 }
-                Err(_) => slots = slots * 7 / 8, // the free figure is a moment's; settle for what the driver gives
+                Err(_) => budget = budget * 7 / 8,
             }
         }
-        if slots < c.n_expert_used {
-            arena = None;
+        if arena.is_none() {
+            slot_offset.clear();
+            layer_range = vec![0..0; c.n_layer];
+            arena_bytes = 0;
             slots = 0;
+            let need = (k * max_expert).max(4);
+            if b.wg.bytes < need {
+                b.wg = ctx.alloc(need).map_err(e)?;
+                b.wu = ctx.alloc(need).map_err(e)?;
+                b.wd = ctx.alloc(need).map_err(e)?;
+            }
         }
-        // auto is measured here, with the dense weights already in RAM and on the device
         let ram_bytes = if tiers.ram_auto {
             let b = crate::pinned::auto_tier_bytes() as usize;
             eprintln!("RAM tier: auto = {:.2} GiB ({:.2} GiB available less a {:.0} GiB margin)", b as f64 / (1u64 << 30) as f64,
@@ -412,26 +555,75 @@ impl<'c, 'm> GpuSession<'c, 'm> {
         } else {
             tiers.ram_bytes
         };
-        let ram = RamTier::fill(ctx, m, ram_bytes, tiers.order.clone())?;
-        let mut cache = ExpertCache {
-            arena, slot_bytes, slots, map: HashMap::new(), owner: vec![None; slots], stamp: vec![0; slots], clock: 0,
-            hits: 0, misses: 0,
-        };
-        // Pre-warm the VRAM expert cache from the RAM tier in placement order so all VRAM slots start populated
-        // before the first token rather than faulting lazily during generation.
-        if cache.slots > 0 && ram.region.is_some() {
-            let order = tiers.order.unwrap_or_else(|| uniform_order(c.n_layer, c.n_expert));
-            let names = |l: usize| ["ffn_gate_exps", "ffn_up_exps", "ffn_down_exps"].map(|r| format!("blk.{l}.{r}.weight"));
-            let src = ram.region.as_ref().unwrap().as_slice();
-            let arena_ptr = cache.arena.as_ref().unwrap().ptr;
-            let mut s = 0usize;
-            for (l, ep) in order {
-                if s >= cache.slots {
+        let per_layer_mode = layer_range.iter().filter(|r| !r.is_empty()).count() > 1
+            && layer_range.windows(2).any(|w| w[0] != w[1]);
+        let mut evict_range = layer_range.clone();
+        let mut vram_pinned: Vec<(usize, usize, u64)> = Vec::new();
+        let mut vram_pinned_slots: Vec<(usize, usize, usize)> = Vec::new();
+        let mut next_in_layer: Vec<usize> = layer_range.iter().map(|r| r.start).collect();
+        // When a sizable RAM tier is present and per-layer VRAM slots are active, pin the hottest ~half of each
+        // layer's VRAM slots permanently in VRAM (keeping at least 2 * n_expert_used LRU slots per layer) and exclude
+        // them from `RamTier` so `RamTier` covers ~1,200 additional experts without duplicating VRAM-pinned ones.
+        if slots > 0 && per_layer_mode && ram_bytes >= (4usize << 30) {
+            let mut pin_end = vec![0usize; c.n_layer];
+            for l in 0..c.n_layer {
+                let len = layer_range[l].len();
+                let n_pin = (len / 2).min(len.saturating_sub(2 * c.n_expert_used));
+                pin_end[l] = layer_range[l].start + n_pin;
+                evict_range[l] = pin_end[l]..layer_range[l].end;
+            }
+            let mut pinned_bytes = 0usize;
+            for &(l, ep) in &order {
+                if !c.is_moe(l) || next_in_layer[l] >= pin_end[l] {
+                    continue;
+                }
+                if pinned_bytes + l_bytes[l] > ram_bytes {
                     break;
                 }
+                let s = next_in_layer[l];
+                next_in_layer[l] += 1;
+                pinned_bytes += l_bytes[l];
+                vram_pinned.push((l, ep, slot_offset[s]));
+                vram_pinned_slots.push((l, ep, s));
+            }
+        }
+        let arena_ptr = arena.as_ref().map_or(0, |a| a.ptr);
+        let ram = RamTier::fill(ctx, m, ram_bytes, tiers.order.clone(), &vram_pinned, arena_ptr)?;
+        let mut cache = ExpertCache {
+            arena, slot_offset, layer_range, evict_range, slot_bytes, arena_bytes, slots, map: HashMap::new(),
+            owner: vec![None; slots], stamp: vec![0; slots], clock: 0, hits: 0, misses: 0,
+        };
+        for (l, ep, s) in vram_pinned_slots {
+            cache.owner[s] = Some((l, ep));
+            cache.map.insert((l, ep), s);
+        }
+        // Pre-warm the remaining (evictable) VRAM expert cache slots from the RAM tier in placement order.
+        if cache.slots > 0 && ram.region.is_some() {
+            let names = |l: usize| ["ffn_gate_exps", "ffn_up_exps", "ffn_down_exps"].map(|r| format!("blk.{l}.{r}.weight"));
+            let src = ram.region.as_ref().unwrap().as_slice();
+            let mut global_s = 0usize;
+            for (l, ep) in order {
+                if cache.map.contains_key(&(l, ep)) {
+                    continue;
+                }
+                let s = if per_layer_mode {
+                    if next_in_layer[l] >= cache.layer_range[l].end {
+                        continue;
+                    }
+                    let s = next_in_layer[l];
+                    next_in_layer[l] += 1;
+                    s
+                } else {
+                    if global_s >= cache.slots {
+                        break;
+                    }
+                    let s = global_s;
+                    global_s += 1;
+                    s
+                };
                 let Some(&off) = ram.at.get(&(l, ep)) else { continue };
                 let total: usize = names(l).iter().map(|n| m.expert_bytes(n)).sum();
-                let dst = arena_ptr + (s * cache.slot_bytes) as u64;
+                let dst = arena_ptr + cache.slot_offset[s];
                 ctx.bind().map_err(e)?;
                 let r = unsafe {
                     (ctx.api.cuMemcpyHtoDAsync)(dst, src[off..off + total].as_ptr() as *const std::ffi::c_void, total,
@@ -440,7 +632,6 @@ impl<'c, 'm> GpuSession<'c, 'm> {
                 assert_eq!(r, 0, "cuMemcpyHtoDAsync pre-warm failed ({r})");
                 cache.owner[s] = Some((l, ep));
                 cache.map.insert((l, ep), s);
-                s += 1;
             }
             ctx.synchronize().map_err(e)?;
         }
@@ -560,6 +751,39 @@ impl<'c, 'm> GpuSession<'c, 'm> {
         if s != 1.0 {
             self.k1("scale_vec", rows, &[Arg::Ptr(y), Arg::U32(rows as u32), Arg::F32(s)]);
         }
+    }
+
+    /// Fuses y0 = W0 x and y1 = W1 x into a single launch when W0 and W1 share the same quant type, column count,
+    /// unit scale, and 8-row alignment; falls back to two `mv` launches otherwise.
+    fn mv_pair(&self, name0: &str, y0: u64, name1: &str, y1: u64, x: u64) {
+        let (t0, b0) = self.m.dense(name0);
+        let (t1, b1) = self.m.dense(name1);
+        let ty = t0.ty.name();
+        let (qk, qb) = t0.ty.block().unwrap();
+        let r0 = b0.len() / (t0.dims[0] / qk * qb) as usize;
+        let r1 = b1.len() / (t1.dims[0] / qk * qb) as usize;
+        if t0.ty == t1.ty
+            && t0.dims[0] == t1.dims[0]
+            && r0.is_multiple_of(8)
+            && self.m.scale(name0) == 1.0
+            && self.m.scale(name1) == 1.0
+            && (matches!(ty.as_str(), "BF16" | "F32") || t0.dims[0].is_multiple_of(8))
+        {
+            if let Some(&(_, entry)) = PAIR_KERNELS.iter().find(|q| q.0 == ty) {
+                let w0 = self.w.get(name0).unwrap_or_else(|| panic!("{name0} is not resident")).ptr;
+                let w1 = self.w.get(name1).unwrap_or_else(|| panic!("{name1} is not resident")).ptr;
+                unsafe {
+                    self.mvp.launch(entry, (((r0 + r1) as u32).div_ceil(8), 1, 1), (256, 1, 1), 0, None,
+                                    &[Arg::Ptr(w0), Arg::Ptr(y0), Arg::U32(r0 as u32),
+                                      Arg::Ptr(w1), Arg::Ptr(y1), Arg::U32(r1 as u32),
+                                      Arg::Ptr(x), Arg::U32(t0.dims[0] as u32)])
+                }
+                .unwrap_or_else(|err| panic!("{name0}+{name1}: {err}"));
+                return;
+            }
+        }
+        self.mv(name0, x, y0);
+        self.mv(name1, x, y1);
     }
 
     fn sv(&self, name: &str) -> u64 {
@@ -804,15 +1028,8 @@ impl<'c, 'm> GpuSession<'c, 'm> {
         let (kh, vh, d) = (c.ssm_k_heads, c.ssm_v_heads, c.ssm_head_dim);
         let (kd, vd) = (kh * d, vh * d);
         let ch = 2 * kd + vd;
-        self.mv(&format!("{p}.attn_qkv.weight"), b.u.ptr, b.qkv.ptr);
-        self.mv(&format!("{p}.attn_gate.weight"), b.u.ptr, b.z.ptr);
-        unsafe {
-            self.mvp.launch("matvec_pair_bf16", (((2 * vh) as u32).div_ceil(8), 1, 1), (256, 1, 1), 0, None, &[
-                Arg::Ptr(self.w[&format!("{p}.ssm_beta.weight")].ptr), Arg::Ptr(b.beta.ptr), Arg::U32(vh as u32),
-                Arg::Ptr(self.w[&format!("{p}.ssm_alpha.weight")].ptr), Arg::Ptr(b.alpha.ptr), Arg::U32(vh as u32),
-                Arg::Ptr(b.u.ptr), Arg::U32(c.hidden as u32),
-            ]).unwrap_or_else(|err| panic!("matvec_pair_bf16: {err}"));
-        }
+        self.mv_pair(&format!("{p}.attn_qkv.weight"), b.qkv.ptr, &format!("{p}.attn_gate.weight"), b.z.ptr, b.u.ptr);
+        self.mv_pair(&format!("{p}.ssm_beta.weight"), b.beta.ptr, &format!("{p}.ssm_alpha.weight"), b.alpha.ptr, b.u.ptr);
         let (s, conv) = self.delta[l].as_ref().unwrap();
         self.k1("conv_silu_step", ch, &[Arg::Ptr(b.qkv.ptr), Arg::Ptr(conv.ptr), Arg::Ptr(self.sv(&format!("{p}.ssm_conv1d.weight"))),
                                        Arg::Ptr(b.x.ptr), Arg::U32(ch as u32), Arg::U32(c.conv_k as u32)]);
@@ -842,16 +1059,8 @@ impl<'c, 'm> GpuSession<'c, 'm> {
             let slot = (pos * nkv * hd * 4) as u64;
             let raw_slot = at.raw.ptr + (pos * id * 4) as u64;
             self.mv(&format!("{p}.attn_q.weight"), b.u.ptr, b.qg.ptr);
-            self.mv(&format!("{p}.attn_k.weight"), b.u.ptr, b.kk.ptr);
-            self.mv(&format!("{p}.attn_v.weight"), b.u.ptr, at.v.ptr + slot);
-            let iq_rows = (c.idx_heads * id) as u32;
-            unsafe {
-                self.mvp.launch("matvec_pair_bf16", ((iq_rows + id as u32).div_ceil(8), 1, 1), (256, 1, 1), 0, None, &[
-                    Arg::Ptr(self.w[&format!("{p}.indexer.q_proj.weight")].ptr), Arg::Ptr(b.iq.ptr), Arg::U32(iq_rows),
-                    Arg::Ptr(self.w[&format!("{p}.indexer.k_proj.weight")].ptr), Arg::Ptr(raw_slot), Arg::U32(id as u32),
-                    Arg::Ptr(b.u.ptr), Arg::U32(c.hidden as u32),
-                ]).unwrap_or_else(|err| panic!("matvec_pair_bf16: {err}"));
-            }
+            self.mv_pair(&format!("{p}.attn_k.weight"), b.kk.ptr, &format!("{p}.attn_v.weight"), at.v.ptr + slot, b.u.ptr);
+            self.mv_pair(&format!("{p}.indexer.q_proj.weight"), b.iq.ptr, &format!("{p}.indexer.k_proj.weight"), raw_slot, b.u.ptr);
             self.k("head_norm_rope_qgk", (nh + nkv) as u32, 128, &[
                 Arg::Ptr(b.qg.ptr), Arg::Ptr(b.q.ptr), Arg::Ptr(b.gate.ptr), Arg::Ptr(self.sv(&format!("{p}.attn_q_norm.weight"))),
                 Arg::Ptr(b.kk.ptr), Arg::Ptr(at.k.ptr + slot), Arg::Ptr(self.sv(&format!("{p}.attn_k_norm.weight"))),
@@ -965,28 +1174,47 @@ impl<'c, 'm> GpuSession<'c, 'm> {
     }
 
     /// Puts expert e of layer l (its gate, up and down slices) at the three device addresses: a DMA copy from the
-    /// pinned RAM tier if it holds the expert, otherwise read from the file into the pinned staging buffer and copied
-    /// on `copy_stream`.
+    /// pinned RAM tier if it holds the expert, otherwise read from the file (promoting into `RamTier`'s Clock ring if
+    /// active, else into the pinned staging buffer) and copied on `copy_stream`.
     fn fetch_expert(&mut self, l: usize, e: usize, slot_idx: usize, names: &[String; 3], sizes: &[usize], dst: [u64; 3]) {
         let stream = self.copy_stream.raw();
         let contiguous = dst[1] == dst[0] + sizes[0] as u64 && dst[2] == dst[1] + sizes[1] as u64;
         let total = sizes[0] + sizes[1] + sizes[2];
+        let part_offs = [0usize, sizes[0], sizes[0] + sizes[1]];
         if let Some(&off) = self.ram.at.get(&(l, e)) {
+            if let Some(&r_idx) = self.ram.ring_by_off.get(&off) {
+                self.ram.ring_ref[r_idx] = true;
+            }
             let src = self.ram.region.as_ref().unwrap().as_slice();
             if contiguous {
                 self.upload_pinned_on(dst[0], &src[off..off + total], stream);
             } else {
-                let mut o = off;
                 for i in 0..3 {
-                    self.upload_pinned_on(dst[i], &src[o..o + sizes[i]], stream);
-                    o += sizes[i];
+                    self.upload_pinned_on(dst[i], &src[off + part_offs[i]..off + part_offs[i] + sizes[i]], stream);
                 }
             }
             self.ram.served += 1;
             self.mark("expert upload (pinned RAM)");
+        } else if let Some(off) = self.ram.promote_slot((l, e), total.next_multiple_of(256)) {
+            {
+                let buf = &mut self.ram.region.as_mut().unwrap().as_mut_slice()[off..off + total];
+                for &i in &[2usize, 0, 1] {
+                    self.m.expert_into(&names[i], e, &mut buf[part_offs[i]..part_offs[i] + sizes[i]]);
+                }
+            }
+            self.mark("expert read (file)");
+            let src = &self.ram.region.as_ref().unwrap().as_slice()[off..off + total];
+            if contiguous {
+                self.upload_pinned_on(dst[0], src, stream);
+            } else {
+                for i in 0..3 {
+                    self.upload_pinned_on(dst[i], &src[part_offs[i]..part_offs[i] + sizes[i]], stream);
+                }
+            }
+            self.ram.drive += 1;
+            self.mark("expert upload (pageable)");
         } else if let Some(st) = self.staging.as_mut() {
             let base_off = slot_idx * self.cache.slot_bytes;
-            let part_offs = [0usize, sizes[0], sizes[0] + sizes[1]];
             // Read in file-offset order (`ffn_down_exps` @ part 2, `ffn_gate_exps` @ part 0, `ffn_up_exps` @ part 1).
             {
                 let buf = &mut st.as_mut_slice()[base_off..base_off + total];
@@ -1026,7 +1254,12 @@ impl<'c, 'm> GpuSession<'c, 'm> {
         let sh_g_name = format!("{p}.ffn_gate_shexp.weight");
         let sh_u_name = format!("{p}.ffn_up_shexp.weight");
         self.mark("mixers, norms, hc glue, ple");
-        self.mv(&format!("{p}.ffn_gate_inp.weight"), self.b.u.ptr, self.b.rl.ptr);
+        if !is_flint {
+            self.mv_pair(&format!("{p}.ffn_gate_inp.weight"), self.b.rl.ptr,
+                         &format!("{p}.ffn_gate_inp_shexp.weight"), self.b.sgl.ptr, self.b.u.ptr);
+        } else {
+            self.mv(&format!("{p}.ffn_gate_inp.weight"), self.b.u.ptr, self.b.rl.ptr);
+        }
         let mut lb = vec![0u8; c.n_expert * 4];
         self.download(self.b.rl.ptr, &mut lb);
         // Launch Qwen's shared expert on stream 0 immediately so the GPU SMs compute it while the CPU runs `route`
@@ -1038,11 +1271,9 @@ impl<'c, 'm> GpuSession<'c, 'm> {
             let sh_eu = self.b.eu.ptr + (k * ff * 4) as u64;
             let sh_act = self.b.act.ptr + (k * ff * 4) as u64;
             let sh_out = self.b.eo.ptr + (k * h * 4) as u64;
-            self.mv(&sh_g_name, self.b.u.ptr, sh_eg);
-            self.mv(&sh_u_name, self.b.u.ptr, sh_eu);
+            self.mv_pair(&sh_g_name, sh_eg, &sh_u_name, sh_eu, self.b.u.ptr);
             self.k1("swiglu", sff, &[Arg::Ptr(sh_eg), Arg::Ptr(sh_eu), Arg::Ptr(sh_act), Arg::U32(sff as u32)]);
             self.mv(&format!("{p}.ffn_down_shexp.weight"), sh_act, sh_out);
-            self.mv(&format!("{p}.ffn_gate_inp_shexp.weight"), self.b.u.ptr, self.b.sgl.ptr);
         }
         let top = if is_flint {
             route_sigmoid(&floats(&lb), c.n_expert_used)
@@ -1078,8 +1309,8 @@ impl<'c, 'm> GpuSession<'c, 'm> {
                     None => {
                         self.cache.misses += 1;
                         layer_misses += 1;
-                        let s = self.cache.victim();
-                        let base = self.cache.arena.as_ref().unwrap().ptr + (s * self.cache.slot_bytes) as u64;
+                        let s = self.cache.victim(l);
+                        let base = self.cache.arena.as_ref().unwrap().ptr + self.cache.slot_offset[s];
                         let dst = [base, base + sizes[0] as u64, base + (sizes[0] + sizes[1]) as u64];
                         self.fetch_expert(l, e, i, &names, &sizes, dst);
                         self.cache.owner[s] = Some((l, e));
@@ -1088,7 +1319,7 @@ impl<'c, 'm> GpuSession<'c, 'm> {
                         s
                     }
                 };
-                let base = self.cache.arena.as_ref().unwrap().ptr + (slot * self.cache.slot_bytes) as u64;
+                let base = self.cache.arena.as_ref().unwrap().ptr + self.cache.slot_offset[slot];
                 at.push([base, base + sizes[0] as u64, base + (sizes[0] + sizes[1]) as u64]);
             }
         }
@@ -1191,15 +1422,11 @@ impl<'c, 'm> GpuSession<'c, 'm> {
             let sh_act_ptr = if fuse_shexp {
                 b.act.ptr + (n * ff * 4) as u64
             } else {
-                self.mv(&sh_g_name, b.u.ptr, b.eg.ptr);
-                self.mv(&sh_u_name, b.u.ptr, b.eu.ptr);
+                self.mv_pair(&sh_g_name, b.eg.ptr, &sh_u_name, b.eu.ptr, b.u.ptr);
                 self.k1("swiglu", sff, &[Arg::Ptr(b.eg.ptr), Arg::Ptr(b.eu.ptr), Arg::Ptr(b.act.ptr), Arg::U32(sff as u32)]);
                 b.act.ptr
             };
             self.mv(&format!("{p}.ffn_down_shexp.weight"), sh_act_ptr, sh_out_ptr);
-            if !is_flint {
-                self.mv(&format!("{p}.ffn_gate_inp_shexp.weight"), b.u.ptr, b.sgl.ptr);
-            }
         }
         if is_flint {
             self.k1("moe_combine_flint", h, &[
@@ -1222,10 +1449,9 @@ impl<'c, 'm> GpuSession<'c, 'm> {
         let e: Vec<f32> = ple_rows(c, &self.tokens).into_iter().flat_map(|row| self.m.ple_row(row)).collect();
         let b = &self.b;
         self.upload_to(b.pe.ptr, &f32s(&e));
-        self.mv(&format!("{p}.ple_key.weight"), b.pe.ptr, b.key.ptr);
+        self.mv_pair(&format!("{p}.ple_key.weight"), b.key.ptr, &format!("{p}.ple_value.weight"), b.val.ptr, b.pe.ptr);
         self.k("rmsnorm_groups", cs as u32, 256, &[Arg::Ptr(b.key.ptr), Arg::Ptr(self.sv(&format!("{p}.ple_norm_key.weight"))),
                                                   Arg::Ptr(b.keyn.ptr), Arg::U32(h as u32), Arg::F32(c.eps)]);
-        self.mv(&format!("{p}.ple_value.weight"), b.pe.ptr, b.val.ptr);
         self.k("rmsnorm_groups", cs as u32, 256, &[Arg::Ptr(b.r.ptr), Arg::Ptr(self.sv(&format!("{p}.ple_norm_query.weight"))),
                                                   Arg::Ptr(b.qry.ptr), Arg::U32(h as u32), Arg::F32(c.eps)]);
         self.k("ple_gate", cs as u32, 256, &[Arg::Ptr(b.keyn.ptr), Arg::Ptr(b.qry.ptr), Arg::Ptr(b.val.ptr), Arg::Ptr(b.gv.ptr),
@@ -1256,8 +1482,9 @@ impl Stepper for GpuSession<'_, '_> {
     }
     fn report(&self) -> String {
         let (slots, bytes, hits, misses) = self.cache_stats();
-        format!("expert cache: {slots} slots x {:.2} MiB = {:.2} GiB; {hits} hits, {misses} misses ({:.1}% hits); {} slice uploads",
-                bytes as f64 / (1u64 << 20) as f64, (slots * bytes) as f64 / (1u64 << 30) as f64,
+        let arena_gib = self.cache.arena_bytes as f64 / (1u64 << 30) as f64;
+        let avg_mib = if slots > 0 { (self.cache.arena_bytes as f64 / slots as f64) / (1u64 << 20) as f64 } else { bytes as f64 / (1u64 << 20) as f64 };
+        format!("expert cache: {slots} slots x {avg_mib:.2} MiB = {arena_gib:.2} GiB; {hits} hits, {misses} misses ({:.1}% hits); {} slice uploads",
                 100.0 * hits as f64 / (hits + misses).max(1) as f64, self.expert_uploads)
             + &format!("; RAM tier: {} experts, {:.2} GiB pinned (filled in {:.1} s), misses served {} from RAM, {} from the file",
                        self.ram.at.len(), self.ram.region.as_ref().map_or(0, |r| r.len()) as f64 / (1u64 << 30) as f64,

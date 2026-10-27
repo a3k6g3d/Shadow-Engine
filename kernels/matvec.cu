@@ -53,10 +53,16 @@ template <> struct Fast<Q4K> {
         q_scale_min_k4(b + 4, ig, &sc, &mn);
         float ds = __fmul_rn(qf16(b), (float) sc), dm = __fmul_rn(qf16(b + 2), (float) mn), s = 0.0f;
         const u8* q = b + 16 + (ig / 2) * 32 + c0;
+        u32 q0 = *(const u32*) q, q1 = *(const u32*) (q + 4);
 #pragma unroll
-        for (unsigned int k = 0; k < 8; k++) {
-            u8 v = (q[k] >> sh) & 0x0f;
+        for (unsigned int k = 0; k < 4; k++) {
+            u8 v = (u8) ((q0 >> (8 * k + sh)) & 0x0f);
             s += __fsub_rn(__fmul_rn(ds, (float) v), dm) * x[k];
+        }
+#pragma unroll
+        for (unsigned int k = 0; k < 4; k++) {
+            u8 v = (u8) ((q1 >> (8 * k + sh)) & 0x0f);
+            s += __fsub_rn(__fmul_rn(ds, (float) v), dm) * x[4 + k];
         }
         return s;
     }
@@ -71,10 +77,17 @@ template <> struct Fast<Q5K> {
         float ds = __fmul_rn(qf16(b), (float) sc), dm = __fmul_rn(qf16(b + 2), (float) mn), s = 0.0f;
         const u8* ql = b + 48 + (ig / 2) * 32 + c0;
         const u8* qh = b + 16 + c0;
+        u32 ql0 = *(const u32*) ql, ql1 = *(const u32*) (ql + 4);
+        u32 qh0 = *(const u32*) qh, qh1 = *(const u32*) (qh + 4);
 #pragma unroll
-        for (unsigned int k = 0; k < 8; k++) {
-            u8 v = ((ql[k] >> sh) & 0x0f) | (((qh[k] >> ig) & 1) << 4);
+        for (unsigned int k = 0; k < 4; k++) {
+            u8 v = (u8) (((ql0 >> (8 * k + sh)) & 0x0f) | (((qh0 >> (8 * k + ig)) & 1u) << 4));
             s += __fsub_rn(__fmul_rn(ds, (float) v), dm) * x[k];
+        }
+#pragma unroll
+        for (unsigned int k = 0; k < 4; k++) {
+            u8 v = (u8) (((ql1 >> (8 * k + sh)) & 0x0f) | (((qh1 >> (8 * k + ig)) & 1u) << 4));
+            s += __fsub_rn(__fmul_rn(ds, (float) v), dm) * x[4 + k];
         }
         return s;
     }
@@ -86,14 +99,17 @@ template <> struct Fast<Q6K> {
         unsigned int e0 = i % 256, r_idx = e0 / 32, c0 = e0 % 32;
         unsigned int g = r_idx / 4, h = (r_idx % 4) / 2, k_idx = r_idx % 2, s_idx = r_idx % 4;
         float d = __fmul_rn(qf16(b + 208), (float) (signed char) b[192 + e0 / 16]), s = 0.0f;
-        const u8* ql = b + g * 64 + k_idx * 32 + c0;
-        const u8* qh = b + 128 + g * 32 + c0;
+        const u16* ql = (const u16*) (b + g * 64 + k_idx * 32 + c0);
+        const u16* qh = (const u16*) (b + 128 + g * 32 + c0);
 #pragma unroll
-        for (unsigned int k = 0; k < 8; k++) {
-            u8 lo = (ql[k] >> (h * 4)) & 0x0f;
-            u8 hi = (qh[k] >> (2 * s_idx)) & 0x03;
-            int q = (int) (signed char) (u8) (lo | (hi << 4)) - 32;
-            s += __fmul_rn(d, (float) q) * x[k];
+        for (unsigned int k = 0; k < 4; k++) {
+            u16 wl = ql[k], wh = qh[k];
+            u8 lo0 = (wl >> (h * 4)) & 0x0f, hi0 = (wh >> (2 * s_idx)) & 0x03;
+            u8 lo1 = (wl >> (8 + h * 4)) & 0x0f, hi1 = (wh >> (8 + 2 * s_idx)) & 0x03;
+            int q0 = (int) (signed char) (u8) (lo0 | (hi0 << 4)) - 32;
+            int q1 = (int) (signed char) (u8) (lo1 | (hi1 << 4)) - 32;
+            s += __fmul_rn(d, (float) q0) * x[2 * k];
+            s += __fmul_rn(d, (float) q1) * x[2 * k + 1];
         }
         return s;
     }
@@ -102,13 +118,14 @@ template <> struct Fast<Q6K> {
 template <> struct Fast<IQ4NL> {
     static __device__ __forceinline__ float dot8(const u8* r, unsigned int i, const float* x) {
         const u8* b = r + (i / 32) * 18;
-        unsigned int e0 = i % 32;
+        unsigned int e0 = i % 32, sh = (e0 >= 16) ? 4u : 0u;
         float d = qf16(b), s = 0.0f;
-        const u8* q = b + 2 + (e0 & 15);
+        const u16* q = (const u16*) (b + 2 + (e0 & 15));
 #pragma unroll
-        for (unsigned int k = 0; k < 8; k++) {
-            u8 v = e0 < 16 ? (q[k] & 0x0f) : (q[k] >> 4);
-            s += __fmul_rn(d, iq4nl_val(v)) * x[k];
+        for (unsigned int k = 0; k < 4; k++) {
+            u16 w = q[k];
+            s += __fmul_rn(d, iq4nl_val((w >> sh) & 0x0f)) * x[2 * k];
+            s += __fmul_rn(d, iq4nl_val((w >> (8 + sh)) & 0x0f)) * x[2 * k + 1];
         }
         return s;
     }
@@ -117,16 +134,21 @@ template <> struct Fast<IQ4NL> {
 template <> struct Fast<IQ4XS> {
     static __device__ __forceinline__ float dot8(const u8* r, unsigned int i, const float* x) {
         const u8* b = r + (i / 256) * 136;
-        unsigned int e0 = i % 256, g = e0 / 32, c0 = e0 % 32;
-        u16 sh = (u16) b[2] | ((u16) b[3] << 8);
+        unsigned int e0 = i % 256, g = e0 / 32, c0 = e0 % 32, sh_nib = (c0 >= 16) ? 4u : 0u;
+        u32 hdr = *(const u32*) b;
+        u16 sh = (u16) (hdr >> 16);
         u8 lo = (b[4 + g / 2] >> (4 * (g % 2))) & 0x0f;
         u8 hi = (sh >> (2 * g)) & 3;
-        float dl = __fmul_rn(qf16(b), (float) ((int) (u8) (lo | (hi << 4)) - 32)), s = 0.0f;
+        float dl = __fmul_rn(f16_to_f32((u16) hdr), (float) ((int) (u8) (lo | (hi << 4)) - 32)), s = 0.0f;
         const u8* q = b + 8 + g * 16 + (c0 & 15);
+        u32 q0 = *(const u32*) q, q1 = *(const u32*) (q + 4);
 #pragma unroll
-        for (unsigned int k = 0; k < 8; k++) {
-            u8 v = c0 < 16 ? (q[k] & 0x0f) : (q[k] >> 4);
-            s += __fmul_rn(dl, iq4nl_val(v)) * x[k];
+        for (unsigned int k = 0; k < 4; k++) {
+            s += __fmul_rn(dl, iq4nl_val((q0 >> (8 * k + sh_nib)) & 0x0f)) * x[k];
+        }
+#pragma unroll
+        for (unsigned int k = 0; k < 4; k++) {
+            s += __fmul_rn(dl, iq4nl_val((q1 >> (8 * k + sh_nib)) & 0x0f)) * x[4 + k];
         }
         return s;
     }
@@ -137,10 +159,10 @@ template <> struct Fast<Q20> {
         const u8* b = r + (i / 64) * 18;
         unsigned int e0 = i % 64;
         float d = qf16(b), s = 0.0f;
+        u16 q16 = *(const u16*) (b + 2 + e0 / 4);
 #pragma unroll
         for (unsigned int k = 0; k < 8; k++) {
-            unsigned int e = e0 + k;
-            u8 q = (b[2 + e / 4] >> ((e % 4) * 2)) & 0x03;
+            u8 q = (q16 >> (2 * k)) & 0x03;
             s += __fmul_rn((float) ((int) q - 1), d) * x[k];
         }
         return s;
@@ -188,12 +210,12 @@ template <> struct Fast<IQ3XXS> {
     static __device__ __forceinline__ float dot8(const u8* r, unsigned int i, const float* x) {
         const u8* b = r + (i / 256) * 98;
         unsigned int e0 = i % 256, g = e0 / 32, kk = (e0 % 32) / 8;
-        const u8* sp = b + 66 + g * 4;
-        unsigned int s32 = (unsigned int) sp[0] | ((unsigned int) sp[1] << 8) | ((unsigned int) sp[2] << 16)
-                         | ((unsigned int) sp[3] << 24);
+        const u16* sp = (const u16*) (b + 66 + g * 4);
+        unsigned int s32 = (unsigned int) sp[0] | ((unsigned int) sp[1] << 16);
         float db = __fmul_rn(__fmul_rn(qf16(b), __fadd_rn(0.5f, (float) (s32 >> 28))), 0.5f), s = 0.0f;
         u8 signs = kKSigns[(s32 >> (7 * kk)) & 0x7f];
-        u32 r0 = *(const u32*) kIQ3XXSGrid[b[2 + e0 / 4]], r1 = *(const u32*) kIQ3XXSGrid[b[2 + e0 / 4 + 1]];
+        u16 q2 = *(const u16*) (b + 2 + e0 / 4);
+        u32 r0 = *(const u32*) kIQ3XXSGrid[q2 & 0xff], r1 = *(const u32*) kIQ3XXSGrid[q2 >> 8];
 #pragma unroll
         for (unsigned int k = 0; k < 8; k++) {
             u8 v = (u8) ((k < 4 ? r0 : r1) >> (8 * (k % 4)));
@@ -209,13 +231,13 @@ template <> struct Fast<IQ3S> {
         unsigned int e0 = i % 256, j0 = e0 / 4, g = e0 / 32;
         unsigned int sc = (b[106 + g / 2] >> (4 * (g % 2))) & 0x0f;
         float db = __fmul_rn(qf16(b), (float) (1 + 2 * sc)), s = 0.0f;
-        u8 signs = b[74 + e0 / 8];
-        u32 rr[2];
-#pragma unroll
-        for (unsigned int h = 0; h < 2; h++) {
-            unsigned int j = j0 + h;
-            rr[h] = *(const u32*) kIQ3SGrid[b[2 + j] | (((b[66 + j / 8] >> (j % 8)) & 1) << 8)];
-        }
+        u8 signs = b[74 + e0 / 8], qh = b[66 + g];
+        u16 q2 = *(const u16*) (b + 2 + j0);
+        unsigned int sh0 = j0 % 8;
+        u32 rr[2] = {
+            *(const u32*) kIQ3SGrid[(q2 & 0xff) | (((qh >> sh0) & 1u) << 8)],
+            *(const u32*) kIQ3SGrid[(q2 >> 8) | (((qh >> (sh0 + 1)) & 1u) << 8)],
+        };
 #pragma unroll
         for (unsigned int k = 0; k < 8; k++) {
             u8 v = (u8) (rr[k / 4] >> (8 * (k % 4)));
@@ -230,6 +252,27 @@ static __device__ __forceinline__ void matvec_fast_rows(const u8* w, const float
                                                         unsigned int cols) {
     unsigned int row = blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32, lane = threadIdx.x % 32;
     if (row >= rows) return;
+    const u8* r = w + (u64) row * (cols / Q::QK) * Q::BYTES;
+    float acc = 0.0f;
+    for (unsigned int c = lane; c < cols / 8; c += 32) acc += Fast<Q>::dot8(r, c * 8, x + c * 8);
+    for (int off = 16; off > 0; off >>= 1) acc += __shfl_down_sync(0xffffffffu, acc, off);
+    if (lane == 0) y[row] = acc;
+}
+
+template <typename Q>
+static __device__ __forceinline__ void matvec_pair_fast_rows(const u8* w0, float* y0, unsigned int r0,
+                                                             const u8* w1, float* y1, unsigned int r1,
+                                                             const float* x, unsigned int cols) {
+    unsigned int row = blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32, lane = threadIdx.x % 32;
+    const u8* w;
+    float* y;
+    if (row < r0) {
+        w = w0; y = y0;
+    } else if (row < r0 + r1) {
+        row -= r0; w = w1; y = y1;
+    } else {
+        return;
+    }
     const u8* r = w + (u64) row * (cols / Q::QK) * Q::BYTES;
     float acc = 0.0f;
     for (unsigned int c = lane; c < cols / 8; c += 32) acc += Fast<Q>::dot8(r, c * 8, x + c * 8);
@@ -345,3 +388,32 @@ extern "C" __global__ void hc_down_inject_bf16(const u8* w_down, float* down, un
 }
 extern "C" __global__ void matvec_fast_f32(const u8* w, const float* x, float* y, unsigned int rows, unsigned int cols) { matvec_fast_rows<F32>(w, x, y, rows, cols); }
 extern "C" __global__ void matvec_batch_f32(const u64* wtab, const float* x, unsigned int xs, float* y, unsigned int ys, unsigned int rows, unsigned int cols) { matvec_batch_rows<F32>(wtab, x, xs, y, ys, rows, cols); }
+extern "C" __global__ void matvec_pair_q4_k(const u8* w0, float* y0, unsigned int r0, const u8* w1, float* y1, unsigned int r1, const float* x, unsigned int cols) { matvec_pair_fast_rows<Q4K>(w0, y0, r0, w1, y1, r1, x, cols); }
+extern "C" __global__ void matvec_pair_q5_k(const u8* w0, float* y0, unsigned int r0, const u8* w1, float* y1, unsigned int r1, const float* x, unsigned int cols) { matvec_pair_fast_rows<Q5K>(w0, y0, r0, w1, y1, r1, x, cols); }
+extern "C" __global__ void matvec_pair_q6_k(const u8* w0, float* y0, unsigned int r0, const u8* w1, float* y1, unsigned int r1, const float* x, unsigned int cols) { matvec_pair_fast_rows<Q6K>(w0, y0, r0, w1, y1, r1, x, cols); }
+extern "C" __global__ void matvec_pair_iq4_nl(const u8* w0, float* y0, unsigned int r0, const u8* w1, float* y1, unsigned int r1, const float* x, unsigned int cols) { matvec_pair_fast_rows<IQ4NL>(w0, y0, r0, w1, y1, r1, x, cols); }
+extern "C" __global__ void matvec_pair_iq4_xs(const u8* w0, float* y0, unsigned int r0, const u8* w1, float* y1, unsigned int r1, const float* x, unsigned int cols) { matvec_pair_fast_rows<IQ4XS>(w0, y0, r0, w1, y1, r1, x, cols); }
+extern "C" __global__ void matvec_pair_nvfp4(const u8* w0, float* y0, unsigned int r0, const u8* w1, float* y1, unsigned int r1, const float* x, unsigned int cols) { matvec_pair_fast_rows<NVFP4>(w0, y0, r0, w1, y1, r1, x, cols); }
+extern "C" __global__ void matvec_pair_q2_0(const u8* w0, float* y0, unsigned int r0, const u8* w1, float* y1, unsigned int r1, const float* x, unsigned int cols) { matvec_pair_fast_rows<Q20>(w0, y0, r0, w1, y1, r1, x, cols); }
+extern "C" __global__ void matvec_pair_iq2_s(const u8* w0, float* y0, unsigned int r0, const u8* w1, float* y1, unsigned int r1, const float* x, unsigned int cols) { matvec_pair_fast_rows<IQ2S>(w0, y0, r0, w1, y1, r1, x, cols); }
+extern "C" __global__ void matvec_pair_iq3_xxs(const u8* w0, float* y0, unsigned int r0, const u8* w1, float* y1, unsigned int r1, const float* x, unsigned int cols) { matvec_pair_fast_rows<IQ3XXS>(w0, y0, r0, w1, y1, r1, x, cols); }
+extern "C" __global__ void matvec_pair_iq3_s(const u8* w0, float* y0, unsigned int r0, const u8* w1, float* y1, unsigned int r1, const float* x, unsigned int cols) { matvec_pair_fast_rows<IQ3S>(w0, y0, r0, w1, y1, r1, x, cols); }
+extern "C" __global__ void matvec_pair_f32(const u8* w0, float* y0, unsigned int r0,
+                                           const u8* w1, float* y1, unsigned int r1,
+                                           const float* x, unsigned int cols) {
+    unsigned int row = blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32, lane = threadIdx.x % 32;
+    const u8* w;
+    float* y;
+    if (row < r0) {
+        w = w0; y = y0;
+    } else if (row < r0 + r1) {
+        row -= r0; w = w1; y = y1;
+    } else {
+        return;
+    }
+    const float* r = (const float*) (w + (u64) row * cols * F32::BYTES);
+    float acc = 0.0f;
+    for (unsigned int i = lane; i < cols; i += 32) acc += r[i] * x[i];
+    for (int off = 16; off > 0; off >>= 1) acc += __shfl_down_sync(0xffffffffu, acc, off);
+    if (lane == 0) y[row] = acc;
+}
