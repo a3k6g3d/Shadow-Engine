@@ -63,8 +63,9 @@ shadow stats    MODEL TENSOR...            # min/mean/max of float tensors (summ
 shadow dump     MODEL TENSOR OUT [--rows a,b | --expert E]   # dequantized f32; prints "ROWS COLS"
 shadow compare  MODEL FIXTURE_DIR [--gpu]  # stream-by-stream against a reference fixture
 shadow generate MODEL "prompt" [-n N] [--chat] [--gpu]
-    [--expert-cache-gib G] [--ram-tier-gib G --placement profiles/routing-6prompts.shrc] [--record-routing FILE]
-    # a RAM tier of G GiB raises the working set by G: give run_capped a cap of G + 8 or more
+    [--expert-cache-gib G] [--ram-tier-gib G|auto --placement profiles/routing-6prompts.shrc] [--record-routing FILE]
+    # a RAM tier of G GiB raises the working set by G: give run_capped a cap of G + 8 or more (auto: -CapGiB 44)
+    # best measured (8 runs): --ram-tier-gib auto (~32.7 GiB here) + the placement: ~0.100 s/token
 ```
 MODEL is `J:/Strata-work/models/swift15/IQ3_S/Swift-Qwen3.8-Flash-Next-GSQ-RCO-abliterated-IQ3_S-00001-of-00002.gguf`
 (`SHADOW_MODEL` overrides it in the tests). Regenerating fixtures: `tools/make_reference_fixture.py`

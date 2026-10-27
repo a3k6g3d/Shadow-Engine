@@ -13,6 +13,17 @@ use std::ffi::c_void;
 /// RAM that must stay available after pinning, in bytes.  Not configurable, by design.
 pub const RAM_FLOOR: u64 = 4 << 30;
 
+/// What `auto` leaves available when it sizes a pinned tier: the floor plus room for what moves after the fill
+/// (the file cache, the desktop, other programs).  With a 32 GiB tier filled at ~41 GiB available, available RAM
+/// later dipped to 5.6 GiB in one of 8 runs - 2.4 GiB below what was left at the fill - so the margin is the floor
+/// plus 6 GiB.
+pub const AUTO_MARGIN: u64 = RAM_FLOOR + (6 << 30);
+
+/// The pinned tier `auto` asks for right now: the RAM available less `AUTO_MARGIN` (0 if that is nothing).
+pub fn auto_tier_bytes() -> u64 {
+    available_ram().saturating_sub(AUTO_MARGIN)
+}
+
 /// Whether pinning `bytes` more leaves at least `RAM_FLOOR` available out of `available`.
 pub fn headroom(bytes: u64, available: u64) -> Result<(), String> {
     let gib = |b: u64| b as f64 / (1u64 << 30) as f64;

@@ -118,6 +118,13 @@ router top-10 on the host 1%. That is why the RAM tier came before moving the ro
   (10.1%) but not the p90 floor (27.0%), and both are Strata's floor, not Shadow's** (unmeasured until stage 4). Not
   `decode_warm` (one generation per launch). The 24 GiB fill adds ~20 s at start.
 - Before the RAM tier, single runs: 0.371 s/token without the cache, 0.215 at 2 GiB, 0.176 at 4.57 GiB.
+- **RAM tier size, 8 rotating runs per arm (2026-10-27, b4c9f8b, batched kernels, 64 tokens):** 24 GiB median 0.136
+  s/token (p90 0.148, lowest available RAM 13.9 GiB); 28 GiB 0.118 (p90 0.126, 9.8 GiB); 32 GiB **0.102** (p90 0.108,
+  **5.6 GiB**). Paired against 24 GiB: 28 GiB 13.3% (min 11.3%), 32 GiB 25.1% (min 23.5%); identical tokens in all 24
+  runs. A first round at 34 GiB (0.099 s/token) left 4.3 GiB available and was stopped as too close to the floor.
+- **`--ram-tier-gib auto`** (`pinned::auto_tier_bytes`): the RAM available when the session starts, less
+  `AUTO_MARGIN` (the 4 GiB floor + 6 GiB for what moves after the fill). Two runs: 32.66 GiB pinned (fill ~32 s),
+  0.100-0.101 s/token, lowest available RAM 7.6 GiB, same tokens.
 - **The drive tier stays on plain buffered reads; two attempts to speed it up lost (2026-10-27, both reverted):**
   1. All of a layer's slice reads at once on scoped threads (buffered `seek_read`, one synchronous handle): correct,
      but slower (p1 0.223 vs 0.167 s/token, no-cache 0.435-0.520 vs 0.29). Windows serializes I/O on a synchronous

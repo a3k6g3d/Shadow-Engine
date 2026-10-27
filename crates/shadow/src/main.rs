@@ -257,7 +257,16 @@ fn generate(path: &std::path::Path, prompt: &str, rest: &[String]) -> ExitCode {
             };
             let tiers = shadow_cuda::session::Tiers {
                 vram_cache: gib("--expert-cache-gib"),
-                ram_bytes: gib("--ram-tier-gib").unwrap_or(0),
+                ram_bytes: match flag("--ram-tier-gib").map(String::as_str) {
+                    Some("auto") => {
+                        let b = shadow_cuda::pinned::auto_tier_bytes() as usize;
+                        eprintln!("RAM tier: auto = {:.2} GiB ({:.2} GiB available less a {:.0} GiB margin)", b as f64 / GIB,
+                                  shadow_cuda::pinned::available_ram() as f64 / GIB,
+                                  shadow_cuda::pinned::AUTO_MARGIN as f64 / GIB);
+                        b
+                    }
+                    _ => gib("--ram-tier-gib").unwrap_or(0),
+                },
                 order,
             };
             if tiers.ram_bytes > 0 && tiers.order.is_none() {
