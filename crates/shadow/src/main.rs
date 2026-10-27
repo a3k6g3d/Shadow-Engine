@@ -34,6 +34,12 @@ fn main() -> ExitCode {
     if args.first().map(String::as_str) == Some("stats") && args.len() >= 3 {
         return stats(&PathBuf::from(&args[1]), &args[2..]);
     }
+    if args.first().map(String::as_str) == Some("dump") && args.len() >= 4 {
+        return dump(&PathBuf::from(&args[1]), &args[2], &PathBuf::from(&args[3]), &args[4..]);
+    }
+    if args.first().map(String::as_str) == Some("compare") && args.len() >= 3 {
+        return compare(&PathBuf::from(&args[1]), &PathBuf::from(&args[2]), args.iter().any(|a| a == "--gpu"));
+    }
     if args.first().map(String::as_str) == Some("generate") && args.len() >= 3 {
         return generate(&PathBuf::from(&args[1]), &args[2], &args[3..]);
     }
@@ -52,6 +58,89 @@ fn main() -> ExitCode {
         }
     };
     inspect(&g, all_tensors, all_kv);
+    ExitCode::SUCCESS
+}
+
+/// `shadow dump MODEL NAME OUT [--rows a,b,c | --expert E]`: a tensor (or some rows of it, or one expert's slice of a
+/// fused expert tensor) dequantized to little-endian f32 in OUT, with "ROWS COLS" printed.  The row length is the
+/// tensor's first ggml dimension, so a `[in, out]` matrix comes out as `out` rows of `in` weights: the layout PyTorch's
+/// `nn.Linear.weight` has.  This is how the reference is run on Shadow's own (dequantized) weights.
+fn dump(path: &std::path::Path, name: &str, out: &std::path::Path, rest: &[String]) -> ExitCode {
+    use shadow_model::quant::dequantize;
+    use std::io::{Read, Seek, SeekFrom, Write};
+    let g = match Gguf::open(path) {
+        Ok(g) => g,
+        Err(e) => {
+            eprintln!("shadow dump: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let Some(t) = g.tensor(name) else {
+        eprintln!("shadow dump: no tensor {name}");
+        return ExitCode::FAILURE;
+    };
+    let Some((qk, qb)) = t.ty.block() else {
+        eprintln!("shadow dump: {name}: unknown type {}", t.ty);
+        return ExitCode::FAILURE;
+    };
+    let cols = t.dims[0];
+    let row_bytes = cols / qk * qb;
+    // (first byte, byte count) of each chunk to read, in order
+    let flag = |f: &str| rest.iter().position(|a| a == f).and_then(|i| rest.get(i + 1));
+    let chunks: Vec<(u64, u64)> = if let Some(r) = flag("--rows") {
+        r.split(',').map(|x| (x.parse::<u64>().expect("row index") * row_bytes, row_bytes)).collect()
+    } else if let Some(e) = flag("--expert") {
+        let per = t.nbytes() / t.dims[2];
+        vec![(e.parse::<u64>().expect("expert index") * per, per)]
+    } else {
+        vec![(0, t.nbytes())]
+    };
+    let mut f = std::fs::File::open(&g.shards[t.shard].path).expect("open shard");
+    let mut o = std::io::BufWriter::new(std::fs::File::create(out).expect("create output"));
+    let mut rows = 0u64;
+    for (start, len) in chunks {
+        let mut buf = vec![0u8; len as usize];
+        f.seek(SeekFrom::Start(t.offset + start)).unwrap();
+        f.read_exact(&mut buf).unwrap();
+        let mut y = vec![0f32; (len / qb * qk) as usize];
+        dequantize(t.ty, &buf, &mut y).expect("dequantize");
+        for v in &y {
+            o.write_all(&v.to_le_bytes()).unwrap();
+        }
+        rows += len / row_bytes;
+    }
+    o.flush().unwrap();
+    println!("{rows} {cols}");
+    ExitCode::SUCCESS
+}
+
+/// The stage 1 gate: the reference fixture's prompt through Shadow's forward pass, stream by stream.
+fn compare(path: &std::path::Path, fixture: &std::path::Path, use_gpu: bool) -> ExitCode {
+    use shadow::reference::{compare, print, Fixture};
+    use shadow_model::forward::{CpuBackend, Model};
+    let fx = match Fixture::load(fixture) {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!("shadow compare: {fixture:?}: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let g = match Gguf::open(path) {
+        Ok(g) => g,
+        Err(e) => {
+            eprintln!("shadow compare: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let model = Model::load(g).expect("model");
+    println!("fixture: {:?} ({} tokens, {} layers)", fx.prompt, fx.ids.len(), fx.layers);
+    let ctx = if use_gpu { Some(shadow_cuda::Context::new(0).expect("--gpu")) } else { None };
+    let gpu = ctx.as_ref().map(|c| shadow_cuda::backend::GpuBackend::new(c, 8 << 30).expect("gpu backend"));
+    let be: &dyn shadow_model::forward::Backend = match &gpu {
+        Some(g) => g,
+        None => &CpuBackend,
+    };
+    print(&compare(&model, be, &fx));
     ExitCode::SUCCESS
 }
 

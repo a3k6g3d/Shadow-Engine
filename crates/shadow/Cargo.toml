@@ -9,3 +9,4 @@ license.workspace = true
 [dependencies]
 shadow-model = { path = "../shadow-model" }
 shadow-cuda = { path = "../shadow-cuda" }
+shadow-eval = { path = "../shadow-eval" }   # its JSON reader, for the fixtures

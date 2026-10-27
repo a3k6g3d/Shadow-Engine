@@ -1,0 +1,273 @@
+{
+ "prompt": "The capital of France is Paris. The capital of Germany is",
+ "ids": [
+  760,
+  6511,
+  314,
+  9338,
+  369,
+  11751,
+  13,
+  561,
+  6511,
+  314,
+  9564,
+  369
+ ],
+ "layers": 4,
+ "repo": "Qwen/Qwen3.8-Flash-Next",
+ "transformers": "5.21.0",
+ "torch": "2.11.0+cpu",
+ "dtype": "float32",
+ "note": "reference run on the BF16 weights widened to float32; streams are [tokens, 4*2560] unless noted",
+ "tensors": [
+  {
+   "name": "embed",
+   "shape": [
+    12,
+    2560
+   ],
+   "offset": 0
+  },
+  {
+   "name": "layer0.attn_hc_u",
+   "shape": [
+    12,
+    2560
+   ],
+   "offset": 122880
+  },
+  {
+   "name": "layer0.mixer",
+   "shape": [
+    12,
+    2560
+   ],
+   "offset": 245760
+  },
+  {
+   "name": "layer0.mlp_hc_u",
+   "shape": [
+    12,
+    2560
+   ],
+   "offset": 368640
+  },
+  {
+   "name": "layer0.moe",
+   "shape": [
+    12,
+    2560
+   ],
+   "offset": 491520
+  },
+  {
+   "name": "layer0.out",
+   "shape": [
+    12,
+    10240
+   ],
+   "offset": 614400
+  },
+  {
+   "name": "layer1.ple",
+   "shape": [
+    12,
+    10240
+   ],
+   "offset": 1105920
+  },
+  {
+   "name": "layer1.attn_hc_u",
+   "shape": [
+    12,
+    2560
+   ],
+   "offset": 1597440
+  },
+  {
+   "name": "layer1.mixer",
+   "shape": [
+    12,
+    2560
+   ],
+   "offset": 1720320
+  },
+  {
+   "name": "layer1.mlp_hc_u",
+   "shape": [
+    12,
+    2560
+   ],
+   "offset": 1843200
+  },
+  {
+   "name": "layer1.moe",
+   "shape": [
+    12,
+    2560
+   ],
+   "offset": 1966080
+  },
+  {
+   "name": "layer1.out",
+   "shape": [
+    12,
+    10240
+   ],
+   "offset": 2088960
+  },
+  {
+   "name": "layer2.attn_hc_u",
+   "shape": [
+    12,
+    2560
+   ],
+   "offset": 2580480
+  },
+  {
+   "name": "layer2.mixer",
+   "shape": [
+    12,
+    2560
+   ],
+   "offset": 2703360
+  },
+  {
+   "name": "layer2.mlp_hc_u",
+   "shape": [
+    12,
+    2560
+   ],
+   "offset": 2826240
+  },
+  {
+   "name": "layer2.moe",
+   "shape": [
+    12,
+    2560
+   ],
+   "offset": 2949120
+  },
+  {
+   "name": "layer2.out",
+   "shape": [
+    12,
+    10240
+   ],
+   "offset": 3072000
+  },
+  {
+   "name": "layer3.attn_hc_u",
+   "shape": [
+    12,
+    2560
+   ],
+   "offset": 3563520
+  },
+  {
+   "name": "layer3.mixer",
+   "shape": [
+    12,
+    2560
+   ],
+   "offset": 3686400
+  },
+  {
+   "name": "layer3.mlp_hc_u",
+   "shape": [
+    12,
+    2560
+   ],
+   "offset": 3809280
+  },
+  {
+   "name": "layer3.moe",
+   "shape": [
+    12,
+    2560
+   ],
+   "offset": 3932160
+  },
+  {
+   "name": "layer3.out",
+   "shape": [
+    12,
+    10240
+   ],
+   "offset": 4055040
+  },
+  {
+   "name": "final_u",
+   "shape": [
+    12,
+    2560
+   ],
+   "offset": 4546560
+  },
+  {
+   "name": "layer0.route_idx",
+   "shape": [
+    12,
+    10
+   ],
+   "offset": 4669440
+  },
+  {
+   "name": "layer0.route_w",
+   "shape": [
+    12,
+    10
+   ],
+   "offset": 4669920
+  },
+  {
+   "name": "layer1.route_idx",
+   "shape": [
+    12,
+    10
+   ],
+   "offset": 4670400
+  },
+  {
+   "name": "layer1.route_w",
+   "shape": [
+    12,
+    10
+   ],
+   "offset": 4670880
+  },
+  {
+   "name": "layer2.route_idx",
+   "shape": [
+    12,
+    10
+   ],
+   "offset": 4671360
+  },
+  {
+   "name": "layer2.route_w",
+   "shape": [
+    12,
+    10
+   ],
+   "offset": 4671840
+  },
+  {
+   "name": "layer3.route_idx",
+   "shape": [
+    12,
+    10
+   ],
+   "offset": 4672320
+  },
+  {
+   "name": "layer3.route_w",
+   "shape": [
+    12,
+    10
+   ],
+   "offset": 4672800
+  }
+ ]
+}

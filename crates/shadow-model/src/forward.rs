@@ -298,6 +298,13 @@ pub struct Session<'m> {
     attn: Vec<Option<AttnCache>>,
     ple_conv: Vec<f32>, // the last (conv_k - 1) * ngram inputs, oldest first
     tokens: Vec<u32>,
+    /// With `Some`, every step appends its intermediate streams under a name (token-major, so a name's vector holds
+    /// all the steps so far one after another): `embed`, `layerL.ple`, `layerL.attn_hc_u`, `layerL.mixer`,
+    /// `layerL.mlp_hc_u`, `layerL.moe`, `layerL.out`, `layerL.route_idx`, `layerL.route_w`, `final_u`.  The names are
+    /// the reference fixture's (eval/fixtures/reference).
+    pub trace: Option<std::collections::BTreeMap<String, Vec<f32>>>,
+    /// With `Some(n)`, a step stops after layer n-1 and returns no logits.
+    pub stop_after: Option<usize>,
 }
 
 impl<'m> Session<'m> {
@@ -310,7 +317,13 @@ impl<'m> Session<'m> {
         })).collect();
         let attn = (0..c.n_layer).map(|l| c.is_attention(l).then(|| AttnCache { k: vec![], v: vec![] })).collect();
         let ple_conv = vec![0f32; (c.ple_conv_k - 1) * c.ple_ngram * c.streams * c.hidden];
-        Session { m, be, delta, attn, ple_conv, tokens: vec![] }
+        Session { m, be, delta, attn, ple_conv, tokens: vec![], trace: None, stop_after: None }
+    }
+
+    fn rec(&mut self, name: String, v: &[f32]) {
+        if let Some(t) = self.trace.as_mut() {
+            t.entry(name).or_default().extend_from_slice(v);
+        }
     }
 
     /// y = W x for a dense tensor, through the backend.
@@ -343,20 +356,33 @@ impl<'m> Session<'m> {
             x
         };
         let mut r: Vec<f32> = (0..cs).flat_map(|_| emb.iter().copied()).collect();
+        self.rec("embed".into(), &emb);
 
         for l in 0..c.n_layer {
+            if self.stop_after == Some(l) {
+                let (u, _) = self.hc_read(&r, "output_hc", false);
+                self.rec("final_u".into(), &u);
+                return vec![];
+            }
             if l == c.ple_layer {
                 let add = self.ple(&r, l);
                 r.iter_mut().zip(&add).for_each(|(a, b)| *a += b);
+                self.rec(format!("layer{l}.ple"), &add);
             }
             let (u, g) = self.hc_read(&r, &format!("blk.{l}.hc_attn"), true);
+            self.rec(format!("layer{l}.attn_hc_u"), &u);
             let y = if c.is_attention(l) { self.attention(l, &u) } else { self.delta_net(l, &u) };
+            self.rec(format!("layer{l}.mixer"), &y);
             hc_write(&mut r, &g, &y, h);
             let (u, g) = self.hc_read(&r, &format!("blk.{l}.hc_ffn"), true);
+            self.rec(format!("layer{l}.mlp_hc_u"), &u);
             let y = self.moe(l, &u);
+            self.rec(format!("layer{l}.moe"), &y);
             hc_write(&mut r, &g, &y, h);
+            self.rec(format!("layer{l}.out"), &r);
         }
         let (u, _) = self.hc_read(&r, "output_hc", false);
+        self.rec("final_u".into(), &u);
         self.mv("output.weight", &u)
     }
 
@@ -520,7 +546,7 @@ impl<'m> Session<'m> {
         self.mv(&format!("{p}.attn_output.weight"), &o)
     }
 
-    fn moe(&self, l: usize, u: &[f32]) -> Vec<f32> {
+    fn moe(&mut self, l: usize, u: &[f32]) -> Vec<f32> {
         let m = self.m;
         let c = &m.cfg;
         let p = format!("blk.{l}");
@@ -532,6 +558,10 @@ impl<'m> Session<'m> {
         idx.sort_by(|&a, &b| ex[b].partial_cmp(&ex[a]).unwrap().then(a.cmp(&b)));
         let top = &idx[..c.n_expert_used];
         let tz: f64 = top.iter().map(|&e| ex[e] / z).sum();
+        let route_idx: Vec<f32> = top.iter().map(|&e| e as f32).collect();
+        let route_w: Vec<f32> = top.iter().map(|&e| ((ex[e] / z) / tz) as f32).collect();
+        self.rec(format!("layer{l}.route_idx"), &route_idx);
+        self.rec(format!("layer{l}.route_w"), &route_w);
         let mut y = vec![0f64; c.hidden];
         let swiglu = |gate: Vec<f32>, up: Vec<f32>| -> Vec<f32> { gate.iter().zip(&up).map(|(&g, &u)| silu(g) * u).collect() };
         for &e in top {

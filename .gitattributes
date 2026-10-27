@@ -4,3 +4,6 @@
 eval/** text eol=lf
 memory/*.jsonl text eol=lf
 crates/**/tests/**/*.jsonl text eol=lf
+
+# Binary fixtures (float32 tensors): the eval/** rule above would rewrite their 0x0d 0x0a pairs.
+eval/fixtures/**/*.bin binary
