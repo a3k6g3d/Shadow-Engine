@@ -100,3 +100,38 @@ fn the_sparse_indexer_matches_the_reference() {
     assert!(sel.1.iter().all(|&d| d == 0), "layer 3 attends to different positions than the reference: {:?}", sel.1);
     assert_exact(&r, "cpu, long prompt", 1e-3);
 }
+
+/// The whole forward pass on the GPU (shadow_cuda::session::GpuSession): every stream of layers 0-3 against the
+/// reference on Shadow's own weights, and the routing exactly.
+#[test]
+fn the_gpu_session_matches_the_reference() {
+    let p = std::env::var("SHADOW_MODEL").unwrap_or_else(|_| MODEL.into());
+    if !Path::new(&p).is_file() {
+        return eprintln!("SKIPPED, not passed: no model at {p}");
+    }
+    let Ok(ctx) = shadow_cuda::Context::new(0) else { return eprintln!("SKIPPED, not passed: no CUDA device") };
+    let fx = Fixture::load(&Path::new(env!("CARGO_MANIFEST_DIR")).join("../../eval/fixtures/reference_gguf")).unwrap();
+    let model = Model::load(Gguf::open(Path::new(&p)).unwrap()).unwrap();
+    let mut s = shadow_cuda::session::GpuSession::new(&ctx, &model, 4096).unwrap();
+    let r = shadow::reference::compare_stepper(&mut s, &fx);
+    assert_exact(&r, "gpu session", 5e-3);
+}
+
+/// The GPU session's sparse indexer on the 2,600-token prompt (about a minute).
+#[test]
+#[ignore = "about a minute: 2,600 tokens through 4 layers on the GPU"]
+fn the_gpu_sessions_sparse_indexer_matches_the_reference() {
+    let p = std::env::var("SHADOW_MODEL").unwrap_or_else(|_| MODEL.into());
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../eval/fixtures/reference_gguf_long");
+    if !Path::new(&p).is_file() || !dir.join("manifest.json").is_file() {
+        return eprintln!("SKIPPED, not passed: no model or no long fixture");
+    }
+    let Ok(ctx) = shadow_cuda::Context::new(0) else { return eprintln!("SKIPPED, not passed: no CUDA device") };
+    let fx = Fixture::load(&dir).unwrap();
+    let model = Model::load(Gguf::open(Path::new(&p)).unwrap()).unwrap();
+    let mut s = shadow_cuda::session::GpuSession::new(&ctx, &model, 4096).unwrap();
+    let r = shadow::reference::compare_stepper(&mut s, &fx);
+    let sel = r.selections.iter().find(|(n, _)| n == "layer3").expect("layer 3 selection");
+    assert!(sel.1.iter().all(|&d| d == 0), "layer 3 attends to different positions than the reference: {:?}", sel.1);
+    assert_exact(&r, "gpu session, long prompt", 5e-3);
+}

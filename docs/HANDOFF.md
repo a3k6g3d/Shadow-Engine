@@ -30,16 +30,16 @@ Implemented in `forward.rs` and held to the reference by `eval/fixtures/referenc
 the GPU backend (150 s). The CPU backend run and `cargo test --release -p shadow --test reference -- --ignored`
 (minutes) are the same comparison; regenerate the fixture with the command in `tools/make_reference_fixture.py`'s
 docstring plus `--prompt-file J:\Shadow\docs\SHADOW_PLAN.md J:\Shadow\docs\ARCH.md J:\Shadow\docs\STATUS.md --tokens
-2600 --positions 5,1000,2047,2050,2051,2052,2053,2054,2055,2056,2400,2599 --out evalixtureseference_gguf_long`
+2600 --positions 5,1000,2047,2050,2051,2052,2053,2054,2055,2056,2400,2599 --out evalixtures
+eference_gguf_long`
 (~10 minutes, `--weights gguf`, no download, capped at 30 GiB). Note that the prompt is made of the docs, so editing
 them changes the prompt; the fixture records the ids, so it stays valid as a fixture.
 
 ### Then, in the plan's order
 
-- **Stage 2, finish the GPU path** (checked against the 48-layer comparison each step): norms, the DeltaNet
-  recurrence, attention (+ the indexer), routing, and the hyper-connection glue on the GPU; today only the matrix-vector
-  products are there and every expert is uploaded per use (58k uploads per 41 tokens). The reference matvec kernels are
-  slow (15-23 GB/s on the IQ2/IQ3 experts); the fast ones are measured against them.
+- **Stage 2 is done for correctness**: `GpuSession` runs the whole forward pass on the GPU and matches the reference
+  (48 layers and the long prompt). `shadow generate --gpu` uses it; `--gpu-matvec` is the older matvec-only path. What
+  is left in stage 2 is speed: fast matvec kernels (the reference ones decode per weight) and CUDA graphs.
 - **Stage 3, the tiers**: VRAM expert cache, pinned RAM (the 4 GiB headroom rule enforced in code, not in a doc), the
   drive through `shadow-host`'s ring. Needs a placement profile in Shadow's own format.
 - **Stage 4**: the HTTP server (hyper + serde_json, decided), `shadow-bench`, and Shadow's own noise floor (the

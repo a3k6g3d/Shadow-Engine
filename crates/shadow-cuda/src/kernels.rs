@@ -87,6 +87,12 @@ const fn matvec(name: &'static str) -> Entry {
     Entry { name, params: MATVEC }
 }
 
+const fn e(name: &'static str, params: &'static [P]) -> Entry {
+    Entry { name, params }
+}
+
+use P::{ConstPtr as C, Ptr as W, F32 as F, U32 as U};
+
 pub const FILES: &[File] = &[
     File {
         file: "vector_add.cu",
@@ -118,6 +124,35 @@ pub const FILES: &[File] = &[
             matvec("matvec_q4_k"), matvec("matvec_q5_k"), matvec("matvec_q6_k"), matvec("matvec_iq4_nl"),
             matvec("matvec_iq4_xs"), matvec("matvec_q2_0"), matvec("matvec_iq2_s"), matvec("matvec_iq3_xxs"),
             matvec("matvec_iq3_s"), matvec("matvec_bf16"), matvec("matvec_f32"),
+        ],
+    },
+    File {
+        file: "forward.cu",
+        source: include_str!("../../../kernels/forward.cu"),
+        headers: &[],
+        entries: &[
+            e("rmsnorm_groups", &[C, C, W, U, F]),
+            e("silu_div", &[W, U, F]),
+            e("sigmoid_div", &[C, W, U, F, F]),
+            e("hc_mix", &[C, C, W, U, U]),
+            e("hc_write", &[W, C, C, U, U]),
+            e("broadcast", &[C, W, U, U]),
+            e("add", &[W, C, U]),
+            e("copy", &[W, C, U]),
+            e("conv_silu_step", &[C, W, C, W, U, U]),
+            e("l2norm_heads", &[W, U, F]),
+            e("delta_step", &[C, C, C, C, C, C, C, W, W, U, U]),
+            e("gated_rmsnorm_heads", &[W, C, C, U, F]),
+            e("head_norm_rope", &[C, U, W, U, C, U, F, U, U, F]),
+            e("split_gate", &[C, W, U, U]),
+            e("attention_heads", &[C, C, C, C, U, C, W, W, U, U, U, U]),
+            e("pool_block", &[C, W, C, U, U, U, F, U, F]),
+            e("index_scores", &[C, C, W, U, U, U]),
+            e("swiglu", &[C, C, W, U]),
+            e("axpy", &[W, C, U, F]),
+            e("axpy_sigmoid", &[W, C, C, U]),
+            e("ple_gate", &[C, C, C, W, U]),
+            e("ple_conv_step", &[C, W, C, W, U, U, U]),
         ],
     },
 ];

@@ -7,6 +7,7 @@ pub mod driver;
 pub mod dylib;
 pub mod kernels;
 pub mod nvrtc;
+pub mod session;
 pub mod sha256;
 
 pub use driver::{Context, CudaError, DeviceBuffer};

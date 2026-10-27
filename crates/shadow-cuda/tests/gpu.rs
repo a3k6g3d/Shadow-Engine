@@ -100,3 +100,17 @@ fn a_compile_error_returns_the_log() {
     assert!(e.contains("NVRTC log for bad.cu"), "{e}");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn every_registered_kernel_file_compiles_and_every_entry_point_resolves() {
+    let Some(ctx) = context() else { return };
+    if nvrtc::version().is_err() {
+        return eprintln!("SKIPPED, not passed: no NVRTC");
+    }
+    for f in shadow_cuda::kernels::FILES {
+        let prog = Program::load(&ctx, f).unwrap_or_else(|e| panic!("{}: {e}", f.file));
+        for e in f.entries {
+            prog.module.function(e.name).unwrap_or_else(|err| panic!("{}: {}: {err}", f.file, e.name));
+        }
+    }
+}

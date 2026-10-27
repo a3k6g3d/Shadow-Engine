@@ -48,13 +48,23 @@ is 10/10, on the GPU backend (150 s). Positions up to 2,050, where the indexer k
 Known gaps: one prompt family (this plan's own text and a 12-token sentence); decoding many tokens is only checked by
 greedy runs, not stream by stream; no sampling (greedy only).
 
-## Stage 2: begun
+## Stage 2: the whole forward pass runs on the GPU, gated; not fast yet
 
-- Every quant type dequantizes on the GPU bit for bit like the Rust reference (`kernels/quants.cuh`, `dequant.cu`).
-- A reference GPU matvec for all 11 types (`kernels/matvec.cu`), relative error ~3e-8 on real tensors; not fast yet
-  (264 GB/s Q6_K, 15-23 GB/s for the IQ2_S/IQ3 expert slices).
-- `shadow generate --gpu` runs the matrix-vector products on the GPU: same tokens, **0.40 s/token against 2.35** on the CPU.
-- Still on the CPU: norms, the DeltaNet recurrence, attention, routing, and every expert upload.
+- **`GpuSession`** (`crates/shadow-cuda/src/session.rs`, kernels in `kernels/forward.cu` + `matvec.cu`): the streams,
+  every DeltaNet state, every KV cache with the indexer's keys and the n-gram state live on the device; norms,
+  hyper-connection glue, the DeltaNet step, attention with the sparse indexer, the MoE glue and the n-gram memory are
+  kernels. On the host still: the embedding and n-gram rows (dequantized and uploaded), the router's top-10 (512 logits
+  come down), the indexer's top-512 past 2,051 positions (scores come down), and the routed experts, read from the file
+  and uploaded per use.
+- **Gated against the reference on Shadow's own weights:** 4 layers (`eval/fixtures/reference_gguf`), **all 48
+  layers** (243 streams, cosine 1.00000, routing identical at every layer) and the **2,600-token sparse-indexer
+  prompt** (identical attended positions, every stream exact). `tests/reference.rs` holds the first and (ignored, a
+  minute) the last.
+- **Speed: 0.347 s/token** generating (`shadow generate ... --gpu`), against 0.40 with only the matvecs on the GPU and
+  2.35 on the CPU. The answer is unchanged ("17 times 23 is 391."). It is not faster because the time is in the 480
+  expert slices read from the file and uploaded per token, and in the reference matvec kernels (15-23 GB/s on the
+  IQ2/IQ3 experts). Both are the next work: stage 3's VRAM/RAM tiers keep experts resident, and fast matvec kernels.
+- Every quant type dequantizes on the GPU bit for bit like the Rust reference (`kernels/quants.cuh`).
 
 ## Open
 

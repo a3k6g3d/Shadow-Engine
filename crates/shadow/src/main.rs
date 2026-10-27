@@ -38,7 +38,7 @@ fn main() -> ExitCode {
         return dump(&PathBuf::from(&args[1]), &args[2], &PathBuf::from(&args[3]), &args[4..]);
     }
     if args.first().map(String::as_str) == Some("compare") && args.len() >= 3 {
-        return compare(&PathBuf::from(&args[1]), &PathBuf::from(&args[2]), args.iter().any(|a| a == "--gpu"));
+        return compare(&PathBuf::from(&args[1]), &PathBuf::from(&args[2]), mode(&args));
     }
     if args.first().map(String::as_str) == Some("generate") && args.len() >= 3 {
         return generate(&PathBuf::from(&args[1]), &args[2], &args[3..]);
@@ -114,9 +114,33 @@ fn dump(path: &std::path::Path, name: &str, out: &std::path::Path, rest: &[Strin
     ExitCode::SUCCESS
 }
 
+/// Where a forward pass runs: the CPU reference, the CPU with its matrix-vector products on the GPU (`--gpu-matvec`),
+/// or the whole forward pass on the GPU (`--gpu`).
+#[derive(Clone, Copy, PartialEq)]
+enum Mode {
+    Cpu,
+    GpuMatvec,
+    Gpu,
+}
+
+fn mode(args: &[String]) -> Mode {
+    if args.iter().any(|a| a == "--gpu-matvec") {
+        Mode::GpuMatvec
+    } else if args.iter().any(|a| a == "--gpu") {
+        Mode::Gpu
+    } else {
+        Mode::Cpu
+    }
+}
+
+/// The positions a GPU session is made for: the prompt plus what is generated, rounded up, at least 4,096.
+fn gpu_capacity(n: usize) -> usize {
+    (n + 64).max(4096).next_multiple_of(1024)
+}
+
 /// The stage 1 gate: the reference fixture's prompt through Shadow's forward pass, stream by stream.
-fn compare(path: &std::path::Path, fixture: &std::path::Path, use_gpu: bool) -> ExitCode {
-    use shadow::reference::{compare, print, Fixture};
+fn compare(path: &std::path::Path, fixture: &std::path::Path, mode: Mode) -> ExitCode {
+    use shadow::reference::{compare, compare_stepper, print, Fixture};
     use shadow_model::forward::{CpuBackend, Model};
     let fx = match Fixture::load(fixture) {
         Ok(f) => f,
@@ -133,29 +157,38 @@ fn compare(path: &std::path::Path, fixture: &std::path::Path, use_gpu: bool) -> 
         }
     };
     let model = Model::load(g).expect("model");
-    println!("fixture: {:?} ({} tokens, {} layers)", fx.prompt, fx.ids.len(), fx.layers);
-    let ctx = if use_gpu { Some(shadow_cuda::Context::new(0).expect("--gpu")) } else { None };
-    let gpu = ctx.as_ref().map(|c| shadow_cuda::backend::GpuBackend::new(c, 8 << 30).expect("gpu backend"));
-    let be: &dyn shadow_model::forward::Backend = match &gpu {
-        Some(g) => g,
-        None => &CpuBackend,
+    println!("fixture: {:?} ({} tokens, {} layers)", fx.prompt.chars().take(120).collect::<String>(), fx.ids.len(), fx.layers);
+    let t0 = std::time::Instant::now();
+    let report = match mode {
+        Mode::Cpu => compare(&model, &CpuBackend, &fx),
+        Mode::GpuMatvec => {
+            let ctx = shadow_cuda::Context::new(0).expect("--gpu-matvec");
+            let gpu = shadow_cuda::backend::GpuBackend::new(&ctx, 8 << 30).expect("gpu backend");
+            compare(&model, &gpu, &fx)
+        }
+        Mode::Gpu => {
+            let ctx = shadow_cuda::Context::new(0).expect("--gpu");
+            let mut s = shadow_cuda::session::GpuSession::new(&ctx, &model, gpu_capacity(fx.ids.len())).expect("gpu session");
+            compare_stepper(&mut s, &fx)
+        }
     };
-    print(&compare(&model, be, &fx));
+    print(&report);
+    println!("({:.1} s)", t0.elapsed().as_secs_f64());
     ExitCode::SUCCESS
 }
 
-/// Greedy decoding.  `-n N` tokens (default 8); `--chat` wraps the prompt in the chat template (thinking off);
-/// `--gpu` runs every matrix-vector product on GPU 0 (the dense weights resident in VRAM), the rest on the CPU.
-/// Without it: the stage 1 CPU reference, slow by design.
+/// Greedy decoding.  `-n N` tokens (default 8); `--chat` wraps the prompt in the chat template (thinking off).
+/// `--gpu` runs the whole forward pass on GPU 0; `--gpu-matvec` only its matrix-vector products; neither: the stage 1
+/// CPU reference, slow by design.
 fn generate(path: &std::path::Path, prompt: &str, rest: &[String]) -> ExitCode {
     use shadow_model::chat::{render, Message, Options, Role};
-    use shadow_model::forward::{check_layout, CpuBackend, Model, Session};
+    use shadow_model::forward::{check_layout, CpuBackend, Model, Session, Stepper};
     use shadow_model::tokenizer::Tokenizer;
     use std::io::Write;
     let n_new: usize = rest.iter().position(|a| a == "-n").and_then(|i| rest.get(i + 1)).and_then(|v| v.parse().ok())
         .unwrap_or(8);
     let chat = rest.iter().any(|a| a == "--chat");
-    let use_gpu = rest.iter().any(|a| a == "--gpu");
+    let mode = mode(rest);
     let g = match Gguf::open(path) {
         Ok(g) => g,
         Err(e) => {
@@ -185,43 +218,48 @@ fn generate(path: &std::path::Path, prompt: &str, rest: &[String]) -> ExitCode {
     };
     let ids = tok.encode(&text, chat);
     eprintln!("prompt: {} tokens {:?}", ids.len(), &ids[..ids.len().min(16)]);
-    let ctx = if use_gpu {
+    let ctx = if mode == Mode::Cpu {
+        None
+    } else {
         match shadow_cuda::Context::new(0) {
             Ok(c) => Some(c),
             Err(e) => {
-                eprintln!("shadow generate: --gpu: {e}");
+                eprintln!("shadow generate: GPU: {e}");
                 return ExitCode::FAILURE;
             }
         }
-    } else {
-        None
     };
-    let gpu = match &ctx {
-        Some(c) => {
-            let (free, _) = c.mem_info().expect("VRAM");
-            let budget = free.saturating_sub(1 << 30); // leave 1 GiB for scratch, the desktop and the driver
-            eprintln!("GPU: {} - {:.2} GiB free, resident budget {:.2} GiB", c.name, free as f64 / GIB, budget as f64 / GIB);
-            match shadow_cuda::backend::GpuBackend::new(c, budget) {
-                Ok(b) => Some(b),
+    if let Some(c) = &ctx {
+        let (free, _) = c.mem_info().expect("VRAM");
+        eprintln!("GPU: {} - {:.2} GiB free", c.name, free as f64 / GIB);
+    }
+    let backend = match (&ctx, mode) {
+        (Some(c), Mode::GpuMatvec) => Some(shadow_cuda::backend::GpuBackend::new(c, 8 << 30).expect("gpu backend")),
+        _ => None,
+    };
+    let t_up = std::time::Instant::now();
+    let mut s: Box<dyn Stepper + '_> = match (&ctx, &backend) {
+        (Some(c), None) => {
+            let gs = match shadow_cuda::session::GpuSession::new(c, &model, gpu_capacity(ids.len() + n_new)) {
+                Ok(s) => s,
                 Err(e) => {
                     eprintln!("shadow generate: --gpu: {e}");
                     return ExitCode::FAILURE;
                 }
-            }
+            };
+            eprintln!("GPU session: {:.2} GiB of weights resident in {:.1} s", gs.resident_bytes as f64 / GIB,
+                      t_up.elapsed().as_secs_f64());
+            Box::new(gs)
         }
-        None => None,
+        (_, Some(b)) => Box::new(Session::new(&model, b)),
+        _ => Box::new(Session::new(&model, &CpuBackend)),
     };
-    let be: &dyn shadow_model::forward::Backend = match &gpu {
-        Some(g) => g,
-        None => &CpuBackend,
-    };
-    let mut s = Session::new(&model, be);
     let t1 = std::time::Instant::now();
     let mut logits = Vec::new();
     for &id in &ids {
         logits = s.step(id);
     }
-    eprintln!("prompt read in {:.1} s ({:.2} s/token)", t1.elapsed().as_secs_f64(),
+    eprintln!("prompt read in {:.1} s ({:.3} s/token)", t1.elapsed().as_secs_f64(),
               t1.elapsed().as_secs_f64() / ids.len() as f64);
     print!("{text}");
     let _ = std::io::stdout().flush();
@@ -238,11 +276,8 @@ fn generate(path: &std::path::Path, prompt: &str, rest: &[String]) -> ExitCode {
         logits = s.step(next);
     }
     println!();
-    eprintln!("generated {} tokens {:?} in {:.1} s ({:.2} s/token)", out.len(), out, t2.elapsed().as_secs_f64(),
+    eprintln!("generated {} tokens {:?} in {:.1} s ({:.3} s/token)", out.len(), out, t2.elapsed().as_secs_f64(),
               t2.elapsed().as_secs_f64() / out.len().max(1) as f64);
-    if let Some(g) = &gpu {
-        eprintln!("GPU: {:.2} GiB of weights resident, {} uploads", g.resident_bytes.get() as f64 / GIB, g.uploads.get());
-    }
     ExitCode::SUCCESS
 }
 
