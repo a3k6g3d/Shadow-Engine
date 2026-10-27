@@ -1,0 +1,169 @@
+== files
+  J:/Strata-work/models/swift15/IQ3_S\Swift-Qwen3.8-Flash-Next-GSQ-RCO-abliterated-IQ3_S-00001-of-00002.gguf  v3  44849330016 bytes, data at 10969824, alignment 32
+  J:/Strata-work/models/swift15/IQ3_S\Swift-Qwen3.8-Flash-Next-GSQ-RCO-abliterated-IQ3_S-00002-of-00002.gguf  v3  38699929024 bytes, data at 54336, alignment 32
+
+== key-values (75 total; arrays shortened)
+  general.architecture = "qwen4exp"
+  general.base_model.0.name = "Qwen3.8 Flash Next"
+  general.base_model.0.organization = "Qwen"
+  general.base_model.0.repo_url = "https://huggingface.co/Qwen/Qwen3.8-Flash-Next"
+  general.base_model.count = 1
+  general.dataset.0.name = "Qwen3.8 27B Multi Turn Agent Sft"
+  general.dataset.0.organization = "Ukisai"
+  general.dataset.0.repo_url = "https://huggingface.co/ukisai/Qwen3.8-27B-multi-turn-agent-sft"
+  general.dataset.count = 1
+  general.file_type = 26
+  general.license = "other"
+  general.license.link = "https://huggingface.co/ukisai/Swift-Qwen3.8-Flash-Next/blob/main/LICENSE"
+  general.license.name = "swift-open-license-1.0"
+  general.name = "Swift Flash Next"
+  general.quantization_version = 2
+  general.sampling.temp = 1.0
+  general.sampling.top_k = 20
+  general.sampling.top_p = 0.95
+  general.size_label = "512x56B"
+  general.tags = ["qwen3_8", "moe", "reasoning", "efficient-thinking", ...] (8 items)
+  general.type = "model"
+  qwen4exp.attention.compress_ratios = [0, 0, 0, 4, ...] (48 items)
+  qwen4exp.attention.head_count = 24
+  qwen4exp.attention.head_count_kv = 2
+  qwen4exp.attention.indexer.head_count = 4
+  qwen4exp.attention.indexer.key_length = 128
+  qwen4exp.attention.indexer.top_k = 2048
+  qwen4exp.attention.key_length = 256
+  qwen4exp.attention.layer_norm_rms_epsilon = 1e-6
+  qwen4exp.attention.recurrent_layers = [true, true, true, false, ...] (48 items)
+  qwen4exp.attention.value_length = 256
+  qwen4exp.block_count = 48
+  qwen4exp.context_length = 262144
+  qwen4exp.embedding_length = 2560
+  qwen4exp.embedding_length_per_layer_input = 160
+  qwen4exp.expert_count = 512
+  qwen4exp.expert_feed_forward_length = 640
+  qwen4exp.expert_shared_feed_forward_length = 640
+  qwen4exp.expert_used_count = 10
+  qwen4exp.full_attention_interval = 4
+  qwen4exp.hyper_connection.count = 4
+  qwen4exp.hyper_connection.low_rank = 320
+  qwen4exp.ple.conv_kernel = 4
+  qwen4exp.ple.eos_token_id = 248044
+  qwen4exp.ple.head_offsets = [0, 20000003, 40000026, 60000059, ...] (16 items)
+  qwen4exp.ple.head_vocab_sizes = [20000003, 20000023, 20000033, 20000047, ...] (16 items)
+  qwen4exp.ple.heads_per_ngram = 8
+  qwen4exp.ple.image_token_id = 248056
+  qwen4exp.ple.layer_multipliers = [23703573157769, 20109073645365, 8052911324071] (3 items)
+  qwen4exp.ple.layers = [1] (1 items)
+  qwen4exp.ple.ngram_size = 3
+  qwen4exp.rope.dimension_count = 64
+  qwen4exp.rope.dimension_sections = [11, 11, 10, 0] (4 items)
+  qwen4exp.rope.freq_base = 10000000.0
+  qwen4exp.ssm.conv_kernel = 4
+  qwen4exp.ssm.group_count = 16
+  qwen4exp.ssm.inner_size = 6144
+  qwen4exp.ssm.state_size = 128
+  qwen4exp.ssm.time_step_rank = 48
+  split.count = 2
+  split.no = 0
+  split.tensors.count = 1224
+  tokenizer.chat_template = "{%- set image_count = namespace(value=0) %}\n{%- set video_count = namespace(valu"... (8952 bytes)
+  tokenizer.ggml.bos_token_id = 248044
+  tokenizer.ggml.eos_token_id = 248046
+  tokenizer.ggml.merges = ["Ġ Ġ", "ĠĠ ĠĠ", "i n", "Ġ t", ...] (247587 items)
+  tokenizer.ggml.model = "gpt2"
+  tokenizer.ggml.padding_token_id = 248044
+  tokenizer.ggml.pre = "qwen35"
+  tokenizer.ggml.token_type = [1, 1, 1, 1, ...] (248320 items)
+  tokenizer.ggml.tokens = ["!", "\"", "#", "$", ...] (248320 items)
+
+== accounting
+  tensors: 1224
+  tensor bytes: 77.801 GiB (83538234880 bytes)
+  files: 77.811 GiB (83549259040 bytes); headers + padding: 11024160 bytes
+  alignment padding inside the data sections: 0 bytes
+  tensors whose size came from the offsets, not the type: 9
+    blk.1.ffn_down_exps.weight [640, 2560, 512] type42 -> 235929600 bytes
+    blk.8.ffn_down_exps.weight [640, 2560, 512] type42 -> 235929600 bytes
+    blk.10.ffn_down_exps.weight [640, 2560, 512] type42 -> 235929600 bytes
+    blk.12.ffn_down_exps.weight [640, 2560, 512] type42 -> 235929600 bytes
+    blk.13.ffn_down_exps.weight [640, 2560, 512] type42 -> 235929600 bytes
+    blk.20.ffn_down_exps.weight [640, 2560, 512] type42 -> 235929600 bytes
+    blk.21.ffn_down_exps.weight [640, 2560, 512] type42 -> 235929600 bytes
+    blk.30.ffn_down_exps.weight [640, 2560, 512] type42 -> 235929600 bytes
+    blk.36.ffn_down_exps.weight [640, 2560, 512] type42 -> 235929600 bytes
+
+== by type
+  BF16       388 tensors  1.306 GiB
+  F16          1 tensors  0.000 GiB
+  F32        388 tensors  0.244 GiB
+  IQ2_S       40 tensors  10.010 GiB
+  IQ3_S       20 tensors  6.714 GiB
+  IQ3_XXS     34 tensors  10.168 GiB
+  IQ4_NL      88 tensors  44.002 GiB
+  IQ4_XS      93 tensors  1.676 GiB
+  Q4_K        43 tensors  0.152 GiB
+  Q5_K        31 tensors  0.283 GiB
+  Q6_K        89 tensors  1.268 GiB
+  type42       9 tensors  1.978 GiB
+
+== layers (48)
+  K (attention tensors present): 12 [3, 7, 11, 15, 19, 23, 27, 31, 35, 39, 43, 47]
+  full_attention_interval 4: layer % 4 == 3 matches the tensors
+  J: 36 layers, 37.137 GiB (1.032 GiB per layer), routed experts 34.595 GiB (0.961 GiB per layer)
+  K: 12 layers, 13.029 GiB (1.086 GiB per layer), routed experts 12.244 GiB (1.020 GiB per layer)
+
+== roles inside a block (count, total, first seen)
+  attn_gate.weight                      36     0.353 GiB  Q4_K [2560, 6144]
+  attn_k.weight                         12     0.012 GiB  Q6_K [2560, 512]
+  attn_k_norm.weight                    12     0.000 GiB  F32 [256]
+  attn_output.weight                    12     0.093 GiB  IQ4_XS [6144, 2560]
+  attn_q.weight                         12     0.244 GiB  IQ4_XS [2560, 12288]
+  attn_q_norm.weight                    12     0.000 GiB  F32 [256]
+  attn_qkv.weight                       36     0.662 GiB  Q6_K [2560, 10240]
+  attn_v.weight                         12     0.012 GiB  Q6_K [2560, 512]
+  ffn_down_exps.weight                  48    19.116 GiB  IQ4_NL [640, 2560, 512]
+  ffn_down_shexp.weight                 48     0.041 GiB  IQ4_NL [640, 2560]
+  ffn_gate_exps.weight                  48    13.861 GiB  IQ3_XXS [2560, 640, 512]
+  ffn_gate_inp.weight                   48     0.234 GiB  F32 [2560, 512]
+  ffn_gate_inp_shexp.weight             48     0.000 GiB  F32 [2560]
+  ffn_gate_shexp.weight                 48     0.046 GiB  Q4_K [2560, 640]
+  ffn_up_exps.weight                    48    13.861 GiB  IQ3_XXS [2560, 640, 512]
+  ffn_up_shexp.weight                   48     0.047 GiB  IQ4_XS [2560, 640]
+  hc_attn_down.weight                   48     0.293 GiB  BF16 [10240, 320]
+  hc_attn_inject.weight                 48     0.004 GiB  BF16 [10240, 4]
+  hc_attn_norm.weight                   48     0.002 GiB  F32 [10240]
+  hc_attn_up.weight                     48     0.293 GiB  BF16 [320, 10240]
+  hc_ffn_down.weight                    48     0.293 GiB  BF16 [10240, 320]
+  hc_ffn_inject.weight                  48     0.004 GiB  BF16 [10240, 4]
+  hc_ffn_norm.weight                    48     0.002 GiB  F32 [10240]
+  hc_ffn_up.weight                      48     0.293 GiB  BF16 [320, 10240]
+  indexer.k_norm.weight                 12     0.000 GiB  F32 [128]
+  indexer.k_proj.weight                 12     0.007 GiB  BF16 [2560, 128]
+  indexer.q_norm.weight                 12     0.000 GiB  F32 [128]
+  indexer.q_proj.weight                 12     0.029 GiB  BF16 [2560, 512]
+  ple_conv1d.weight                      1     0.000 GiB  F16 [4, 10240]
+  ple_key.weight                         1     0.049 GiB  BF16 [2560, 10240]
+  ple_norm_conv.weight                   1     0.000 GiB  F32 [10240]
+  ple_norm_key.weight                    1     0.000 GiB  F32 [10240]
+  ple_norm_query.weight                  1     0.000 GiB  F32 [10240]
+  ple_value.weight                       1     0.012 GiB  BF16 [2560, 2560]
+  ssm_a                                 36     0.000 GiB  F32 [48]
+  ssm_alpha.weight                      36     0.008 GiB  BF16 [2560, 48]
+  ssm_beta.weight                       36     0.008 GiB  BF16 [2560, 48]
+  ssm_conv1d.weight                     36     0.005 GiB  F32 [4, 10240]
+  ssm_dt.bias                           36     0.000 GiB  F32 [48]
+  ssm_norm.weight                       36     0.000 GiB  F32 [128]
+  ssm_out.weight                        36     0.280 GiB  IQ4_XS [6144, 2560]
+
+== outside the layers: 27.635 GiB in 6 tensors
+  output.weight                        Q6_K   [2560, 248320]  0.486 GiB
+  output_hc_down.weight                BF16   [10240, 320]  0.006 GiB
+  output_hc_norm.weight                F32    [10240]  0.000 GiB
+  output_hc_up.weight                  BF16   [320, 10240]  0.006 GiB
+  per_layer_token_embd.weight          IQ4_NL [160, 320001536]  26.822 GiB
+  token_embd.weight                    IQ4_XS [2560, 248320]  0.315 GiB
+
+== the budget that decides placement
+  routed experts (tiered: VRAM / pinned RAM / drive): 46.838 GiB
+  everything else inside the layers (always resident on the GPU): 3.328 GiB
+  outside the layers (embeddings, head, norms): 27.635 GiB
+  total: 77.801 GiB

@@ -1,0 +1,15 @@
+[package]
+name = "shadow-model"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# The model side of the engine (docs/SHADOW_PLAN.md, stage 0): the GGUF reader, the tokenizer, and later the
+# forward pass.  Dependency-free on purpose: a file format and a tokenizer are exactly the code that should not move
+# under a `cargo update`.
+
+[dependencies]
+
+[[bin]]
+name = "shadow"
+path = "src/bin/shadow.rs"
