@@ -28,8 +28,11 @@ fn is_routed_expert(name: &str) -> bool {
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.first().map(String::as_str) == Some("kv") && args.len() == 3 {
+        return kv(&PathBuf::from(&args[1]), &args[2]);
+    }
     if args.first().map(String::as_str) != Some("inspect") || args.len() < 2 {
-        eprintln!("usage: shadow inspect MODEL.gguf [--tensors] [--kv]");
+        eprintln!("usage: shadow inspect MODEL.gguf [--tensors] [--kv]\n       shadow kv MODEL.gguf KEY");
         return ExitCode::from(2);
     }
     let path = PathBuf::from(&args[1]);
@@ -43,6 +46,35 @@ fn main() -> ExitCode {
         }
     };
     inspect(&g, all_tensors, all_kv);
+    ExitCode::SUCCESS
+}
+
+/// One key's whole value, raw: a string as it is, an array one element per line.  For reading the chat template and
+/// the vocabulary without a script.
+fn kv(path: &std::path::Path, key: &str) -> ExitCode {
+    let g = match Gguf::open(path) {
+        Ok(g) => g,
+        Err(e) => {
+            eprintln!("shadow kv: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    match g.get(key) {
+        Some(Value::Str(s)) => print!("{s}"),
+        Some(Value::Array(a)) => {
+            for v in a {
+                match v {
+                    Value::Str(s) => println!("{s}"),
+                    v => println!("{}", v.brief()),
+                }
+            }
+        }
+        Some(v) => println!("{}", v.brief()),
+        None => {
+            eprintln!("shadow kv: no key {key}");
+            return ExitCode::FAILURE;
+        }
+    }
     ExitCode::SUCCESS
 }
 
