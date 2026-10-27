@@ -2,7 +2,7 @@
 //! eval/fixtures/dequant.txt of the types the kernels cover (all but F32 and F16, which need no kernel) (themselves checked bit for bit against ggml's reference),
 //! plus Q2_0 on real blocks of the model when it is on this machine.
 
-use shadow_cuda::kernels::{file, Arg, Program, DEQUANT};
+use shadow_cuda::kernels::{file, Arg, Program, QUANT_KERNELS};
 use shadow_cuda::{nvrtc, Context};
 use shadow_model::gguf::{GgmlType, Gguf};
 use shadow_model::quant::dequantize;
@@ -46,9 +46,7 @@ fn gpu_dequant_matches_the_reference_bit_for_bit() {
     if let Err(e) = nvrtc::version() {
         return eprintln!("SKIPPED, not passed: no NVRTC ({e})");
     }
-    let progs = [Program::load(&ctx, file("dequant.cu").unwrap()).unwrap(),
-                 Program::load(&ctx, file("dequant_iq.cu").unwrap()).unwrap()];
-    let prog_for = |entry: &str| progs.iter().find(|p| p.file.entries.iter().any(|e| e.name == entry)).unwrap();
+    let prog = Program::load(&ctx, file("dequant.cu").unwrap()).unwrap();
     let text = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../../eval/fixtures/dequant.txt")).unwrap();
     let lines: Vec<&str> = text.lines().filter(|l| !l.starts_with('#') && !l.is_empty()).collect();
     let mut checked = std::collections::BTreeMap::new();
@@ -56,17 +54,12 @@ fn gpu_dequant_matches_the_reference_bit_for_bit() {
         let head: Vec<&str> = rec[0].split_whitespace().collect();
         let ty = head[0];
         let bytes = hex(rec[1]);
-        let mut cpu = vec![0f32; if ty == "BF16" { 1 } else { DEQUANT.iter().find(|d| d.1 == ty).map_or(0, |d| d.2 as usize) }];
-        if cpu.is_empty() {
+        let Some(&(_, per_block, _, entry, _)) = QUANT_KERNELS.iter().find(|q| q.0 == ty && !q.3.is_empty()) else {
             continue;
-        }
-        dequantize(GgmlType::from_id(type_id(ty)), &bytes, &mut cpu).unwrap();
-        let got = if ty == "BF16" {
-            gpu(&ctx, prog_for("dequant_bf16"), "dequant_bf16", 1, &bytes, 1)
-        } else {
-            let d = DEQUANT.iter().find(|d| d.1 == ty).unwrap();
-            gpu(&ctx, prog_for(d.0), d.0, d.2, &bytes, 1)
         };
+        let mut cpu = vec![0f32; per_block as usize];
+        dequantize(GgmlType::from_id(type_id(ty)), &bytes, &mut cpu).unwrap();
+        let got = gpu(&ctx, &prog, entry, per_block, &bytes, 1);
         same(&got, &cpu, &format!("{ty} {} block {}", head[1], head[2]));
         *checked.entry(ty).or_insert(0) += 1;
     }
@@ -92,6 +85,6 @@ fn gpu_dequant_matches_the_reference_bit_for_bit() {
     f.read_exact(&mut data).unwrap();
     let mut cpu = vec![0f32; n_blocks as usize * 64];
     dequantize(t.ty, &data, &mut cpu).unwrap();
-    same(&gpu(&ctx, prog_for("dequant_q2_0"), "dequant_q2_0", 64, &data, n_blocks), &cpu, "Q2_0 blk.1 expert 0");
+    same(&gpu(&ctx, &prog, "dequant_q2_0", 64, &data, n_blocks), &cpu, "Q2_0 blk.1 expert 0");
     eprintln!("Q2_0: {} real blocks checked", n_blocks);
 }

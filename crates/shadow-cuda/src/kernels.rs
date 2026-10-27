@@ -59,22 +59,33 @@ pub struct Header {
 pub const PRELUDE: &str = include_str!("../../../kernels/prelude.cuh");
 
 pub const IQ_TABLES: Header = Header { file: "iq_tables.cuh", source: include_str!("../../../kernels/iq_tables.cuh") };
+pub const QUANTS: Header = Header { file: "quants.cuh", source: include_str!("../../../kernels/quants.cuh") };
 
 const UNARY: &[P] = &[P::ConstPtr, P::Ptr, P::U32];
+const MATVEC: &[P] = &[P::ConstPtr, P::ConstPtr, P::Ptr, P::U32, P::U32];
 
-/// The dequant kernels: (entry point, ggml type name, weights per block, bytes per block).  BF16 is separate (one
-/// weight per thread, any count).
-pub const DEQUANT: &[(&str, &str, u32, u32)] = &[
-    ("dequant_q4_k", "Q4_K", 256, 144),
-    ("dequant_q5_k", "Q5_K", 256, 176),
-    ("dequant_q6_k", "Q6_K", 256, 210),
-    ("dequant_iq4_nl", "IQ4_NL", 32, 18),
-    ("dequant_iq4_xs", "IQ4_XS", 256, 136),
-    ("dequant_q2_0", "Q2_0", 64, 18),
-    ("dequant_iq2_s", "IQ2_S", 256, 82),
-    ("dequant_iq3_xxs", "IQ3_XXS", 256, 98),
-    ("dequant_iq3_s", "IQ3_S", 256, 110),
+/// Per quant type of the model: (ggml type name, weights per block, bytes per block, dequant entry, matvec entry).
+pub const QUANT_KERNELS: &[(&str, u32, u32, &str, &str)] = &[
+    ("Q4_K", 256, 144, "dequant_q4_k", "matvec_q4_k"),
+    ("Q5_K", 256, 176, "dequant_q5_k", "matvec_q5_k"),
+    ("Q6_K", 256, 210, "dequant_q6_k", "matvec_q6_k"),
+    ("IQ4_NL", 32, 18, "dequant_iq4_nl", "matvec_iq4_nl"),
+    ("IQ4_XS", 256, 136, "dequant_iq4_xs", "matvec_iq4_xs"),
+    ("Q2_0", 64, 18, "dequant_q2_0", "matvec_q2_0"),
+    ("IQ2_S", 256, 82, "dequant_iq2_s", "matvec_iq2_s"),
+    ("IQ3_XXS", 256, 98, "dequant_iq3_xxs", "matvec_iq3_xxs"),
+    ("IQ3_S", 256, 110, "dequant_iq3_s", "matvec_iq3_s"),
+    ("BF16", 1, 2, "dequant_bf16", "matvec_bf16"),
+    ("F32", 1, 4, "", "matvec_f32"),
 ];
+
+const fn unary(name: &'static str) -> Entry {
+    Entry { name, params: UNARY }
+}
+
+const fn matvec(name: &'static str) -> Entry {
+    Entry { name, params: MATVEC }
+}
 
 pub const FILES: &[File] = &[
     File {
@@ -87,35 +98,26 @@ pub const FILES: &[File] = &[
         file: "convert.cu",
         source: include_str!("../../../kernels/convert.cu"),
         headers: &[],
-        entries: &[
-            Entry { name: "f16_to_f32_all", params: UNARY },
-            Entry { name: "bf16_to_f32_all", params: UNARY },
-            Entry { name: "f32_to_f16_all", params: UNARY },
-            Entry { name: "f32_to_bf16_all", params: UNARY },
-        ],
+        entries: &[unary("f16_to_f32_all"), unary("bf16_to_f32_all"), unary("f32_to_f16_all"), unary("f32_to_bf16_all")],
     },
     File {
         file: "dequant.cu",
         source: include_str!("../../../kernels/dequant.cu"),
-        headers: &[],
+        headers: &[IQ_TABLES, QUANTS],
         entries: &[
-            Entry { name: "dequant_q4_k", params: UNARY },
-            Entry { name: "dequant_q5_k", params: UNARY },
-            Entry { name: "dequant_q6_k", params: UNARY },
-            Entry { name: "dequant_iq4_nl", params: UNARY },
-            Entry { name: "dequant_iq4_xs", params: UNARY },
-            Entry { name: "dequant_q2_0", params: UNARY },
-            Entry { name: "dequant_bf16", params: UNARY },
+            unary("dequant_q4_k"), unary("dequant_q5_k"), unary("dequant_q6_k"), unary("dequant_iq4_nl"),
+            unary("dequant_iq4_xs"), unary("dequant_q2_0"), unary("dequant_iq2_s"), unary("dequant_iq3_xxs"),
+            unary("dequant_iq3_s"), unary("dequant_bf16"),
         ],
     },
     File {
-        file: "dequant_iq.cu",
-        source: include_str!("../../../kernels/dequant_iq.cu"),
-        headers: &[IQ_TABLES],
+        file: "matvec.cu",
+        source: include_str!("../../../kernels/matvec.cu"),
+        headers: &[IQ_TABLES, QUANTS],
         entries: &[
-            Entry { name: "dequant_iq2_s", params: UNARY },
-            Entry { name: "dequant_iq3_xxs", params: UNARY },
-            Entry { name: "dequant_iq3_s", params: UNARY },
+            matvec("matvec_q4_k"), matvec("matvec_q5_k"), matvec("matvec_q6_k"), matvec("matvec_iq4_nl"),
+            matvec("matvec_iq4_xs"), matvec("matvec_q2_0"), matvec("matvec_iq2_s"), matvec("matvec_iq3_xxs"),
+            matvec("matvec_iq3_s"), matvec("matvec_bf16"), matvec("matvec_f32"),
         ],
     },
 ];
@@ -124,7 +126,7 @@ pub fn file(name: &str) -> Option<&'static File> {
     FILES.iter().find(|f| f.file == name)
 }
 
-/// The whole program NVRTC compiles for one file: the prelude, then the file.
+/// The whole program NVRTC compiles for one file: the prelude, its headers, then the file.
 pub fn program_source(f: &File) -> String {
     let mut s = String::from(PRELUDE);
     for h in f.headers {
