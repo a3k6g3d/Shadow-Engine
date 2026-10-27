@@ -203,14 +203,7 @@ impl Tiers {
         let mtp_dir = match flag("--mtp").map(String::as_str) {
             Some("off") => None,
             Some(p) => Some(std::path::PathBuf::from(p)),
-            None => {
-                let candidates = [
-                    std::path::PathBuf::from("models/mtp-basalt-ft1"),
-                    std::path::PathBuf::from("J:/Shadow/models/mtp-basalt-ft1"),
-                    std::path::PathBuf::from("J:/Strata-work/models/mtp-basalt-ft1"),
-                ];
-                candidates.into_iter().find(|p| p.exists())
-            }
+            None => None,
         };
         Ok(Tiers { vram_cache: gib("--expert-cache-gib")?, ram_bytes, ram_auto, order, mtp_dir })
     }

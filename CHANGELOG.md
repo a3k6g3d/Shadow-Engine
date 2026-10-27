@@ -2,6 +2,14 @@
 
 All notable changes to Shadow will be documented in this file.
 
+## [0.1.21] — 2026-10-27
+### Changed
+- **Made MTP Speculative Decoding Strictly Opt-In (`--mtp <DIR>`)**:
+  - Removed auto-activation of MTP when `models/mtp-basalt-ft1` is found on disk. Server now defaults to pure GPU base-model decoding at full speed with maximum Tier 1 VRAM expert cache allocation (~3.8 GiB) unless `--mtp <DIR>` is explicitly passed.
+  - Fixed MTP draft normalization dimension: `pre_fc_norm_hidden` now normalizes across the full 10,240-element multi-stream residual (1 group of 10,240 floats instead of 4 groups of 2560).
+  - Fixed MTP residual initialization bug: initialized `r_mtp` via `copy` + `add` rather than in-place accumulation over uninitialized buffer memory.
+  - Restored full VRAM expert cache headroom for the base model, preventing expert cache misses and PCIe thrashing during standard inference.
+
 ## [0.1.20] — 2026-10-27
 ### Added
 - **MTP (Multi-Token Prediction) Speculative Decoding Engine (`crates/shadow-cuda/src/mtp.rs`)**:

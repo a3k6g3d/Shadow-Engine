@@ -299,11 +299,11 @@ impl<'c> MtpModel<'c> {
                 .map_err(|e| e.to_string())?;
         }
 
-        // Pre-FC norm on hidden residual (4 groups of 2560 = 10,240 floats) -> hn
+        // Pre-FC norm on hidden residual (1 group of 10,240 floats) -> hn
         let pre_hid_norm = self.tensor_ptr("pre_fc_norm_hidden.weight").ok_or("pre_fc_norm_hidden missing")?;
         unsafe {
-            fw.launch("rmsnorm_groups", (cs as u32, 1, 1), (256, 1, 1), 0, None,
-                      &[KArg::Ptr(r_in), KArg::Ptr(pre_hid_norm), KArg::Ptr(b.hn.ptr), KArg::U32(h as u32), KArg::F32(EPS)])
+            fw.launch("rmsnorm_groups", (1, 1, 1), (256, 1, 1), 0, None,
+                      &[KArg::Ptr(r_in), KArg::Ptr(pre_hid_norm), KArg::Ptr(b.hn.ptr), KArg::U32((h * cs) as u32), KArg::F32(EPS)])
                 .map_err(|e| e.to_string())?;
         }
 
@@ -324,7 +324,7 @@ impl<'c> MtpModel<'c> {
             let r_s = b.r_mtp.ptr + (s * h * 4) as u64;
             let h2_s = b.h2.ptr + (s * h * 4) as u64;
             unsafe {
-                fw.launch("add", ((h.div_ceil(256)) as u32, 1, 1), (256, 1, 1), 0, None,
+                fw.launch("copy", ((h.div_ceil(256)) as u32, 1, 1), (256, 1, 1), 0, None,
                           &[KArg::Ptr(r_s), KArg::Ptr(h2_s), KArg::U32(h as u32)]).map_err(|e| e.to_string())?;
                 fw.launch("add", ((h.div_ceil(256)) as u32, 1, 1), (256, 1, 1), 0, None,
                           &[KArg::Ptr(r_s), KArg::Ptr(b.e2.ptr), KArg::U32(h as u32)]).map_err(|e| e.to_string())?;
