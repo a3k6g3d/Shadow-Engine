@@ -130,6 +130,12 @@ const TYPES: &[(u32, &str, u64, u64)] = &[
     (34, "TQ1_0", 256, 54),
     (35, "TQ2_0", 256, 66),
     (39, "MXFP4", 32, 17),
+    // Newer upstream ggml types (ggml.h, 2026): NVFP4 = 4 UE4M3 scales + 32 bytes of E2M1; Q1_0 = f16 + 16 bytes;
+    // Q2_0 = f16 scale + 16 bytes of 2-bit codes per 64 weights (2.25 bits/weight).  This model uses Q2_0 for 9 of
+    // its down projections.
+    (40, "NVFP4", 64, 36),
+    (41, "Q1_0", 128, 18),
+    (42, "Q2_0", 64, 18),
 ];
 
 impl GgmlType {

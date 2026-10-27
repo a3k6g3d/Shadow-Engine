@@ -12,10 +12,12 @@ says which:
 
 Nothing here comes from Strata.
 
-**This answers the plan's oracle question.** Option 1, llama.cpp, is out: the only build on this PC is Strata's fork
-(`J:\Strata-work\RUN.md`), mainline cannot know the file's type 42, and three load attempts failed. **Option 2 holds:**
-the architecture has a public reference implementation, and the base model's weights are public (BF16 safetensors, 131
-shards, 360 GB). A fixture can be made from them without downloading all of it (see the end).
+**This answers the plan's oracle question.** Option 1, llama.cpp: the only build on this PC is Strata's fork and it
+failed three loads (`J:\Strata-work\RUN.md`), so it is out. Mainline llama.cpp now has a `qwen4exp` converter and
+knows type 42 (Q2_0), so a mainline build is a possible second oracle, but it fuses tensors this file keeps separate
+and may not load this file as it is. **Option 2 holds:** the architecture has a public reference implementation, and
+the base model's weights are public (BF16 safetensors, 131 shards, 360 GB). A fixture can be made from them without
+downloading all of it (see the end).
 
 ## Shapes
 
@@ -44,10 +46,18 @@ Notation: `H = 2560` hidden, `C = 4` hyper-connection streams, `CH = 10240`, `T`
 - **`ssm_a` is stored as `A = -exp(A_log)`**: every value is negative (−158.0 to −0.028) [file].
 - **`blk.1.ple_norm_key` and `blk.1.ple_norm_query` are identical**, value for value [file]. Either the checkpoint ties
   them or the conversion copied one into the other. [open]
-- **Type 42.** 9 of the 48 `ffn_down_exps` tensors (blk 1, 8, 10, 12, 13, 20, 21, 30, 36) are ggml type 42, which
-  upstream ggml does not define: 235,929,600 bytes for 640 x 2560 x 512 weights = **2.25 bits per weight**, so
-  72 bytes per 256-weight block if the block is 256 [file]. Its layout is not documented anywhere public. [open, and
-  the largest one: Shadow cannot dequantize these 9 tensors until it is settled]
+- **Type 42 is upstream ggml's `GGML_TYPE_Q2_0`** (ggml.h, with NVFP4 = 40 and Q1_0 = 41, all newer than the first
+  type table here): 64 weights per block, an f16 scale `d` and 16 bytes of 2-bit codes, 18 bytes = 2.25 bits per
+  weight, which is exactly what the offsets gave. 9 of the 48 `ffn_down_exps` use it (blk 1, 8, 10, 12, 13, 20, 21,
+  30, 36) [file]. [open: the code-to-value map, from upstream `dequantize_row_q2_0`, before stage 1 writes it]
+- **The routed experts are mixed precision, per layer** [file]: `ffn_gate_exps` / `ffn_up_exps` are IQ3_XXS in 17
+  layers, IQ2_S in 20, IQ3_S in 10, IQ4_XS in 1; `ffn_down_exps` are IQ4_NL in 39 and Q2_0 in 9. So stage 1 needs
+  dequant for IQ2_S, IQ3_XXS, IQ3_S, IQ4_XS, IQ4_NL and Q2_0 on the expert path alone, plus Q4_K, Q5_K, Q6_K, BF16,
+  F16 and F32 elsewhere.
+- **This file's tensor layout predates upstream's converter.** Upstream llama.cpp now has `conversion/qwen4exp.py`,
+  which fuses `attn_qkv`+`attn_gate`, `ssm_beta`+`ssm_alpha` and each `hc_*_down`+`hc_*_inject` into single
+  tensors; this file keeps all of them separate. The same converter adds +1 to the PLE and indexer norms ("Gemma
+  zero-centred gammas") and takes `ple.norm_key` and `ple.norm_query` from **separate** source tensors.
 
 ## The forward pass, one token at a time
 
@@ -127,8 +137,8 @@ keep the top 512 blocks + the tail; mask everything else
 no bias]
 
 ### MoE (48 layers)
-Tensors: `ffn_gate_inp [2560, 512]` F32 (router), `ffn_gate_exps` / `ffn_up_exps [2560, 640, 512]` IQ3_XXS,
-`ffn_down_exps [640, 2560, 512]` IQ4_NL or type 42, `ffn_gate_shexp [2560, 640]`, `ffn_up_shexp [2560, 640]`,
+Tensors: `ffn_gate_inp [2560, 512]` F32 (router), `ffn_gate_exps` / `ffn_up_exps [2560, 640, 512]`,
+`ffn_down_exps [640, 2560, 512]` IQ4_NL or Q2_0 (gate/up: IQ2_S, IQ3_XXS, IQ3_S or IQ4_XS by layer), `ffn_gate_shexp [2560, 640]`, `ffn_up_shexp [2560, 640]`,
 `ffn_down_shexp [640, 2560]`, `ffn_gate_inp_shexp [2560]` F32 [file].
 ```
 p    = softmax( ffn_gate_inp · u )                  # over all 512, in f32                       [ref]
@@ -169,11 +179,11 @@ logits = output · u                                  # no further norm: the fil
 
 | # | question | how |
 |---|---|---|
-| 1 | **type 42**: the block layout of 9 `ffn_down_exps` tensors | Not documented publicly. Either re-derive those 9 tensors from the BF16 checkpoint into a known type (IQ4_NL, as their 39 siblings), or reverse-engineer the 72-byte block against the BF16 weights. The first is the honest one; it costs ~9 shards of download |
+| 1 | Q2_0's code-to-value map (`d * (q - ?)`) | upstream ggml's `dequantize_row_q2_0`, read before stage 1 |
 | 2 | norm weights: +1 folded in, or stored as-is | compare one `attn_q_norm` against the BF16 checkpoint: one HTTP range read of a safetensors header and one tensor |
 | 3 | `attn_qkv` order (q,k,v grouped or per-head interleaved) and `ssm_alpha` vs `ssm_beta` | the reference's `fix_query_key_value_ordering` plus one layer's output against the checkpoint |
 | 4 | PLE hashing details (multiplier per position, per head, negative mod) | the reference's `Qwen4ExpTextNGramEmbedding`, read line by line before stage 1 writes it |
-| 5 | `ple_norm_key == ple_norm_query` | the checkpoint |
+| 5 | `ple_norm_key == ple_norm_query` here, though upstream's converter reads two source tensors | the checkpoint: identical there too, or a conversion slip in this file |
 | 6 | indexer `k_norm`: LayerNorm or RMSNorm | the reference |
 | 7 | MTP for speculative decoding | the base model's MTP layer is in the checkpoint, not in this GGUF; quantize it ourselves, or use prompt-lookup drafting first |
 

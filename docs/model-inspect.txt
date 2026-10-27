@@ -2,7 +2,7 @@
   J:/Strata-work/models/swift15/IQ3_S\Swift-Qwen3.8-Flash-Next-GSQ-RCO-abliterated-IQ3_S-00001-of-00002.gguf  v3  44849330016 bytes, data at 10969824, alignment 32
   J:/Strata-work/models/swift15/IQ3_S\Swift-Qwen3.8-Flash-Next-GSQ-RCO-abliterated-IQ3_S-00002-of-00002.gguf  v3  38699929024 bytes, data at 54336, alignment 32
 
-== key-values (75 total; arrays shortened)
+== key-values (75 total; arch qwen4exp)
   general.architecture = "qwen4exp"
   general.base_model.0.name = "Qwen3.8 Flash Next"
   general.base_model.0.organization = "Qwen"
@@ -24,6 +24,10 @@
   general.size_label = "512x56B"
   general.tags = ["qwen3_8", "moe", "reasoning", "efficient-thinking", ...] (8 items)
   general.type = "model"
+  quantize.imatrix.chunks_count = 2472
+  quantize.imatrix.dataset = "/data/calib/imatrix_calib.txt"
+  quantize.imatrix.entries_count = 926
+  quantize.imatrix.file = "/data/gguf_fn/v1mix/imatrix-swiftfn-v1mix.gguf"
   qwen4exp.attention.compress_ratios = [0, 0, 0, 4, ...] (48 items)
   qwen4exp.attention.head_count = 24
   qwen4exp.attention.head_count_kv = 2
@@ -80,16 +84,7 @@
   tensor bytes: 77.801 GiB (83538234880 bytes)
   files: 77.811 GiB (83549259040 bytes); headers + padding: 11024160 bytes
   alignment padding inside the data sections: 0 bytes
-  tensors whose size came from the offsets, not the type: 9
-    blk.1.ffn_down_exps.weight [640, 2560, 512] type42 -> 235929600 bytes
-    blk.8.ffn_down_exps.weight [640, 2560, 512] type42 -> 235929600 bytes
-    blk.10.ffn_down_exps.weight [640, 2560, 512] type42 -> 235929600 bytes
-    blk.12.ffn_down_exps.weight [640, 2560, 512] type42 -> 235929600 bytes
-    blk.13.ffn_down_exps.weight [640, 2560, 512] type42 -> 235929600 bytes
-    blk.20.ffn_down_exps.weight [640, 2560, 512] type42 -> 235929600 bytes
-    blk.21.ffn_down_exps.weight [640, 2560, 512] type42 -> 235929600 bytes
-    blk.30.ffn_down_exps.weight [640, 2560, 512] type42 -> 235929600 bytes
-    blk.36.ffn_down_exps.weight [640, 2560, 512] type42 -> 235929600 bytes
+  tensors whose size came from the offsets, not the type: 0
 
 == by type
   BF16       388 tensors  1.306 GiB
@@ -100,10 +95,10 @@
   IQ3_XXS     34 tensors  10.168 GiB
   IQ4_NL      88 tensors  44.002 GiB
   IQ4_XS      93 tensors  1.676 GiB
+  Q2_0         9 tensors  1.978 GiB
   Q4_K        43 tensors  0.152 GiB
   Q5_K        31 tensors  0.283 GiB
   Q6_K        89 tensors  1.268 GiB
-  type42       9 tensors  1.978 GiB
 
 == layers (48)
   K (attention tensors present): 12 [3, 7, 11, 15, 19, 23, 27, 31, 35, 39, 43, 47]
