@@ -59,6 +59,8 @@ Say what you ran and what it returned, in a few lines. Never state a number you 
 
 
 def load_config(path: str) -> dict:
+    if not path or not os.path.isfile(path):
+        return {}
     with open(path, encoding="utf-8-sig") as f:
         return json.load(f)
 
@@ -303,12 +305,13 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("task", nargs="*", help="what to do; leave it out to chat")
     ap.add_argument("--config", default=r"J:\Strata-work\strata.json")
-    ap.add_argument("--url", default="http://127.0.0.1:8080")
+    ap.add_argument("--url", default=os.environ.get("SHADOW_URL", "http://127.0.0.1:8080"))
     ap.add_argument("--skills", default="", help="a folder of .md procedures to list in the prompt")
     ap.add_argument("--memory", default="", help="a folder; every run is appended here as JSONL, and grep finds it")
     ap.add_argument("--cap", type=int, default=MAX_RESULT)
     ap.add_argument("--rounds", type=int, default=40)
     ap.add_argument("--max-tokens", type=int, default=2048)
+    ap.add_argument("--no-think", action="store_true")
     ap.add_argument("--quiet", action="store_true")
     a = ap.parse_args()
     MAX_RESULT = a.cap
@@ -336,6 +339,8 @@ def main() -> int:
             messages.append({"role": "user", "content": line})
         body = {"model": cfg.get("model_name", ""), "messages": messages, "tools": TOOLS,
                 "max_tokens": a.max_tokens, "temperature": 0.2}
+        if a.no_think or a.max_tokens <= 256:
+            body["chat_template_kwargs"] = {"enable_thinking": False}
         t0 = time.time()
         r = api(cfg, a.url, body, key)
         dt = time.time() - t0

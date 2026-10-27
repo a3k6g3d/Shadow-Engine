@@ -52,6 +52,22 @@ CONVS = [
      [{"role": "user", "content": "go"}, {"role": "assistant", "content": "ok"}, {"role": "tool", "content": "r1"},
       {"role": "tool", "content": "r2"}], {"reasoning_effort": "medium"}),
     ("no generation prompt", [{"role": "user", "content": "Hi"}], {"add_generation_prompt": False}),
+    ("tools + tool_calls + system",
+     [{"role": "system", "content": "Sys."},
+      {"role": "user", "content": "Read foo.py"},
+      {"role": "assistant", "content": "Reading.", "reasoning_content": "need foo.py",
+       "tool_calls": [{"id": "1", "type": "function",
+                       "function": {"name": "read_file", "arguments": {"path": "foo.py", "start": 1}}}]},
+      {"role": "tool", "content": "1|print(1)"}],
+     {"tools": [{"name": "read_file", "description": "a file",
+                 "input_schema": {"type": "object", "properties": {"path": {"type": "string"}, "start": {"type": "integer"}}}}]}),
+    ("multiple tool_calls without content",
+     [{"role": "user", "content": "Search and read"},
+      {"role": "assistant", "content": "", "reasoning_content": "parallel",
+       "tool_calls": [{"function": {"name": "grep", "arguments": {"pattern": "cap", "ignore_case": True}}},
+                      {"function": {"name": "glob", "arguments": {"pattern": "**/*.rs", "max_results": 200}}}]}],
+     {"tools": [{"type": "function", "function": {"name": "grep", "description": "search"}},
+                {"name": "glob", "description": "find files"}]}),
 ]
 
 
@@ -70,9 +86,19 @@ def main() -> None:
         encoding="utf-8", newline="\n")
     chats = []
     for name, msgs, kw in CONVS:
+        kw = dict(kw)
         text = tok.apply_chat_template(msgs, tokenize=False, add_generation_prompt=kw.pop("add_generation_prompt", True), **kw)
         chats.append({"name": name, "messages": msgs, "options": kw, "text": text})
     (OUT / "chat.json").write_text(json.dumps({"cases": chats}, ensure_ascii=False, indent=1), encoding="utf-8", newline="\n")
+    flint_dir = pathlib.Path("I:/shadow-ref/flint")
+    if flint_dir.is_dir():
+        tok_f = AutoTokenizer.from_pretrained(str(flint_dir))
+        chats_f = []
+        for name, msgs, kw in CONVS:
+            kw = dict(kw)
+            text = tok_f.apply_chat_template(msgs, tokenize=False, add_generation_prompt=kw.pop("add_generation_prompt", True), **kw)
+            chats_f.append({"name": name, "messages": msgs, "options": kw, "text": text})
+        (OUT / "chat_flint.json").write_text(json.dumps({"cases": chats_f}, ensure_ascii=False, indent=1), encoding="utf-8", newline="\n")
     print(f"{len(cases)} tokenizer cases ({sum(len(c['ids']) for c in cases)} ids), {len(chats)} chat cases -> {OUT}")
 
 

@@ -47,12 +47,11 @@ them changes the prompt; the fixture records the ids, so it stays valid as a fix
   Shadow's own `SHRC` routing counts (`profiles/`, `--record-routing`).
 - **Stage 2 speed**: batched expert matvecs are in (0.1.3). Left: the mixers/norms/glue (~30 ms/token, 21%) and
   launch overhead (CUDA graphs). `SHADOW_PROFILE=1` prints where a token's time goes.
-- **Stage 4**: `shadow-serve` (`crates/shadow-serve`, `shadow serve`, 15/15 live checks in `tools/serve_check.py`) and
-  `shadow-bench` (`crates/shadow-bench`) are in (0.1.7-0.1.8). Shadow's own 8-launch noise floor is measured in
+- **Stage 4**: `shadow-serve` (`crates/shadow-serve`, `shadow serve`, 16/16 live checks in `tools/serve_check.py`,
+  including `<tool_call>` parsing and `tools/shadow_harness.py` + `shadow-eval run`) and `shadow-bench`
+  (`crates/shadow-bench`) are in (0.1.7-0.1.11). Shadow's own 8-launch noise floor is measured in
   `bench/floor-2026-10-27`: **median 0.8%, p90 2.0%, worst 3.6%** at **10.20 tok/s** `decode_warm` (`--ram-tier-gib 30`),
-  lowest available RAM 9.6 GiB, 0 answer differences across 48 turns. Still owed for Stage 4's `shadow-eval run` gate:
-  tool-calling formatting in `chat.rs` and `shadow-serve` (`shadow_harness.py` sends `tools` definitions, which `chat.rs`
-  currently refuses).
+  lowest available RAM 9.6 GiB, 0 answer differences across 48 turns.
 - Cleanup done (0.1.4): `shadow-abi`, `include/shadow/c/abi.h`, `shadow-host/src/ffi.rs` and `protocol.rs` are
   removed. Still owed: copy the model under `J:\\Shadow\\models\\` and record its SHA-256 (the plan
   says the model file is the only input; it is still read from `J:\Strata-work\models\swift15\IQ3_S\`).

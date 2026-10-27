@@ -193,6 +193,111 @@
    ],
    "options": {},
    "text": "<|im_start|>system\nReasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.<|im_end|>\n<|im_start|>user\nHi<|im_end|>\n"
+  },
+  {
+   "name": "tools + tool_calls + system",
+   "messages": [
+    {
+     "role": "system",
+     "content": "Sys."
+    },
+    {
+     "role": "user",
+     "content": "Read foo.py"
+    },
+    {
+     "role": "assistant",
+     "content": "Reading.",
+     "reasoning_content": "need foo.py",
+     "tool_calls": [
+      {
+       "id": "1",
+       "type": "function",
+       "function": {
+        "name": "read_file",
+        "arguments": {
+         "path": "foo.py",
+         "start": 1
+        }
+       }
+      }
+     ]
+    },
+    {
+     "role": "tool",
+     "content": "1|print(1)"
+    }
+   ],
+   "options": {
+    "tools": [
+     {
+      "name": "read_file",
+      "description": "a file",
+      "input_schema": {
+       "type": "object",
+       "properties": {
+        "path": {
+         "type": "string"
+        },
+        "start": {
+         "type": "integer"
+        }
+       }
+      }
+     }
+    ]
+   },
+   "text": "<|im_start|>system\nReasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.\n\n# Tools\n\nYou have access to the following functions:\n\n<tools>\n{\"name\": \"read_file\", \"description\": \"a file\", \"input_schema\": {\"type\": \"object\", \"properties\": {\"path\": {\"type\": \"string\"}, \"start\": {\"type\": \"integer\"}}}}\n</tools>\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n- Required parameters MUST be specified\n- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n</IMPORTANT>\n\nSys.<|im_end|>\n<|im_start|>user\nRead foo.py<|im_end|>\n<|im_start|>assistant\n<think>\nneed foo.py\n</think>\n\nReading.\n\n<tool_call>\n<function=read_file>\n<parameter=path>\nfoo.py\n</parameter>\n<parameter=start>\n1\n</parameter>\n</function>\n</tool_call><|im_end|>\n<|im_start|>user\n<tool_response>\n1|print(1)\n</tool_response><|im_end|>\n<|im_start|>assistant\n<think>\n"
+  },
+  {
+   "name": "multiple tool_calls without content",
+   "messages": [
+    {
+     "role": "user",
+     "content": "Search and read"
+    },
+    {
+     "role": "assistant",
+     "content": "",
+     "reasoning_content": "parallel",
+     "tool_calls": [
+      {
+       "function": {
+        "name": "grep",
+        "arguments": {
+         "pattern": "cap",
+         "ignore_case": true
+        }
+       }
+      },
+      {
+       "function": {
+        "name": "glob",
+        "arguments": {
+         "pattern": "**/*.rs",
+         "max_results": 200
+        }
+       }
+      }
+     ]
+    }
+   ],
+   "options": {
+    "tools": [
+     {
+      "type": "function",
+      "function": {
+       "name": "grep",
+       "description": "search"
+      }
+     },
+     {
+      "name": "glob",
+      "description": "find files"
+     }
+    ]
+   },
+   "text": "<|im_start|>system\nReasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.\n\n# Tools\n\nYou have access to the following functions:\n\n<tools>\n{\"type\": \"function\", \"function\": {\"name\": \"grep\", \"description\": \"search\"}}\n{\"name\": \"glob\", \"description\": \"find files\"}\n</tools>\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n- Required parameters MUST be specified\n- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n</IMPORTANT><|im_end|>\n<|im_start|>user\nSearch and read<|im_end|>\n<|im_start|>assistant\n<think>\nparallel\n</think>\n\n<tool_call>\n<function=grep>\n<parameter=pattern>\ncap\n</parameter>\n<parameter=ignore_case>\ntrue\n</parameter>\n</function>\n</tool_call>\n<tool_call>\n<function=glob>\n<parameter=pattern>\n**/*.rs\n</parameter>\n<parameter=max_results>\n200\n</parameter>\n</function>\n</tool_call><|im_end|>\n<|im_start|>assistant\n<think>\n"
   }
  ]
 }

@@ -1,9 +1,8 @@
 //! Shadow's HTTP server (docs/SHADOW_PLAN.md, stage 4): an OpenAI-style `/v1/chat/completions` (whole or streamed as
-//! server-sent events), `/health`, `/v1/models`, `/v1/status`, `/props` and `/metrics`, over hyper, in front of one
-//! engine thread (engine.rs).  Requests queue; one is answered at a time.
+//! server-sent events, with tool definitions and `<tool_call>` parsing), `/health`, `/v1/models`, `/v1/status`, `/props`
+//! and `/metrics`, over hyper, in front of one engine thread (engine.rs).  Requests queue; one is answered at a time.
 //!
-//! Not yet: tool definitions and tool calls (the chat template refuses them, so a request with `tools` is answered
-//! 400 rather than rendered wrongly), sampling (greedy only), images.
+//! Not yet: sampling (greedy only), images.
 
 pub mod engine;
 
@@ -13,7 +12,7 @@ use http_body_util::{combinators::BoxBody, BodyExt, Full, StreamBody};
 use hyper::body::{Frame, Incoming};
 use hyper::{Method, Request, Response, StatusCode};
 use serde_json::{json, Value};
-use shadow_model::chat::{Effort, Message, Options, Role};
+use shadow_model::chat::{parse_tool_calls, Effort, Message, Options, Role, ToolCall};
 use std::convert::Infallible;
 use std::sync::{Arc, Mutex};
 
@@ -105,7 +104,7 @@ async fn handle(req: Request<Incoming>, app: Arc<App>) -> Result<Response<Body>,
             json_resp(StatusCode::OK, &json!({
                 "model_path": s.model, "n_ctx": s.n_ctx, "engine": "shadow", "version": env!("CARGO_PKG_VERSION"),
                 "sampling": "greedy only (temperature, top_p, seed are accepted and ignored)",
-                "tools": false, "streaming": true, "default_generation_settings": {"n_ctx": s.n_ctx},
+                "tools": true, "streaming": true, "default_generation_settings": {"n_ctx": s.n_ctx},
             }))
         }
         (&Method::GET, "/metrics") => {
@@ -149,10 +148,128 @@ fn content_text(v: &Value) -> Result<String, String> {
     }
 }
 
+/// Formats a `serde_json::Value` like Jinja's `tojson(ensure_ascii=False)` (`", "` and `": "`), ordering common
+/// schema keys first so `BTreeMap` does not scramble tool definitions.
+fn tojson_serde(v: &Value) -> String {
+    match v {
+        Value::Null => "null".into(),
+        Value::Bool(b) => b.to_string(),
+        Value::Number(n) => n.to_string(),
+        Value::String(s) => serde_json::to_string(s).unwrap(),
+        Value::Array(a) => format!("[{}]", a.iter().map(tojson_serde).collect::<Vec<_>>().join(", ")),
+        Value::Object(m) => {
+            const ORDER: &[&str] = &[
+                "type", "function", "name", "description", "parameters", "input_schema", "properties", "required",
+                "path", "pattern", "glob", "ignore_case", "start", "end", "oldText", "newText", "content", "command", "cwd",
+            ];
+            let mut items = Vec::with_capacity(m.len());
+            for &k in ORDER {
+                if let Some(val) = m.get(k) {
+                    items.push(format!("{}: {}", serde_json::to_string(k).unwrap(), tojson_serde(val)));
+                }
+            }
+            for (k, val) in m {
+                if !ORDER.contains(&k.as_str()) {
+                    items.push(format!("{}: {}", serde_json::to_string(k).unwrap(), tojson_serde(val)));
+                }
+            }
+            format!("{{{}}}", items.join(", "))
+        }
+    }
+}
+
+/// Converts a parsed `<parameter=K>V</parameter>` string into a JSON value using the tool's schema when available.
+fn arg_to_json(tools: Option<&Vec<Value>>, fn_name: &str, key: &str, val: &str) -> Value {
+    let prop_type = tools.and_then(|ts| {
+        ts.iter().find_map(|t| {
+            let f = t.get("function").unwrap_or(t);
+            if f.get("name").and_then(Value::as_str) != Some(fn_name) {
+                return None;
+            }
+            let schema = f.get("parameters").or_else(|| f.get("input_schema"))?;
+            schema.get("properties")?.get(key)?.get("type")?.as_str()
+        })
+    });
+    match prop_type {
+        Some("string") => Value::String(val.to_string()),
+        Some("integer") | Some("number") | Some("boolean") | Some("array") | Some("object") => {
+            serde_json::from_str(val.trim()).unwrap_or_else(|_| Value::String(val.to_string()))
+        }
+        _ => match serde_json::from_str::<Value>(val.trim()) {
+            Ok(v @ (Value::Number(_) | Value::Bool(_) | Value::Array(_) | Value::Object(_))) => v,
+            _ => Value::String(val.to_string()),
+        },
+    }
+}
+
+/// Parses a top-level JSON object string into `(key, Value)` pairs in exact source key order (whereas `serde_json::Map`
+/// uses `BTreeMap` and alphabetizes keys, which would reorder `<parameter=...>` tags on the next turn and break prefix
+/// cache reuse).
+fn parse_json_object_ordered(s: &str) -> Result<Vec<(String, Value)>, String> {
+    let v: Value = serde_json::from_str(s).map_err(|e| format!("tool_call arguments is not valid JSON: {e}"))?;
+    if !v.is_object() {
+        return Err("tool_call arguments must be a JSON object".into());
+    }
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() && bytes[i].is_ascii_whitespace() { i += 1; }
+    if bytes.get(i) != Some(&b'{') { return Ok(Vec::new()); }
+    i += 1;
+    let mut out = Vec::new();
+    loop {
+        while i < bytes.len() && (bytes[i].is_ascii_whitespace() || bytes[i] == b',') { i += 1; }
+        if i >= bytes.len() || bytes[i] == b'}' { break; }
+        if bytes[i] != b'"' { break; }
+        let key_start = i;
+        i += 1;
+        while i < bytes.len() {
+            if bytes[i] == b'\\' { i += 2; continue; }
+            if bytes[i] == b'"' { i += 1; break; }
+            i += 1;
+        }
+        let key: String = serde_json::from_str(&s[key_start..i]).map_err(|e| e.to_string())?;
+        while i < bytes.len() && (bytes[i].is_ascii_whitespace() || bytes[i] == b':') { i += 1; }
+        let val_start = i;
+        let mut depth = 0i32;
+        let mut in_str = false;
+        while i < bytes.len() {
+            let b = bytes[i];
+            if in_str {
+                if b == b'\\' { i += 2; continue; }
+                if b == b'"' { in_str = false; }
+            } else {
+                match b {
+                    b'"' => in_str = true,
+                    b'{' | b'[' => depth += 1,
+                    b'}' | b']' => {
+                        if depth == 0 { break; }
+                        depth -= 1;
+                    }
+                    b',' if depth == 0 => break,
+                    _ => {}
+                }
+            }
+            i += 1;
+        }
+        let val: Value = serde_json::from_str(s[val_start..i].trim()).map_err(|e| e.to_string())?;
+        out.push((key, val));
+    }
+    Ok(out)
+}
+
 /// The request body as the engine's request (without its channel).
 pub fn parse_chat(body: &Value) -> Result<(Vec<Message>, Options, usize, bool), String> {
-    if body.get("tools").and_then(Value::as_array).is_some_and(|t| !t.is_empty()) {
-        return Err("tools are not supported yet: Shadow's chat template does not render tool definitions".into());
+    let mut opts = Options::default();
+    if let Some(tools_val) = body.get("tools") {
+        let arr = tools_val.as_array().ok_or("\"tools\" must be an array")?;
+        for t in arr {
+            let fn_obj = t.get("function").unwrap_or(t);
+            if fn_obj.get("name").and_then(Value::as_str).is_none() {
+                return Err("each tool definition must have a \"name\"".into());
+            }
+            opts.tools.push(tojson_serde(t));
+            opts.tools_fn.push(tojson_serde(fn_obj));
+        }
     }
     let msgs = body.get("messages").and_then(Value::as_array).ok_or("\"messages\" must be an array")?;
     let mut out = Vec::new();
@@ -164,14 +281,30 @@ pub fn parse_chat(body: &Value) -> Result<(Vec<Message>, Options, usize, bool), 
             Some("tool") => Role::Tool,
             other => return Err(format!("unknown role {other:?}")),
         };
-        if m.get("tool_calls").and_then(Value::as_array).is_some_and(|t| !t.is_empty()) {
-            return Err("assistant tool_calls are not supported yet".into());
-        }
         let mut msg = Message::new(role, &content_text(m.get("content").unwrap_or(&Value::Null))?);
         msg.reasoning = m.get("reasoning_content").and_then(Value::as_str).map(str::to_string);
+        if let Some(tcs) = m.get("tool_calls").and_then(Value::as_array) {
+            for tc in tcs {
+                let fn_obj = tc.get("function").unwrap_or(tc);
+                let name = fn_obj.get("name").and_then(Value::as_str).ok_or("tool_call must have a function \"name\"")?.to_string();
+                let pairs: Vec<(String, Value)> = match fn_obj.get("arguments") {
+                    Some(Value::String(s)) if !s.trim().is_empty() => parse_json_object_ordered(s)?,
+                    Some(Value::Object(map)) => map.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
+                    _ => Vec::new(),
+                };
+                let mut arguments = Vec::with_capacity(pairs.len());
+                for (k, v) in pairs {
+                    let vs = match v {
+                        Value::String(s) => s,
+                        other => tojson_serde(&other),
+                    };
+                    arguments.push((k, vs));
+                }
+                msg.tool_calls.push(ToolCall { name, arguments });
+            }
+        }
         out.push(msg);
     }
-    let mut opts = Options::default();
     if let Some(k) = body.get("chat_template_kwargs") {
         if let Some(t) = k.get("enable_thinking").and_then(Value::as_bool) {
             opts.thinking = Some(t);
@@ -233,13 +366,33 @@ async fn chat(req: Request<Incoming>, app: Arc<App>) -> Response<Body> {
                 Some(Event::Reasoning(s)) => reasoning += &s,
                 Some(Event::Done(st)) => {
                     let (u, t) = usage(&st);
-                    let mut msg = json!({"role": "assistant", "content": content});
+                    let (clean_content, calls) = parse_tool_calls(&content);
+                    let mut msg = json!({"role": "assistant", "content": clean_content});
                     if !reasoning.is_empty() {
                         msg["reasoning_content"] = json!(reasoning);
                     }
+                    let mut finish_reason = st.finish_reason;
+                    if !calls.is_empty() {
+                        let tools_arr = body.get("tools").and_then(Value::as_array);
+                        let tc_json: Vec<Value> = calls.iter().enumerate().map(|(i, tc)| {
+                            let pairs: Vec<String> = tc.arguments.iter().map(|(k, v)| {
+                                format!("{}:{}", serde_json::to_string(k).unwrap(), arg_to_json(tools_arr, &tc.name, k, v))
+                            }).collect();
+                            json!({
+                                "id": format!("call_{i}"),
+                                "type": "function",
+                                "function": {
+                                    "name": tc.name,
+                                    "arguments": format!("{{{}}}", pairs.join(",")),
+                                }
+                            })
+                        }).collect();
+                        msg["tool_calls"] = Value::Array(tc_json);
+                        finish_reason = "tool_calls";
+                    }
                     break json_resp(StatusCode::OK, &json!({
                         "id": id, "object": "chat.completion", "created": created, "model": model,
-                        "choices": [{"index": 0, "message": msg, "finish_reason": st.finish_reason}],
+                        "choices": [{"index": 0, "message": msg, "finish_reason": finish_reason}],
                         "usage": u, "timings": t}));
                 }
                 Some(Event::Error(e)) => break error(StatusCode::BAD_REQUEST, &e),
@@ -316,5 +469,24 @@ mod tests {
         assert!(parse_chat(&json!({"messages": [{"role": "user", "content": [{"type": "image_url"}]}]})).is_err());
         assert!(parse_chat(&json!({"messages": [{"role": "wizard", "content": "x"}]})).is_err());
         assert!(parse_chat(&json!({"nope": 1})).is_err());
+    }
+
+    #[test]
+    fn parses_tools_and_tool_calls() {
+        let b = json!({
+            "messages": [
+                {"role": "user", "content": "read foo.py"},
+                {"role": "assistant", "content": "", "tool_calls": [
+                    {"id": "call_0", "type": "function", "function": {"name": "read_file", "arguments": "{\"path\":\"foo.py\",\"start\":1,\"end\":8}"}}
+                ]},
+                {"role": "tool", "tool_call_id": "call_0", "content": "1|hi"}
+            ],
+            "tools": [{"name": "read_file", "description": "read a file", "input_schema": {"type": "object", "properties": {"path": {"type": "string"}, "start": {"type": "integer"}}}}]
+        });
+        let (m, o, _, _) = parse_chat(&b).unwrap();
+        assert_eq!(o.tools.len(), 1);
+        assert_eq!(m[1].tool_calls.len(), 1);
+        assert_eq!(m[1].tool_calls[0].name, "read_file");
+        assert_eq!(m[1].tool_calls[0].arguments, vec![("path".into(), "foo.py".into()), ("start".into(), "1".into()), ("end".into(), "8".into())]);
     }
 }

@@ -148,9 +148,14 @@ router top-10 on the host 1%. That is why the RAM tier came before moving the ro
   conversation's token prefix matches (`cache_n` tokens skipped); otherwise calls `GpuSession::reset()`. Verified by
   3 unit tests and `tools/serve_check.py` (15/15 live checks across streaming, multi-turn prefix reuse, reset and
   metrics).
-- **Known Stage 4 gap (`shadow-eval`):** `shadow-eval run` calls `tools/shadow_harness.py`, which sends `tools`
-  definitions in `/v1/chat/completions`; `crates/shadow-model/src/chat.rs` refuses `tools` until the tool-calling
-  branch of the checkpoint's Jinja template is transcribed, so `shadow-serve` returns HTTP 400 on tool requests.
+- **Tool calling + `shadow-eval run` (`0.1.11`):** transcribed the `tools` system preamble and assistant `tool_calls`
+  branches of both Qwen3.8-Flash-Next (`<tools>` + `<tool_call><function=...><parameter=...>`) and `RecursiveSI/flint`
+  (`<tools>` + `<tool_call>NAME<arg_key>...<arg_value>...`) in `crates/shadow-model/src/chat.rs`, held to `transformers`
+  `apply_chat_template` across 14/14 Qwen conversations (`eval/fixtures/chat.json`) and 14/14 Flint conversations
+  (`eval/fixtures/chat_flint.json`). `shadow-serve` parses `<tool_call>` blocks into OpenAI `tool_calls` responses (preserving
+  argument key order so multi-turn tool sessions keep their token prefix cache warm). Verified by `tools/serve_check.py`
+  (16/16 live checks), a multi-turn `tools/shadow_harness.py` tool execution against `shadow serve`, and `shadow-eval run`
+  + `shadow-eval answers` (`14/14` correct).
 - **`shadow-bench` (`crates/shadow-bench`) and Shadow's noise floor (`bench/floor-2026-10-27`):** launches `shadow serve`
   under `tools/run_capped.ps1`, waits for available RAM to settle before each launch, runs a 6-turn conversation (96
   tokens/turn, greedy), drops turn 0 (`decode_warm`), and computes turn-matched pair differences across runs. Over **8

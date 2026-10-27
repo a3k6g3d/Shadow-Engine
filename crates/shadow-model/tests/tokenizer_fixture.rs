@@ -4,7 +4,7 @@
 //! without it every test says SKIPPED and passes.
 
 use shadow_eval::json::{parse, Value as J};
-use shadow_model::chat::{render, render_flint, Effort, Message, Options, Role};
+use shadow_model::chat::{parse_tool_calls, render, render_flint, Effort, Message, Options, Role, ToolCall};
 use shadow_model::gguf::Gguf;
 use shadow_model::tokenizer::Tokenizer;
 
@@ -69,12 +69,35 @@ fn check_chat_fixture(fixture_name: &str, f_render: fn(&[Message], &Options) -> 
             };
             let mut msg = Message::new(role, m.get("content").unwrap().as_str().unwrap());
             msg.reasoning = m.get("reasoning_content").and_then(J::as_str).map(str::to_string);
+            if let Some(tcs) = m.get("tool_calls").and_then(J::as_arr) {
+                for tc in tcs {
+                    let fn_obj = tc.get("function").unwrap_or(tc);
+                    let name = fn_obj.get("name").and_then(J::as_str).unwrap().to_string();
+                    let mut arguments = Vec::new();
+                    if let Some(args) = fn_obj.get("arguments").and_then(J::as_obj) {
+                        for (k, v) in args {
+                            let val_s = match v {
+                                J::Str(s) => s.clone(),
+                                other => other.tojson(),
+                            };
+                            arguments.push((k.clone(), val_s));
+                        }
+                    }
+                    msg.tool_calls.push(ToolCall { name, arguments });
+                }
+            }
             msg
         }).collect();
         let opts = c.get("options").unwrap();
         let mut o = Options::default();
         if let Some(J::Bool(b)) = opts.get("enable_thinking") { o.thinking = Some(*b); }
         if let Some(J::Bool(b)) = opts.get("preserve_thinking") { o.preserve_thinking = Some(*b); }
+        if let Some(tools) = opts.get("tools").and_then(J::as_arr) {
+            for t in tools {
+                o.tools.push(t.tojson());
+                o.tools_fn.push(t.get("function").unwrap_or(t).tojson());
+            }
+        }
         o.effort = match opts.get("reasoning_effort").and_then(J::as_str) {
             Some("medium") => Effort::Medium,
             Some("low") => Effort::Low,
@@ -95,4 +118,10 @@ fn check_chat_fixture(fixture_name: &str, f_render: fn(&[Message], &Options) -> 
 fn chat_template_matches_the_checkpoints() {
     check_chat_fixture("chat.json", render);
     check_chat_fixture("chat_flint.json", render_flint);
+    let (rem, calls) = parse_tool_calls("Let me check.\n\n<tool_call>\n<function=read_file>\n<parameter=path>\na/b.rs\n</parameter>\n<parameter=start>\n10\n</parameter>\n</function>\n</tool_call>");
+    assert_eq!(rem, "Let me check.");
+    assert_eq!(calls, vec![ToolCall { name: "read_file".into(), arguments: vec![("path".into(), "a/b.rs".into()), ("start".into(), "10".into())] }]);
+    let (rem_f, calls_f) = parse_tool_calls("Checking.<tool_call>read_file<arg_key>path</arg_key><arg_value>a/b.rs</arg_value><arg_key>start</arg_key><arg_value>10</arg_value></tool_call>");
+    assert_eq!(rem_f, "Checking.");
+    assert_eq!(calls_f, calls);
 }

@@ -6,8 +6,6 @@
 //! store contains whatever the last session typed into it — quotes, backslashes, emoji — and a line that does not
 //! parse must not silently rank the wrong record.
 
-use std::collections::BTreeMap;
-
 #[derive(Debug, Clone, PartialEq)]
 pub enum Value {
     Null,
@@ -15,14 +13,46 @@ pub enum Value {
     Num(f64),
     Str(String),
     Arr(Vec<Value>),
-    Obj(BTreeMap<String, Value>),
+    Obj(Vec<(String, Value)>),
 }
 
 impl Value {
     pub fn get(&self, key: &str) -> Option<&Value> {
         match self {
-            Value::Obj(m) => m.get(key),
+            Value::Obj(m) => m.iter().rev().find(|(k, _)| k == key).map(|(_, v)| v),
             _ => None,
+        }
+    }
+
+    pub fn as_obj(&self) -> Option<&[(String, Value)]> {
+        match self {
+            Value::Obj(m) => Some(m),
+            _ => None,
+        }
+    }
+
+    /// Formats a JSON value like Jinja's `tojson(ensure_ascii=False)` in `transformers` (`", "` and `": "` separators).
+    pub fn tojson(&self) -> String {
+        match self {
+            Value::Null => "null".into(),
+            Value::Bool(true) => "true".into(),
+            Value::Bool(false) => "false".into(),
+            Value::Num(x) => {
+                if x.fract() == 0.0 && (*x as i64) as f64 == *x {
+                    (*x as i64).to_string()
+                } else {
+                    x.to_string()
+                }
+            }
+            Value::Str(s) => escape_json_str(s),
+            Value::Arr(a) => {
+                let items: Vec<String> = a.iter().map(Value::tojson).collect();
+                format!("[{}]", items.join(", "))
+            }
+            Value::Obj(m) => {
+                let items: Vec<String> = m.iter().map(|(k, v)| format!("{}: {}", escape_json_str(k), v.tojson())).collect();
+                format!("{{{}}}", items.join(", "))
+            }
         }
     }
 
@@ -50,6 +80,26 @@ impl Value {
     pub fn as_str_list(&self) -> Option<Vec<&str>> {
         self.as_arr().map(|v| v.iter().filter_map(|x| x.as_str()).collect())
     }
+}
+
+fn escape_json_str(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '"' => out += "\\\"",
+            '\\' => out += "\\\\",
+            '\u{08}' => out += "\\b",
+            '\u{0c}' => out += "\\f",
+            '\n' => out += "\\n",
+            '\r' => out += "\\r",
+            '\t' => out += "\\t",
+            c if (c as u32) < 0x20 => out += &format!("\\u{:04x}", c as u32),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
 }
 
 pub fn parse(src: &str) -> Result<Value, String> {
@@ -113,7 +163,7 @@ impl<'a> Parser<'a> {
 
     fn object(&mut self) -> Result<Value, String> {
         self.i += 1;
-        let mut out = BTreeMap::new();
+        let mut out = Vec::new();
         self.ws();
         if self.peek() == Some('}') {
             self.i += 1;
@@ -131,7 +181,12 @@ impl<'a> Parser<'a> {
             }
             self.i += 1;
             self.ws();
-            out.insert(key, self.value()?);
+            let val = self.value()?;
+            if let Some(slot) = out.iter_mut().find(|(k, _)| k == &key) {
+                slot.1 = val;
+            } else {
+                out.push((key, val));
+            }
             self.ws();
             match self.peek() {
                 Some(',') => {

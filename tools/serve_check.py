@@ -56,7 +56,7 @@ check("/health ready", True, f"{time.time() - t0:.0f} s")
 s, b = get("/v1/models"); m = json.loads(b)
 check("/v1/models", s == 200 and m["data"][0]["object"] == "model", m["data"][0]["id"])
 s, b = get("/props"); p = json.loads(b)
-check("/props", s == 200 and p["engine"] == "shadow" and p["tools"] is False)
+check("/props", s == 200 and p["engine"] == "shadow" and p["tools"] is True)
 s, b = get("/metrics")
 check("/metrics", s == 200 and "shadow_requests_total" in b)
 
@@ -88,8 +88,15 @@ check("follow-up answered", s == 200 and len(f["choices"][0]["message"]["content
 s, again = post(base)
 check("same answer after the session moved on", again["choices"][0]["message"]["content"] == c1)
 
-s, e = post({"messages": msgs, "tools": [{"type": "function", "function": {"name": "x"}}]})
-check("tools refused with 400", s == 400 and "tools" in e["error"]["message"])
+s, e = post({"messages": msgs, "tools": [{"type": "function"}]})
+check("malformed tool refused with 400", s == 400 and "name" in e["error"]["message"])
+s, tc_resp = post({"messages": [{"role": "user", "content": "Call the tool read_file on Cargo.toml with start=1 and end=10."}],
+                   "tools": [{"name": "read_file", "description": "read lines of a file",
+                              "input_schema": {"type": "object", "properties": {"path": {"type": "string"}, "start": {"type": "integer"}, "end": {"type": "integer"}}}}],
+                   "max_tokens": 96, "chat_template_kwargs": {"enable_thinking": False}})
+tcs = (tc_resp.get("choices") or [{}])[0].get("message", {}).get("tool_calls") or []
+check("tool call parsed into tool_calls", s == 200 and len(tcs) >= 1 and tcs[0]["function"]["name"] == "read_file"
+      and tc_resp["choices"][0]["finish_reason"] == "tool_calls", repr(tcs[:1]))
 s, e = post({"messages": msgs, "max_tokens": 10 ** 7})
 check("too long refused", s == 400, e["error"]["message"][:80])
 
