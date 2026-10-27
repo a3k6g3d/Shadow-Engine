@@ -377,6 +377,24 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
     }
     .send-btn:hover { background: var(--accent-hover); }
     .send-btn:disabled { opacity: 0.4; cursor: not-allowed; }
+    .stop-btn {
+      background: #ef4444;
+      color: white;
+      border: none;
+      border-radius: 0.6rem;
+      padding: 0 1.25rem;
+      font-weight: 600;
+      font-size: 0.9rem;
+      cursor: pointer;
+      transition: background 0.15s;
+      display: none;
+      align-items: center;
+      justify-content: center;
+      gap: 0.4rem;
+      align-self: flex-end;
+      height: 48px;
+    }
+    .stop-btn:hover { background: #dc2626; }
 
     /* Bottom Control Bar */
     .controls-bar {
@@ -806,6 +824,9 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
         <div class="input-box">
           <textarea id="prompt-input" rows="1" placeholder="Ask Shadow to inspect files, run tests, or chat... (Shift+Enter for newline)"></textarea>
           <button id="send-btn" class="send-btn">Send</button>
+          <button id="stop-btn" class="stop-btn" onclick="stopGeneration()">
+            <span>⏹</span> Stop
+          </button>
         </div>
         <div class="controls-bar">
           <div class="controls-left">
@@ -1059,6 +1080,7 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
     const messagesEl = document.getElementById('messages');
     const inputEl = document.getElementById('prompt-input');
     const sendBtn = document.getElementById('send-btn');
+    const stopBtn = document.getElementById('stop-btn');
     const thinkingBtn = document.getElementById('thinking-btn');
     const thinkingLabel = document.getElementById('thinking-btn-label');
     const thinkingDropdown = document.getElementById('thinking-dropdown');
@@ -1074,6 +1096,20 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
     let history = [];
     let isGenerating = false;
     let availableTools = [];
+    let currentAbortController = null;
+
+    function stopGeneration() {
+      if (currentAbortController) {
+        currentAbortController.abort();
+        currentAbortController = null;
+      }
+      isGenerating = false;
+      sendBtn.style.display = 'flex';
+      stopBtn.style.display = 'none';
+      sendBtn.disabled = false;
+      inputEl.focus();
+      timingInfo.textContent = 'Generation stopped by user';
+    }
 
     // Load tool schemas from server
     async function loadTools() {
@@ -1264,7 +1300,9 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
       if (!text || isGenerating) return;
 
       isGenerating = true;
-      sendBtn.disabled = true;
+      sendBtn.style.display = 'none';
+      stopBtn.style.display = 'flex';
+      currentAbortController = new AbortController();
       inputEl.value = '';
       inputEl.style.height = 'auto';
 
@@ -1326,7 +1364,8 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
           const response = await fetch('/v1/chat/completions', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(requestBody)
+            body: JSON.stringify(requestBody),
+            signal: currentAbortController ? currentAbortController.signal : undefined
           });
 
           if (!response.ok) {
@@ -1409,14 +1448,27 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
             break;
           }
         } catch (err) {
+          if (err.name === 'AbortError') {
+            msgContent.innerHTML = renderMarkdown(rawContent);
+            const cursor = msgContent.querySelector('.cursor-blink');
+            if (cursor) cursor.remove();
+            timingInfo.textContent = 'Generation stopped by user';
+            history.push({ role: 'assistant', content: rawContent });
+            break;
+          }
           msgContent.innerHTML = `<span style="color:var(--danger);">Connection error: ${escapeHtml(err.message)}</span>`;
           break;
         }
       }
 
       const dt = (performance.now() - t0) / 1000;
-      timingInfo.textContent = `Completed in ${dt.toFixed(2)}s`;
+      if (timingInfo.textContent !== 'Generation stopped by user') {
+        timingInfo.textContent = `Completed in ${dt.toFixed(2)}s`;
+      }
       isGenerating = false;
+      currentAbortController = null;
+      sendBtn.style.display = 'flex';
+      stopBtn.style.display = 'none';
       sendBtn.disabled = false;
       inputEl.focus();
       pollTelemetry();
