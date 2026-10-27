@@ -131,7 +131,23 @@ fn now() -> String {
     format!("{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs())
 }
 
+/// Waits (up to two minutes) until available RAM stops moving - the previous run's pinned tier being handed back to
+/// the system - so every launch starts from the same place.  Returns the settled figure in GiB.
+fn settle_ram() -> f64 {
+    let t0 = Instant::now();
+    let mut last = shadow_cuda::pinned::available_ram();
+    loop {
+        std::thread::sleep(Duration::from_secs(3));
+        let now = shadow_cuda::pinned::available_ram();
+        if now.abs_diff(last) < (256 << 20) || t0.elapsed() > Duration::from_secs(120) {
+            return gib(now);
+        }
+        last = now;
+    }
+}
+
 fn one_run(arm: &str, run: usize, port: u16, launch: &str, turns: usize, tokens: usize) -> Value {
+    let ram_at_launch = settle_ram();
     let t0 = Instant::now();
     let mut child = std::process::Command::new("powershell")
         .args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", launch])
@@ -208,6 +224,7 @@ fn one_run(arm: &str, run: usize, port: u16, launch: &str, turns: usize, tokens:
                        error.as_ref().map(|e| format!(" - ERROR {e}")).unwrap_or_default());
     json!({
         "arm": arm, "run": run, "launch": launch, "load_s": load_s, "turns": turns_out, "error": error,
+        "available_ram_at_launch_gib": ram_at_launch,
         "min_available_ram_gib": gib(min_ram), "peak_gpu_mib": max_gpu,
         "run_capped": capped_out.trim().lines().last().unwrap_or(""), "line": line, "ended": now(),
     })

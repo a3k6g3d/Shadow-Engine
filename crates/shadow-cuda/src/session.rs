@@ -160,13 +160,16 @@ pub struct Tiers {
     pub vram_cache: Option<usize>,
     /// The pinned RAM tier in bytes (0: none).  Refused if it would leave less than `pinned::RAM_FLOOR` available.
     pub ram_bytes: usize,
+    /// Size the RAM tier as `pinned::auto_tier_bytes()` says, measured when the session fills it - after the dense
+    /// weights are loaded and uploaded, so the figure is what is really left (`ram_bytes` is then ignored).
+    pub ram_auto: bool,
     /// Which experts the RAM tier holds, best first; `None`: `placement::uniform_order`.
     pub order: Option<Vec<(usize, usize)>>,
 }
 
 impl Tiers {
     /// From command-line flags: `--expert-cache-gib G`, `--ram-tier-gib G|auto`, `--placement FILE` (SHRC).  Says on
-    /// stderr what `auto` chose and when the RAM tier has no placement.
+    /// stderr when the RAM tier has no placement.
     pub fn from_args(args: &[String]) -> Result<Tiers, String> {
         const GIB: f64 = (1u64 << 30) as f64;
         let flag = |f: &str| args.iter().position(|a| a == f).and_then(|i| args.get(i + 1));
@@ -182,19 +185,12 @@ impl Tiers {
             }
             None => None,
         };
-        let ram_bytes = match flag("--ram-tier-gib").map(String::as_str) {
-            Some("auto") => {
-                let b = crate::pinned::auto_tier_bytes() as usize;
-                eprintln!("RAM tier: auto = {:.2} GiB ({:.2} GiB available less a {:.0} GiB margin)", b as f64 / GIB,
-                          crate::pinned::available_ram() as f64 / GIB, crate::pinned::AUTO_MARGIN as f64 / GIB);
-                b
-            }
-            _ => gib("--ram-tier-gib")?.unwrap_or(0),
-        };
-        if ram_bytes > 0 && order.is_none() {
+        let ram_auto = flag("--ram-tier-gib").map(String::as_str) == Some("auto");
+        let ram_bytes = if ram_auto { 0 } else { gib("--ram-tier-gib")?.unwrap_or(0) };
+        if (ram_auto || ram_bytes > 0) && order.is_none() {
             eprintln!("RAM tier: no --placement, so an arbitrary (uniform) choice of experts");
         }
-        Ok(Tiers { vram_cache: gib("--expert-cache-gib")?, ram_bytes, order })
+        Ok(Tiers { vram_cache: gib("--expert-cache-gib")?, ram_bytes, ram_auto, order })
     }
 }
 
@@ -245,7 +241,7 @@ impl<'c> RamTier<'c> {
                 o += n_bytes;
             }
             since_check += o - off;
-            if since_check >= 1 << 30 {
+            if since_check >= 256 << 20 {
                 region.check_floor()?; // the file cache and everything else move while we fill
                 since_check = 0;
             }
@@ -401,7 +397,17 @@ impl<'c, 'm> GpuSession<'c, 'm> {
             arena, slot_bytes, slots, map: HashMap::new(), owner: vec![None; slots], stamp: vec![0; slots], clock: 0,
             hits: 0, misses: 0,
         };
-        let ram = RamTier::fill(ctx, m, tiers.ram_bytes, tiers.order)?;
+        // auto is measured here, with the dense weights already in RAM and on the device
+        let ram_bytes = if tiers.ram_auto {
+            let b = crate::pinned::auto_tier_bytes() as usize;
+            eprintln!("RAM tier: auto = {:.2} GiB ({:.2} GiB available less a {:.0} GiB margin)", b as f64 / (1u64 << 30) as f64,
+                      crate::pinned::available_ram() as f64 / (1u64 << 30) as f64,
+                      crate::pinned::AUTO_MARGIN as f64 / (1u64 << 30) as f64);
+            b
+        } else {
+            tiers.ram_bytes
+        };
+        let ram = RamTier::fill(ctx, m, ram_bytes, tiers.order)?;
         Ok(GpuSession {
             ctx, m, mvp, fw, w, v, b, delta, attn, ple_state, tokens: vec![], cap, trace: None, stop_after: None,
             resident_bytes, expert_uploads: 0, cache, ram,
