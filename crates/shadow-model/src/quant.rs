@@ -3,8 +3,8 @@
 //!
 //! Each format follows its ggml definition. The arithmetic is written in the same order as the gguf Python
 //! package's numpy implementation, so that with no fused multiply-adds (Rust never fuses on its own) the two agree bit
-//! for bit; `tests/dequant.rs` checks that on real blocks of the model. Q2_0 is not here yet: its code-to-value map is
-//! ARCH.md's open question 1.
+//! for bit; `tests/dequant.rs` checks that on real blocks of the model. Q2_0 has no such check: the gguf package (0.19) does
+//! not implement it, so it is written from upstream ggml's `dequantize_row_q2_0` and tested by hand and for sanity.
 
 use crate::gguf::GgmlType;
 use crate::half::{bf16_to_f32, f16_to_f32};
@@ -120,6 +120,16 @@ fn iq3_s(b: &[u8], y: &mut [f32]) {
     }
 }
 
+/// Q2_0 (upstream ggml, `dequantize_row_q2_0`): an f16 scale, then 64 two-bit codes, four per byte, lowest bits first;
+/// code `q` is `(q - 1) * d`, so the four levels are -d, 0, d, 2d.
+fn q2_0(b: &[u8], y: &mut [f32]) {
+    let d = f16_at(b, 0);
+    for (j, v) in y.iter_mut().enumerate().take(64) {
+        let q = (b[2 + j / 4] >> ((j % 4) * 2)) & 0x03;
+        *v = (q as i32 - 1) as f32 * d;
+    }
+}
+
 fn iq4_nl(b: &[u8], y: &mut [f32]) {
     let d = f16_at(b, 0);
     for c in 0..16 {
@@ -164,6 +174,7 @@ pub fn dequantize(ty: GgmlType, data: &[u8], out: &mut [f32]) -> Result<(), Stri
         "IQ3_S" => iq3_s,
         "IQ4_NL" => iq4_nl,
         "IQ4_XS" => iq4_xs,
+        "Q2_0" => q2_0,
         _ => return Err(format!("{name}: dequantization not implemented")),
     };
     for (b, y) in data.chunks_exact(bytes).zip(out.chunks_exact_mut(block)) {

@@ -39,7 +39,44 @@ fn every_fixture_block_matches_the_reference_bit_for_bit() {
 }
 
 #[test]
-fn q2_0_is_refused_by_name_not_guessed() {
-    let e = dequantize(GgmlType::from_id(42), &[0u8; 18], &mut [0f32; 64]).unwrap_err();
-    assert!(e.contains("Q2_0"), "{e}");
+fn q2_0_by_hand() {
+    // d = 0.5 (f16 0x3800); codes 0,1,2,3 repeated: byte 0b11_10_01_00 = 0xe4.
+    let mut block = vec![0x00, 0x38];
+    block.extend([0xe4u8; 16]);
+    let mut y = [0f32; 64];
+    dequantize(GgmlType::from_id(42), &block, &mut y).unwrap();
+    for (j, v) in y.iter().enumerate() {
+        assert_eq!(*v, [-0.5, 0.0, 0.5, 1.0][j % 4], "element {j}");
+    }
+}
+
+/// No reference exists for Q2_0 here, so this checks it is at least the right kind of number: a Q2_0 down
+/// projection's weights must have about the spread of an IQ4_NL down projection's (the same role, a layer away).
+#[test]
+fn q2_0_real_blocks_look_like_their_neighbours() {
+    let p = std::env::var("SHADOW_MODEL").unwrap_or_else(|_| {
+        "J:/Strata-work/models/swift15/IQ3_S/Swift-Qwen3.8-Flash-Next-GSQ-RCO-abliterated-IQ3_S-00001-of-00002.gguf".into()
+    });
+    if !std::path::Path::new(&p).is_file() {
+        return eprintln!("SKIPPED, not passed: no model at {p}");
+    }
+    let g = shadow_model::gguf::Gguf::open(std::path::Path::new(&p)).unwrap();
+    let rms = |name: &str| -> f64 {
+        let t = g.tensor(name).unwrap();
+        let (block, bytes) = t.ty.block().unwrap();
+        // the first expert's whole down projection: 2560 rows of 640
+        let n = 640 * 2560;
+        let nbytes = (n / block * bytes) as usize;
+        use std::io::{Read, Seek, SeekFrom};
+        let mut f = std::fs::File::open(&g.shards[t.shard].path).unwrap();
+        let mut buf = vec![0u8; nbytes];
+        f.seek(SeekFrom::Start(t.offset)).unwrap();
+        f.read_exact(&mut buf).unwrap();
+        let mut y = vec![0f32; n as usize];
+        dequantize(t.ty, &buf, &mut y).unwrap();
+        (y.iter().map(|&v| (v as f64) * (v as f64)).sum::<f64>() / n as f64).sqrt()
+    };
+    let (q2, nl) = (rms("blk.1.ffn_down_exps.weight"), rms("blk.2.ffn_down_exps.weight"));
+    eprintln!("expert 0 down projection RMS: blk.1 (Q2_0) {q2:.5}, blk.2 (IQ4_NL) {nl:.5}");
+    assert!(q2 > nl / 3.0 && q2 < nl * 3.0, "Q2_0 {q2} vs IQ4_NL {nl}");
 }

@@ -49,7 +49,11 @@ Notation: `H = 2560` hidden, `C = 4` hyper-connection streams, `CH = 10240`, `T`
 - **Type 42 is upstream ggml's `GGML_TYPE_Q2_0`** (ggml.h, with NVFP4 = 40 and Q1_0 = 41, all newer than the first
   type table here): 64 weights per block, an f16 scale `d` and 16 bytes of 2-bit codes, 18 bytes = 2.25 bits per
   weight, which is exactly what the offsets gave. 9 of the 48 `ffn_down_exps` use it (blk 1, 8, 10, 12, 13, 20, 21,
-  30, 36) [file]. [open: the code-to-value map, from upstream `dequantize_row_q2_0`, before stage 1 writes it]
+  30, 36) [file]. Code `q` is `(q - 1) * d` (levels -d, 0, d, 2d), four codes per byte, lowest bits first (upstream
+  `dequantize_row_q2_0`). Implemented in `quant.rs`; no independent fixture exists for it (the gguf package lacks
+  Q2_0), so it is checked by hand and by its spread against the neighbouring IQ4_NL layer (RMS 0.0115 vs 0.0128).
+- **Every other type is checked bit for bit** against ggml's reference dequantizer on real blocks of this file
+  (`eval/fixtures/dequant.txt`, 84 blocks, 11 types; `crates/shadow-model/tests/dequant.rs`).
 - **The routed experts are mixed precision, per layer** [file]: `ffn_gate_exps` / `ffn_up_exps` are IQ3_XXS in 17
   layers, IQ2_S in 20, IQ3_S in 10, IQ4_XS in 1; `ffn_down_exps` are IQ4_NL in 39 and Q2_0 in 9. So stage 1 needs
   dequant for IQ2_S, IQ3_XXS, IQ3_S, IQ4_XS, IQ4_NL and Q2_0 on the expert path alone, plus Q4_K, Q5_K, Q6_K, BF16,
@@ -179,7 +183,7 @@ logits = output · u                                  # no further norm: the fil
 
 | # | question | how |
 |---|---|---|
-| 1 | Q2_0's code-to-value map (`d * (q - ?)`) | upstream ggml's `dequantize_row_q2_0`, read before stage 1 |
+| 1 | ~~Q2_0's code-to-value map~~ settled: `(q - 1) * d`, from upstream; a fixture would still be better | a mainline ggml build, or a gguf package that has Q2_0 |
 | 2 | norm weights: +1 folded in, or stored as-is | compare one `attn_q_norm` against the BF16 checkpoint: one HTTP range read of a safetensors header and one tensor |
 | 3 | `attn_qkv` order (q,k,v grouped or per-head interleaved) and `ssm_alpha` vs `ssm_beta` | the reference's `fix_query_key_value_ordering` plus one layer's output against the checkpoint |
 | 4 | PLE hashing details (multiplier per position, per head, negative mod) | the reference's `Qwen4ExpTextNGramEmbedding`, read line by line before stage 1 writes it |
