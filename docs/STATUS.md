@@ -118,6 +118,16 @@ router top-10 on the host 1%. That is why the RAM tier came before moving the ro
   (10.1%) but not the p90 floor (27.0%), and both are Strata's floor, not Shadow's** (unmeasured until stage 4). Not
   `decode_warm` (one generation per launch). The 24 GiB fill adds ~20 s at start.
 - Before the RAM tier, single runs: 0.371 s/token without the cache, 0.215 at 2 GiB, 0.176 at 4.57 GiB.
+- **The drive tier stays on plain buffered reads; two attempts to speed it up lost (2026-10-27, both reverted):**
+  1. All of a layer's slice reads at once on scoped threads (buffered `seek_read`, one synchronous handle): correct,
+     but slower (p1 0.223 vs 0.167 s/token, no-cache 0.435-0.520 vs 0.29). Windows serializes I/O on a synchronous
+     file handle, so the threads only added spawn cost.
+  2. `shadow-host`'s direct-access ring (overlapped, unbuffered, a layer's reads in flight together): correct, but
+     about **2x slower** in generation (p1 0.360, p2 0.317, no-cache 0.77-0.78 s/token). On random cold offsets it
+     wins (`crates/shadow-host/examples/expert_read_bench.rs`: 2.2-3.5 GB/s at depth 4-64 vs 1.4-1.8 buffered), but
+     real expert reads repeat, and buffered reads are served from Windows' file cache at memory speed while
+     unbuffered ones always go to the NVMe. Untried: overlapped *buffered* reads (queue depth and the cache), and
+     reading into pinned staging buffers.
 
 ## Things that went wrong, so they are not repeated
 

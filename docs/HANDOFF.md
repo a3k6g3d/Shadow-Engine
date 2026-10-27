@@ -41,14 +41,14 @@ them changes the prompt; the fixture records the ids, so it stays valid as a fix
   (48 layers and the long prompt). `shadow generate --gpu` uses it; `--gpu-matvec` is the older matvec-only path. What
   is left in stage 2 is speed: fast matvec kernels (the reference ones decode per weight) and CUDA graphs.
 - **Stage 3, the tiers**: the VRAM expert cache and the pinned RAM tier (4 GiB rule in `pinned.rs`) are done and
-  gated (STATUS.md, Stage 3). Left: the drive through `shadow-host`'s ring (`shadow-host` is free of the retired seam now), and an evictable/adaptive RAM tier if the static one proves too rigid. Placement profiles are
+  gated (STATUS.md, Stage 3). The drive tier stays on buffered reads: a threaded version and `shadow-host`'s direct-access ring were both measured slower (STATUS.md says why - the file cache), and an evictable/adaptive RAM tier is untried. Placement profiles are
   Shadow's own `SHRC` routing counts (`profiles/`, `--record-routing`).
 - **Stage 2 speed**: batched expert matvecs are in (0.1.3). Left: the mixers/norms/glue (~30 ms/token, 21%) and
   launch overhead (CUDA graphs). `SHADOW_PROFILE=1` prints where a token's time goes.
 - **Stage 4**: the HTTP server (hyper + serde_json, decided), `shadow-bench`, and Shadow's own noise floor (the
   10.1% / 27.0% / 51.9% in BENCH_NOISE.md is Strata's).
-- Cleanup owed: remove `shadow-abi`, `include/shadow/c/abi.h`, `shadow-host/src/ffi.rs` and `protocol.rs` once
-  nothing needs them (SHADOW_PLAN.md says so); copy the model under `J:\Shadow\models\` and record its SHA-256 (the plan
+- Cleanup done (0.1.4): `shadow-abi`, `include/shadow/c/abi.h`, `shadow-host/src/ffi.rs` and `protocol.rs` are
+  removed. Still owed: copy the model under `J:\\Shadow\\models\\` and record its SHA-256 (the plan
   says the model file is the only input; it is still read from `J:\Strata-work\models\swift15\IQ3_S\`).
 
 ## Commands
