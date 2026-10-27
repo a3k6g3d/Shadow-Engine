@@ -2,9 +2,9 @@
 
 Where the plan ([SHADOW_PLAN.md](SHADOW_PLAN.md)) stands. Updated 2026-10-27.
 
-Build and run: `cargo build --release -p shadow`, then `target/release/shadow.exe` with `inspect`, `kv`, `stats`, `dump`,
-`generate` (`--chat`, `--gpu`) and `compare`. Any process that loads the model runs under `tools/run_capped.ps1`
-(hard working-set cap, killed below 4 GiB available).
+Build and run: `cargo build --release -p shadow -p shadow-bench`, then `target/release/shadow.exe` with `inspect`, `kv`,
+`stats`, `dump`, `generate` (`--chat`, `--gpu`), `compare` and `serve`. Any process that loads the model runs under
+`tools/run_capped.ps1` (hard working-set cap, killed below 4 GiB available).
 
 ## Stage 0: done
 
@@ -122,9 +122,11 @@ router top-10 on the host 1%. That is why the RAM tier came before moving the ro
   s/token (p90 0.148, lowest available RAM 13.9 GiB); 28 GiB 0.118 (p90 0.126, 9.8 GiB); 32 GiB **0.102** (p90 0.108,
   **5.6 GiB**). Paired against 24 GiB: 28 GiB 13.3% (min 11.3%), 32 GiB 25.1% (min 23.5%); identical tokens in all 24
   runs. A first round at 34 GiB (0.099 s/token) left 4.3 GiB available and was stopped as too close to the floor.
-- **`--ram-tier-gib auto`** (`pinned::auto_tier_bytes`): the RAM available when the session starts, less
-  `AUTO_MARGIN` (the 4 GiB floor + 6 GiB for what moves after the fill). Two runs: 32.66 GiB pinned (fill ~32 s),
-  0.100-0.101 s/token, lowest available RAM 7.6 GiB, same tokens.
+- **`--ram-tier-gib auto`** (`pinned::auto_tier_bytes`): the RAM available inside `GpuSession::with_tiers` *after*
+  `Model::load` and the dense GPU upload, less `AUTO_MARGIN` (the 4 GiB floor + 6 GiB for what moves after the fill),
+  re-checking the 4 GiB floor every 256 MiB during the fill. (In 0.1.7 `shadow serve` evaluated `auto` before
+  `Model::load`, which asked for ~37 GiB before the 4.14 GiB of dense weights were loaded and tripped the 4 GiB
+  watchdog; fixed in 0.1.8: 42.54 GiB available after dense upload -> 32.54 GiB pinned, lowest available 7.8 GiB.)
 - **The drive tier stays on plain buffered reads; two attempts to speed it up lost (2026-10-27, both reverted):**
   1. All of a layer's slice reads at once on scoped threads (buffered `seek_read`, one synchronous handle): correct,
      but slower (p1 0.223 vs 0.167 s/token, no-cache 0.435-0.520 vs 0.29). Windows serializes I/O on a synchronous
@@ -135,6 +137,28 @@ router top-10 on the host 1%. That is why the RAM tier came before moving the ro
      real expert reads repeat, and buffered reads are served from Windows' file cache at memory speed while
      unbuffered ones always go to the NVMe. Untried: overlapped *buffered* reads (queue depth and the cache), and
      reading into pinned staging buffers.
+
+## Stage 4: HTTP server (`shadow-serve`), `shadow-bench`, and Shadow's noise floor
+
+- **`shadow-serve` (`crates/shadow-serve`, `shadow serve`):** `hyper` + `serde_json` OpenAI-compatible server on
+  127.0.0.1 (`--port`, `--ctx`, `--expert-cache-gib`, `--ram-tier-gib`, `--placement`). Endpoints:
+  `/v1/chat/completions` (streaming SSE and non-streaming, returns `timings.predicted_per_second`, `prompt_n`,
+  `predicted_n`, `cache_n`), `/health`, `/v1/models`, `/v1/status`, `/props`, `/metrics` and `/shutdown`. Keeps the
+  token history of the last request on the `GpuSession` and reuses the KV + DeltaNet + n-gram state when the next
+  conversation's token prefix matches (`cache_n` tokens skipped); otherwise calls `GpuSession::reset()`. Verified by
+  3 unit tests and `tools/serve_check.py` (15/15 live checks across streaming, multi-turn prefix reuse, reset and
+  metrics).
+- **Known Stage 4 gap (`shadow-eval`):** `shadow-eval run` calls `tools/shadow_harness.py`, which sends `tools`
+  definitions in `/v1/chat/completions`; `crates/shadow-model/src/chat.rs` refuses `tools` until the tool-calling
+  branch of the checkpoint's Jinja template is transcribed, so `shadow-serve` returns HTTP 400 on tool requests.
+- **`shadow-bench` (`crates/shadow-bench`) and Shadow's noise floor (`bench/floor-2026-10-27`):** launches `shadow serve`
+  under `tools/run_capped.ps1`, waits for available RAM to settle before each launch, runs a 6-turn conversation (96
+  tokens/turn, greedy), drops turn 0 (`decode_warm`), and computes turn-matched pair differences across runs. Over **8
+  launches x 5 warm turns (140 pairs)** with `--ctx 8192 --ram-tier-gib 30 --placement profiles/routing-6prompts.shrc`:
+  - **`decode_warm` median: 10.20 tok/s** (p90 slow end 10.04, worst 10.04, best 10.29 tok/s; 98.0 ms/token)
+  - **Shadow's noise floor: median 0.8%, p90 2.0%, worst 3.6%** (against Strata's 10.1% / 27.0% / 51.9%)
+  - **Lowest available RAM across all 8 launches: 9.6 GiB**; peak GPU memory 10,319-10,422 MiB; **0 answer differences**
+    across all 48 turns.
 
 ## Things that went wrong, so they are not repeated
 

@@ -3,6 +3,6 @@ resolver = "2"
 members = ["crates/shadow-host", "crates/shadow-eval", "crates/shadow-model", "crates/shadow-cuda", "crates/shadow-serve", "crates/shadow-bench", "crates/shadow"]
 
 [workspace.package]
-version = "0.1.8"
+version = "0.1.9"
 edition = "2021"
 license = "MIT"

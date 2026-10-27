@@ -45,8 +45,12 @@ them changes the prompt; the fixture records the ids, so it stays valid as a fix
   Shadow's own `SHRC` routing counts (`profiles/`, `--record-routing`).
 - **Stage 2 speed**: batched expert matvecs are in (0.1.3). Left: the mixers/norms/glue (~30 ms/token, 21%) and
   launch overhead (CUDA graphs). `SHADOW_PROFILE=1` prints where a token's time goes.
-- **Stage 4**: the HTTP server (hyper + serde_json, decided), `shadow-bench`, and Shadow's own noise floor (the
-  10.1% / 27.0% / 51.9% in BENCH_NOISE.md is Strata's).
+- **Stage 4**: `shadow-serve` (`crates/shadow-serve`, `shadow serve`, 15/15 live checks in `tools/serve_check.py`) and
+  `shadow-bench` (`crates/shadow-bench`) are in (0.1.7-0.1.8). Shadow's own 8-launch noise floor is measured in
+  `bench/floor-2026-10-27`: **median 0.8%, p90 2.0%, worst 3.6%** at **10.20 tok/s** `decode_warm` (`--ram-tier-gib 30`),
+  lowest available RAM 9.6 GiB, 0 answer differences across 48 turns. Still owed for Stage 4's `shadow-eval run` gate:
+  tool-calling formatting in `chat.rs` and `shadow-serve` (`shadow_harness.py` sends `tools` definitions, which `chat.rs`
+  currently refuses).
 - Cleanup done (0.1.4): `shadow-abi`, `include/shadow/c/abi.h`, `shadow-host/src/ffi.rs` and `protocol.rs` are
   removed. Still owed: copy the model under `J:\\Shadow\\models\\` and record its SHA-256 (the plan
   says the model file is the only input; it is still read from `J:\Strata-work\models\swift15\IQ3_S\`).
@@ -107,7 +111,8 @@ the user said to use it if more space is needed).
 Q2_0 has no independent fixture; the GGUF has no MTP tensors (speculative decoding needs another draft: quantize the
 checkpoint's own MTP layer, or prompt-lookup drafting); a prompt other than the one 12-token sentence has not been
 compared stream by stream apart from the 2,600-token one above; sampling (temperature, top-p) is not implemented
-(greedy only); no streaming server; vision is out of scope until asked for.
+(greedy only); `chat.rs` refuses `tools` definitions (needed before `shadow-eval run` can run `tools/shadow_harness.py`
+against `shadow-serve`); vision is out of scope until asked for.
 
 ## The user
 

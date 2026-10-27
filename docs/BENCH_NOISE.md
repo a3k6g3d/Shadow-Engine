@@ -495,3 +495,19 @@ position effect shows up as disagreement between repetitions, which is what it w
 gives is that nothing below about 20% is a result at six launches. So the move now is not another batch: it is to
 stop quoting the 5-13% claims in `SWEEP_ADAPT_KV.md` and `CACHE_VS_DRAFTS.md` as results, and to read the sweeps
 off the warm column (item 2) and turn by turn (item 3), both of which need no re-run at all.
+
+## Shadow's own noise floor (2026-10-27)
+
+Everything above was measured on Strata. Shadow's own noise floor was measured by `shadow-bench`
+(`bench/floor-2026-10-27/results.jsonl`, commit `2148bba`): 8 separate server launches (`shadow serve --ctx 8192
+--ram-tier-gib 30 --placement profiles/routing-6prompts.shrc`, under `tools/run_capped.ps1`), 6 multi-turn prompts
+per launch (96 tokens per turn, greedy), turn 0 dropped for `decode_warm`, and `settle_ram()` waiting for available
+RAM to stop moving before each launch:
+
+| engine | launches | warm turns/launch | turn-matched pairs | decode_warm median | floor median | floor p90 | floor worst | lowest RAM GiB |
+|---|---|---|---|---|---|---|---|---|
+| Strata (earlier, above) | 8 | - | 336 | - | 10.1% | 27.0% | 51.9% | - |
+| **Shadow (`ram30`)** | **8** | **5** | **140** | **10.20 tok/s** (10.04-10.29) | **0.8%** | **2.0%** | **3.6%** | **9.6** |
+
+Across all 8 launches and all 6 turns (48 completions), 0 answers differed from run 0.
+
