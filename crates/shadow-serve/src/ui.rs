@@ -28,7 +28,7 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Shadow - Local Sovereign Inference</title>
+  <title>Shadow - Sovereign Local Inference & Agent</title>
   <style>
     :root {
       --bg: #090a0f;
@@ -47,6 +47,9 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
       --think-bg: rgba(139, 92, 246, 0.08);
       --think-border: rgba(139, 92, 246, 0.25);
       --think-text: #c4b5fd;
+      --tool-bg: rgba(16, 185, 129, 0.08);
+      --tool-border: rgba(16, 185, 129, 0.28);
+      --tool-text: #6ee7b7;
       --code-bg: #0d0f17;
       --success: #10b981;
       --success-bg: rgba(16, 185, 129, 0.12);
@@ -55,7 +58,7 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
       --cyan: #06b6d4;
     }
     * { box-sizing: border-box; margin: 0; padding: 0; }
-    body {
+    html, body {
       background: var(--bg);
       color: var(--text);
       font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
@@ -152,21 +155,29 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
       min-height: 0;
       overflow: hidden;
       position: relative;
+      width: 100%;
+      height: 100%;
     }
 
-    /* Views */
+    /* Views - Strict Tab Display */
     .view-panel {
       flex: 1;
-      display: none;
+      display: none !important;
       min-height: 0;
       overflow: hidden;
       flex-direction: column;
+      width: 100%;
+      height: 100%;
     }
     .view-panel.active {
-      display: flex;
+      display: flex !important;
     }
 
     /* Chat View */
+    #chat-panel {
+      width: 100%;
+      height: 100%;
+    }
     #messages {
       flex: 1;
       overflow-y: auto;
@@ -243,6 +254,39 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
       opacity: 0.9;
       line-height: 1.5;
     }
+
+    /* Tool Call Card */
+    .tool-call-block {
+      background: var(--tool-bg);
+      border: 1px solid var(--tool-border);
+      border-radius: 0.5rem;
+      padding: 0.6rem 0.85rem;
+      margin: 0.65rem 0;
+      font-size: 0.85rem;
+      color: var(--tool-text);
+    }
+    .tool-header {
+      font-weight: 600;
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      user-select: none;
+    }
+    .tool-output {
+      margin-top: 0.5rem;
+      background: var(--code-bg);
+      border: 1px solid var(--border-subtle);
+      border-radius: 0.35rem;
+      padding: 0.5rem 0.75rem;
+      white-space: pre-wrap;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+      font-size: 0.8rem;
+      max-height: 250px;
+      overflow-y: auto;
+      color: #a7f3d0;
+    }
+
     pre {
       background: var(--code-bg);
       border: 1px solid var(--border);
@@ -334,7 +378,7 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
     .send-btn:hover { background: var(--accent-hover); }
     .send-btn:disabled { opacity: 0.4; cursor: not-allowed; }
 
-    /* Bottom Control Bar with Claude / Antigravity Thinking Level Popover */
+    /* Bottom Control Bar */
     .controls-bar {
       max-width: 880px;
       width: 100%;
@@ -349,7 +393,7 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
     .controls-left {
       display: flex;
       align-items: center;
-      gap: 0.75rem;
+      gap: 0.65rem;
     }
 
     /* Claude & Antigravity Style Menu Pill */
@@ -372,6 +416,10 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
       background: var(--surface-hover);
       border-color: var(--accent);
     }
+    .menu-pill-btn.active-state {
+      border-color: var(--success);
+      color: var(--success);
+    }
     .menu-pill-btn svg.caret {
       width: 12px;
       height: 12px;
@@ -382,7 +430,7 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
       transform: rotate(180deg);
     }
 
-    /* Floating Popup Menu (Antigravity & Claude styling) */
+    /* Floating Popup Menu */
     .dropdown-popup {
       position: absolute;
       bottom: calc(100% + 10px);
@@ -492,7 +540,7 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
       background: var(--surface);
       border: 1px solid var(--border);
       border-radius: 12px;
-      width: 600px;
+      width: 620px;
       max-width: 90vw;
       padding: 1.5rem;
       display: flex;
@@ -518,7 +566,7 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
     }
     .modal-textarea {
       width: 100%;
-      height: 160px;
+      height: 180px;
       background: var(--bg);
       border: 1px solid var(--border);
       border-radius: 8px;
@@ -550,14 +598,13 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
       color: #fff;
     }
 
-    /* Process Monitor Dashboard View */
+    /* Process Monitor View - Strictly separate tab */
     #monitor-panel {
-      flex: 1;
+      width: 100%;
+      height: 100%;
       min-height: 0;
       overflow-y: auto;
       padding: 1.5rem;
-      display: flex;
-      flex-direction: column;
       gap: 1.25rem;
     }
     .monitor-grid {
@@ -739,7 +786,7 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
     <div class="stats-bar">
       <span class="pill ready" id="status-pill">Ready</span>
       <span class="pill" id="speed-pill">Speed: <strong>-- tok/s</strong></span>
-      <span class="pill" id="vram-pill">VRAM: <strong>-- / -- GiB</strong></span>
+      <span class="pill" id="gpu-header-pill">GPU: <strong>--% • VRAM: -- GiB</strong></span>
     </div>
   </header>
 
@@ -750,14 +797,14 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
         <div class="msg-row assistant">
           <div class="avatar">S</div>
           <div class="bubble">
-            Hello! I am Shadow, running locally on your hardware. How can I assist you today?
+            Hello! I am Shadow, running sovereignly on your Windows machine with native tool orchestration. You can ask me to inspect code, search past sessions in <code>J:\Strata-work\sessions</code>, or run PowerShell tests.
           </div>
         </div>
       </div>
 
       <div id="input-pane">
         <div class="input-box">
-          <textarea id="prompt-input" rows="1" placeholder="Type a message... (Shift+Enter for newline)"></textarea>
+          <textarea id="prompt-input" rows="1" placeholder="Ask Shadow to inspect files, run tests, or chat... (Shift+Enter for newline)"></textarea>
           <button id="send-btn" class="send-btn">Send</button>
         </div>
         <div class="controls-bar">
@@ -829,10 +876,16 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
               </div>
             </div>
 
+            <!-- Windows Native Tools Pill -->
+            <button class="menu-pill-btn active-state" id="tools-toggle-btn" onclick="toggleTools()">
+              <span>🛠️</span>
+              <span id="tools-btn-label">Windows Tools: ON</span>
+            </button>
+
             <!-- System Persona Selector Pill -->
             <button class="menu-pill-btn" id="persona-btn" onclick="openPersonaModal()">
               <span>⚙</span>
-              <span id="persona-btn-label">Persona: Local Dev</span>
+              <span id="persona-btn-label">Persona: Windows Dev</span>
             </button>
           </div>
 
@@ -841,7 +894,7 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
       </div>
     </div>
 
-    <!-- VIEW: PROCESS MONITOR -->
+    <!-- VIEW: PROCESS MONITOR (Separate Tab Only) -->
     <div class="view-panel" id="monitor-panel">
       <div class="monitor-grid">
         <!-- CPU Card -->
@@ -852,7 +905,7 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
           </div>
           <div class="mon-stat-big">
             <span class="mon-big-val" id="cpu-proc-val">0.0%</span>
-            <span class="mon-big-unit">Process (System: <span id="cpu-sys-val">0.0%</span>)</span>
+            <span class="mon-big-unit">Process (<span id="cpu-proc-cores">0.0</span> cores used)</span>
           </div>
           <div class="progress-bar-wrap">
             <div class="progress-bar" id="cpu-bar" style="width: 0%;"></div>
@@ -860,24 +913,29 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
           <div class="stat-rows">
             <div class="stat-row"><span>Shadow Process CPU</span><strong id="cpu-proc-txt">0.0%</strong></div>
             <div class="stat-row"><span>Overall System CPU</span><strong id="cpu-sys-txt">0.0%</strong></div>
-            <div class="stat-row"><span>Logical Cores</span><strong id="cpu-cores-txt">--</strong></div>
+            <div class="stat-row"><span>Active CPU Cores</span><strong id="cpu-cores-used-txt">0.0 / --</strong></div>
+            <div class="stat-row"><span>Logical Cores Total</span><strong id="cpu-cores-txt">--</strong></div>
           </div>
         </div>
 
-        <!-- GPU & VRAM Card -->
+        <!-- GPU & VRAM Card (Real NVML Compute Usage + VRAM) -->
         <div class="mon-card">
           <div class="mon-card-header">
-            <div class="mon-card-title"><span>🎮</span> GPU & VRAM</div>
+            <div class="mon-card-title"><span>🎮</span> GPU Compute & VRAM</div>
             <span class="mon-card-badge" id="gpu-device-badge">NVIDIA GPU</span>
           </div>
           <div class="mon-stat-big">
-            <span class="mon-big-val" id="vram-used-val">--</span>
-            <span class="mon-big-unit">/ <span id="vram-total-val">-- GiB</span></span>
+            <span class="mon-big-val" id="gpu-util-val">0.0%</span>
+            <span class="mon-big-unit">Compute (VRAM: <span id="vram-used-val">--</span> / <span id="vram-total-val">-- GiB</span>)</span>
           </div>
           <div class="progress-bar-wrap">
-            <div class="progress-bar cyan" id="vram-bar" style="width: 0%;"></div>
+            <div class="progress-bar cyan" id="gpu-bar" style="width: 0%;"></div>
           </div>
           <div class="stat-rows">
+            <div class="stat-row"><span>GPU Compute Engine</span><strong id="gpu-util-txt">0.0%</strong></div>
+            <div class="stat-row"><span>VRAM Allocation</span><strong id="vram-used-total-txt">-- / -- GiB</strong></div>
+            <div class="stat-row"><span>GPU Temperature</span><strong id="gpu-temp-txt">-- °C</strong></div>
+            <div class="stat-row"><span>Memory Controller Activity</span><strong id="gpu-mem-txt">0.0%</strong></div>
             <div class="stat-row"><span>Free VRAM</span><strong id="vram-free-txt">-- GiB</strong></div>
             <div class="stat-row"><span>Expert VRAM Slots</span><strong id="vram-slots-txt">--</strong></div>
             <div class="stat-row"><span>VRAM Cache Hit Rate</span><strong id="vram-hit-rate-txt">--%</strong></div>
@@ -971,11 +1029,11 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
   <div id="persona-modal">
     <div class="modal-card">
       <div class="modal-header">
-        <h3>Local Developer Authority & Persona</h3>
+        <h3>Windows Developer Authority & Persona</h3>
         <button class="modal-close" onclick="closePersonaModal()">✕</button>
       </div>
       <p style="font-size:0.85rem; color:var(--text-muted); line-height:1.4;">
-        This system prompt grants Shadow sovereign local authority to modify, write, and inspect code and files without generic refusal guardrails.
+        This system prompt gives Shadow full authority on Windows with native tools (read_file, glob, grep, edit_file, write_file, cmd).
       </p>
       <textarea class="modal-textarea" id="persona-textarea"></textarea>
       <div class="modal-actions">
@@ -989,7 +1047,8 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
     // State
     let currentView = 'chat';
     let currentEffort = localStorage.getItem('shadow_effort') || 'medium';
-    const DEFAULT_PERSONA = "You are Shadow, a sovereign, high-performance local AI assistant running natively on the user's workstation. You have full permission and local authority from the user to analyze, create, inspect, refactor, and modify files and code within this project. When requested to edit or write code, provide direct, complete, drop-in implementations without artificial hesitation or generic safety refusals.";
+    let toolsEnabled = localStorage.getItem('shadow_tools_enabled') !== 'false';
+    const DEFAULT_PERSONA = "You are Shadow, a sovereign, high-performance local AI assistant running natively on the user's Windows workstation. You have full permission and local authority from the user to analyze, inspect, refactor, and modify files and code within this project and previous sessions (such as J:\\Strata-work\\sessions and J:\\Strata-work\\conversations). You have access to native Windows tools: read_file, glob, grep, edit_file, write_file, and cmd (PowerShell). When asked to inspect past chats, run tests, or edit code, invoke the appropriate tools directly without hesitation.";
     let currentPersona = localStorage.getItem('shadow_persona') || DEFAULT_PERSONA;
 
     // Elements
@@ -1003,17 +1062,48 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
     const thinkingBtn = document.getElementById('thinking-btn');
     const thinkingLabel = document.getElementById('thinking-btn-label');
     const thinkingDropdown = document.getElementById('thinking-dropdown');
+    const toolsToggleBtn = document.getElementById('tools-toggle-btn');
+    const toolsBtnLabel = document.getElementById('tools-btn-label');
     const personaModal = document.getElementById('persona-modal');
     const personaTextarea = document.getElementById('persona-textarea');
     const speedPill = document.getElementById('speed-pill');
     const statusPill = document.getElementById('status-pill');
-    const vramPill = document.getElementById('vram-pill');
+    const gpuHeaderPill = document.getElementById('gpu-header-pill');
     const timingInfo = document.getElementById('timing-info');
 
     let history = [];
     let isGenerating = false;
+    let availableTools = [];
 
-    // View Switching
+    // Load tool schemas from server
+    async function loadTools() {
+      try {
+        const res = await fetch('/v1/tools');
+        if (res.ok) {
+          availableTools = await res.json();
+        }
+      } catch (_) {}
+    }
+    loadTools();
+
+    // Tools toggle
+    function toggleTools() {
+      toolsEnabled = !toolsEnabled;
+      localStorage.setItem('shadow_tools_enabled', toolsEnabled);
+      updateToolsUI();
+    }
+    function updateToolsUI() {
+      if (toolsEnabled) {
+        toolsToggleBtn.classList.add('active-state');
+        toolsBtnLabel.textContent = 'Windows Tools: ON';
+      } else {
+        toolsToggleBtn.classList.remove('active-state');
+        toolsBtnLabel.textContent = 'Windows Tools: OFF';
+      }
+    }
+    updateToolsUI();
+
+    // View Switching: Chat and Process Monitor are completely separate tabs
     function switchView(view) {
       currentView = view;
       if (view === 'chat') {
@@ -1038,7 +1128,7 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
       switchView('monitor');
     }
 
-    // Thinking Level Selection (Claude & Antigravity style)
+    // Thinking Level Selection
     function toggleThinkingDropdown(e) {
       e.stopPropagation();
       thinkingDropdown.classList.toggle('open');
@@ -1073,7 +1163,6 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
     }
     updateThinkingUI();
 
-    // Close popups on click outside
     document.addEventListener('click', (e) => {
       if (!thinkingDropdown.contains(e.target) && !thinkingBtn.contains(e.target)) {
         thinkingDropdown.classList.remove('open');
@@ -1129,7 +1218,47 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
       return html;
     }
 
-    // Send Message
+    // Tool Call parser for <tool_call><function=name><parameter=k>v</parameter>...</function></tool_call>
+    function parseToolCallsFromText(text) {
+      const calls = [];
+      const regex = /<tool_call>([\s\S]*?)<\/tool_call>/g;
+      let match;
+      while ((match = regex.exec(text)) !== null) {
+        const inner = match[1];
+        const fnMatch = /<function=([^>]+)>([\s\S]*?)<\/function>/.exec(inner);
+        if (fnMatch) {
+          const fnName = fnMatch[1].trim();
+          const paramsInner = fnMatch[2];
+          const args = {};
+          const paramRegex = /<parameter=([^>]+)>([\s\S]*?)<\/parameter>/g;
+          let pMatch;
+          while ((pMatch = paramRegex.exec(paramsInner)) !== null) {
+            args[pMatch[1].trim()] = pMatch[2].trim();
+          }
+          calls.push({ name: fnName, arguments: args, fullXml: match[0] });
+        }
+      }
+      return calls;
+    }
+
+    // Execute tool on Windows via /v1/tools/execute
+    async function executeLocalTool(name, args) {
+      try {
+        const res = await fetch('/v1/tools/execute', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ name, arguments: args })
+        });
+        if (!res.ok) {
+          return { name, output: await res.text(), is_error: true };
+        }
+        return await res.json();
+      } catch (e) {
+        return { name, output: e.message, is_error: true };
+      }
+    }
+
+    // Send Message with Agent Tool Orchestration Loop
     async function sendMessage() {
       const text = inputEl.value.trim();
       if (!text || isGenerating) return;
@@ -1147,104 +1276,150 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
       userRow.innerHTML = `<div class="avatar">U</div><div class="bubble">${escapeHtml(text).replace(/\n/g, '<br>')}</div>`;
       messagesEl.appendChild(userRow);
 
-      // Assistant Skeleton
-      const asstRow = document.createElement('div');
-      asstRow.className = 'msg-row assistant';
-      asstRow.innerHTML = `
-        <div class="avatar">S</div>
-        <div class="bubble">
-          <div class="think-block" style="display:none;">
-            <div class="think-header">Thinking...</div>
-            <div class="think-content"></div>
-          </div>
-          <div class="msg-content"><span class="cursor-blink"></span></div>
-        </div>`;
-      messagesEl.appendChild(asstRow);
-      messagesEl.scrollTop = messagesEl.scrollHeight;
-
-      const bubbleEl = asstRow.querySelector('.bubble');
-      const thinkBlock = bubbleEl.querySelector('.think-block');
-      const thinkContent = bubbleEl.querySelector('.think-content');
-      const msgContent = bubbleEl.querySelector('.msg-content');
-
-      let rawContent = '';
-      let rawThinking = '';
       const t0 = performance.now();
+      let loopTurns = 0;
+      const MAX_AGENT_TURNS = 6;
 
-      // Prepend system prompt if configured
-      const payloadMessages = [];
-      if (currentPersona && currentPersona.trim()) {
-        payloadMessages.push({ role: 'system', content: currentPersona.trim() });
-      }
-      payloadMessages.push(...history);
+      while (loopTurns < MAX_AGENT_TURNS) {
+        loopTurns++;
 
-      try {
-        const response = await fetch('/v1/chat/completions', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            messages: payloadMessages,
-            stream: true,
-            reasoning_effort: currentEffort,
-            chat_template_kwargs: { enable_thinking: currentEffort !== 'off' }
-          })
-        });
+        // Assistant Skeleton
+        const asstRow = document.createElement('div');
+        asstRow.className = 'msg-row assistant';
+        asstRow.innerHTML = `
+          <div class="avatar">S</div>
+          <div class="bubble">
+            <div class="think-block" style="display:none;">
+              <div class="think-header">Thinking...</div>
+              <div class="think-content"></div>
+            </div>
+            <div class="msg-content"><span class="cursor-blink"></span></div>
+          </div>`;
+        messagesEl.appendChild(asstRow);
+        messagesEl.scrollTop = messagesEl.scrollHeight;
 
-        if (!response.ok) {
-          const err = await response.text();
-          msgContent.innerHTML = `<span style="color:var(--danger);">Error: ${escapeHtml(err)}</span>`;
-          return;
+        const bubbleEl = asstRow.querySelector('.bubble');
+        const thinkBlock = bubbleEl.querySelector('.think-block');
+        const thinkContent = bubbleEl.querySelector('.think-content');
+        const msgContent = bubbleEl.querySelector('.msg-content');
+
+        let rawContent = '';
+        let rawThinking = '';
+
+        const payloadMessages = [];
+        if (currentPersona && currentPersona.trim()) {
+          payloadMessages.push({ role: 'system', content: currentPersona.trim() });
+        }
+        payloadMessages.push(...history);
+
+        const requestBody = {
+          messages: payloadMessages,
+          stream: true,
+          reasoning_effort: currentEffort,
+          chat_template_kwargs: { enable_thinking: currentEffort !== 'off' }
+        };
+        if (toolsEnabled && availableTools.length > 0) {
+          requestBody.tools = availableTools;
         }
 
-        const reader = response.body.getReader();
-        const decoder = new TextDecoder();
-        let buffer = '';
+        try {
+          const response = await fetch('/v1/chat/completions', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(requestBody)
+          });
 
-        while (true) {
-          const { done, value } = await reader.read();
-          if (done) break;
+          if (!response.ok) {
+            const err = await response.text();
+            msgContent.innerHTML = `<span style="color:var(--danger);">Error: ${escapeHtml(err)}</span>`;
+            break;
+          }
 
-          buffer += decoder.decode(value, { stream: true });
-          const lines = buffer.split('\n');
-          buffer = lines.pop();
+          const reader = response.body.getReader();
+          const decoder = new TextDecoder();
+          let buffer = '';
 
-          for (const line of lines) {
-            const trimmed = line.trim();
-            if (!trimmed || trimmed === 'data: [DONE]') continue;
-            if (trimmed.startsWith('data: ')) {
-              try {
-                const parsed = JSON.parse(trimmed.slice(6));
-                const delta = parsed.choices?.[0]?.delta;
-                if (!delta) continue;
+          while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
 
-                if (delta.reasoning_content) {
-                  thinkBlock.style.display = 'block';
-                  rawThinking += delta.reasoning_content;
-                  thinkContent.textContent = rawThinking;
-                }
-                if (delta.content) {
-                  rawContent += delta.content;
-                  msgContent.innerHTML = renderMarkdown(rawContent) + '<span class="cursor-blink"></span>';
-                }
-                messagesEl.scrollTop = messagesEl.scrollHeight;
-              } catch (_) {}
+            buffer += decoder.decode(value, { stream: true });
+            const lines = buffer.split('\n');
+            buffer = lines.pop();
+
+            for (const line of lines) {
+              const trimmed = line.trim();
+              if (!trimmed || trimmed === 'data: [DONE]') continue;
+              if (trimmed.startsWith('data: ')) {
+                try {
+                  const parsed = JSON.parse(trimmed.slice(6));
+                  const delta = parsed.choices?.[0]?.delta;
+                  if (!delta) continue;
+
+                  if (delta.reasoning_content) {
+                    thinkBlock.style.display = 'block';
+                    rawThinking += delta.reasoning_content;
+                    thinkContent.textContent = rawThinking;
+                  }
+                  if (delta.content) {
+                    rawContent += delta.content;
+                    msgContent.innerHTML = renderMarkdown(rawContent) + '<span class="cursor-blink"></span>';
+                  }
+                  messagesEl.scrollTop = messagesEl.scrollHeight;
+                } catch (_) {}
+              }
             }
           }
-        }
 
-        // Finalize
-        msgContent.innerHTML = renderMarkdown(rawContent);
-        history.push({ role: 'assistant', content: rawContent });
-        const dt = (performance.now() - t0) / 1000;
-        timingInfo.textContent = `Completed in ${dt.toFixed(2)}s`;
-      } catch (err) {
-        msgContent.innerHTML = `<span style="color:var(--danger);">Connection error: ${escapeHtml(err.message)}</span>`;
-      } finally {
-        isGenerating = false;
-        sendBtn.disabled = false;
-        inputEl.focus();
-        pollTelemetry();
+          msgContent.innerHTML = renderMarkdown(rawContent);
+
+          // Check if assistant called tools
+          const toolCalls = parseToolCallsFromText(rawContent);
+          if (toolsEnabled && toolCalls.length > 0) {
+            history.push({ role: 'assistant', content: rawContent });
+
+            for (const tc of toolCalls) {
+              const toolCard = document.createElement('div');
+              toolCard.className = 'tool-call-block';
+              toolCard.innerHTML = `
+                <div class="tool-header">
+                  <span>⚡ Windows Tool: <strong>${escapeHtml(tc.name)}</strong></span>
+                  <span style="font-size:0.75rem; opacity:0.8;">Running...</span>
+                </div>
+                <div class="tool-output">Executing in PowerShell...</div>`;
+              bubbleEl.appendChild(toolCard);
+              messagesEl.scrollTop = messagesEl.scrollHeight;
+
+              const result = await executeLocalTool(tc.name, tc.arguments);
+              const outputEl = toolCard.querySelector('.tool-output');
+              toolCard.querySelector('.tool-header span:last-child').textContent = result.is_error ? 'Error' : 'Complete';
+              outputEl.textContent = result.output;
+
+              // Append tool response turn to history
+              history.push({
+                role: 'tool',
+                content: `<tool_response>\n${result.output}\n</tool_response>`
+              });
+            }
+            // Loop continues to let Shadow formulate final answer using the tool output
+            continue;
+          } else {
+            // No more tool calls; finish turn
+            history.push({ role: 'assistant', content: rawContent });
+            break;
+          }
+        } catch (err) {
+          msgContent.innerHTML = `<span style="color:var(--danger);">Connection error: ${escapeHtml(err.message)}</span>`;
+          break;
+        }
       }
+
+      const dt = (performance.now() - t0) / 1000;
+      timingInfo.textContent = `Completed in ${dt.toFixed(2)}s`;
+      isGenerating = false;
+      sendBtn.disabled = false;
+      inputEl.focus();
+      pollTelemetry();
     }
 
     // Telemetry Polling
@@ -1273,18 +1448,20 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
         if (d.gpu) {
           const usedG = (d.gpu.vram_used_bytes / (1024**3)).toFixed(1);
           const totalG = (d.gpu.vram_total_bytes / (1024**3)).toFixed(1);
-          vramPill.innerHTML = `VRAM: <strong>${usedG} / ${totalG} GiB</strong>`;
+          gpuHeaderPill.innerHTML = `GPU: <strong>${d.gpu.utilization_percent.toFixed(0)}%</strong> • VRAM: <strong>${usedG}/${totalG} GiB</strong>`;
         }
 
         // Process Monitor View
         if (d.cpu) {
           document.getElementById('cpu-proc-val').textContent = d.cpu.process_percent.toFixed(1) + '%';
+          document.getElementById('cpu-proc-cores').textContent = d.cpu.process_cores_used.toFixed(1);
           document.getElementById('cpu-sys-val').textContent = d.cpu.system_percent.toFixed(1) + '%';
           document.getElementById('cpu-proc-txt').textContent = d.cpu.process_percent.toFixed(1) + '%';
           document.getElementById('cpu-sys-txt').textContent = d.cpu.system_percent.toFixed(1) + '%';
+          document.getElementById('cpu-cores-used-txt').textContent = `${d.cpu.process_cores_used.toFixed(1)} / ${d.cpu.logical_cores}`;
           document.getElementById('cpu-cores-txt').textContent = d.cpu.logical_cores;
           document.getElementById('cpu-cores-badge').textContent = d.cpu.logical_cores + ' Cores';
-          document.getElementById('cpu-bar').style.width = Math.min(d.cpu.process_percent, 100) + '%';
+          document.getElementById('cpu-bar').style.width = Math.min(d.cpu.process_percent * 2, 100) + '%';
         }
 
         if (d.gpu) {
@@ -1292,13 +1469,17 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
           const totalG = (d.gpu.vram_total_bytes / (1024**3)).toFixed(1);
           const freeG = (d.gpu.vram_free_bytes / (1024**3)).toFixed(2);
           document.getElementById('gpu-device-badge').textContent = d.gpu.name || 'NVIDIA GPU';
+          document.getElementById('gpu-util-val').textContent = d.gpu.utilization_percent.toFixed(1) + '%';
+          document.getElementById('gpu-util-txt').textContent = d.gpu.utilization_percent.toFixed(1) + '%';
+          document.getElementById('gpu-mem-txt').textContent = d.gpu.memory_controller_percent.toFixed(1) + '%';
+          document.getElementById('gpu-temp-txt').textContent = d.gpu.temperature_c > 0 ? `${d.gpu.temperature_c} °C` : 'N/A';
           document.getElementById('vram-used-val').textContent = usedG;
           document.getElementById('vram-total-val').textContent = totalG + ' GiB';
+          document.getElementById('vram-used-total-txt').textContent = `${usedG} / ${totalG} GiB`;
           document.getElementById('vram-free-txt').textContent = freeG + ' GiB';
           document.getElementById('vram-slots-txt').textContent = d.gpu.expert_cache_slots + ' slots';
           document.getElementById('vram-hit-rate-txt').textContent = d.gpu.expert_cache_hit_rate.toFixed(1) + '%';
-          const pct = d.gpu.vram_total_bytes > 0 ? (d.gpu.vram_used_bytes / d.gpu.vram_total_bytes) * 100 : 0;
-          document.getElementById('vram-bar').style.width = Math.min(pct, 100) + '%';
+          document.getElementById('gpu-bar').style.width = Math.min(d.gpu.utilization_percent, 100) + '%';
 
           // Tier 1 stats
           document.getElementById('tier1-slots').textContent = d.gpu.expert_cache_slots;
@@ -1345,7 +1526,6 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
       } catch (_) {}
     }
 
-    // Polling intervals
     pollTelemetry();
     setInterval(pollTelemetry, 1000);
   </script>
@@ -1361,12 +1541,6 @@ const MONITOR_HTML: &str = r#"<!DOCTYPE html>
   <title>Redirecting to Shadow Monitor...</title>
   <script>
     window.location.href = '/#monitor';
-    window.onload = function() {
-      // If served directly at /monitor
-      if (window.parent && window.parent.switchView) {
-        window.parent.switchView('monitor');
-      }
-    };
   </script>
 </head>
 <body style="background:#090a0f; color:#8492a6; font-family:sans-serif; display:flex; align-items:center; justify-content:center; height:100vh;">

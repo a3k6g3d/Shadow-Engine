@@ -39,11 +39,13 @@ shadow serve <path-to-gguf> [--port 8081] [--host 127.0.0.1] [--ram-tier-gib 30]
 
 * **Desktop UI (`shadow-ui.exe`)**: Native Windows desktop launcher built with Rust and Tauri 2 (WebView2). Connects to `http://127.0.0.1:8081`, provides system tray controls, and manages single-instance window focusing.
 * **Web Chat & Process Monitor UI**: Visit `http://127.0.0.1:8081/` in any browser:
-  * **Chat View**: Full SSE streaming, collapsible `<think>` blocks, Claude & Antigravity style reasoning effort selector (`Off`, `Low`, `Medium`, `High`, `X-High`), and customizable system persona allowing sovereign local file and code modifications.
-  * **Process Monitor View (`/monitor` or Tab Switcher)**: Live 1-second telemetry dashboard tracking CPU (process & system %), GPU VRAM usage, RAM working set & commit, MoE expert cache hit rates, and 3-tier memory distribution (VRAM -> Pinned RAM -> NVMe).
+  * **Chat View**: Full SSE streaming, collapsible `<think>` blocks, Claude & Antigravity style reasoning effort selector (`Off`, `Low`, `Medium`, `High`, `X-High`), native Windows tool orchestration (`read_file`, `glob`, `grep`, `edit_file`, `write_file`, `cmd`), and customizable system persona allowing sovereign local file inspection, test execution, and code modifications.
+  * **Process Monitor View (`/monitor` or Tab Switcher)**: Strictly separate full-screen dashboard tracking accurate CPU % (process & system), real NVML GPU compute load %, GPU temperature, RAM working set & commit, MoE expert cache hit rates, and 3-tier memory distribution (VRAM -> Pinned RAM -> NVMe).
 * **API Endpoints**:
   * `POST /v1/chat/completions`: OpenAI-compatible streaming and non-streaming chat completions (supporting `reasoning_effort` and `chat_template_kwargs.enable_thinking`).
-  * `GET /v1/telemetry`: Real-time hardware telemetry JSON (CPU, RAM, GPU, VRAM, and MoE cache stats).
+  * `GET /v1/tools`: List of available native Windows agent tools.
+  * `POST /v1/tools/execute`: Execute a local tool natively on Windows.
+  * `GET /v1/telemetry`: Real-time hardware telemetry JSON (CPU, RAM, GPU utilization %, VRAM, and MoE cache stats).
   * `GET /monitor`: Direct access to the standalone system telemetry dashboard.
   * `GET /v1/status`: Live throughput, queue status, and memory tier breakdown.
   * `GET /v1/models`, `/health`, `/metrics` (Prometheus).

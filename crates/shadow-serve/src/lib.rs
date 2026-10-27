@@ -5,6 +5,7 @@
 //! Not yet: sampling (greedy only), images.
 
 pub mod engine;
+pub mod orchestrator;
 pub mod telemetry;
 pub mod ui;
 
@@ -139,6 +140,8 @@ async fn handle(req: Request<Incoming>, app: Arc<App>) -> Result<Response<Body>,
                 s.busy as u8, shadow_cuda::pinned::available_ram());
             full(StatusCode::OK, "text/plain; version=0.0.4", text)
         }
+        (&Method::GET, "/v1/tools") => json_resp(StatusCode::OK, &orchestrator::tool_definitions()),
+        (&Method::POST, "/v1/tools/execute") => tool_execute(req).await,
         (&Method::POST, "/v1/chat/completions") => chat(req, app).await,
         // for shadow-bench, which ends each run's server this way; only ever bound to what --host says
         (&Method::POST, "/shutdown") => {
@@ -355,6 +358,22 @@ fn usage(st: &engine::Stats) -> (Value, Value) {
             "predicted_n": st.completion_tokens, "predicted_ms": st.predicted_ms,
             "predicted_per_second": st.completion_tokens as f64 / (st.predicted_ms / 1e3).max(1e-9),
             "cache_n": st.cached_tokens}))
+}
+
+async fn tool_execute(req: Request<Incoming>) -> Response<Body> {
+    let bytes = match req.into_body().collect().await {
+        Ok(b) => b.to_bytes(),
+        Err(e) => return error(StatusCode::BAD_REQUEST, &e.to_string()),
+    };
+    let v: Value = match serde_json::from_slice(&bytes) {
+        Ok(v) => v,
+        Err(e) => return error(StatusCode::BAD_REQUEST, &format!("invalid tool invocation json: {e}")),
+    };
+    let name = v.get("name").and_then(Value::as_str).unwrap_or("").to_string();
+    let arguments = v.get("arguments").cloned().unwrap_or(Value::Null);
+    let inv = orchestrator::ToolInvocation { name, arguments };
+    let res = orchestrator::execute_tool(&inv);
+    json_resp(StatusCode::OK, &res.to_json())
 }
 
 async fn chat(req: Request<Incoming>, app: Arc<App>) -> Response<Body> {

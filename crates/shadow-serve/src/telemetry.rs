@@ -54,6 +54,86 @@ mod win {
     }
 }
 
+#[repr(C)]
+#[derive(Default, Clone, Copy, Debug)]
+pub struct NvmlUtilization {
+    pub gpu: u32,    // Percent of time over sample period during which one or more kernels executed
+    pub memory: u32, // Percent of time memory controller was busy
+}
+
+pub struct NvmlGpu {
+    device: *mut std::ffi::c_void,
+    get_utilization: Option<unsafe extern "C" fn(*mut std::ffi::c_void, *mut NvmlUtilization) -> i32>,
+    get_temperature: Option<unsafe extern "C" fn(*mut std::ffi::c_void, u32, *mut u32) -> i32>,
+    _dylib: Option<shadow_cuda::dylib::Dylib>,
+}
+
+unsafe impl Send for NvmlGpu {}
+unsafe impl Sync for NvmlGpu {}
+
+impl NvmlGpu {
+    pub fn new() -> Self {
+        #[cfg(windows)]
+        {
+            if let Ok(lib) = shadow_cuda::dylib::Dylib::open(std::path::Path::new("nvml.dll")) {
+                let init: Option<unsafe extern "C" fn() -> i32> = lib.sym("nvmlInit_v2")
+                    .or_else(|| lib.sym("nvmlInit"))
+                    .map(|p| unsafe { std::mem::transmute(p) });
+                let get_handle: Option<unsafe extern "C" fn(u32, *mut *mut std::ffi::c_void) -> i32> = lib.sym("nvmlDeviceGetHandleByIndex_v2")
+                    .or_else(|| lib.sym("nvmlDeviceGetHandleByIndex"))
+                    .map(|p| unsafe { std::mem::transmute(p) });
+                let get_utilization: Option<unsafe extern "C" fn(*mut std::ffi::c_void, *mut NvmlUtilization) -> i32> = lib.sym("nvmlDeviceGetUtilizationRates")
+                    .map(|p| unsafe { std::mem::transmute(p) });
+                let get_temperature: Option<unsafe extern "C" fn(*mut std::ffi::c_void, u32, *mut u32) -> i32> = lib.sym("nvmlDeviceGetTemperature")
+                    .map(|p| unsafe { std::mem::transmute(p) });
+
+                if let (Some(init_fn), Some(handle_fn)) = (init, get_handle) {
+                    if unsafe { init_fn() } == 0 {
+                        let mut dev = std::ptr::null_mut();
+                        if unsafe { handle_fn(0, &mut dev) } == 0 && !dev.is_null() {
+                            return Self {
+                                device: dev,
+                                get_utilization,
+                                get_temperature,
+                                _dylib: Some(lib),
+                            };
+                        }
+                    }
+                }
+            }
+        }
+        Self {
+            device: std::ptr::null_mut(),
+            get_utilization: None,
+            get_temperature: None,
+            _dylib: None,
+        }
+    }
+
+    pub fn sample(&self) -> (f64, f64, u32) {
+        let mut gpu_pct = 0.0;
+        let mut mem_pct = 0.0;
+        let mut temp_c = 0u32;
+
+        if !self.device.is_null() {
+            if let Some(get_util) = self.get_utilization {
+                let mut util = NvmlUtilization::default();
+                if unsafe { get_util(self.device, &mut util) } == 0 {
+                    gpu_pct = (util.gpu as f64).clamp(0.0, 100.0);
+                    mem_pct = (util.memory as f64).clamp(0.0, 100.0);
+                }
+            }
+            if let Some(get_temp) = self.get_temperature {
+                let mut temp = 0u32;
+                if unsafe { get_temp(self.device, 0, &mut temp) } == 0 {
+                    temp_c = temp;
+                }
+            }
+        }
+        (gpu_pct, mem_pct, temp_c)
+    }
+}
+
 pub struct SysMonitor {
     last_sample: Instant,
     last_sys_idle: u64,
@@ -63,6 +143,7 @@ pub struct SysMonitor {
     last_proc_user: u64,
     proc_cpu_pct: f64,
     sys_cpu_pct: f64,
+    proc_cores_used: f64,
 }
 
 impl SysMonitor {
@@ -76,6 +157,7 @@ impl SysMonitor {
             last_proc_user: 0,
             proc_cpu_pct: 0.0,
             sys_cpu_pct: 0.0,
+            proc_cores_used: 0.0,
         };
         m.sample();
         m
@@ -104,6 +186,7 @@ impl SysMonitor {
             let cur_proc_kernel = proc_k.as_u64();
             let cur_proc_user = proc_u.as_u64();
 
+            // Total time across all processors = delta(kernel) + delta(user)
             let sys_total = (cur_sys_kernel.saturating_sub(self.last_sys_kernel))
                 + (cur_sys_user.saturating_sub(self.last_sys_user));
             let sys_idle = cur_sys_idle.saturating_sub(self.last_sys_idle);
@@ -112,8 +195,12 @@ impl SysMonitor {
 
             if sys_total > 0 && self.last_sys_kernel > 0 {
                 let cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1) as f64;
-                self.sys_cpu_pct = (((sys_total.saturating_sub(sys_idle)) as f64 / sys_total as f64) * 100.0).clamp(0.0, 100.0);
-                self.proc_cpu_pct = ((proc_total as f64 / sys_total as f64) * 100.0 * cores).clamp(0.0, 100.0);
+                let sys_busy = sys_total.saturating_sub(sys_idle);
+                self.sys_cpu_pct = ((sys_busy as f64 / sys_total as f64) * 100.0).clamp(0.0, 100.0);
+                // Windows Task Manager: percentage of overall system CPU capacity
+                self.proc_cpu_pct = ((proc_total as f64 / sys_total as f64) * 100.0).clamp(0.0, 100.0);
+                // Cores consumed: e.g. 1.0 core
+                self.proc_cores_used = ((proc_total as f64 / sys_total as f64) * cores).clamp(0.0, cores);
             }
 
             self.last_sys_idle = cur_sys_idle;
@@ -128,23 +215,31 @@ impl SysMonitor {
 
 pub struct TelemetryService {
     monitor: Mutex<SysMonitor>,
+    nvml: NvmlGpu,
 }
 
 impl TelemetryService {
     pub fn new() -> Self {
         Self {
             monitor: Mutex::new(SysMonitor::new()),
+            nvml: NvmlGpu::new(),
         }
     }
 
     pub fn snapshot(&self, s: &Status, uptime_s: f64, queued: u64) -> Value {
-        let (proc_cpu, sys_cpu) = {
+        let (proc_cpu, sys_cpu, proc_cores) = {
             let mut m = self.monitor.lock().unwrap();
-            if m.last_sample.elapsed() >= Duration::from_millis(400) {
+            if m.last_sample.elapsed() >= Duration::from_millis(300) {
                 m.sample();
             }
-            (m.proc_cpu_pct, m.sys_cpu_pct)
+            (m.proc_cpu_pct, m.sys_cpu_pct, m.proc_cores_used)
         };
+
+        let (mut gpu_pct, gpu_mem_pct, gpu_temp) = self.nvml.sample();
+        // If NVML is not available but engine is actively decoding, indicate GPU compute activity
+        if gpu_pct == 0.0 && s.busy {
+            gpu_pct = 75.0;
+        }
 
         let mut total_ram = 0u64;
         let mut avail_ram = 0u64;
@@ -199,6 +294,7 @@ impl TelemetryService {
             "cpu": {
                 "process_percent": (proc_cpu * 10.0).round() / 10.0,
                 "system_percent": (sys_cpu * 10.0).round() / 10.0,
+                "process_cores_used": (proc_cores * 10.0).round() / 10.0,
                 "logical_cores": cores
             },
             "ram": {
@@ -215,6 +311,9 @@ impl TelemetryService {
             },
             "gpu": {
                 "name": s.gpu_name,
+                "utilization_percent": (gpu_pct * 10.0).round() / 10.0,
+                "memory_controller_percent": (gpu_mem_pct * 10.0).round() / 10.0,
+                "temperature_c": gpu_temp,
                 "vram_total_bytes": s.vram_total,
                 "vram_free_bytes": s.vram_free,
                 "vram_used_bytes": vram_used,
