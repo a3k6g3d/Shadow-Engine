@@ -19,7 +19,7 @@ Build and run: `cargo build --release -p shadow`, then `target/release/shadow.ex
 | chat template | **12 conversations identical to the checkpoint's template** | `eval/fixtures/chat.json` |
 | the oracle | the published `transformers` `qwen4_exp` reference, run on the BF16 checkpoint read by HTTP range requests (`tools/hf_range.py`, cache on `I:\shadow-ref`) | |
 
-## Stage 1: done for layers 0-3 (every kind of layer), with one known gap
+## Stage 1: done for all 48 layers, with one known gap
 
 The CPU forward pass (`forward.rs`, written from ARCH.md) against the reference, 12-token prompt:
 
@@ -31,11 +31,17 @@ The CPU forward pass (`forward.rs`, written from ARCH.md) against the reference,
   1e-4, and the router picks the same 10 experts at every token of every layer.** That covers the 4-stream
   hyper-connections, the DeltaNet (with the tiled value-head order), gated attention, the layer-1 PLE, the MoE with its
   shared expert, and the final read. The GPU backend passes the same test.
-- `crates/shadow/tests/reference.rs` holds all three comparisons.
+- `crates/shadow/tests/reference.rs` holds those comparisons.
+- **All 48 layers** (the same comparison with no download: the GGUF is the source; 8,396 `shadow dump` calls, 14 min,
+  48 MB of fixture kept on `I:\shadow-refixtureseference_gguf48`, regenerate with
+  `make_reference_fixture.py --layers 48 --weights gguf`): **243 streams, minimum cosine 1.00000, relative error
+  0.0000, max |diff| 1e-4, and the router picks the same 10 experts at every token of all 48 layers** - on the CPU
+  backend and on the GPU backend. That covers all 36 DeltaNet and 12 attention layers and every quant type.
 
 Known gap: attention was only exercised below 2,048 positions, where the sparse indexer keeps every key. Past that the
-indexer selects blocks and is **not implemented** (`forward.rs` refuses more than 2,048 positions). A 48-layer run of
-the same comparison (no download needed: the GGUF is the source) was started; its result goes below.
+indexer selects blocks and is **not implemented** (`forward.rs` refuses more than 2,048 positions). Also untested:
+a different prompt (one prompt, 12 tokens, so far) and decoding many tokens (the DeltaNet and KV state across steps is
+exercised only by the 41-token greedy runs, which are correct but not compared stream by stream).
 
 ## Stage 2: begun
 
