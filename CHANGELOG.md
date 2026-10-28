@@ -2,6 +2,23 @@
 
 All notable changes to Shadow will be documented in this file.
 
+## [0.1.25] — 2026-10-28
+### Added (default on, exact)
+- **Batched step**: `GpuSession::step_batch` / `prefill_batch`, up to 64 tokens through the layers together (Qwen):
+  shared projections through `matvec_cols` (new `matvec_cols_ref_bf16/f32` and `hc_down_inject_cols_bf16` keep the
+  BF16/F32 sums in the one-token order), the union of the tokens' experts fetched once (overflow into a 128-slot VRAM
+  scratch arena). Logits bit-identical to `step` (`tests/reference.rs`, also past the sparse indexer). Used to read
+  prompts in `shadow serve` and `shadow generate`: **0.062 -> 0.035 s/token on a 1,262-token prompt, -46.0% paired,
+  all 8 pairs** (`bench/prefill-2026-10-28`); decode a tie, 0 answer differences (`bench/batch-2026-10-28`).
+  `SHADOW_BATCH=n`, `SHADOW_BATCH_SCRATCH=n` for comparisons. `shadow generate @FILE` reads the prompt from a file.
+### Added (opt-in, measured, slower)
+- `shadow serve --spec K`: speculative decoding with prompt-lookup drafts verified by `step_batch`
+  (`GpuSession::snapshot_again` + `restore` on rejection). `bench/spec-2026-10-28`: K=2 -11.2%, K=3 -18.3%.
+### Fixed
+- `RamTier::promote_slot` could hand out a ring slot twice in one layer (wrapping Clock hand), overwriting an expert
+  still being read or copied; claimed offsets are now skipped until the copies are waited for.
+- The kernel drift test (it failed on the `COLS` macro; the declarations are written out).
+
 ## [0.1.24] — 2026-10-27
 ### Changed (default on, exact)
 - Router logits read through mapped pinned memory by a copy kernel; small uploads (embedding, expert tables, n-gram

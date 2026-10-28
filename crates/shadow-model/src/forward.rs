@@ -1070,6 +1070,14 @@ pub trait Stepper {
     fn step_prefill(&mut self, token: u32) {
         self.step(token);
     }
+    /// Feeds a prompt; the logits after its last token (none for an empty one).
+    fn prefill(&mut self, tokens: &[u32]) -> Vec<f32> {
+        let Some((&last, pfx)) = tokens.split_last() else { return vec![] };
+        for &t in pfx {
+            self.step_prefill(t);
+        }
+        self.step(last)
+    }
     /// Start recording the named streams (see `Session::trace`).
     fn start_trace(&mut self);
     fn take_trace(&mut self) -> Option<std::collections::BTreeMap<String, Vec<f32>>>;

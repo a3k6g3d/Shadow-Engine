@@ -137,6 +137,45 @@ struct Bufs<'c> {
     logits: DeviceBuffer<'c>,
 }
 
+/// The most tokens `step_batch` takes through the layers together.  The projections take them COLS_MAX at a time
+/// (matvec_cols' limit); the MoE fetches the union of all of them, which grows slowly: on an 1,271-token prompt a
+/// token needs 5.95 experts of its 10 a layer in groups of 8, 3.60 in groups of 32, 2.51 in groups of 64.
+pub const MAX_BATCH: usize = 64;
+const COLS_MAX: usize = 8;
+
+/// Expert slots outside the cache for a batched step's misses beyond the layer's free cache slots (a layer keeps only
+/// a dozen evictable slots next to its pinned hot experts, and a prompt misses most of its experts); `SHADOW_BATCH_SCRATCH`
+/// overrides it.
+const BATCH_SCRATCH_SLOTS: usize = 32;
+
+/// `step_batch`'s per-token intermediates, MAX_BATCH rows each, row j of a buffer at ptr + j * its stride: what goes
+/// into or comes out of a projection all m tokens share (the rest stay in `Bufs`, used one token at a time).
+struct BatchBufs<'c> {
+    r: DeviceBuffer<'c>,
+    rn: DeviceBuffer<'c>,
+    u: DeviceBuffer<'c>,
+    g: DeviceBuffer<'c>,
+    y: DeviceBuffer<'c>,
+    down: DeviceBuffer<'c>,
+    up: DeviceBuffer<'c>,
+    qkv: DeviceBuffer<'c>,
+    z: DeviceBuffer<'c>,
+    beta: DeviceBuffer<'c>,
+    alpha: DeviceBuffer<'c>,
+    o: DeviceBuffer<'c>,
+    qg: DeviceBuffer<'c>,
+    kk: DeviceBuffer<'c>,
+    iq: DeviceBuffer<'c>,
+    ao: DeviceBuffer<'c>,
+    rl: DeviceBuffer<'c>,
+    sgl: DeviceBuffer<'c>,
+    sg: DeviceBuffer<'c>,
+    su: DeviceBuffer<'c>,
+    sa: DeviceBuffer<'c>,
+    so: DeviceBuffer<'c>,
+    logits: DeviceBuffer<'c>,
+}
+
 pub struct GpuSession<'c, 'm> {
     ctx: &'c Context,
     m: &'m Model,
@@ -145,6 +184,7 @@ pub struct GpuSession<'c, 'm> {
     w: HashMap<String, DeviceBuffer<'c>>,
     v: HashMap<String, DeviceBuffer<'c>>,
     b: Bufs<'c>,
+    bb: BatchBufs<'c>,
     delta: Vec<Option<(DeviceBuffer<'c>, DeviceBuffer<'c>)>>,
     attn: Vec<Option<Attn<'c>>>,
     ple_state: DeviceBuffer<'c>,
@@ -156,6 +196,8 @@ pub struct GpuSession<'c, 'm> {
     pub resident_bytes: usize,
     pub expert_uploads: usize,
     cache: ExpertCache<'c>,
+    /// Expert slots of `cache.slot_bytes` for `moe_batch`'s overflow misses (not cached), and how many.
+    batch_scratch: Option<(DeviceBuffer<'c>, usize)>,
     ram: RamTier<'c>,
     copy_stream: Stream<'c>,
     copy_event: Event<'c>,
@@ -189,6 +231,9 @@ pub struct GpuSession<'c, 'm> {
     /// `SHADOW_MTP_PROBE=1` with `--mtp`: every step drafts first and counts (drafts, hits) against its own argmax.
     mtp_probe: Option<(u64, u64)>,
     pub mtp: Option<crate::mtp::MtpModel<'c>>,
+    /// The most tokens `step_batch` takes through the layers together: `MAX_BATCH`, or `SHADOW_BATCH=n` (1: one token
+    /// at a time, for comparisons).
+    pub batch_max: usize,
 }
 
 /// What the pre-gating probe has seen: the prediction waiting for each layer, and per-layer counts of (real experts,
@@ -356,6 +401,9 @@ struct RamTier<'c> {
     ring_owner: Vec<Option<(usize, usize)>>,
     ring_ref: Vec<bool>,
     ring_hand: usize,
+    /// Offsets in use since the copies were last waited for (a copy from them in flight, or a file read into them
+    /// pending): the Clock hand must not hand them out again, even when it wraps.  Cleared by `moe` per layer.
+    claimed: std::collections::HashSet<usize>,
     /// Misses served from this tier, and from the file.
     served: u64,
     drive: u64,
@@ -368,7 +416,7 @@ impl<'c> RamTier<'c> {
         let mut t = RamTier {
             region: None, at: HashMap::new(), ring_by_off: HashMap::new(), ring_offs: Vec::new(),
             ring_sizes: Vec::new(), ring_owner: Vec::new(), ring_ref: Vec::new(), ring_hand: 0,
-            served: 0, drive: 0, fill_secs: 0.0,
+            claimed: Default::default(), served: 0, drive: 0, fill_secs: 0.0,
         };
         if bytes == 0 {
             return Ok(t);
@@ -480,7 +528,7 @@ impl<'c> RamTier<'c> {
         for _ in 0..(2 * len) {
             let h = self.ring_hand;
             self.ring_hand = (h + 1) % len;
-            if self.ring_sizes[h] != req_size {
+            if self.ring_sizes[h] != req_size || self.claimed.contains(&self.ring_offs[h]) {
                 continue;
             }
             if self.ring_ref[h] {
@@ -491,6 +539,7 @@ impl<'c> RamTier<'c> {
                 self.at.remove(&old);
             }
             let off = self.ring_offs[h];
+            self.claimed.insert(off);
             self.ring_owner[h] = Some(key);
             self.ring_ref[h] = true;
             self.at.insert(key, off);
@@ -509,6 +558,11 @@ fn f32s(v: &[f32]) -> Vec<u8> {
 
 fn floats(b: &[u8]) -> Vec<f32> {
     b.chunks(4).map(|c| f32::from_le_bytes(c.try_into().unwrap())).collect()
+}
+
+/// Row j of a [rows][stride] f32 buffer.
+fn row(b: &DeviceBuffer, stride: usize, j: usize) -> u64 {
+    b.ptr + (j * stride * 4) as u64
 }
 
 fn is_small(name: &str) -> bool {
@@ -590,6 +644,13 @@ impl<'c, 'm> GpuSession<'c, 'm> {
             pe: a(h)?, key: a(ch)?, keyn: a(ch)?, val: a(h)?, qry: a(ch)?, gv: a(ch)?, gvn: a(ch)?,
             logits: a(c.vocab)?,
         };
+        let ab = |n: usize| a(MAX_BATCH * n);
+        let bb = BatchBufs {
+            r: ab(ch)?, rn: ab(ch)?, u: ab(h)?, g: ab(cs)?, y: ab(h)?, down: ab(c.hc_rank)?, up: ab(ch)?,
+            qkv: ab(2 * kd + vd)?, z: ab(vd)?, beta: ab(c.ssm_v_heads)?, alpha: ab(c.ssm_v_heads)?, o: ab(vd)?,
+            qg: ab(2 * qd)?, kk: ab(kvd)?, iq: ab(c.idx_heads * id)?, ao: ab(qd)?, rl: ab(c.n_expert)?, sgl: ab(1)?,
+            sg: ab(c.shared_ff)?, su: ab(c.shared_ff)?, sa: ab(c.shared_ff)?, so: ab(h)?, logits: a(COLS_MAX * c.vocab)?,
+        };
         let mut delta = Vec::new();
         let mut attn = Vec::new();
         for l in 0..c.n_layer {
@@ -635,6 +696,13 @@ impl<'c, 'm> GpuSession<'c, 'm> {
             .collect();
         let slot_bytes = l_bytes.iter().copied().max().unwrap_or(0);
         let min_per_layer: usize = (0..c.n_layer).filter(|&l| c.is_moe(l)).map(|l| c.n_expert_used * l_bytes[l]).sum();
+        let batch_scratch = match (c.arch.as_str(), cache_bytes, slot_bytes) {
+            ("flint", _, _) | (_, Some(0), _) | (_, _, 0) => None,
+            _ => {
+                let n = std::env::var("SHADOW_BATCH_SCRATCH").ok().and_then(|v| v.parse().ok()).unwrap_or(BATCH_SCRATCH_SLOTS);
+                (n > 0).then(|| ctx.alloc(n * slot_bytes).map(|b| (b, n))).transpose().map_err(e)?
+            }
+        };
         let mut budget = match cache_bytes {
             Some(b) => b,
             None => ctx.mem_info().map_err(e)?.0.saturating_sub(VRAM_RESERVE),
@@ -792,12 +860,13 @@ impl<'c, 'm> GpuSession<'c, 'm> {
         let copy_stream = ctx.stream().map_err(e)?;
         let copy_event = ctx.event().map_err(e)?;
         let staging = if slot_bytes > 0 && c.n_expert_used > 0 {
-            Some(PinnedRegion::new(ctx, c.n_expert_used * slot_bytes)?)
+            // four tokens' worth: a batched step may read up to 4 * n_expert_used of a layer's misses together
+            Some(PinnedRegion::new(ctx, 4 * c.n_expert_used * slot_bytes)?)
         } else {
             None
         };
         let mut s = GpuSession {
-            ctx, m, mvp, fw, w, v, b, delta, attn, ple_state, tokens: vec![], cap, trace: None, stop_after: None,
+            ctx, m, mvp, fw, w, v, b, bb, batch_scratch, delta, attn, ple_state, tokens: vec![], cap, trace: None, stop_after: None,
             resident_bytes, expert_uploads: 0, cache, ram, copy_stream, copy_event, staging,
             pending: vec![], routing: RoutingCounts::new(c.n_layer, c.n_expert),
             prof: std::env::var("SHADOW_PROFILE").is_ok_and(|v| v == "1")
@@ -806,7 +875,7 @@ impl<'c, 'm> GpuSession<'c, 'm> {
             cpu: (tiers.cpu_experts > 0 && tiers.cpu_threads > 0)
                 .then(|| (shadow_model::cpu_expert::ExpertPool::new(tiers.cpu_threads), tiers.cpu_experts)),
             cpu_served: 0,
-            mapped: PinnedRegion::new(ctx, 2 * c.n_expert * 4)?,
+            mapped: PinnedRegion::new(ctx, MAX_BATCH.max(2) * c.n_expert * 4)?,
             mapped_event: ctx.event().map_err(e)?,
             waits: [0.0; 3],
             stage_ptr: std::ptr::null_mut(),
@@ -824,6 +893,7 @@ impl<'c, 'm> GpuSession<'c, 'm> {
             },
             mtp_probe: std::env::var("SHADOW_MTP_PROBE").is_ok_and(|v| v == "1").then_some((0, 0)),
             mtp,
+            batch_max: std::env::var("SHADOW_BATCH").ok().and_then(|v| v.parse().ok()).unwrap_or(MAX_BATCH).clamp(1, MAX_BATCH),
         };
         s.stage_ptr = s.stage.as_mut_slice().as_mut_ptr();
         Ok(s)
@@ -922,6 +992,37 @@ impl<'c, 'm> GpuSession<'c, 'm> {
         }
         Ok(Snapshot { tokens: self.tokens.clone(), delta, ple: copy(&self.ple_state, self.ple_state.bytes)?, kv,
                       nblocks: self.attn.iter().map(|a| a.as_ref().map_or(0, |a| a.nblocks)).collect() })
+    }
+
+    /// Takes `snap` again at the current position, into its own buffers: a speculative pass's rollback point, once per
+    /// pass without allocating (a device snapshot without the KV, from this session; otherwise a new one).
+    pub fn snapshot_again(&self, snap: &mut Snapshot<'c>) -> Result<(), String> {
+        let reusable = snap.kv.iter().all(|k| k.is_none()) && snap.delta.len() == self.delta.len()
+            && matches!(snap.ple, Saved::Dev(..))
+            && snap.delta.iter().zip(&self.delta).all(|(s, d)| match (s, d) {
+                (Some((Saved::Dev(a, an), Saved::Dev(b, bn))), Some((st, conv))) => {
+                    *an == st.bytes && *bn == conv.bytes && a.bytes >= st.bytes && b.bytes >= conv.bytes
+                }
+                (None, None) => true,
+                _ => false,
+            });
+        if !reusable {
+            *snap = self.snapshot(false)?;
+            return Ok(());
+        }
+        let e = |x: crate::driver::CudaError| x.to_string();
+        for (s, d) in snap.delta.iter().zip(&self.delta) {
+            if let (Some((Saved::Dev(a, an), Saved::Dev(b, bn))), Some((st, conv))) = (s, d) {
+                a.copy_prefix_from(st, *an).map_err(e)?;
+                b.copy_prefix_from(conv, *bn).map_err(e)?;
+            }
+        }
+        if let Saved::Dev(p, n) = &snap.ple {
+            p.copy_prefix_from(&self.ple_state, *n).map_err(e)?;
+        }
+        snap.tokens.clone_from(&self.tokens);
+        snap.nblocks = self.attn.iter().map(|a| a.as_ref().map_or(0, |a| a.nblocks)).collect();
+        Ok(())
     }
 
     /// Puts the session back to `snap`: the token list, every recurrent state, and the KV prefix if the snapshot has
@@ -1358,13 +1459,12 @@ impl<'c, 'm> GpuSession<'c, 'm> {
 
     /// The hyper-connection read: u (and g, with `inject`) from the streams r.
     fn hc_read(&self, p: &str, inject: bool, skip_norm: bool) {
-        let c = &self.m.cfg;
-        let (h, cs) = (c.hidden as u32, c.streams as u32);
         let b = &self.b;
         if !skip_norm {
-            self.k("rmsnorm_groups", cs, 256, &[Arg::Ptr(b.r.ptr), Arg::Ptr(self.sv(&format!("{p}_norm.weight"))),
-                                               Arg::Ptr(b.rn.ptr), Arg::U32(h), Arg::F32(c.eps)]);
+            self.hc_norm(p, b.r.ptr, b.rn.ptr);
         }
+        let c = &self.m.cfg;
+        let (h, cs) = (c.hidden as u32, c.streams as u32);
         let r_down = c.hc_rank as u32;
         let (w_inj, r_inj) = if inject {
             (self.w[&format!("{p}_inject.weight")].ptr, cs)
@@ -1379,67 +1479,108 @@ impl<'c, 'm> GpuSession<'c, 'm> {
             ]).unwrap_or_else(|err| panic!("hc_down_inject_bf16: {err}"));
         }
         self.mv(&format!("{p}_up.weight"), b.down.ptr, b.up.ptr);
-        self.k1("hc_mix", h as usize, &[Arg::Ptr(b.rn.ptr), Arg::Ptr(b.up.ptr), Arg::Ptr(b.u.ptr), Arg::U32(h), Arg::U32(cs)]);
+        self.hc_mix(b.rn.ptr, b.up.ptr, b.u.ptr);
+    }
+
+    fn hc_norm(&self, p: &str, r: u64, rn: u64) {
+        let c = &self.m.cfg;
+        self.k("rmsnorm_groups", c.streams as u32, 256, &[Arg::Ptr(r), Arg::Ptr(self.sv(&format!("{p}_norm.weight"))),
+                                                          Arg::Ptr(rn), Arg::U32(c.hidden as u32), Arg::F32(c.eps)]);
+    }
+
+    fn hc_mix(&self, rn: u64, up: u64, u: u64) {
+        let c = &self.m.cfg;
+        self.k1("hc_mix", c.hidden, &[Arg::Ptr(rn), Arg::Ptr(up), Arg::Ptr(u), Arg::U32(c.hidden as u32),
+                                      Arg::U32(c.streams as u32)]);
     }
 
     fn hc_write(&self) {
+        self.hc_write_at(self.b.r.ptr, self.b.g.ptr, self.b.y.ptr);
+    }
+
+    fn hc_write_at(&self, r: u64, g: u64, y: u64) {
         let c = &self.m.cfg;
-        let b = &self.b;
-        self.k1("hc_write", c.hidden * c.streams, &[Arg::Ptr(b.r.ptr), Arg::Ptr(b.g.ptr), Arg::Ptr(b.y.ptr),
-                                                   Arg::U32(c.hidden as u32), Arg::U32(c.streams as u32)]);
+        self.k1("hc_write", c.hidden * c.streams, &[Arg::Ptr(r), Arg::Ptr(g), Arg::Ptr(y), Arg::U32(c.hidden as u32),
+                                                   Arg::U32(c.streams as u32)]);
     }
 
     fn hc_write_norm(&self, next_norm: &str) {
+        self.hc_write_norm_at(next_norm, self.b.r.ptr, self.b.g.ptr, self.b.y.ptr, self.b.rn.ptr);
+    }
+
+    fn hc_write_norm_at(&self, next_norm: &str, r: u64, g: u64, y: u64, rn: u64) {
         let c = &self.m.cfg;
-        let b = &self.b;
         self.k("hc_write_rmsnorm_groups", c.streams as u32, 256, &[
-            Arg::Ptr(b.r.ptr), Arg::Ptr(b.g.ptr), Arg::Ptr(b.y.ptr), Arg::Ptr(self.sv(next_norm)),
-            Arg::Ptr(b.rn.ptr), Arg::U32(c.hidden as u32), Arg::F32(c.eps)]);
+            Arg::Ptr(r), Arg::Ptr(g), Arg::Ptr(y), Arg::Ptr(self.sv(next_norm)), Arg::Ptr(rn), Arg::U32(c.hidden as u32),
+            Arg::F32(c.eps)]);
     }
 
     fn delta_net(&self, l: usize) {
+        let b = &self.b;
+        let p = format!("blk.{l}");
+        self.mv_pair(&format!("{p}.attn_qkv.weight"), b.qkv.ptr, &format!("{p}.attn_gate.weight"), b.z.ptr, b.u.ptr);
+        self.mv_pair(&format!("{p}.ssm_beta.weight"), b.beta.ptr, &format!("{p}.ssm_alpha.weight"), b.alpha.ptr, b.u.ptr);
+        self.delta_mid(l, b.qkv.ptr, b.z.ptr, b.beta.ptr, b.alpha.ptr, b.o.ptr);
+        self.mv(&format!("{p}.ssm_out.weight"), b.o.ptr, b.y.ptr);
+    }
+
+    /// DeltaNet's per-token part, in order: the conv window, the q/k norms, the state update, the gated norm into o.
+    fn delta_mid(&self, l: usize, qkv: u64, z: u64, beta: u64, alpha: u64, o: u64) {
         let c = &self.m.cfg;
         let b = &self.b;
         let p = format!("blk.{l}");
         let (kh, vh, d) = (c.ssm_k_heads, c.ssm_v_heads, c.ssm_head_dim);
-        let (kd, vd) = (kh * d, vh * d);
-        let ch = 2 * kd + vd;
-        self.mv_pair(&format!("{p}.attn_qkv.weight"), b.qkv.ptr, &format!("{p}.attn_gate.weight"), b.z.ptr, b.u.ptr);
-        self.mv_pair(&format!("{p}.ssm_beta.weight"), b.beta.ptr, &format!("{p}.ssm_alpha.weight"), b.alpha.ptr, b.u.ptr);
+        let kd = kh * d;
+        let ch = 2 * kd + vh * d;
         let (s, conv) = self.delta[l].as_ref().unwrap();
-        self.k1("conv_silu_step", ch, &[Arg::Ptr(b.qkv.ptr), Arg::Ptr(conv.ptr), Arg::Ptr(self.sv(&format!("{p}.ssm_conv1d.weight"))),
+        self.k1("conv_silu_step", ch, &[Arg::Ptr(qkv), Arg::Ptr(conv.ptr), Arg::Ptr(self.sv(&format!("{p}.ssm_conv1d.weight"))),
                                        Arg::Ptr(b.x.ptr), Arg::U32(ch as u32), Arg::U32(c.conv_k as u32)]);
         self.k("l2norm_qk_heads", (2 * kh) as u32, 128, &[
             Arg::Ptr(b.x.ptr), Arg::U32(kh as u32), Arg::U32(d as u32), Arg::F32((d as f32).sqrt())]);
         self.k("delta_step", vh as u32, d as u32, &[
             Arg::Ptr(b.x.ptr), Arg::Ptr(b.x.ptr + (kd * 4) as u64), Arg::Ptr(b.x.ptr + (2 * kd * 4) as u64),
-            Arg::Ptr(b.beta.ptr), Arg::Ptr(b.alpha.ptr), Arg::Ptr(self.sv(&format!("{p}.ssm_a"))),
-            Arg::Ptr(self.sv(&format!("{p}.ssm_dt.bias"))), Arg::Ptr(s.ptr), Arg::Ptr(b.o.ptr), Arg::U32(kh as u32),
+            Arg::Ptr(beta), Arg::Ptr(alpha), Arg::Ptr(self.sv(&format!("{p}.ssm_a"))),
+            Arg::Ptr(self.sv(&format!("{p}.ssm_dt.bias"))), Arg::Ptr(s.ptr), Arg::Ptr(o), Arg::U32(kh as u32),
             Arg::U32(d as u32)]);
-        self.k("gated_rmsnorm_heads", vh as u32, 128, &[Arg::Ptr(b.o.ptr), Arg::Ptr(self.sv(&format!("{p}.ssm_norm.weight"))),
-                                                       Arg::Ptr(b.z.ptr), Arg::U32(d as u32), Arg::F32(c.eps)]);
-        let _ = vd;
-        self.mv(&format!("{p}.ssm_out.weight"), b.o.ptr, b.y.ptr);
+        self.k("gated_rmsnorm_heads", vh as u32, 128, &[Arg::Ptr(o), Arg::Ptr(self.sv(&format!("{p}.ssm_norm.weight"))),
+                                                       Arg::Ptr(z), Arg::U32(d as u32), Arg::F32(c.eps)]);
     }
 
     fn attention(&mut self, l: usize) {
-        let c = &self.m.cfg;
         let p = format!("blk.{l}");
-        let (nh, nkv, hd) = (c.n_head, c.n_kv_head, c.head_dim);
-        let (id, ratio) = (c.idx_dim, c.compress[l].max(1));
+        let c = &self.m.cfg;
+        let (nkv, hd, id) = (c.n_kv_head, c.head_dim, c.idx_dim);
         let pos = self.tokens.len() - 1;
-        let (rd, th, eps) = (c.rope_dims as u32, c.rope_theta as f32, c.eps);
+        let (qg, kk, iq, ao) = (self.b.qg.ptr, self.b.kk.ptr, self.b.iq.ptr, self.b.ao.ptr);
         {
             let b = &self.b;
             let at = self.attn[l].as_ref().unwrap();
             let slot = (pos * nkv * hd * 4) as u64;
             let raw_slot = at.raw.ptr + (pos * id * 4) as u64;
-            self.mv(&format!("{p}.attn_q.weight"), b.u.ptr, b.qg.ptr);
-            self.mv_pair(&format!("{p}.attn_k.weight"), b.kk.ptr, &format!("{p}.attn_v.weight"), at.v.ptr + slot, b.u.ptr);
-            self.mv_pair(&format!("{p}.indexer.q_proj.weight"), b.iq.ptr, &format!("{p}.indexer.k_proj.weight"), raw_slot, b.u.ptr);
+            self.mv(&format!("{p}.attn_q.weight"), b.u.ptr, qg);
+            self.mv_pair(&format!("{p}.attn_k.weight"), kk, &format!("{p}.attn_v.weight"), at.v.ptr + slot, b.u.ptr);
+            self.mv_pair(&format!("{p}.indexer.q_proj.weight"), iq, &format!("{p}.indexer.k_proj.weight"), raw_slot, b.u.ptr);
+        }
+        self.attention_mid(l, pos, qg, kk, iq, ao);
+        self.mv(&format!("{p}.attn_output.weight"), ao, self.b.y.ptr);
+    }
+
+    /// Attention's per-position part, once its projections are in (v and the indexer key already in the caches at
+    /// `pos`): q/k norms and RoPE (k into the cache), the indexer's pooled blocks and selection, attention over the
+    /// positions <= pos into ao.
+    fn attention_mid(&mut self, l: usize, pos: usize, qg: u64, kk: u64, iq: u64, ao: u64) {
+        let c = &self.m.cfg;
+        let p = format!("blk.{l}");
+        let (nh, nkv, hd) = (c.n_head, c.n_kv_head, c.head_dim);
+        let (id, ratio) = (c.idx_dim, c.compress[l].max(1));
+        let (rd, th, eps) = (c.rope_dims as u32, c.rope_theta as f32, c.eps);
+        {
+            let b = &self.b;
+            let at = self.attn[l].as_ref().unwrap();
+            let slot = (pos * nkv * hd * 4) as u64;
             self.k("head_norm_rope_qgk", (nh + nkv) as u32, 128, &[
-                Arg::Ptr(b.qg.ptr), Arg::Ptr(b.q.ptr), Arg::Ptr(b.gate.ptr), Arg::Ptr(self.sv(&format!("{p}.attn_q_norm.weight"))),
-                Arg::Ptr(b.kk.ptr), Arg::Ptr(at.k.ptr + slot), Arg::Ptr(self.sv(&format!("{p}.attn_k_norm.weight"))),
+                Arg::Ptr(qg), Arg::Ptr(b.q.ptr), Arg::Ptr(b.gate.ptr), Arg::Ptr(self.sv(&format!("{p}.attn_q_norm.weight"))),
+                Arg::Ptr(kk), Arg::Ptr(at.k.ptr + slot), Arg::Ptr(self.sv(&format!("{p}.attn_k_norm.weight"))),
                 Arg::U32(nh as u32), Arg::U32(hd as u32), Arg::F32(eps), Arg::U32(pos as u32), Arg::U32(rd), Arg::F32(th)]);
         }
         // complete blocks get their pooled keys once
@@ -1458,7 +1599,7 @@ impl<'c, 'm> GpuSession<'c, 'm> {
             let b = &self.b;
             let at = self.attn[l].as_ref().unwrap();
             self.k("head_norm_rope", c.idx_heads as u32, 128, &[
-                Arg::Ptr(b.iq.ptr), Arg::U32(id as u32), Arg::Ptr(b.iqn.ptr), Arg::U32(id as u32),
+                Arg::Ptr(iq), Arg::U32(id as u32), Arg::Ptr(b.iqn.ptr), Arg::U32(id as u32),
                 Arg::Ptr(self.sv(&format!("{p}.indexer.q_norm.weight"))), Arg::U32(id as u32), Arg::F32(eps), Arg::U32(pos as u32),
                 Arg::U32(rd), Arg::F32(th)]);
             self.k1("index_scores", nb, &[Arg::Ptr(b.iqn.ptr), Arg::Ptr(at.blocks.ptr), Arg::Ptr(b.scores.ptr), Arg::U32(nb as u32),
@@ -1484,9 +1625,8 @@ impl<'c, 'm> GpuSession<'c, 'm> {
             let at = self.attn[l].as_ref().unwrap();
             self.k("attention_heads", nh as u32, 256, &[
                 Arg::Ptr(b.q.ptr), Arg::Ptr(at.k.ptr), Arg::Ptr(at.v.ptr), Arg::Ptr(tptr), Arg::U32(ntok as u32),
-                Arg::Ptr(b.gate.ptr), Arg::Ptr(b.ao.ptr), Arg::Ptr(b.scratch.ptr), Arg::U32(self.cap as u32),
+                Arg::Ptr(b.gate.ptr), Arg::Ptr(ao), Arg::Ptr(b.scratch.ptr), Arg::U32(self.cap as u32),
                 Arg::U32(nkv as u32), Arg::U32(hd as u32), Arg::U32((nh / nkv) as u32)]);
-            self.mv(&format!("{p}.attn_output.weight"), b.ao.ptr, b.y.ptr);
         }
         if self.trace.is_some() {
             let mut row = vec![-1f32; c.idx_budget + ratio - 1];
@@ -1564,6 +1704,7 @@ impl<'c, 'm> GpuSession<'c, 'm> {
         if let Some(&off) = self.ram.at.get(&(l, e)) {
             if let Some(&r_idx) = self.ram.ring_by_off.get(&off) {
                 self.ram.ring_ref[r_idx] = true;
+                self.ram.claimed.insert(off);
             }
             let src = self.ram.region.as_ref().unwrap().as_slice();
             if contiguous {
@@ -1685,6 +1826,7 @@ impl<'c, 'm> GpuSession<'c, 'm> {
     }
 
     fn moe(&mut self, l: usize) {
+        self.ram.claimed.clear(); // the previous layer's copies were waited for
         let c = &self.m.cfg;
         let p = format!("blk.{l}");
         let h = c.hidden;
@@ -1924,19 +2066,7 @@ impl<'c, 'm> GpuSession<'c, 'm> {
         self.upload_to(self.b.tab.ptr, &tab);
         let b = &self.b;
         let batch = |t: &TensorInfo, tab_off: u64, count: usize, x: u64, xs: usize, y: u64, ys: usize| {
-            let ty = t.ty.name();
-            let entry = FAST_KERNELS.iter().find(|q| q.0 == ty).unwrap_or_else(|| panic!("{}: no batched kernel", t.name)).2;
-            let (rows, cols) = (t.dims[1] as u32, t.dims[0] as u32);
-            assert_eq!(cols % 8, 0, "{}: the batched kernel needs whole chunks of 8", t.name);
-            // SAFETY: `count` table entries from tab + tab_off, each a rows x cols matrix as stored; `count` inputs of
-            // cols floats (stride xs, or 0 when shared) and `count` outputs of rows floats (stride ys) inside this
-            // session's buffers.
-            unsafe {
-                self.mvp.launch(entry, (rows.div_ceil(8), count as u32, 1), (256, 1, 1), 0, None,
-                                &[Arg::Ptr(b.tab.ptr + tab_off), Arg::Ptr(x), Arg::U32(xs as u32), Arg::Ptr(y),
-                                  Arg::U32(ys as u32), Arg::U32(rows), Arg::U32(cols)])
-            }
-            .unwrap_or_else(|err| panic!("{}: {err}", t.name));
+            self.mv_batch(t, tab_off, count, x, xs, y, ys)
         };
         let down_tab_off = 16 * n_gu as u64;
         let w_off = down_tab_off + 8 * ng as u64;
@@ -1992,19 +2122,425 @@ impl<'c, 'm> GpuSession<'c, 'm> {
         self.mark("shared expert + combine");
     }
 
+    // -------------------------------------------------------------------------------------------- the batched step
+    /// Up to `MAX_BATCH` tokens at a time through the model layer-major, and each one's logits: the same numbers, bit
+    /// for bit, as `step` on each in turn (tests/reference.rs).  Per layer the projections the tokens share run once for
+    /// all of them (`mv_cols`), the recurrences, the KV writes and attention run per token in order, and the MoE
+    /// fetches the union of their experts once.  What it does not cover (Flint, tracing, no expert cache, the hybrid
+    /// and prefetch experiments) steps one token at a time.
+    pub fn step_batch(&mut self, tokens: &[u32]) -> Vec<Vec<f32>> {
+        self.step_batch_opt(tokens, true)
+    }
+
+    /// `step_batch` without the logits (reading a prompt).
+    pub fn prefill_batch(&mut self, tokens: &[u32]) {
+        self.step_batch_opt(tokens, false);
+    }
+
+    pub fn step_batch_opt(&mut self, tokens: &[u32], with_logits: bool) -> Vec<Vec<f32>> {
+        let per_token = self.m.cfg.arch == "flint" || self.trace.is_some() || self.stop_after.is_some()
+            || self.cache.slots == 0 || self.cpu.is_some() || self.prefetch.is_some() || self.pregate.is_some()
+            || self.mtp_probe.is_some();
+        let mut out = Vec::new();
+        for chunk in tokens.chunks(self.batch_max) {
+            if per_token || chunk.len() == 1 {
+                for &t in chunk {
+                    let logits = self.step_opt(t, with_logits);
+                    if with_logits {
+                        out.push(logits);
+                    }
+                }
+            } else {
+                out.extend(self.batch(chunk, with_logits));
+            }
+        }
+        out
+    }
+
+    fn batch(&mut self, toks: &[u32], with_logits: bool) -> Vec<Vec<f32>> {
+        let m = toks.len();
+        let p0 = self.tokens.len();
+        assert!(p0 + m <= self.cap, "this session was made for {} positions", self.cap);
+        self.tokens.extend_from_slice(toks);
+        self.routing.tokens += m as u64;
+        let c = &self.m.cfg;
+        let (h, cs) = (c.hidden, c.streams);
+        let ch = h * cs;
+        {
+            let (t, bytes) = self.m.dense("token_embd.weight");
+            let (qk, qb) = t.ty.block().unwrap();
+            let rb = (t.dims[0] / qk * qb) as usize;
+            for (j, &tok) in toks.iter().enumerate() {
+                let mut x = vec![0f32; h];
+                dequantize(t.ty, &bytes[tok as usize * rb..(tok as usize + 1) * rb], &mut x).unwrap();
+                self.upload_to(self.b.e.ptr, &f32s(&x));
+                self.k1("broadcast", ch, &[Arg::Ptr(self.b.e.ptr), Arg::Ptr(row(&self.bb.r, ch, j)), Arg::U32(h as u32),
+                                           Arg::U32(cs as u32)]);
+            }
+        }
+        let mut logs: Vec<Vec<u16>> = vec![vec![]; m];
+        let mut rn_ready = false;
+        for l in 0..c.n_layer {
+            if l == c.ple_layer {
+                for j in 0..m {
+                    let r = row(&self.bb.r, ch, j);
+                    self.ple_at(l, p0 + j + 1, r);
+                    self.k1("add", ch, &[Arg::Ptr(r), Arg::Ptr(self.b.gv.ptr), Arg::U32(ch as u32)]);
+                }
+                rn_ready = false;
+            }
+            self.hc_read_batch(&format!("blk.{l}.hc_attn"), true, rn_ready, m);
+            if c.is_attention(l) {
+                self.attention_batch(l, p0, m);
+            } else {
+                self.delta_batch(l, m);
+            }
+            self.hc_write_batch(Some(&format!("blk.{l}.hc_ffn_norm.weight")), m);
+            self.hc_read_batch(&format!("blk.{l}.hc_ffn"), true, true, m);
+            self.moe_batch(l, m, &mut logs);
+            let next = if l + 1 == c.ple_layer {
+                None
+            } else if l + 1 < c.n_layer {
+                Some(format!("blk.{}.hc_attn_norm.weight", l + 1))
+            } else {
+                Some("output_hc_norm.weight".to_string())
+            };
+            self.hc_write_batch(next.as_deref(), m);
+            rn_ready = next.is_some();
+        }
+        if let Some((_, log)) = self.route_log.as_mut() {
+            log.extend(logs.into_iter().flatten());
+        }
+        if !with_logits {
+            return vec![];
+        }
+        self.hc_read_batch("output_hc", false, rn_ready, m);
+        let mut logits = Vec::with_capacity(m);
+        for j0 in (0..m).step_by(COLS_MAX) {
+            let n = (m - j0).min(COLS_MAX);
+            self.mv_cols("output.weight", row(&self.bb.u, h, j0), h, self.bb.logits.ptr, c.vocab, n);
+            let mut out = vec![0u8; n * c.vocab * 4];
+            self.download(self.bb.logits.ptr, &mut out);
+            logits.extend(out.chunks(c.vocab * 4).map(floats));
+        }
+        logits
+    }
+
+    /// y_j = W x_j for j < m (x_j at x + j * xs floats, y_j at y + j * ys): bit for bit what `mv` gives each input,
+    /// in one launch where a matvec_cols kernel computes the same sums (`mv` per input otherwise).
+    fn mv_cols(&self, name: &str, x: u64, xs: usize, y: u64, ys: usize, m: usize) {
+        let (t, bytes) = self.m.dense(name);
+        let (qk, qb) = t.ty.block().unwrap();
+        let rows = bytes.len() / (t.dims[0] / qk * qb) as usize;
+        let ty = t.ty.name();
+        let entry = match ty.as_str() {
+            _ if self.m.scale(name) != 1.0 => None,
+            // `mv` runs these in the reference order, and so do the _ref kernels
+            "BF16" => Some("matvec_cols_ref_bf16".to_string()),
+            "F32" => Some("matvec_cols_ref_f32".to_string()),
+            _ if t.dims[0].is_multiple_of(8) && xs.is_multiple_of(4) && x.is_multiple_of(16) => {
+                Some(format!("matvec_cols_{}", ty.to_lowercase()))
+            }
+            _ => None,
+        };
+        let Some(entry) = entry else {
+            for j in 0..m {
+                self.mv(name, x + (j * xs * 4) as u64, y + (j * ys * 4) as u64);
+            }
+            return;
+        };
+        let wptr = self.w.get(name).unwrap_or_else(|| panic!("{name} is not resident")).ptr;
+        for j0 in (0..m).step_by(COLS_MAX) {
+            let (x, y, n) = (x + (j0 * xs * 4) as u64, y + (j0 * ys * 4) as u64, (m - j0).min(COLS_MAX));
+            // SAFETY: `rows` whole rows of t.dims[0] weights at wptr; n inputs of t.dims[0] floats at x + j * xs and n
+            // outputs of `rows` floats at y + j * ys, inside this session's buffers (the callers' strides are their
+            // sizes).
+            unsafe {
+                self.mvp.launch(&entry, ((rows as u32).div_ceil(32), 1, 1), (256, 1, 1), 0, None,
+                                &[Arg::Ptr(wptr), Arg::Ptr(x), Arg::U32(xs as u32), Arg::Ptr(y), Arg::U32(ys as u32),
+                                  Arg::U32(rows as u32), Arg::U32(t.dims[0] as u32), Arg::U32(n as u32)])
+            }
+            .unwrap_or_else(|err| panic!("{name}: {err}"));
+        }
+    }
+
+    /// `count` matrices of t's shape from the device table at tab + tab_off, one per blockIdx.y, on inputs x + n * xs
+    /// (xs = 0: shared) into y + n * ys.
+    #[allow(clippy::too_many_arguments)]
+    fn mv_batch(&self, t: &TensorInfo, tab_off: u64, count: usize, x: u64, xs: usize, y: u64, ys: usize) {
+        let ty = t.ty.name();
+        let entry = FAST_KERNELS.iter().find(|q| q.0 == ty).unwrap_or_else(|| panic!("{}: no batched kernel", t.name)).2;
+        let (rows, cols) = (t.dims[1] as u32, t.dims[0] as u32);
+        assert_eq!(cols % 8, 0, "{}: the batched kernel needs whole chunks of 8", t.name);
+        // SAFETY: `count` table entries from tab + tab_off, each a rows x cols matrix as stored; `count` inputs of
+        // cols floats (stride xs, or 0 when shared) and `count` outputs of rows floats (stride ys) inside this
+        // session's buffers.
+        unsafe {
+            self.mvp.launch(entry, (rows.div_ceil(8), count as u32, 1), (256, 1, 1), 0, None,
+                            &[Arg::Ptr(self.b.tab.ptr + tab_off), Arg::Ptr(x), Arg::U32(xs as u32), Arg::Ptr(y),
+                              Arg::U32(ys as u32), Arg::U32(rows), Arg::U32(cols)])
+        }
+        .unwrap_or_else(|err| panic!("{}: {err}", t.name));
+    }
+
+    /// `hc_read` for the batch's m tokens.
+    fn hc_read_batch(&self, p: &str, inject: bool, skip_norm: bool, m: usize) {
+        let c = &self.m.cfg;
+        let (h, cs, rank) = (c.hidden, c.streams, c.hc_rank);
+        let ch = h * cs;
+        let bb = &self.bb;
+        if !skip_norm {
+            for j in 0..m {
+                self.hc_norm(p, row(&bb.r, ch, j), row(&bb.rn, ch, j));
+            }
+        }
+        let (w_inj, r_inj) = if inject { (self.w[&format!("{p}_inject.weight")].ptr, cs as u32) } else { (0, 0) };
+        for j0 in (0..m).step_by(COLS_MAX) {
+            // SAFETY: rank + r_inj rows of ch BF16 weights; n inputs of ch floats in rn, n outputs of rank (down) and
+            // cs (g) floats, from row j0.
+            unsafe {
+                self.mvp.launch("hc_down_inject_cols_bf16", ((rank as u32 + r_inj).div_ceil(32), 1, 1), (256, 1, 1), 0, None, &[
+                    Arg::Ptr(self.w[&format!("{p}_down.weight")].ptr), Arg::Ptr(row(&bb.down, rank, j0)), Arg::U32(rank as u32),
+                    Arg::U32(rank as u32), Arg::Ptr(w_inj), Arg::Ptr(row(&bb.g, cs, j0)), Arg::U32(r_inj), Arg::U32(cs as u32),
+                    Arg::Ptr(row(&bb.rn, ch, j0)), Arg::U32(ch as u32), Arg::U32(ch as u32), Arg::F32(cs as f32),
+                    Arg::U32((m - j0).min(COLS_MAX) as u32),
+                ]).unwrap_or_else(|err| panic!("hc_down_inject_cols_bf16: {err}"));
+            }
+        }
+        self.mv_cols(&format!("{p}_up.weight"), bb.down.ptr, rank, bb.up.ptr, ch, m);
+        for j in 0..m {
+            self.hc_mix(row(&bb.rn, ch, j), row(&bb.up, ch, j), row(&bb.u, h, j));
+        }
+    }
+
+    /// `hc_write_norm` (with the next norm) or `hc_write` (without) for the batch's m tokens.
+    fn hc_write_batch(&self, next_norm: Option<&str>, m: usize) {
+        let c = &self.m.cfg;
+        let (h, cs) = (c.hidden, c.streams);
+        let bb = &self.bb;
+        for j in 0..m {
+            let (r, g, y) = (row(&bb.r, h * cs, j), row(&bb.g, cs, j), row(&bb.y, h, j));
+            match next_norm {
+                Some(n) => self.hc_write_norm_at(n, r, g, y, row(&bb.rn, h * cs, j)),
+                None => self.hc_write_at(r, g, y),
+            }
+        }
+    }
+
+    fn delta_batch(&self, l: usize, m: usize) {
+        let c = &self.m.cfg;
+        let p = format!("blk.{l}");
+        let (h, vh, d) = (c.hidden, c.ssm_v_heads, c.ssm_head_dim);
+        let (kd, vd) = (c.ssm_k_heads * d, vh * d);
+        let ch = 2 * kd + vd;
+        let bb = &self.bb;
+        self.mv_cols(&format!("{p}.attn_qkv.weight"), bb.u.ptr, h, bb.qkv.ptr, ch, m);
+        self.mv_cols(&format!("{p}.attn_gate.weight"), bb.u.ptr, h, bb.z.ptr, vd, m);
+        self.mv_cols(&format!("{p}.ssm_beta.weight"), bb.u.ptr, h, bb.beta.ptr, vh, m);
+        self.mv_cols(&format!("{p}.ssm_alpha.weight"), bb.u.ptr, h, bb.alpha.ptr, vh, m);
+        for j in 0..m {
+            self.delta_mid(l, row(&bb.qkv, ch, j), row(&bb.z, vd, j), row(&bb.beta, vh, j), row(&bb.alpha, vh, j),
+                           row(&bb.o, vd, j));
+        }
+        self.mv_cols(&format!("{p}.ssm_out.weight"), bb.o.ptr, vd, bb.y.ptr, h, m);
+    }
+
+    /// Attention for the batch's tokens at positions p0..p0 + m: v and the indexer keys go straight into the caches
+    /// (consecutive positions are consecutive rows), then each token attends over the positions up to its own.
+    fn attention_batch(&mut self, l: usize, p0: usize, m: usize) {
+        let c = &self.m.cfg;
+        let p = format!("blk.{l}");
+        let h = c.hidden;
+        let (qd, kvd, id) = (c.n_head * c.head_dim, c.n_kv_head * c.head_dim, c.idx_dim);
+        let iqd = c.idx_heads * id;
+        {
+            let bb = &self.bb;
+            let at = self.attn[l].as_ref().unwrap();
+            self.mv_cols(&format!("{p}.attn_q.weight"), bb.u.ptr, h, bb.qg.ptr, 2 * qd, m);
+            self.mv_cols(&format!("{p}.attn_k.weight"), bb.u.ptr, h, bb.kk.ptr, kvd, m);
+            self.mv_cols(&format!("{p}.attn_v.weight"), bb.u.ptr, h, at.v.ptr + (p0 * kvd * 4) as u64, kvd, m);
+            self.mv_cols(&format!("{p}.indexer.q_proj.weight"), bb.u.ptr, h, bb.iq.ptr, iqd, m);
+            self.mv_cols(&format!("{p}.indexer.k_proj.weight"), bb.u.ptr, h, at.raw.ptr + (p0 * id * 4) as u64, id, m);
+        }
+        for j in 0..m {
+            let bb = &self.bb;
+            let (qg, kk, iq, ao) = (row(&bb.qg, 2 * qd, j), row(&bb.kk, kvd, j), row(&bb.iq, iqd, j), row(&bb.ao, qd, j));
+            self.attention_mid(l, p0 + j, qg, kk, iq, ao);
+        }
+        self.mv_cols(&format!("{p}.attn_output.weight"), self.bb.ao.ptr, qd, self.bb.y.ptr, h, m);
+    }
+
+    /// The MoE for the batch's m tokens: the router and the shared expert for all of them at once, one read of their
+    /// router logits, then the union of their routed experts into the VRAM cache (the misses beyond the layer's free
+    /// slots into `batch_scratch`) - in groups of consecutive tokens whose misses fit together - and each token's
+    /// routed experts and combine.
+    fn moe_batch(&mut self, l: usize, m: usize, logs: &mut [Vec<u16>]) {
+        let c = &self.m.cfg;
+        let p = format!("blk.{l}");
+        let (h, sff, k, ne) = (c.hidden, c.shared_ff, c.n_expert_used, c.n_expert);
+        let u = self.bb.u.ptr;
+        self.mv_cols(&format!("{p}.ffn_gate_inp.weight"), u, h, self.bb.rl.ptr, ne, m);
+        self.mv_cols(&format!("{p}.ffn_gate_inp_shexp.weight"), u, h, self.bb.sgl.ptr, 1, m);
+        let srcs: Vec<(u64, usize)> = (0..m).map(|j| (row(&self.bb.rl, ne, j), ne)).collect();
+        let t_wait = std::time::Instant::now();
+        let logits = self.download_mapped(&srcs);
+        self.waits[0] += t_wait.elapsed().as_secs_f64();
+        {
+            // the shared expert, on the GPU while the host routes and the copies run
+            let bb = &self.bb;
+            self.mv_cols(&format!("{p}.ffn_gate_shexp.weight"), u, h, bb.sg.ptr, sff, m);
+            self.mv_cols(&format!("{p}.ffn_up_shexp.weight"), u, h, bb.su.ptr, sff, m);
+            self.k1("swiglu", m * sff, &[Arg::Ptr(bb.sg.ptr), Arg::Ptr(bb.su.ptr), Arg::Ptr(bb.sa.ptr), Arg::U32((m * sff) as u32)]);
+            self.mv_cols(&format!("{p}.ffn_down_shexp.weight"), bb.sa.ptr, sff, bb.so.ptr, h, m);
+        }
+        let tops: Vec<Vec<(usize, f64)>> = logits.iter().map(|lg| route(lg, k)).collect();
+        for (j, top) in tops.iter().enumerate() {
+            for &(e, _) in top {
+                self.routing.add(l, e);
+            }
+            if self.route_log.is_some() {
+                logs[j].push(l as u16);
+                logs[j].extend(top.iter().map(|&(e, _)| e as u16));
+            }
+        }
+        let names = [format!("{p}.ffn_gate_exps.weight"), format!("{p}.ffn_up_exps.weight"), format!("{p}.ffn_down_exps.weight")];
+        let infos: Vec<TensorInfo> = names.iter().map(|n| self.expert_info(n)).collect();
+        let sizes: Vec<usize> = names.iter().map(|n| self.m.expert_bytes(n)).collect();
+        // misses read from the file may wait in the staging buffer, a slot each
+        let max_file = self.staging.as_ref().map_or(usize::MAX, |s| s.len() / self.cache.slot_bytes.max(1));
+        let scratch = self.batch_scratch.as_ref().map_or((0, 0), |(b, n)| (b.ptr, *n));
+        let arena = self.cache.arena.as_ref().unwrap().ptr;
+        let mut start = 0;
+        while start < m {
+            let mut set: Vec<usize> = Vec::new();
+            let mut end = start;
+            while end < m {
+                let mut cand = set.clone();
+                for &(e, _) in &tops[end] {
+                    if !cand.contains(&e) {
+                        cand.push(e);
+                    }
+                }
+                let missing = || cand.iter().filter(|&&e| !self.cache.map.contains_key(&(l, e)));
+                let file = missing().filter(|&&e| !self.ram.at.contains_key(&(l, e))).count();
+                let free = self.cache.evict_range[l].clone()
+                    .filter(|&i| self.cache.owner[i].is_none_or(|(ol, oe)| ol != l || !cand.contains(&oe)))
+                    .count();
+                if end > start && (missing().count() > free + scratch.1 || file > max_file) {
+                    break;
+                }
+                set = cand;
+                end += 1;
+            }
+            if start > 0 {
+                // the previous group's matvecs may still be reading slots this group's misses take
+                self.ctx.synchronize().unwrap();
+            }
+            self.ram.claimed.clear(); // the previous group's copies were waited for
+            self.cache.clock += 1;
+            for &e in &set {
+                self.cache.touch((l, e));
+            }
+            let (mut n_miss, mut n_file) = (0, 0);
+            let mut extra: Vec<(usize, u64)> = Vec::new();
+            for &e in &set {
+                if self.cache.map.contains_key(&(l, e)) {
+                    self.cache.hits += 1;
+                    continue;
+                }
+                self.cache.misses += 1;
+                let base = if self.cache.has_victim(l) {
+                    let s = self.cache.victim(l);
+                    self.cache.owner[s] = Some((l, e));
+                    self.cache.map.insert((l, e), s);
+                    self.cache.stamp[s] = self.cache.clock;
+                    arena + self.cache.slot_offset[s]
+                } else {
+                    let b = scratch.0 + (extra.len() * self.cache.slot_bytes) as u64;
+                    extra.push((e, b));
+                    b
+                };
+                let dst = [base, base + sizes[0] as u64, base + (sizes[0] + sizes[1]) as u64];
+                let from_file = !self.ram.at.contains_key(&(l, e));
+                self.fetch_expert(l, e, n_file, &names, &sizes, dst);
+                n_file += from_file as usize;
+                n_miss += 1;
+            }
+            self.read_drive(&names, &sizes);
+            if n_miss > 0 {
+                let t_wait = std::time::Instant::now();
+                self.copy_stream.synchronize().unwrap();
+                self.waits[1] += t_wait.elapsed().as_secs_f64();
+            }
+            for (j, top) in tops.iter().enumerate().take(end).skip(start) {
+                self.routed_qwen(l, j, top, &extra, &infos, &sizes);
+            }
+            start = end;
+        }
+    }
+
+    /// Token j's routed experts (resident in the cache, or at `extra`'s scratch addresses) and the combine with its
+    /// shared expert, into its row of y.
+    #[allow(clippy::too_many_arguments)]
+    fn routed_qwen(&self, l: usize, j: usize, top: &[(usize, f64)], extra: &[(usize, u64)], infos: &[TensorInfo],
+                   sizes: &[usize]) {
+        let c = &self.m.cfg;
+        let (h, ff) = (c.hidden, c.expert_ff);
+        let n = top.len();
+        let arena = self.cache.arena.as_ref().unwrap().ptr;
+        let at: Vec<[u64; 3]> = top.iter().map(|&(e, _)| {
+            let base = match self.cache.map.get(&(l, e)) {
+                Some(&s) => arena + self.cache.slot_offset[s],
+                None => extra.iter().find(|x| x.0 == e).expect("a routed expert neither cached nor fetched").1,
+            };
+            [base, base + sizes[0] as u64, base + (sizes[0] + sizes[1]) as u64]
+        }).collect();
+        // the layout `moe` uses: gate, up and down addresses, then the weights
+        let mut tab = Vec::with_capacity(n * 28);
+        for part in 0..3 {
+            for a in &at {
+                tab.extend_from_slice(&a[part].to_le_bytes());
+            }
+        }
+        for &(_, w) in top {
+            tab.extend_from_slice(&(w as f32).to_le_bytes());
+        }
+        self.upload_to(self.b.tab.ptr, &tab);
+        let b = &self.b;
+        let u = row(&self.bb.u, h, j);
+        let eu = if infos[0].ty == infos[1].ty && infos[0].dims == infos[1].dims {
+            self.mv_batch(&infos[0], 0, 2 * n, u, 0, b.eg.ptr, ff);
+            b.eg.ptr + (n * ff * 4) as u64
+        } else {
+            self.mv_batch(&infos[0], 0, n, u, 0, b.eg.ptr, ff);
+            self.mv_batch(&infos[1], 8 * n as u64, n, u, 0, b.eu.ptr, ff);
+            b.eu.ptr
+        };
+        self.k1("swiglu", n * ff, &[Arg::Ptr(b.eg.ptr), Arg::Ptr(eu), Arg::Ptr(b.act.ptr), Arg::U32((n * ff) as u32)]);
+        self.mv_batch(&infos[2], 16 * n as u64, n, b.act.ptr, ff, b.eo.ptr, h);
+        self.k1("moe_combine_qwen", h, &[
+            Arg::Ptr(row(&self.bb.y, h, j)), Arg::Ptr(b.eo.ptr), Arg::Ptr(b.tab.ptr + 24 * n as u64),
+            Arg::Ptr(row(&self.bb.so, h, j)), Arg::Ptr(row(&self.bb.sgl, 1, j)), Arg::U32(h as u32), Arg::U32(n as u32)]);
+    }
+
     /// The n-gram memory at layer l, into gv (the caller adds it to r).
     fn ple(&self, l: usize) {
+        self.ple_at(l, self.tokens.len(), self.b.r.ptr);
+    }
+
+    /// The n-gram memory at layer l for the token at position n - 1 with streams r, into gv.
+    fn ple_at(&self, l: usize, n: usize, r: u64) {
         let c = &self.m.cfg;
         let p = format!("blk.{l}");
         let (h, cs) = (c.hidden, c.streams);
         let ch = h * cs;
-        let e: Vec<f32> = ple_rows(c, &self.tokens).into_iter().flat_map(|row| self.m.ple_row(row)).collect();
+        let e: Vec<f32> = ple_rows(c, &self.tokens[..n]).into_iter().flat_map(|row| self.m.ple_row(row)).collect();
         let b = &self.b;
         self.upload_to(b.pe.ptr, &f32s(&e));
         self.mv_pair(&format!("{p}.ple_key.weight"), b.key.ptr, &format!("{p}.ple_value.weight"), b.val.ptr, b.pe.ptr);
         self.k("rmsnorm_groups", cs as u32, 256, &[Arg::Ptr(b.key.ptr), Arg::Ptr(self.sv(&format!("{p}.ple_norm_key.weight"))),
                                                   Arg::Ptr(b.keyn.ptr), Arg::U32(h as u32), Arg::F32(c.eps)]);
-        self.k("rmsnorm_groups", cs as u32, 256, &[Arg::Ptr(b.r.ptr), Arg::Ptr(self.sv(&format!("{p}.ple_norm_query.weight"))),
+        self.k("rmsnorm_groups", cs as u32, 256, &[Arg::Ptr(r), Arg::Ptr(self.sv(&format!("{p}.ple_norm_query.weight"))),
                                                   Arg::Ptr(b.qry.ptr), Arg::U32(h as u32), Arg::F32(c.eps)]);
         self.k("ple_gate", cs as u32, 256, &[Arg::Ptr(b.keyn.ptr), Arg::Ptr(b.qry.ptr), Arg::Ptr(b.val.ptr), Arg::Ptr(b.gv.ptr),
                                             Arg::U32(h as u32)]);
@@ -2038,6 +2574,9 @@ impl Stepper for GpuSession<'_, '_> {
     }
     fn step_prefill(&mut self, token: u32) {
         GpuSession::step_prefill(self, token);
+    }
+    fn prefill(&mut self, tokens: &[u32]) -> Vec<f32> {
+        self.step_batch(tokens).pop().unwrap_or_default()
     }
     fn start_trace(&mut self) {
         self.trace = Some(BTreeMap::new());

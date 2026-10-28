@@ -1,0 +1,9 @@
+placement: J:\Shadow\profiles\routing-6prompts.shrc, 675 tokens of routing
+shadow serve: listening on http://127.0.0.1:8091
+shadow serve: ready in 31.4 s; expert cache: 2767 slots x 1.96 MiB = 5.29 GiB; 0 hits, 0 misses (0.0% hits); 0 slice uploads; RAM tier: 15841 experts, 30.00 GiB pinned (filled in 28.3 s), misses served 0 from RAM, 0 from the file; host waits per step: router 0.0 ms, copies 0.0 ms, file 0.0 ms
+shadow serve: speculation: 5 passes, 1 of 15 drafted tokens accepted, 83 tokens in 5.0 s
+shadow serve: speculation: 1 passes, 0 of 3 drafted tokens accepted, 55 tokens in 2.9 s
+shadow serve: speculation: 5 passes, 1 of 15 drafted tokens accepted, 44 tokens in 3.0 s
+shadow serve: speculation: 12 passes, 10 of 36 drafted tokens accepted, 94 tokens in 6.2 s
+shadow serve: speculation: 5 passes, 2 of 15 drafted tokens accepted, 54 tokens in 3.7 s
+shadow serve: speculation: 0 passes, 0 of 0 drafted tokens accepted, 14 tokens in 0.8 s

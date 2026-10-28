@@ -206,6 +206,8 @@ pub const FILES: &[File] = &[
             cols("matvec_cols_q4_k"), cols("matvec_cols_q5_k"), cols("matvec_cols_q6_k"), cols("matvec_cols_iq4_nl"), cols("matvec_cols_iq4_xs"),
             cols("matvec_cols_nvfp4"), cols("matvec_cols_q2_0"), cols("matvec_cols_q8_0"), cols("matvec_cols_iq2_s"), cols("matvec_cols_iq3_xxs"),
             cols("matvec_cols_iq3_s"), cols("matvec_cols_bf16"), cols("matvec_cols_f32"),
+            cols("matvec_cols_ref_bf16"), cols("matvec_cols_ref_f32"),
+            e("hc_down_inject_cols_bf16", &[C, W, U, U, C, W, U, U, C, U, U, F, U]),
             pair("matvec_pair_q4_k"), pair("matvec_pair_q5_k"), pair("matvec_pair_q6_k"),
             pair("matvec_pair_iq4_nl"), pair("matvec_pair_iq4_xs"), pair("matvec_pair_nvfp4"),
             pair("matvec_pair_q2_0"), pair("matvec_pair_q8_0"), pair("matvec_pair_iq2_s"), pair("matvec_pair_iq3_xxs"),

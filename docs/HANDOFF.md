@@ -76,6 +76,10 @@ them changes the prompt; the fixture records the ids, so it stays valid as a fix
   - 2026-10-28: `matvec_cols` is fast (5.6-6.8x for 8 inputs on the big matrices, bit-identical); session
     snapshots (`snapshot`/`snapshot_to`/`restore`, bit-exact) and the server's shared-prefix cache (new chats with the
     same system prompt + tools: ~60 s -> ~1 s); web UI fixes.
+  - 2026-10-28 (later): **the batched step is in** (`step_batch` / `prefill_batch`, up to 64 tokens, bit-identical
+    to `step`; STATUS.md last section): prompt reading **0.062 -> 0.035 s/token** (-46%, 8 pairs), decode a tie,
+    speculation (`--spec K`) measured as a loss (-11% / -18%) and kept opt-in. Next there: expert-major routed matvecs
+    in the batched MoE, bigger prefill unions. What follows is the design as it was planned.
   - **Next: the batched step**, `GpuSession::step_batch(&[u32]) -> logits per token` (m <= 8), layer-major. Per layer:
     the mixer's input projections for all m tokens through `matvec_cols` (inputs/outputs laid out [m][dim]); the
     sequential parts (`delta_step` recurrence, conv window, KV write, attention over positions <= its own) per token

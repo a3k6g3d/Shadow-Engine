@@ -215,7 +215,10 @@ fn serve(path: &std::path::Path, rest: &[String]) -> ExitCode {
         }
     };
     let cfg = shadow_serve::ServeConfig {
-        engine: shadow_serve::engine::Config { model: path.to_path_buf(), n_ctx: gpu_capacity(n_ctx), tiers },
+        engine: shadow_serve::engine::Config {
+            model: path.to_path_buf(), n_ctx: gpu_capacity(n_ctx), tiers,
+            spec: flag("--spec").and_then(|v| v.parse().ok()).unwrap_or(0),
+        },
         addr,
     };
     match shadow_serve::run(cfg) {
@@ -232,6 +235,16 @@ fn serve(path: &std::path::Path, rest: &[String]) -> ExitCode {
 /// CPU reference, slow by design.
 fn generate(path: &std::path::Path, prompt: &str, rest: &[String]) -> ExitCode {
     use shadow_model::chat::{render_for_arch, Message, Options, Role};
+    // "@FILE": the prompt is that file's text (long prompts, without the command line's quoting)
+    let from_file = prompt.strip_prefix('@').map(std::fs::read_to_string);
+    let prompt = match &from_file {
+        Some(Ok(t)) => t.as_str(),
+        Some(Err(e)) => {
+            eprintln!("shadow generate: {prompt}: {e}");
+            return ExitCode::FAILURE;
+        }
+        None => prompt,
+    };
     use shadow_model::forward::{check_layout, CpuBackend, Model, Session, Stepper};
     use shadow_model::tokenizer::Tokenizer;
     use std::io::Write;
@@ -312,13 +325,7 @@ fn generate(path: &std::path::Path, prompt: &str, rest: &[String]) -> ExitCode {
         _ => Box::new(Session::new(&model, &CpuBackend)),
     };
     let t1 = std::time::Instant::now();
-    let mut logits = Vec::new();
-    if let Some((&last, pfx)) = ids.split_last() {
-        for &id in pfx {
-            s.step_prefill(id);
-        }
-        logits = s.step(last);
-    }
+    let mut logits = s.prefill(&ids);
     eprintln!("prompt read in {:.1} s ({:.3} s/token)", t1.elapsed().as_secs_f64(),
               t1.elapsed().as_secs_f64() / ids.len() as f64);
     if !s.report().is_empty() {

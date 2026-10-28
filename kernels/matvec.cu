@@ -735,17 +735,103 @@ static __device__ __forceinline__ void matvec_cols_rows(const u8* w, const float
     }
 }
 
-#define COLS(name, Q) extern "C" __global__ void name(const u8* w, const float* x, unsigned int xs, float* y,     unsigned int ys, unsigned int rows, unsigned int cols, unsigned int m) { matvec_cols_rows<Q>(w, x, xs, y, ys, rows, cols, m); }
-COLS(matvec_cols_q4_k, Q4K)
-COLS(matvec_cols_q5_k, Q5K)
-COLS(matvec_cols_q6_k, Q6K)
-COLS(matvec_cols_iq4_nl, IQ4NL)
-COLS(matvec_cols_iq4_xs, IQ4XS)
-COLS(matvec_cols_nvfp4, NVFP4)
-COLS(matvec_cols_q2_0, Q20)
-COLS(matvec_cols_q8_0, Q80)
-COLS(matvec_cols_iq2_s, IQ2S)
-COLS(matvec_cols_iq3_xxs, IQ3XXS)
-COLS(matvec_cols_iq3_s, IQ3S)
-COLS(matvec_cols_bf16, BF16)
-COLS(matvec_cols_f32, F32)
+extern "C" __global__ void matvec_cols_q4_k(const u8* w, const float* x, unsigned int xs, float* y, unsigned int ys, unsigned int rows, unsigned int cols, unsigned int m) { matvec_cols_rows<Q4K>(w, x, xs, y, ys, rows, cols, m); }
+extern "C" __global__ void matvec_cols_q5_k(const u8* w, const float* x, unsigned int xs, float* y, unsigned int ys, unsigned int rows, unsigned int cols, unsigned int m) { matvec_cols_rows<Q5K>(w, x, xs, y, ys, rows, cols, m); }
+extern "C" __global__ void matvec_cols_q6_k(const u8* w, const float* x, unsigned int xs, float* y, unsigned int ys, unsigned int rows, unsigned int cols, unsigned int m) { matvec_cols_rows<Q6K>(w, x, xs, y, ys, rows, cols, m); }
+extern "C" __global__ void matvec_cols_iq4_nl(const u8* w, const float* x, unsigned int xs, float* y, unsigned int ys, unsigned int rows, unsigned int cols, unsigned int m) { matvec_cols_rows<IQ4NL>(w, x, xs, y, ys, rows, cols, m); }
+extern "C" __global__ void matvec_cols_iq4_xs(const u8* w, const float* x, unsigned int xs, float* y, unsigned int ys, unsigned int rows, unsigned int cols, unsigned int m) { matvec_cols_rows<IQ4XS>(w, x, xs, y, ys, rows, cols, m); }
+extern "C" __global__ void matvec_cols_nvfp4(const u8* w, const float* x, unsigned int xs, float* y, unsigned int ys, unsigned int rows, unsigned int cols, unsigned int m) { matvec_cols_rows<NVFP4>(w, x, xs, y, ys, rows, cols, m); }
+extern "C" __global__ void matvec_cols_q2_0(const u8* w, const float* x, unsigned int xs, float* y, unsigned int ys, unsigned int rows, unsigned int cols, unsigned int m) { matvec_cols_rows<Q20>(w, x, xs, y, ys, rows, cols, m); }
+extern "C" __global__ void matvec_cols_q8_0(const u8* w, const float* x, unsigned int xs, float* y, unsigned int ys, unsigned int rows, unsigned int cols, unsigned int m) { matvec_cols_rows<Q80>(w, x, xs, y, ys, rows, cols, m); }
+extern "C" __global__ void matvec_cols_iq2_s(const u8* w, const float* x, unsigned int xs, float* y, unsigned int ys, unsigned int rows, unsigned int cols, unsigned int m) { matvec_cols_rows<IQ2S>(w, x, xs, y, ys, rows, cols, m); }
+extern "C" __global__ void matvec_cols_iq3_xxs(const u8* w, const float* x, unsigned int xs, float* y, unsigned int ys, unsigned int rows, unsigned int cols, unsigned int m) { matvec_cols_rows<IQ3XXS>(w, x, xs, y, ys, rows, cols, m); }
+extern "C" __global__ void matvec_cols_iq3_s(const u8* w, const float* x, unsigned int xs, float* y, unsigned int ys, unsigned int rows, unsigned int cols, unsigned int m) { matvec_cols_rows<IQ3S>(w, x, xs, y, ys, rows, cols, m); }
+extern "C" __global__ void matvec_cols_bf16(const u8* w, const float* x, unsigned int xs, float* y, unsigned int ys, unsigned int rows, unsigned int cols, unsigned int m) { matvec_cols_rows<BF16>(w, x, xs, y, ys, rows, cols, m); }
+extern "C" __global__ void matvec_cols_f32(const u8* w, const float* x, unsigned int xs, float* y, unsigned int ys, unsigned int rows, unsigned int cols, unsigned int m) { matvec_cols_rows<F32>(w, x, xs, y, ys, rows, cols, m); }
+
+// ------------------------------------------------------------------ several inputs at once, in the reference order
+// One token runs BF16 and F32 matrices through the reference order (matvec_rows, matvec_pair_bf16/f32 and
+// hc_down_inject_bf16: lane l adds the products of weights l, l+32, ... one at a time), not dot8's, so a batched step
+// that matches it bit for bit needs the same order: this is that order for m <= 8 inputs, COLS_ROWS rows per warp.
+// Rows [0, r0) are w0's (outputs y0 + j * ys0), rows [r0, r0 + r1) w1's (y1 + j * ys1).  mode 0 writes the sums; mode
+// 1 is hc_down_inject's epilogue (v = sum / div: w0's rows get v * sigmoid(v), w1's 2 * sigmoid(v)).
+template <typename Q, unsigned int M>
+static __device__ __forceinline__ void cols_ref_m(const u8* w0, float* y0, unsigned int r0, unsigned int ys0,
+                                                  const u8* w1, float* y1, unsigned int ys1, const float* x,
+                                                  unsigned int xs, unsigned int row0, unsigned int nr, unsigned int lane,
+                                                  unsigned int cols, unsigned int mode, float div) {
+    const u8* wr[COLS_ROWS];
+#pragma unroll
+    for (unsigned int k = 0; k < COLS_ROWS; k++) {
+        unsigned int row = row0 + k;
+        wr[k] = row < r0 ? w0 + (u64) row * cols * Q::BYTES : w1 + (u64) (row - r0) * cols * Q::BYTES;
+    }
+    float acc[COLS_ROWS][M];
+#pragma unroll
+    for (unsigned int k = 0; k < COLS_ROWS; k++)
+#pragma unroll
+        for (unsigned int j = 0; j < M; j++) acc[k][j] = 0.0f;
+    for (unsigned int i = lane; i < cols; i += 32) {
+        float xr[M];
+#pragma unroll
+        for (unsigned int j = 0; j < M; j++) xr[j] = x[(u64) j * xs + i];
+#pragma unroll
+        for (unsigned int k = 0; k < COLS_ROWS; k++)
+            if (k < nr) {
+                float wv = Q::at(wr[k] + (u64) i * Q::BYTES, 0);
+#pragma unroll
+                for (unsigned int j = 0; j < M; j++) acc[k][j] += wv * xr[j];
+            }
+    }
+#pragma unroll
+    for (unsigned int k = 0; k < COLS_ROWS; k++) {
+        if (k >= nr) break;
+        unsigned int row = row0 + k;
+#pragma unroll
+        for (unsigned int j = 0; j < M; j++) {
+            float a = acc[k][j];
+            for (int off = 16; off > 0; off >>= 1) a += __shfl_down_sync(0xffffffffu, a, off);
+            if (lane != 0) continue;
+            if (mode == 1) {
+                float v = a / div;
+                float sig = (float) (1.0 / (1.0 + exp(-(double) v)));
+                a = row < r0 ? v * sig : 2.0f * sig;
+            }
+            if (row < r0) y0[(u64) j * ys0 + row] = a;
+            else y1[(u64) j * ys1 + row - r0] = a;
+        }
+    }
+}
+
+// Launch: block = 256 threads (32 rows), grid = ceil((r0 + r1) / 32).
+template <typename Q>
+static __device__ __forceinline__ void cols_ref_rows(const u8* w0, float* y0, unsigned int r0, unsigned int ys0,
+                                                     const u8* w1, float* y1, unsigned int r1, unsigned int ys1,
+                                                     const float* x, unsigned int xs, unsigned int cols,
+                                                     unsigned int mode, float div, unsigned int m) {
+    unsigned int row0 = (blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32) * COLS_ROWS, lane = threadIdx.x % 32;
+    if (row0 >= r0 + r1) return;
+    unsigned int nr = min(r0 + r1 - row0, (unsigned int) COLS_ROWS);
+#define CR(M) cols_ref_m<Q, M>(w0, y0, r0, ys0, w1, y1, ys1, x, xs, row0, nr, lane, cols, mode, div)
+    switch (m) {
+        case 1: CR(1); break;
+        case 2: CR(2); break;
+        case 3: CR(3); break;
+        case 4: CR(4); break;
+        case 5: CR(5); break;
+        case 6: CR(6); break;
+        case 7: CR(7); break;
+        default: CR(8); break;
+    }
+#undef CR
+}
+
+extern "C" __global__ void matvec_cols_ref_bf16(const u8* w, const float* x, unsigned int xs, float* y, unsigned int ys, unsigned int rows, unsigned int cols, unsigned int m) { cols_ref_rows<BF16>(w, y, rows, ys, w, y, 0, ys, x, xs, cols, 0, 1.0f, m); }
+extern "C" __global__ void matvec_cols_ref_f32(const u8* w, const float* x, unsigned int xs, float* y, unsigned int ys, unsigned int rows, unsigned int cols, unsigned int m) { cols_ref_rows<F32>(w, y, rows, ys, w, y, 0, ys, x, xs, cols, 0, 1.0f, m); }
+// hc_down_inject_bf16 for m inputs rn + j * rs: down + j * ds, g + j * gs.
+extern "C" __global__ void hc_down_inject_cols_bf16(const u8* w_down, float* down, unsigned int r_down, unsigned int ds,
+                                                    const u8* w_inj, float* g, unsigned int r_inj, unsigned int gs,
+                                                    const float* rn, unsigned int rs, unsigned int cols, float div,
+                                                    unsigned int m) {
+    cols_ref_rows<BF16>(w_down, down, r_down, ds, w_inj, g, r_inj, gs, rn, rs, cols, 1, div, m);
+}

@@ -1,0 +1,9 @@
+loaded 4.14 GiB of dense weights in 2.4 s
+prompt: 1270 tokens [248045, 846, 198, 2, 53359, 20668, 25, 279, 1558, 11, 430, 6673, 11, 494, 279, 999]
+GPU: NVIDIA GeForce RTX 5070 - 10.78 GiB free
+placement: profiles/routing-6prompts.shrc, 675 tokens of routing
+GPU session: 3.83 GiB of weights resident in 28.9 s; expert cache: 2796 slots x 1.96 MiB = 5.34 GiB; 0 hits, 0 misses (0.0% hits); 0 slice uploads; RAM tier: 15841 experts, 30.00 GiB pinned (filled in 28.3 s), misses served 0 from RAM, 0 from the file; host waits per step: router 0.0 ms, copies 0.0 ms, file 0.0 ms
+prompt read in 42.0 s (0.033 s/token)
+after the prompt: expert cache: 2796 slots x 1.96 MiB = 5.34 GiB; 28214 hits, 162624 misses (14.8% hits); 487872 slice uploads; RAM tier: 15841 experts, 30.00 GiB pinned (filled in 28.3 s), misses served 141869 from RAM, 20755 from the file; host waits per step: router 11.3 ms, copies 7.4 ms, file 5.9 ms
+generated 16 tokens [1919, 2128, 16545, 430, 279, 34780, 24332, 364, 264, 1558, 17120, 11, 13849, 494, 54802, 19913] in 1.0 s (0.060 s/token)
+at the end: expert cache: 2796 slots x 1.96 MiB = 5.34 GiB; 31763 hits, 166755 misses (16.0% hits); 500265 slice uploads; RAM tier: 15841 experts, 30.00 GiB pinned (filled in 28.3 s), misses served 145651 from RAM, 21104 from the file; host waits per step: router 11.5 ms, copies 7.6 ms, file 5.9 ms

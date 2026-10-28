@@ -246,3 +246,69 @@ fn a_restored_snapshot_continues_exactly() {
     s.restore(&host).unwrap();
     assert!(bits(&s.step(next)) == want, "restored from host memory: the logits moved");
 }
+
+/// `GpuSession::step_batch` (up to 8 tokens through the layers together) against `step` one token at a time: every
+/// token's logits bit-identical, over chunks of 8 and a short last one, and the state after it the same (one more
+/// `step` on each).  A RAM-tier-free session whose cache misses go through the staging buffer.
+#[test]
+fn a_batched_step_matches_one_token_at_a_time() {
+    let p = std::env::var("SHADOW_MODEL").unwrap_or_else(|_| MODEL.into());
+    if !Path::new(&p).is_file() {
+        return eprintln!("SKIPPED, not passed: no model at {p}");
+    }
+    let Ok(ctx) = shadow_cuda::Context::new(0) else { return eprintln!("SKIPPED, not passed: no CUDA device") };
+    let model = Model::load(Gguf::open(Path::new(&p)).unwrap()).unwrap();
+    let prompt: Vec<u32> = [760u32, 6722, 314, 9338, 369, 11751, 13, 576, 6722, 314, 9294, 369, 13, 1059, 2101, 77,
+                            4096, 512, 9, 760, 6722, 314, 9338, 369, 11751, 13, 576, 6722, 314]
+        .to_vec();
+    let next = 9294u32;
+    let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<u32>>();
+
+    let mut one = shadow_cuda::session::GpuSession::new(&ctx, &model, 4096).unwrap();
+    let want: Vec<Vec<u32>> = prompt.iter().map(|&t| bits(&one.step(t))).collect();
+    let want_next = bits(&one.step(next));
+    drop(one);
+
+    let mut s = shadow_cuda::session::GpuSession::new(&ctx, &model, 4096).unwrap();
+    let got: Vec<Vec<u32>> = s.step_batch(&prompt).iter().map(|v| bits(v)).collect();
+    assert_eq!(got.len(), prompt.len());
+    for (i, (g, w)) in got.iter().zip(&want).enumerate() {
+        assert!(g == w, "token {i}: the batched logits differ from one token at a time");
+    }
+    assert!(bits(&s.step(next)) == want_next, "the state after the batched step differs");
+    // and a prompt read without logits, then one step
+    s.reset();
+    s.prefill_batch(&prompt);
+    assert!(bits(&s.step(next)) == want_next, "prefill_batch then step differs");
+}
+
+/// The same past the sparse indexer's threshold: the long fixture's 2,600 ids read in batches, then its last 8 tokens
+/// through one `step_batch`, against one token at a time.
+#[test]
+#[ignore = "a few minutes: 2,600 tokens through 48 layers twice"]
+fn a_batched_step_matches_one_token_at_a_time_past_the_indexer() {
+    let p = std::env::var("SHADOW_MODEL").unwrap_or_else(|_| MODEL.into());
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../eval/fixtures/reference_gguf_long");
+    if !Path::new(&p).is_file() || !dir.is_dir() {
+        return eprintln!("SKIPPED, not passed: no model or no long fixture");
+    }
+    let Ok(ctx) = shadow_cuda::Context::new(0) else { return eprintln!("SKIPPED, not passed: no CUDA device") };
+    let model = Model::load(Gguf::open(Path::new(&p)).unwrap()).unwrap();
+    let ids = Fixture::load(&dir).unwrap().ids;
+    let (head, tail) = ids.split_at(ids.len() - 8);
+    let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<u32>>();
+
+    let mut one = shadow_cuda::session::GpuSession::new(&ctx, &model, 4096).unwrap();
+    for &t in head {
+        one.step_prefill(t);
+    }
+    let want: Vec<Vec<u32>> = tail.iter().map(|&t| bits(&one.step(t))).collect();
+    drop(one);
+
+    let mut s = shadow_cuda::session::GpuSession::new(&ctx, &model, 4096).unwrap();
+    s.prefill_batch(head);
+    let got: Vec<Vec<u32>> = s.step_batch(tail).iter().map(|v| bits(v)).collect();
+    for (i, (g, w)) in got.iter().zip(&want).enumerate() {
+        assert!(g == w, "position {}: the batched logits differ from one token at a time", head.len() + i);
+    }
+}

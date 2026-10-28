@@ -378,3 +378,57 @@ Single-prompt runs, "Write a Rust function that parses a comma separated list...
   **6.8x (0.071 ms for 8 inputs vs 0.06 ms for one)**, expert-sized IQ*/Q2_0/IQ4 3.4-6.4x, BF16 2.5x, F32 router 4.9x.
   Dense weights are now close to free to batch: the cost of a multi-token pass is the union of its experts plus the
   per-token small kernels. That is what batched prefill and speculative verification need.
+
+## 2026-10-28: the batched step (`GpuSession::step_batch`), batched prefill, speculation measured
+
+- **`step_batch(&[u32]) -> Vec<Vec<f32>>` / `prefill_batch`** (Qwen; Flint, tracing, no cache and the opt-in
+  experiments step one token at a time): up to `MAX_BATCH` = 64 tokens through the layers together. Per layer: every
+  projection the tokens share through `matvec_cols` (8 inputs a launch; v and the indexer keys written straight into
+  the caches, consecutive positions being consecutive rows); the conv window, `delta_step`, q/k norms + RoPE, block
+  pooling, the indexer's selection and attention per token in order; the hc glue per token; the router for all of them
+  and one mapped read of m x 512 logits; the shared expert for all of them; the union of their routed experts into the
+  VRAM cache (misses beyond the layer's free slots into a 128-slot scratch arena, `SHADOW_BATCH_SCRATCH`), in groups of
+  consecutive tokens whose misses fit together; each token's routed experts and combine. `SHADOW_BATCH=n` caps the
+  batch (1: one token at a time, for A/B on one binary).
+- **Exact.** One token runs BF16/F32 matrices in the reference order (not `dot8`'s), so `matvec_cols_ref_bf16/f32`
+  and `hc_down_inject_cols_bf16` do the same for m inputs. `tests/reference.rs::a_batched_step_matches_one_token_at_a_time`:
+  every token's logits of a 29-token prompt **bit-identical** to `step` one at a time, and the state after it (one more
+  step; and `prefill_batch` then a step); `..._past_the_indexer` (ignored, 7 min): the long fixture's 2,600 ids, the
+  last 8 positions (past 2,048, sparse selection on) bit-identical. Reference suite 9/9, `shadow compare --gpu` on the
+  48-layer fixture cosine 1.000 and 10/10 routing on every layer, the drift test green again (it had been failing on
+  the `COLS` macro; the macro is expanded now).
+- **Why 64, not 8: the expert union.** First version (chunks of 8, misses only into the layer's free cache slots):
+  0.063 -> 0.051 s/token on a 1,262-token prompt, because a layer keeps only 12 evictable slots next to its pinned hot
+  experts and a prompt misses ~6 experts a token, so groups were 1-2 tokens wide (misses 362k -> 361k). A 32-slot
+  scratch: 0.044. The union of consecutive prompt tokens' experts grows slowly (`SHADOW_ROUTE_LOG` on that prompt,
+  experts a token needs per layer): **m=8 5.95, 16 4.75, 32 3.60, 64 2.51, 128 1.63** of its 10. Batches of 64 with
+  128 scratch slots: 0.033 s/token; 256 slots the same (0.033), so 128 (~250 MB of VRAM, taken from the cache before it
+  sizes itself).
+- **Bug found on the way (also latent in the one-token path):** `RamTier::promote_slot`'s Clock hand could wrap and
+  hand out a ring slot already pending a file read (or with a copy from it in flight) when few ring slots match the
+  layer's expert size; a 256-slot batch hit it (`read_drive` panicked). The ring now skips offsets claimed since the
+  copies were last waited for.
+- **Measured (8 interleaved launches each):**
+  - `shadow generate @prompt --gpu --chat -n 16 --ram-tier-gib 30 --placement profiles/routing-6prompts.shrc`, a
+    1,262-token prompt (the start of ARCH.md), the same binary with `SHADOW_BATCH=1 SHADOW_BATCH_SCRATCH=0` (one token
+    at a time) and the defaults, interleaved: **0.0622 -> 0.0345 s/token (78.6 s -> 43.5 s), -46.0% paired, all 8
+    pairs -43% to -47%**, the same 16 generated tokens in every run. Waits per token, one at a time -> batched: router
+    18.8 -> 11.3 ms, copies 22.2 -> 7.5 ms, file 9.8 -> 5.9 ms.
+  - `shadow-bench`, `--ctx 8192 --ram-tier-gib 30 --placement profiles/routing-6prompts.shrc`, HEAD (`target/release`)
+    vs this build (`bench/batch-2026-10-28`): **decode tie** (paired median +0.0%, p10 -0.6%, worst -0.8%; both arms
+    median 18.49 tok/s), **0 answer differences in 48 turns**; prompt reading of the turns' 25-31 new tokens **51.3 ->
+    36.0 ms/token** (median over 48 turns each).
+- **Speculative decoding (`shadow serve --spec K`, off by default): measured, loses.** Prompt lookup drafts up to K
+  tokens (the latest earlier occurrence of the last 3, else 2 tokens); one `step_batch` over [next, drafts] checks them
+  (its logits are bit for bit what `step` gives, so the answers cannot change); on a rejection `restore` to a device
+  snapshot taken before the pass (`snapshot_again`, refreshed in place, no allocation) and `prefill_batch` of the kept
+  tokens. `bench/spec-2026-10-28`, 8 interleaved launches per arm, same flags: **spec2 -11.2% paired (17.04 vs 18.62
+  tok/s), spec3 -18.3% (15.22)**, 0 answer differences. Drafts land 1.50 tokens per pass (112 of 448 / 672 drafted
+  accepted over 224 passes), and a pass over 3-4 positions plus the replay costs well over 1.5 steps - what the
+  2026-10-27 cost model predicted. Kept opt-in. Not tried: the `--mtp` head as drafter (its draft step still corrupts
+  the base model; dropped here), keeping per-position DeltaNet states inside the pass so a rejection needs no replay.
+- **What next (in order of expected value):** expert-major routed matvecs in the batched MoE (each union expert once
+  over the tokens that use it, through gathered `matvec_cols`: today every token re-reads its 10 experts' weights from
+  VRAM, ~20 MB a layer); larger prefill unions (m = 128: 1.63 experts a token a layer) by streaming the union through
+  the scratch slots expert by expert; the ~11 ms a token the host waits for the GPU in a batched pass (per-token small
+  kernels: hc glue, the recurrences, routed matvecs).
