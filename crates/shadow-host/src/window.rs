@@ -1,4 +1,4 @@
-//! M7 of docs/RUST_ENGINE.md: the prefetch window as a type, and "a prediction only ever warms" as a test.
+//! M7 of docs/history/RUST_ENGINE.md: the prefetch window as a type, and "a prediction only ever warms" as a test.
 //!
 //! The C++ (`RouterLookahead`, `include/strata/core/expert_source.hpp`) predicts layers l+1..l+depth (depth 1..4,
 //! STRATA_IO_PREFETCH_DEPTH) from layer l's input and asks the source to `warm` the experts no cache holds.  Its rule -

@@ -1,6 +1,6 @@
 //! The ring over Windows 11's I/O ring (ioringapi.h) instead of an I/O completion port - opt-in, STRATA_HOST_IORING=1.
 //!
-//! Why: the benchmark in docs/RUST_ENGINE.md put the IOCP ring ~13% behind the C++ pool at depth 256, and the cause is
+//! Why: the benchmark in docs/history/RUST_ENGINE.md put the IOCP ring ~13% behind the C++ pool at depth 256, and the cause is
 //! the kernel's per-read cost on the one thread that issues them (the pool spreads it over four).  An I/O ring takes
 //! many reads per kernel call: `submit` only writes an entry into the submission queue, and one SubmitIoRing hands
 //! the kernel the whole batch.  Completions come back through a queue in shared memory, popped without a kernel call.

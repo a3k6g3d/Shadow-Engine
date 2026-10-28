@@ -1,5 +1,5 @@
 //! The Rust host's own async read path: a completion ring over a direct-access (unbuffered) file.
-//! See docs/RUST_HOST.md, milestone 3.
+//! See docs/history/RUST_HOST.md, milestone 3.
 //!
 //! This is the half of the vertical slice that is Rust's to own.  The bytes are read here, by this process,
 //! through its own input/output completion port - not through the C++ engine's reader - and then handed down the
@@ -313,7 +313,7 @@ struct Job {
 }
 
 /// The issuing threads.  Why several: at depth the kernel's per-read cost on the issuing thread bounds the rate
-/// (docs/RUST_ENGINE.md: one thread 135k reads/s at depth 256 against the four-thread C++ pool's 190k), and that cost
+/// (docs/history/RUST_ENGINE.md: one thread 135k reads/s at depth 256 against the four-thread C++ pool's 190k), and that cost
 /// is per thread, so it spreads.
 #[cfg(windows)]
 struct Issuers {

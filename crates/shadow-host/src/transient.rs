@@ -1,4 +1,4 @@
-//! M6 of docs/RUST_ENGINE.md: the transient-blob lifetime rule as a type.
+//! M6 of docs/history/RUST_ENGINE.md: the transient-blob lifetime rule as a type.
 //!
 //! The rule today is a comment (`include/strata/core/expert_source.hpp`, `transient`): a blob assembled into a
 //! short-lived buffer "stays valid for the layer it was asked in and the next one or two; a consumer that keeps a

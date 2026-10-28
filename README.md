@@ -25,10 +25,10 @@ The plan is in [docs/SHADOW_PLAN.md](docs/SHADOW_PLAN.md), rewritten 2026-10-26.
 
 ## The floor
 
-[docs/BENCH_NOISE.md](docs/BENCH_NOISE.md): **10.1% median, 27.0% p90, 51.9% worst.** A change must clear that, on
-≥8 runs, interleaved, `decode_warm`, paired turn-by-turn — or it is reported as a tie and not written up as a win.
-That rule is not a formality and it has killed more ideas than any reviewer. That floor was measured on Strata;
-Shadow measures its own once it can run a session (stage 4), and until then Strata's is the working figure.
+Shadow measures its own noise with `shadow-bench` (`bench/floor-2026-10-27`): **0.8% median, 2.0% p90, 3.6% worst**
+on `decode_warm`. A change must clear that on ≥8 interleaved launches, paired turn by turn, or it is reported as a
+tie. Strata's floor (10.1% / 27.0% / 51.9%, [docs/BENCH_NOISE.md](docs/BENCH_NOISE.md)) is history. Current speed and
+every lever tried, kept or not, are in [docs/STATUS.md](docs/STATUS.md).
 
 ## Server & Web UI
 
@@ -54,9 +54,11 @@ shadow serve <path-to-gguf> [--port 8081] [--host 127.0.0.1] [--ram-tier-gib 30]
 
 ## Layout
 
-    crates/          the Rust side, including shadow-eval, the yardstick
-    include/shadow/  the old seam's contract (C ABI) - retired with the C++ engine, removed once stage 2 runs
-    docs/            the plan, and the measurements it is built on
+    crates/          the engine (shadow-model, shadow-cuda, shadow-serve, shadow), shadow-bench, shadow-eval
+    kernels/         the CUDA C++ the engine compiles with NVRTC at run time
+    docs/            the plan, STATUS (what is measured), HANDOFF; docs/history/ holds the retired Strata-era designs
+    bench/           shadow-bench runs, one directory per comparison
+    profiles/        routing profiles for the RAM tier's placement
     tools/           the harness and shadow_memory.py, both Python for now
     bin/ models/     the embedder the memory tool drives
     memory/          the store — committed, so it travels with the repo

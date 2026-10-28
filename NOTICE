@@ -10,11 +10,11 @@ What is carried across from Strata, and what is not:
 
   docs/BENCH_NOISE.md     written on the Strata checkout 2026-10-xx, ours. The measurement floor
                           Shadow holds itself to: 10.1% median, 27.0% p90, 51.9% worst.
-  docs/SPEED_BRANCH.md    ours (Andre and a3k6g). Every number in it was measured on Strata
+  docs/history/SPEED_BRANCH.md ours (Andre and a3k6g). Every number in it was measured on Strata
                           hardware and is quoted as measured there, not re-claimed here.
-  docs/RUST_HOST.md       ours. The decision about where the seam goes.
-  docs/RUST_ENGINE.md     ours. The order the hybrid work was walked in (M1-M8).
-  docs/RUST_ENGINE_NEXT.md ours. What was left of that.
+  docs/history/RUST_HOST.md ours. The decision about where the seam goes.
+  docs/history/RUST_ENGINE.md ours. The order the hybrid work was walked in (M1-M8).
+  docs/history/RUST_ENGINE_NEXT.md ours. What was left of that.
   docs/SHADOW_PLAN.md     ours. The plan for this project, written 2026-10-25.
   tools/shadow_harness.py ours (was tools/pi_harness.py on the Strata checkout).
 
