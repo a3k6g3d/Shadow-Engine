@@ -3,16 +3,17 @@
 An engine for running Qwen3.8-Flash-Next mixture-of-experts models, built mainly in Rust.
 
 **Based on [Strata](https://github.com/Niko1221/strata)** by Niko1221 and the Strata contributors, MIT licensed —
-see [LICENSE](LICENSE) and [NOTICE](NOTICE). Shadow keeps that license, keeps the upstream notice, and copies no
-Strata source code: what came across is the plan, the measurements, the seam's contract and the harness, all of
-which were written by us on a Strata checkout.
+see [LICENSE](LICENSE) and [NOTICE](NOTICE). Shadow keeps that license and the upstream notice. It is not a copy
+of Strata: its engine is its own. It does borrow parts, from Strata and from other projects, where they make Shadow
+better, faster or more efficient, and [NOTICE](NOTICE) lists each one and where it came from.
 
 ## What it is
 
 The plan is in [docs/SHADOW_PLAN.md](docs/SHADOW_PLAN.md), rewritten 2026-10-26. The short version:
 
-- **Shadow is its own engine, start to finish.** A Rust host, CUDA kernels we write ourselves, and nothing from
-  Strata at build time or at run time: no source, no binary, no tool, no file format. The only input is the GGUF.
+- **Shadow is its own engine, start to finish.** A Rust host and CUDA kernels we write ourselves; the engine is not
+  Strata's. Borrowed parts are welcome when they earn their place (the optional MTP draft head is one), and each is
+  credited in NOTICE. The only required input is the GGUF.
 - **The kernels are CUDA C++ source in this repo, compiled at run time by NVRTC** for whatever GPU is present, cached
   as CUBIN, and launched through the CUDA driver API (`nvcuda.dll`), hand-bound with no bindgen and no bindings
   crate. `cargo build` is the whole build: no nvcc, no CMake, no CUDA toolkit needed to compile Shadow.

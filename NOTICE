@@ -18,7 +18,13 @@ What is carried across from Strata, and what is not:
   docs/SHADOW_PLAN.md     ours. The plan for this project, written 2026-10-25.
   tools/shadow_harness.py ours (was tools/pi_harness.py on the Strata checkout).
 
-From other projects, and not from Strata:
+Borrowed from Strata, used as is:
+
+  models/mtp-basalt-ft1   the MTP draft head (dense.bin, experts.bin, draft_vocab.bin), trained
+                          on the Strata side. Optional: loaded only with `--mtp DIR`. Shadow's
+                          loader for it, crates/shadow-cuda/src/mtp.rs, is ours.
+
+From other projects:
 
   crates/shadow-model/src/quant_tables.rs
                           the IQ quant formats' lookup tables (grids, sign patterns, IQ4_NL
@@ -30,10 +36,10 @@ From other projects, and not from Strata:
                           implementation (Hugging Face transformers, models/qwen4_exp, Apache-2.0)
                           and llama.cpp's conversion/qwen4exp.py (MIT). Read, not copied.
 
-No source code from Strata itself has been copied into this project. Strata's engine is
-C++/CUDA/HIP and 1% of it is ours; nothing of it is here. What is here is the plan, the
-measurements and the harness - all of which were written by us on a
-Strata checkout, and all of which are MIT for the same reason Strata is.
+No source code from Strata's engine has been copied into this project; Shadow's engine is
+its own. What came across is the plan, the measurements and the harness (all written by us on
+a Strata checkout) and the borrowed parts listed above, all MIT for the same reason Strata is.
+Shadow borrows from Strata and other projects where it helps, and lists each borrowing here.
 
 The model this is built to run - Qwen3.8-Flash-Next, abliterated, IQ3_S - is not part of
 this repository and is not covered by this license.
