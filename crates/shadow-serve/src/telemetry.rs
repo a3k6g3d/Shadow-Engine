@@ -65,6 +65,9 @@ pub struct NvmlGpu {
     device: *mut std::ffi::c_void,
     get_utilization: Option<unsafe extern "C" fn(*mut std::ffi::c_void, *mut NvmlUtilization) -> i32>,
     get_temperature: Option<unsafe extern "C" fn(*mut std::ffi::c_void, u32, *mut u32) -> i32>,
+    /// nvmlDeviceGetMemoryInfo: (total, free, used) bytes - the whole device, whoever holds it.
+    get_memory: Option<unsafe extern "C" fn(*mut std::ffi::c_void, *mut [u64; 3]) -> i32>,
+    get_name: Option<unsafe extern "C" fn(*mut std::ffi::c_void, *mut std::ffi::c_char, u32) -> i32>,
     _dylib: Option<shadow_cuda::dylib::Dylib>,
 }
 
@@ -92,6 +95,10 @@ impl NvmlGpu {
                     .map(|p| unsafe { std::mem::transmute(p) });
                 let get_temperature: Option<unsafe extern "C" fn(*mut std::ffi::c_void, u32, *mut u32) -> i32> = lib.sym("nvmlDeviceGetTemperature")
                     .map(|p| unsafe { std::mem::transmute(p) });
+                let get_memory: Option<unsafe extern "C" fn(*mut std::ffi::c_void, *mut [u64; 3]) -> i32> = lib.sym("nvmlDeviceGetMemoryInfo")
+                    .map(|p| unsafe { std::mem::transmute(p) });
+                let get_name: Option<unsafe extern "C" fn(*mut std::ffi::c_void, *mut std::ffi::c_char, u32) -> i32> = lib.sym("nvmlDeviceGetName")
+                    .map(|p| unsafe { std::mem::transmute(p) });
 
                 if let (Some(init_fn), Some(handle_fn)) = (init, get_handle) {
                     if unsafe { init_fn() } == 0 {
@@ -101,6 +108,8 @@ impl NvmlGpu {
                                 device: dev,
                                 get_utilization,
                                 get_temperature,
+                                get_memory,
+                                get_name,
                                 _dylib: Some(lib),
                             };
                         }
@@ -112,8 +121,30 @@ impl NvmlGpu {
             device: std::ptr::null_mut(),
             get_utilization: None,
             get_temperature: None,
+            get_memory: None,
+            get_name: None,
             _dylib: None,
         }
+    }
+
+    /// The device's (total, free) memory in bytes, if NVML answers.
+    pub fn memory(&self) -> Option<(u64, u64)> {
+        let f = self.get_memory.filter(|_| !self.device.is_null())?;
+        let mut m = [0u64; 3];
+        // SAFETY: nvmlMemory_t is three u64s (total, free, used); the device handle came from NVML.
+        (unsafe { f(self.device, &mut m) } == 0).then_some((m[0], m[1]))
+    }
+
+    /// The device's name, if NVML answers.
+    pub fn name(&self) -> Option<String> {
+        let f = self.get_name.filter(|_| !self.device.is_null())?;
+        let mut b = [0 as std::ffi::c_char; 96];
+        // SAFETY: NVML writes a NUL-terminated name of at most len bytes into b.
+        if unsafe { f(self.device, b.as_mut_ptr(), b.len() as u32) } != 0 {
+            return None;
+        }
+        // SAFETY: b is NUL-terminated (NVML's contract, and the buffer was zeroed).
+        Some(unsafe { std::ffi::CStr::from_ptr(b.as_ptr()) }.to_string_lossy().into_owned())
     }
 
     pub fn sample(&self) -> (f64, f64, u32) {
@@ -295,7 +326,13 @@ impl TelemetryService {
 
         let used_ram = total_ram.saturating_sub(avail_ram);
         let cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
-        let vram_used = s.vram_total.saturating_sub(s.vram_free);
+        // the session's numbers once it is up; NVML's for the whole device before that (while the model loads)
+        let (vram_total, vram_free) = match (s.vram_total, self.nvml.memory()) {
+            (0, Some((t, f))) => (t as usize, f as usize),
+            _ => (s.vram_total, s.vram_free),
+        };
+        let gpu_name = if s.gpu_name.is_empty() { self.nvml.name().unwrap_or_default() } else { s.gpu_name.clone() };
+        let vram_used = vram_total.saturating_sub(vram_free);
         let hit_rate = if s.vram_hits + s.vram_misses > 0 {
             (s.vram_hits as f64 / (s.vram_hits + s.vram_misses) as f64) * 100.0
         } else {
@@ -328,12 +365,12 @@ impl TelemetryService {
                 "file_served_misses": s.file_served
             },
             "gpu": {
-                "name": s.gpu_name,
+                "name": gpu_name,
                 "utilization_percent": (gpu_pct * 10.0).round() / 10.0,
                 "memory_controller_percent": (gpu_mem_pct * 10.0).round() / 10.0,
                 "temperature_c": gpu_temp,
-                "vram_total_bytes": s.vram_total,
-                "vram_free_bytes": s.vram_free,
+                "vram_total_bytes": vram_total,
+                "vram_free_bytes": vram_free,
                 "vram_used_bytes": vram_used,
                 "expert_cache_slots": s.vram_slots,
                 "expert_cache_hits": s.vram_hits,
@@ -353,7 +390,9 @@ impl TelemetryService {
                 "cached_tokens": s.cached_tokens,
                 "completion_tokens": s.completion_tokens,
                 "requests": s.requests,
-                "mtp_active": s.mtp_active
+                "mtp_active": s.mtp_active,
+                "prefill_done": crate::engine::PREFILL.0.load(std::sync::atomic::Ordering::Relaxed),
+                "prefill_total": crate::engine::PREFILL.1.load(std::sync::atomic::Ordering::Relaxed)
             }
         })
     }

@@ -72,6 +72,11 @@ pub struct Status {
     pub mtp_active: bool,
 }
 
+/// Prompt-reading progress of the request being answered, (tokens read, tokens to read): the UI shows it while the
+/// prompt is read one token at a time, which is most of the wait on a long prompt.
+pub static PREFILL: (std::sync::atomic::AtomicUsize, std::sync::atomic::AtomicUsize) =
+    (std::sync::atomic::AtomicUsize::new(0), std::sync::atomic::AtomicUsize::new(0));
+
 pub struct Config {
     pub model: PathBuf,
     pub n_ctx: usize,
@@ -218,12 +223,17 @@ fn answer(arch: &str, req: &Request, tok: &Tokenizer, sess: &mut GpuSession, las
         0
     };
     let unread = &ids[cached..];
+    use std::sync::atomic::Ordering::Relaxed;
+    PREFILL.0.store(0, Relaxed);
+    PREFILL.1.store(unread.len(), Relaxed);
     if let Some((&last, pfx)) = unread.split_last() {
-        for &id in pfx {
+        for (i, &id) in pfx.iter().enumerate() {
             sess.step_prefill(id);
+            PREFILL.0.store(i + 1, Relaxed);
         }
         *last_logits = sess.step(last);
     }
+    PREFILL.0.store(unread.len(), Relaxed);
     let prompt_ms = t0.elapsed().as_secs_f64() * 1e3;
 
     let t1 = Instant::now();

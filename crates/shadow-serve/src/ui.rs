@@ -28,7 +28,7 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Shadow - Sovereign Local Inference & Agent</title>
+  <title>Shadow</title>
   <style>
     :root {
       --bg: #090a0f;
@@ -148,6 +148,24 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
     }
     .pill.ready { border-color: rgba(16, 185, 129, 0.4); color: var(--success); }
     .pill.busy { border-color: rgba(245, 158, 11, 0.4); color: var(--warning); }
+    .pill.loading { border-color: rgba(99, 102, 241, 0.45); color: #a5b4fc; }
+    .pill.offline { border-color: rgba(239, 68, 68, 0.45); color: var(--danger); }
+    .welcome { display: flex; flex-direction: column; gap: 14px; }
+    .welcome h2 { margin: 0; font-size: 1.05rem; font-weight: 600; }
+    .welcome p { margin: 0; opacity: 0.8; }
+    .chips { display: flex; flex-wrap: wrap; gap: 8px; }
+    .chip { background: rgba(255,255,255,0.04); border: 1px solid rgba(255,255,255,0.1); color: inherit; border-radius: 999px;
+            padding: 6px 12px; font: inherit; font-size: 0.85rem; cursor: pointer; }
+    .chip:hover { border-color: rgba(99, 102, 241, 0.6); background: rgba(99, 102, 241, 0.12); }
+    .msg-error { color: var(--danger); }
+    .bubble ul, .bubble ol { margin: 4px 0 4px 1.3em; padding: 0; }
+    .bubble li { margin: 2px 0; }
+    .md-gap { height: 0.6em; }
+    .md-h { font-weight: 600; margin: 6px 0 2px; }
+    .md-h1 { font-size: 1.15rem; } .md-h2 { font-size: 1.05rem; }
+    .reading-note { opacity: 0.65; font-size: 0.88rem; margin-right: 6px; }
+    .msg-error small { display: block; opacity: 0.7; margin-top: 4px; }
+    #send-btn:disabled { opacity: 0.45; cursor: not-allowed; }
 
     .main-wrap {
       flex: 1;
@@ -859,15 +877,21 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
       <div id="messages">
         <div class="msg-row assistant">
           <div class="avatar">S</div>
-          <div class="bubble">
-            Hello! I am Shadow, running sovereignly on your Windows machine with native tool orchestration. You can ask me to inspect code, search past sessions in <code>J:\Strata-work\sessions</code>, or run PowerShell tests.
+          <div class="bubble welcome" id="welcome">
+            <h2>Shadow is running locally on this PC.</h2>
+            <p>Ask anything. With Windows Tools on, it can read and search files, edit them and run commands; it asks the model, never the cloud.</p>
+            <div class="chips">
+              <button class="chip" onclick="useSuggestion(this)">Explain what a hash table is, briefly</button>
+              <button class="chip" onclick="useSuggestion(this)">List the files in J:\Shadow\docs</button>
+              <button class="chip" onclick="useSuggestion(this)">Write a Rust function that parses comma-separated integers</button>
+            </div>
           </div>
         </div>
       </div>
 
       <div id="input-pane">
         <div class="input-box">
-          <textarea id="prompt-input" rows="1" placeholder="Ask Shadow to inspect files, run tests, or chat... (Shift+Enter for newline)"></textarea>
+          <textarea id="prompt-input" rows="1" placeholder="Message Shadow (Enter to send, Shift+Enter for a new line)"></textarea>
           <button id="send-btn" class="send-btn">Send</button>
           <button id="stop-btn" class="stop-btn" onclick="stopGeneration(event)">
             <span>⏹</span> Stop
@@ -1043,7 +1067,7 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
             <div class="stat-row"><span>Uptime</span><strong id="engine-uptime-txt">--</strong></div>
             <div class="stat-row"><span>Total Requests</span><strong id="engine-requests-txt">0</strong></div>
             <div class="stat-row"><span>Tokens Generated</span><strong id="engine-tokens-txt">0</strong></div>
-            <div class="stat-row"><span>Speculative Decoding</span><strong id="engine-mtp-txt" style="color:var(--success);">Active (MTP Tuned Head)</strong></div>
+            <div class="stat-row"><span>Speculative Decoding</span><strong id="engine-mtp-txt">--</strong></div>
             <div class="stat-row"><span>Queued Requests</span><strong id="engine-queue-txt">0</strong></div>
           </div>
         </div>
@@ -1316,14 +1340,38 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
       }[m]));
     }
 
+    // A small Markdown subset, escape-first: everything the model wrote is HTML-escaped before any tag is added, so model
+    // output can never inject markup.  Fenced code, inline code, bold, italics, headings, bullet and numbered lists.
     function renderMarkdown(raw) {
-      let html = raw.replace(/```(\w*)\n([\s\S]*?)```/g, (_, lang, code) => {
-        return `<pre><button class="copy-btn" onclick="navigator.clipboard.writeText(this.nextElementSibling.innerText)">Copy</button><code>${escapeHtml(code.trim())}</code></pre>`;
+      const blocks = [];
+      let text = raw.replace(/```(\w*)\n?([\s\S]*?)(```|$)/g, (_, lang, code) => {
+        blocks.push(`<pre><button class="copy-btn" onclick="navigator.clipboard.writeText(this.nextElementSibling.innerText)">Copy</button><code>${escapeHtml(code.replace(/\n$/, ''))}</code></pre>`);
+        return `\u0000${blocks.length - 1}\u0000`;
       });
-      html = html.replace(/`([^`]+)`/g, (_, c) => `<code>${escapeHtml(c)}</code>`);
-      html = html.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>');
-      html = html.replace(/\n/g, '<br>');
-      return html;
+      const inline = (t) => escapeHtml(t)
+        .replace(/`([^`]+)`/g, '<code>$1</code>')
+        .replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>')
+        .replace(/(^|[^*\w])\*([^*\s][^*]*)\*(?!\w)/g, '$1<em>$2</em>');
+      const out = [];
+      let list = null; // 'ul' | 'ol'
+      const close = () => { if (list) { out.push(`</${list}>`); list = null; } };
+      for (const line of text.split('\n')) {
+        let m;
+        if ((m = line.match(/^\u0000(\d+)\u0000$/))) { close(); out.push(blocks[+m[1]]); continue; }
+        if ((m = line.match(/^(#{1,4})\s+(.*)$/))) { close(); out.push(`<div class="md-h md-h${m[1].length}">${inline(m[2])}</div>`); continue; }
+        if ((m = line.match(/^\s*[-*]\s+(.*)$/))) {
+          if (list !== 'ul') { close(); out.push('<ul>'); list = 'ul'; }
+          out.push(`<li>${inline(m[1])}</li>`); continue;
+        }
+        if ((m = line.match(/^\s*(\d+)[.)]\s+(.*)$/))) {
+          if (list !== 'ol') { close(); out.push(`<ol start="${m[1]}">`); list = 'ol'; }
+          out.push(`<li>${inline(m[2])}</li>`); continue;
+        }
+        close();
+        out.push(line.trim() === '' ? '<div class="md-gap"></div>' : `<div>${inline(line).replace(/\u0000(\d+)\u0000/g, (_, k) => blocks[+k])}</div>`);
+      }
+      close();
+      return out.join('');
     }
 
     // Tool Call parser for <tool_call><function=name><parameter=k>v</parameter>...</function></tool_call>
@@ -1367,9 +1415,34 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
     }
 
     // Send Message with Agent Tool Orchestration Loop
+    function useSuggestion(el) {
+      inputEl.value = el.textContent;
+      inputEl.dispatchEvent(new Event('input'));
+      inputEl.focus();
+    }
+
+    // The server's model state from /v1/telemetry: 'loading' until the weights are in, then 'ready'.
+    let modelState = 'loading';
+
+    // An HTTP error body as a sentence a person can act on.
+    function friendlyError(status, body) {
+      let msg = body;
+      try { msg = JSON.parse(body).error.message || body; } catch (_) {}
+      if (status === 503 && /loading/i.test(msg)) return ['Shadow is still loading the model.', 'Try again when the status says Ready.'];
+      if (status === 413 || /context|too long|positions/i.test(msg)) return ['The conversation is longer than the context window.', msg];
+      return [`The server answered ${status}.`, msg];
+    }
+
     async function sendMessage() {
       const text = inputEl.value.trim();
       if (!text || isGenerating) return;
+      if (modelState === 'loading') {
+        timingInfo.textContent = 'The model is still loading - your message is still in the box.';
+        return;
+      }
+      const welcome = document.getElementById('welcome');
+      if (welcome) welcome.closest('.msg-row').remove();
+      let failed = false;
 
       isGenerating = true;
       sendBtn.style.display = 'none';
@@ -1413,7 +1486,7 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
               </div>
               <div class="think-content"></div>
             </div>
-            <div class="msg-content"><span class="cursor-blink"></span></div>
+            <div class="msg-content"><span class="reading-note">Reading your message...</span><span class="cursor-blink"></span></div>
           </div>`;
         messagesEl.appendChild(asstRow);
         messagesEl.scrollTop = messagesEl.scrollHeight;
@@ -1453,8 +1526,9 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
           });
 
           if (!response.ok) {
-            const err = await response.text();
-            msgContent.innerHTML = `<span style="color:var(--danger);">Error: ${escapeHtml(err)}</span>`;
+            const [head, detail] = friendlyError(response.status, await response.text());
+            msgContent.innerHTML = `<div class="msg-error">${escapeHtml(head)}<small>${escapeHtml(detail)}</small></div>`;
+            failed = true;
             break;
           }
 
@@ -1484,6 +1558,8 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
                       isThinking = true;
                       thinkStart = performance.now();
                       thinkBlock.style.display = 'block';
+                      const rn = msgContent.querySelector('.reading-note');
+                      if (rn) rn.remove();
                     }
                     rawThinking += delta.reasoning_content;
                     thinkContent.textContent = rawThinking;
@@ -1587,13 +1663,16 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
             history.push({ role: 'assistant', content: rawContent });
             break;
           }
-          msgContent.innerHTML = `<span style="color:var(--danger);">Connection error: ${escapeHtml(err.message)}</span>`;
+          msgContent.innerHTML = `<div class="msg-error">Lost the connection to the server.<small>${escapeHtml(err.message)} - is shadow serve still running?</small></div>`;
+          failed = true;
           break;
         }
       }
 
       const dt = (performance.now() - t0) / 1000;
-      if (timingInfo.textContent !== 'Generation stopped by user') {
+      if (failed) {
+        timingInfo.textContent = 'Failed - nothing was generated';
+      } else if (timingInfo.textContent !== 'Generation stopped by user') {
         timingInfo.textContent = `Completed in ${dt.toFixed(2)}s`;
       }
       isGenerating = false;
@@ -1635,8 +1714,25 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
 
         // Header pills
         if (d.process) {
-          statusPill.textContent = d.process.busy ? 'Busy' : 'Ready';
-          statusPill.className = 'pill ' + (d.process.busy ? 'busy' : 'ready');
+          // while the prompt is read (no token yet), say how far along it is
+          const note = document.querySelector('#messages .msg-row.assistant:last-child .reading-note');
+          if (note && isGenerating && d.process.prefill_total > 0) {
+            const left = d.process.prefill_total - d.process.prefill_done;
+            note.textContent = left > 0
+              ? `Reading your message: ${d.process.prefill_done} / ${d.process.prefill_total} tokens...`
+              : 'Thinking...';
+          }
+          modelState = d.process.state === 'loading' ? 'loading' : 'ready';
+          const [label, cls] = modelState === 'loading' ? ['Loading model...', 'loading']
+            : d.process.busy ? ['Generating', 'busy'] : ['Ready', 'ready'];
+          statusPill.textContent = label;
+          statusPill.className = 'pill ' + cls;
+          if (!isGenerating) {
+            sendBtn.disabled = modelState === 'loading';
+            inputEl.placeholder = modelState === 'loading'
+              ? 'Shadow is loading the model - you can type, sending opens when it is ready'
+              : 'Message Shadow (Enter to send, Shift+Enter for a new line)';
+          }
           if (d.process.tok_per_sec > 0) {
             speedPill.innerHTML = `Speed: <strong>${d.process.tok_per_sec.toFixed(1)} tok/s</strong>`;
           }
@@ -1721,11 +1817,12 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
           setTxt('engine-uptime-txt', `${mins}m ${secs}s`);
           setTxt('engine-requests-txt', d.process.requests.toLocaleString());
           setTxt('engine-tokens-txt', d.process.completion_tokens.toLocaleString());
-          setTxt('engine-mtp-txt', d.process.mtp_active ? 'Active (MTP Speculative)' : 'Disabled');
+          setTxt('engine-mtp-txt', d.process.mtp_active ? 'MTP head loaded (experimental)' : 'Off');
           setTxt('engine-queue-txt', d.process.queued);
         }
       } catch (err) {
-        console.error('telemetry poll error:', err);
+        statusPill.textContent = 'Server offline';
+        statusPill.className = 'pill offline';
       }
     }
 
