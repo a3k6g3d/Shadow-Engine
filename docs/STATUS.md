@@ -565,3 +565,18 @@ Single-prompt runs, "Write a Rust function that parses a comma separated list...
   step here. Fixing all of those lands near break-even, not near Strata's +135%: Strata's gain comes with its
   inexact tail skipping (missed rank >= 7 experts not computed in a verify window), which shrinks each position's
   expert traffic. `--mtp --spec K` stays opt-in at about -10%.
+
+## 2026-10-29: `--tail-skip R` (opt-in, inexact) and other engines
+
+- **Other engines on this PC, same bench:** Strata 48.5 tok/s, Strata with `STRATA_ROUTE_TAIL_SKIP=0` **36.6**
+  (-25.7% paired, `bench/strata-skip-2026-10-28`: the skip is a quarter of its speed, not most of its lead), llama.cpp
+  from Strata's fork (`llama-server`, `-ngl 99 --n-cpu-moe 43`, CPU experts from the mmapped file: the 78 GB model does
+  not fit 64 GB of RAM) **12.8** (16 threads and flash attention the same).
+- **`--tail-skip R`** (Strata's rule, from its `expert_source.cpp`): in a decode step, and over a whole verify pass,
+  a routed expert not in VRAM that every token routes only at 0-based rank >= R is neither copied nor computed; its
+  contribution is zero and the others keep their router weights. The first version garbled every answer: when a token
+  kept fewer than 10 experts, the overlapped combine read the shared expert from row n instead of row 10. Fixed.
+  Quality (`shadow ppl`, new: teacher-forced perplexity one token at a time, the 1,262-token ARCH.md text): exact
+  **6.550**, R=7 6.600 (+0.8%), R=5 6.790 (+3.7%), R=4 7.113 (+8.6%), R=3 7.224 (+10.3%); argmax = next token 57.6-58.6%
+  throughout. Speed (`bench/tail-2026-10-28`, 8 interleaved launches): exact 21.32, **R=7 24.45 (+15.9% paired), R=5
+  27.78 (+29.8%), R=4 29.40 (+36.0%)**; every pair faster. Off by default.
