@@ -7,3 +7,4 @@ __pycache__/
 .env
 .venv-ref/
 models/mtp-basalt-ft1/*.bin
+/target-*/

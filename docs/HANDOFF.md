@@ -73,11 +73,21 @@ them changes the prompt; the fixture records the ids, so it stays valid as a fix
     (`--cpu-experts`) and pre-gated prefetch (`--pregate`) built, exact, and both measured as losses or ties; kept
     opt-in. Default-on and exact: mapped router reads, mapped staging for small uploads, `Gguf::tensor` index, top-k by
     insertion. `matvec_cols_*` + `dotm<M>`: bit-identical multi-input matvecs, the first piece of batched forward.
-  - **Next, in order:** (1) row-tiled `matvec_cols` for the big K-quant matrices; (2) a layer-major batched step
-    (`step_batch(&[u32])`): dense matvecs through `matvec_cols`, per-token mixer kernels, one MoE pass over the union
-    of the batch's experts; gate it on prefill against token-by-token (identical logits) - prefill is 0.059 s/token
-    today; (3) DeltaNet/conv/PLE state snapshots so a verify pass can roll back; (4) only then a drafter, with
-    adaptive draft length from the measured union cost.
+  - 2026-10-28: `matvec_cols` is fast (5.6-6.8x for 8 inputs on the big matrices, bit-identical); session
+    snapshots (`snapshot`/`snapshot_to`/`restore`, bit-exact) and the server's shared-prefix cache (new chats with the
+    same system prompt + tools: ~60 s -> ~1 s); web UI fixes.
+  - **Next: the batched step**, `GpuSession::step_batch(&[u32]) -> logits per token` (m <= 8), layer-major. Per layer:
+    the mixer's input projections for all m tokens through `matvec_cols` (inputs/outputs laid out [m][dim]); the
+    sequential parts (`delta_step` recurrence, conv window, KV write, attention over positions <= its own) per token
+    in order; the output projection through `matvec_cols`; hc glue per token (small kernels); the router for all m
+    through `matvec_cols`, one download of m x 512 logits; one fetch of the union of the m tokens' experts; the routed
+    expert matvecs per token (or `matvec_batch` over (token, expert) pairs); combine per token. Gate: prefill of a
+    prompt through `step_batch` in chunks of 8 gives bit-identical last-token logits... or within the f32 sum-order
+    noise of the token-by-token path (the cols kernels are bit-identical per input, so aim for identical). Then use it
+    for prefill in `shadow serve` (today 0.059 s/token), measure, and only then speculative decoding: draft (MTP head
+    or n-gram), `snapshot(false)` before the verify pass, `step_batch(draft)`, keep the accepted prefix, `restore` +
+    re-step on rejection (or restore and replay the accepted tokens), with the draft length chosen from the measured
+    union cost (`tools/spec_probe.py`).
 - Cleanup done (0.1.4): `shadow-abi`, `include/shadow/c/abi.h`, `shadow-host/src/ffi.rs` and `protocol.rs` are
   removed. Still owed: copy the model under `J:\\Shadow\\models\\` and record its SHA-256 (the plan
   says the model file is the only input; it is still read from `J:\Strata-work\models\swift15\IQ3_S\`).
