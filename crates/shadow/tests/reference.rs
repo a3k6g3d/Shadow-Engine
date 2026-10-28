@@ -188,3 +188,61 @@ fn flint_gpu_session_matches_the_reference() {
     let r = shadow::reference::compare_stepper(&mut s, &fx);
     assert_exact(&r, "flint gpu session", 5e-3);
 }
+
+/// `GpuSession::snapshot` / `restore`, the rollback a speculative pass needs and the prefix a new chat reuses: after
+/// a prefix, a snapshot; then other tokens; then the restore and one more token must give exactly the logits a session
+/// that only ever saw the prefix gives.  Without the KV (rollback: the prefix positions untouched) and with it (after a
+/// reset and a different prompt overwrote them).
+#[test]
+fn a_restored_snapshot_continues_exactly() {
+    let p = std::env::var("SHADOW_MODEL").unwrap_or_else(|_| MODEL.into());
+    if !Path::new(&p).is_file() {
+        return eprintln!("SKIPPED, not passed: no model at {p}");
+    }
+    let Ok(ctx) = shadow_cuda::Context::new(0) else { return eprintln!("SKIPPED, not passed: no CUDA device") };
+    let model = Model::load(Gguf::open(Path::new(&p)).unwrap()).unwrap();
+    let prefix: Vec<u32> = vec![760, 6722, 314, 9338, 369, 11751, 13, 576, 6722, 314, 9294, 369];
+    let (next, other) = (13u32, [1059u32, 2101, 77, 4096, 512, 9]);
+    let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<u32>>();
+
+    let mut fresh = shadow_cuda::session::GpuSession::new(&ctx, &model, 4096).unwrap();
+    for &t in &prefix {
+        fresh.step_prefill(t);
+    }
+    let want = bits(&fresh.step(next));
+    drop(fresh);
+
+    let mut s = shadow_cuda::session::GpuSession::new(&ctx, &model, 4096).unwrap();
+    for &t in &prefix {
+        s.step_prefill(t);
+    }
+    let light = s.snapshot(false).unwrap();
+    let full = s.snapshot(true).unwrap();
+    for &t in &other {
+        s.step_prefill(t);
+    }
+    s.restore(&light).unwrap();
+    assert_eq!(s.tokens(), &prefix[..]);
+    assert!(bits(&s.step(next)) == want, "rolled back without KV: the logits moved");
+
+    s.reset();
+    for &t in other.iter().chain(&other) {
+        s.step_prefill(t);
+    }
+    assert!(s.restore(&light).is_err(), "a KV-less snapshot must refuse a session that moved off its tokens");
+    s.restore(&full).unwrap();
+    assert!(bits(&s.step(next)) == want, "restored with KV after a different prompt: the logits moved");
+
+    // the same through host memory (what the server keeps a shared prompt prefix in)
+    s.reset();
+    for &t in &prefix {
+        s.step_prefill(t);
+    }
+    let host = s.snapshot_to(true, true).unwrap();
+    s.reset();
+    for &t in &other {
+        s.step_prefill(t);
+    }
+    s.restore(&host).unwrap();
+    assert!(bits(&s.step(next)) == want, "restored from host memory: the logits moved");
+}

@@ -213,6 +213,69 @@ struct Prefetch<'c> {
 /// The mapped staging region for small uploads (`GpuSession::upload_to`).
 const STAGE_BYTES: usize = 4 << 20;
 
+/// A session's state at a token boundary (`GpuSession::snapshot`).
+pub struct Snapshot<'c> {
+    tokens: Vec<u32>,
+    delta: Vec<Option<(Saved<'c>, Saved<'c>)>>,
+    ple: Saved<'c>,
+    kv: Vec<Option<SnapKv<'c>>>,
+    nblocks: Vec<usize>,
+}
+
+struct SnapKv<'c> {
+    k: Saved<'c>,
+    v: Saved<'c>,
+    raw: Saved<'c>,
+    blocks: Saved<'c>,
+    nblocks: usize,
+}
+
+/// The first bytes of a device buffer, kept on the device (fast, costs VRAM) or in host memory (costs a PCIe trip).
+enum Saved<'c> {
+    Dev(DeviceBuffer<'c>, usize),
+    Host(Vec<u8>),
+}
+
+impl<'c> Saved<'c> {
+    fn take(ctx: &'c Context, b: &DeviceBuffer<'c>, bytes: usize, host: bool) -> Result<Saved<'c>, String> {
+        let e = |x: crate::driver::CudaError| x.to_string();
+        if host {
+            let mut v = vec![0u8; bytes];
+            if bytes > 0 {
+                b.download(&mut v).map_err(e)?;
+            }
+            Ok(Saved::Host(v))
+        } else {
+            let d = ctx.alloc(bytes.max(4)).map_err(e)?;
+            d.copy_prefix_from(b, bytes).map_err(e)?;
+            Ok(Saved::Dev(d, bytes))
+        }
+    }
+
+    fn put(&self, b: &DeviceBuffer<'c>) -> Result<(), String> {
+        let e = |x: crate::driver::CudaError| x.to_string();
+        match self {
+            Saved::Dev(d, n) => b.copy_prefix_from(d, *n).map_err(e),
+            Saved::Host(v) if v.is_empty() => Ok(()),
+            Saved::Host(v) => b.upload(v).map_err(e),
+        }
+    }
+
+    fn len(&self) -> usize {
+        match self {
+            Saved::Dev(_, n) => *n,
+            Saved::Host(v) => v.len(),
+        }
+    }
+}
+
+impl Snapshot<'_> {
+    /// The tokens the snapshot was taken after.
+    pub fn tokens(&self) -> &[u32] {
+        &self.tokens
+    }
+}
+
 /// An expert to read from the file into pinned memory and then copy to `dst`: into `RamTier`'s region at `off` when
 /// `ring`, else into the staging buffer at `off`.
 struct PendingRead {
@@ -821,6 +884,80 @@ impl<'c, 'm> GpuSession<'c, 'm> {
         }
         self.ple_state.zero().unwrap();
         self.tokens.clear();
+    }
+
+    /// The session's state after its first `tokens().len()` tokens, on the device: every DeltaNet state and conv
+    /// window, the n-gram conv state, and - with `with_kv` - each attention layer's keys, values and indexer keys up to
+    /// that position.  Without the KV it can only be restored onto a session whose first positions are still the same
+    /// tokens (a speculative pass rolled back); with it, onto any (a shared prompt prefix, reused by a new chat).
+    pub fn snapshot(&self, with_kv: bool) -> Result<Snapshot<'c>, String> {
+        self.snapshot_to(with_kv, false)
+    }
+
+    /// `snapshot`, kept in host memory (`host`) or on the device.
+    pub fn snapshot_to(&self, with_kv: bool, host: bool) -> Result<Snapshot<'c>, String> {
+        let copy = |b: &DeviceBuffer<'c>, bytes: usize| Saved::take(self.ctx, b, bytes, host);
+        let n = self.tokens.len();
+        let c = &self.m.cfg;
+        let kvd = c.n_kv_head * c.head_dim;
+        let mut delta = Vec::with_capacity(self.delta.len());
+        for d in &self.delta {
+            delta.push(match d {
+                Some((s, conv)) => Some((copy(s, s.bytes)?, copy(conv, conv.bytes)?)),
+                None => None,
+            });
+        }
+        let mut kv = Vec::with_capacity(self.attn.len());
+        for a in &self.attn {
+            kv.push(match a.as_ref().filter(|_| with_kv) {
+                Some(a) => {
+                    let id = if a.raw.bytes > 0 { a.raw.bytes / self.cap } else { 0 };
+                    Some(SnapKv {
+                        k: copy(&a.k, n * kvd * 4)?, v: copy(&a.v, n * kvd * 4)?, raw: copy(&a.raw, n * id)?,
+                        blocks: copy(&a.blocks, (a.nblocks * id).min(a.blocks.bytes))?, nblocks: a.nblocks,
+                    })
+                }
+                None => None,
+            });
+        }
+        Ok(Snapshot { tokens: self.tokens.clone(), delta, ple: copy(&self.ple_state, self.ple_state.bytes)?, kv,
+                      nblocks: self.attn.iter().map(|a| a.as_ref().map_or(0, |a| a.nblocks)).collect() })
+    }
+
+    /// Puts the session back to `snap`: the token list, every recurrent state, and the KV prefix if the snapshot has
+    /// it.  Without the KV, the session must still hold the snapshot's tokens as its first positions.
+    pub fn restore(&mut self, snap: &Snapshot<'c>) -> Result<(), String> {
+        let has_kv = snap.kv.iter().any(|k| k.is_some());
+        if !has_kv {
+            let n = snap.tokens.len();
+            if self.tokens.len() < n || self.tokens[..n] != snap.tokens[..] {
+                return Err("restore: this snapshot has no KV and the session no longer starts with its tokens".into());
+            }
+        }
+        for (d, s) in self.delta.iter().zip(&snap.delta) {
+            if let (Some((st, conv)), Some((ss, sc))) = (d, s) {
+                ss.put(st)?;
+                sc.put(conv)?;
+            }
+        }
+        snap.ple.put(&self.ple_state)?;
+        for (l, a) in self.attn.iter_mut().enumerate() {
+            let Some(a) = a.as_mut() else { continue };
+            match &snap.kv[l] {
+                Some(k) => {
+                    for (saved, buf) in [(&k.k, &a.k), (&k.v, &a.v), (&k.raw, &a.raw), (&k.blocks, &a.blocks)] {
+                        if saved.len() > buf.bytes {
+                            return Err("restore: the snapshot is from a session with a larger context".into());
+                        }
+                        saved.put(buf)?;
+                    }
+                    a.nblocks = k.nblocks;
+                }
+                None => a.nblocks = a.nblocks.min(snap.nblocks[l]),
+            }
+        }
+        self.tokens = snap.tokens.clone();
+        Ok(())
     }
 
     /// One expert's slice of a fused `[in, out, n_expert]` tensor: its info as a 2-D matrix, without reading it.

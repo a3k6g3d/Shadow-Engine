@@ -72,6 +72,7 @@ table! {
     cuMemcpyHtoD: fn(CuDevicePtr, *const c_void, usize) = ["cuMemcpyHtoD_v2"];
     cuMemcpyDtoH: fn(*mut c_void, CuDevicePtr, usize) = ["cuMemcpyDtoH_v2"];
     cuMemcpyHtoDAsync: fn(CuDevicePtr, *const c_void, usize, H) = ["cuMemcpyHtoDAsync_v2"];
+    cuMemcpyDtoD: fn(CuDevicePtr, CuDevicePtr, usize) = ["cuMemcpyDtoD_v2"];
     cuMemcpyDtoHAsync: fn(*mut c_void, CuDevicePtr, usize, H) = ["cuMemcpyDtoHAsync_v2"];
     cuMemsetD8: fn(CuDevicePtr, u8, usize) = ["cuMemsetD8_v2"];
     cuMemHostRegister: fn(*mut c_void, usize, c_uint) = ["cuMemHostRegister_v2"];
@@ -253,6 +254,16 @@ impl DeviceBuffer<'_> {
         assert!(dst.len() <= self.bytes, "download of {} bytes from a {}-byte buffer", dst.len(), self.bytes);
         self.ctx.bind()?;
         call!(self.ctx.api, cuMemcpyDtoH(dst.as_mut_ptr() as *mut c_void, self.ptr, dst.len()))
+    }
+
+    /// The first `bytes` of `src` into the first `bytes` of this buffer, on the device (ordered on the default stream).
+    pub fn copy_prefix_from(&self, src: &DeviceBuffer, bytes: usize) -> Result<(), CudaError> {
+        assert!(bytes <= self.bytes && bytes <= src.bytes, "copy of {bytes} bytes between {} and {}", src.bytes, self.bytes);
+        if bytes == 0 {
+            return Ok(());
+        }
+        self.ctx.bind()?;
+        call!(self.ctx.api, cuMemcpyDtoD(self.ptr, src.ptr, bytes))
     }
 
     pub fn zero(&mut self) -> Result<(), CudaError> {

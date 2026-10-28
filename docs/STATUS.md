@@ -355,3 +355,18 @@ Single-prompt runs, "Write a Rust function that parses a comma separated list...
   10240 x 2560 Q6_K takes 0.06 ms (~360 GB/s); 8 take 0.40 ms, far above the bandwidth or FMA bound, so the kernel is
   limited by something else (register spills from acc[4][8] or occupancy are the first suspects). Profile it before
   building the batched step on it.
+
+## 2026-10-28: session snapshots and the shared-prefix cache
+
+- **`GpuSession::snapshot(with_kv)` / `snapshot_to(with_kv, host)` / `restore`:** every DeltaNet state and conv window,
+  the n-gram conv state, and optionally each attention layer's K, V, indexer keys and pooled blocks up to the current
+  position; on the device (fast, VRAM) or in host memory. Recurrent state is ~117 MiB (36 x 3 MiB + conv), KV 48 KiB a
+  position. Without the KV it only restores onto a session still holding its tokens (a rolled-back speculative pass);
+  with it, onto anything. `tests/reference.rs::a_restored_snapshot_continues_exactly`: bit-identical logits after a
+  rollback, after a full restore over a different prompt, and through host memory.
+- **Shared-prefix cache in `shadow serve`:** when a prompt shares >= 64 leading tokens with the previous request
+  (system prompt + tool list), the session is snapshotted there into host memory while it reads; a later conversation
+  that starts the same way restores it instead of reading those tokens. Live, 861-token prompts with tools: new chats
+  **59.5 s and 56.1 s -> 1.1 s and 1.0 s** (842 tokens restored), identical answers.
+- **Web UI:** model-loading state, live prompt-reading progress, readable errors, escape-first Markdown (it used to put
+  model text into innerHTML unescaped), NVML VRAM while loading. `tools/serve_check.py` 16/16.
