@@ -21,6 +21,9 @@ use shadow_model::placement::{uniform_order, RoutingCounts};
 use shadow_model::quant::dequantize;
 use std::collections::{BTreeMap, HashMap};
 
+#[path = "session_mtp.rs"]
+mod mtp_layer;
+
 struct Attn<'c> {
     k: DeviceBuffer<'c>,
     v: DeviceBuffer<'c>,
@@ -274,6 +277,8 @@ pub struct Snapshot<'c> {
     ple: Saved<'c>,
     kv: Vec<Option<SnapKv<'c>>>,
     nblocks: Vec<usize>,
+    /// The draft layer's pending residual (and with the KV its K/V cells), when the session has one.
+    mtp: Option<(Saved<'c>, bool, Option<(Saved<'c>, Saved<'c>)>)>,
 }
 
 struct SnapKv<'c> {
@@ -921,7 +926,8 @@ impl<'c, 'm> GpuSession<'c, 'm> {
             mtp_probe: std::env::var("SHADOW_MTP_PROBE").is_ok_and(|v| v == "1").then_some((0, 0)),
             mtp,
             graphs: HashMap::new(),
-            graphs_on: std::env::var("SHADOW_GRAPHS").map_or(true, |v| v != "0"),
+            graphs_on: std::env::var("SHADOW_GRAPHS").map_or(true, |v| v != "0")
+                && !std::env::var("SHADOW_KTIME").is_ok_and(|v| v == "1"),
             overlap: std::env::var("SHADOW_OVERLAP").map_or(true, |v| v != "0"),
             gstream: ctx.blocking_stream().map_err(e)?,
             capturing: std::cell::Cell::new(false),
@@ -986,6 +992,9 @@ impl<'c, 'm> GpuSession<'c, 'm> {
         }
         self.ple_state.zero().unwrap();
         self.tokens.clear();
+        if let Some(mt) = self.mtp.as_mut() {
+            mt.pending = false;
+        }
     }
 
     /// The session's state after its first `tokens().len()` tokens, on the device: every DeltaNet state and conv
@@ -1022,8 +1031,16 @@ impl<'c, 'm> GpuSession<'c, 'm> {
                 None => None,
             });
         }
+        let mtp = match self.mtp.as_ref() {
+            Some(mt) => {
+                let kvd = crate::mtp::N_HEAD_KV * crate::mtp::HEAD_DIM * 4;
+                let kv = if with_kv { Some((copy(&mt.bufs.kv_k, n * kvd)?, copy(&mt.bufs.kv_v, n * kvd)?)) } else { None };
+                Some((copy(&mt.bufs.last_r, mt.bufs.last_r.bytes)?, mt.pending, kv))
+            }
+            None => None,
+        };
         Ok(Snapshot { tokens: self.tokens.clone(), delta, ple: copy(&self.ple_state, self.ple_state.bytes)?, kv,
-                      nblocks: self.attn.iter().map(|a| a.as_ref().map_or(0, |a| a.nblocks)).collect() })
+                      nblocks: self.attn.iter().map(|a| a.as_ref().map_or(0, |a| a.nblocks)).collect(), mtp })
     }
 
     /// Takes `snap` again at the current position, into its own buffers: a speculative pass's rollback point, once per
@@ -1031,6 +1048,10 @@ impl<'c, 'm> GpuSession<'c, 'm> {
     pub fn snapshot_again(&self, snap: &mut Snapshot<'c>) -> Result<(), String> {
         let reusable = snap.kv.iter().all(|k| k.is_none()) && snap.delta.len() == self.delta.len()
             && matches!(snap.ple, Saved::Dev(..))
+            && match (&snap.mtp, &self.mtp) {
+                (Some((Saved::Dev(..), _, None)), Some(_)) | (None, None) => true,
+                _ => false,
+            }
             && snap.delta.iter().zip(&self.delta).all(|(s, d)| match (s, d) {
                 (Some((Saved::Dev(a, an), Saved::Dev(b, bn))), Some((st, conv))) => {
                     *an == st.bytes && *bn == conv.bytes && a.bytes >= st.bytes && b.bytes >= conv.bytes
@@ -1054,6 +1075,10 @@ impl<'c, 'm> GpuSession<'c, 'm> {
         }
         snap.tokens.clone_from(&self.tokens);
         snap.nblocks = self.attn.iter().map(|a| a.as_ref().map_or(0, |a| a.nblocks)).collect();
+        if let (Some((Saved::Dev(d, n), pending, _)), Some(mt)) = (snap.mtp.as_mut(), self.mtp.as_ref()) {
+            d.copy_prefix_from(&mt.bufs.last_r, *n).map_err(e)?;
+            *pending = mt.pending;
+        }
         Ok(())
     }
 
@@ -1087,6 +1112,14 @@ impl<'c, 'm> GpuSession<'c, 'm> {
                     a.nblocks = k.nblocks;
                 }
                 None => a.nblocks = a.nblocks.min(snap.nblocks[l]),
+            }
+        }
+        if let (Some(mt), Some((last, pending, kv))) = (self.mtp.as_mut(), snap.mtp.as_ref()) {
+            last.put(&mt.bufs.last_r)?;
+            mt.pending = *pending;
+            if let Some((k, v)) = kv {
+                k.put(&mt.bufs.kv_k)?;
+                v.put(&mt.bufs.kv_v)?;
             }
         }
         self.tokens = snap.tokens.clone();
@@ -1304,42 +1337,9 @@ impl<'c, 'm> GpuSession<'c, 'm> {
     }
 
     // -------------------------------------------------------------------------------------------- the forward pass
-    pub fn step_draft(&mut self, last_token: u32) -> Result<u32, String> {
-        let (pos, r_in) = (self.tokens.len().saturating_sub(1), self.b.r.ptr);
-        let (t_emb, emb_bytes) = self.m.dense("token_embd.weight");
-        let (qk, qb) = t_emb.ty.block().unwrap();
-        let rb = (t_emb.dims[0] / qk * qb) as usize;
-        let mut emb = vec![0f32; self.m.cfg.hidden];
-        shadow_model::quant::dequantize(t_emb.ty, &emb_bytes[last_token as usize * rb..(last_token as usize + 1) * rb], &mut emb)?;
-
-        let (t_out, _) = self.m.dense("output.weight");
-        let out_ty = t_out.ty.name();
-        let out_rows = t_out.dims[1] as usize;
-        let out_ptr = self.w.get("output.weight").unwrap().ptr;
-
-        if let Some(ref mut mtp) = self.mtp {
-            mtp.bufs.en.upload(&f32s(&emb)).map_err(|e| e.to_string())?;
-            mtp.draft_step(
-                &self.mvp,
-                &self.fw,
-                0,
-                &out_ty,
-                self.m.cfg.hidden,
-                out_ptr,
-                &out_ty,
-                out_rows,
-                r_in,
-                last_token,
-                pos,
-            )
-        } else {
-            Err("mtp: draft model is not loaded".into())
-        }
-    }
-
     pub fn step(&mut self, token: u32) -> Vec<f32> {
-        let draft = if self.mtp_probe.is_some() && self.mtp.is_some() && !self.tokens.is_empty() {
-            self.step_draft(token).ok()
+        let draft = if self.mtp_probe.is_some() {
+            self.mtp_draft(token, 1).first().copied()
         } else {
             None
         };
@@ -1381,8 +1381,7 @@ impl<'c, 'm> GpuSession<'c, 'm> {
         self.mark("embedding");
 
         let graphs = self.graphs_on && self.trace.is_none() && self.stop_after.is_none() && self.prof.is_none()
-            && self.cpu.is_none() && self.prefetch.is_none() && self.pregate.is_none() && self.mtp.is_none()
-            && self.cache.slots > 0;
+            && self.cpu.is_none() && self.prefetch.is_none() && self.pregate.is_none() && self.cache.slots > 0;
         let mut rn_ready = false;
         for l in 0..c.n_layer {
             if self.stop_after == Some(l) {
@@ -1432,6 +1431,9 @@ impl<'c, 'm> GpuSession<'c, 'm> {
                 rn_ready = true;
             }
             self.rec(format!("layer{l}.out"), self.b.r.ptr, h * cs);
+        }
+        if self.mtp.is_some() {
+            self.mtp_observe(self.b.r.ptr, &[token], self.tokens.len() - 1);
         }
         if !with_logits {
             return vec![];
@@ -2278,7 +2280,9 @@ impl<'c, 'm> GpuSession<'c, 'm> {
             }
             self.hc_write_batch(Some(&format!("blk.{l}.hc_ffn_norm.weight")), m);
             self.hc_read_batch(&format!("blk.{l}.hc_ffn"), true, true, m);
+            self.mark("batch: mixers, norms, hc glue");
             self.moe_batch(l, m, &mut logs);
+            self.mark("batch: routed experts + combine");
             let next = if l + 1 == c.ple_layer {
                 None
             } else if l + 1 < c.n_layer {
@@ -2291,6 +2295,9 @@ impl<'c, 'm> GpuSession<'c, 'm> {
         }
         if let Some((_, log)) = self.route_log.as_mut() {
             log.extend(logs.into_iter().flatten());
+        }
+        if self.mtp.is_some() {
+            self.mtp_observe(self.bb.r.ptr, toks, p0);
         }
         if !with_logits {
             return vec![];
@@ -2466,6 +2473,7 @@ impl<'c, 'm> GpuSession<'c, 'm> {
         let t_wait = std::time::Instant::now();
         let logits = self.download_mapped(&srcs);
         self.waits[0] += t_wait.elapsed().as_secs_f64();
+        self.mark("batch: router + logits down");
         {
             // the shared expert, on the GPU while the host routes and the copies run
             let bb = &self.bb;
@@ -2553,6 +2561,7 @@ impl<'c, 'm> GpuSession<'c, 'm> {
                 self.copy_stream.synchronize().unwrap();
                 self.waits[1] += t_wait.elapsed().as_secs_f64();
             }
+            self.mark("batch: shared expert + expert fetch");
             for (j, top) in tops.iter().enumerate().take(end).skip(start) {
                 self.routed_qwen(l, j, top, &extra, &infos, &sizes);
             }
@@ -2783,6 +2792,17 @@ impl Stepper for GpuSession<'_, '_> {
             + &self.mtp_probe.map(|(n, hit)| format!("; MTP probe: {hit}/{n} drafts right ({:.1}%)",
                                                        100.0 * hit as f64 / n.max(1) as f64)).unwrap_or_default()
             + if self.mtp.is_some() { "; MTP: active (speculative decoding with tuned basalt head)" } else { "" }
+            + &{
+                let mut kt: Vec<_> = self.mvp.kernel_times().into_iter().chain(self.fw.kernel_times()).collect();
+                kt.sort_by(|a, b| b.1.total_cmp(&a.1));
+                let n = self.tokens.len().max(1) as f64;
+                if kt.is_empty() { String::new() } else {
+                    let total: f64 = kt.iter().map(|k| k.1).sum();
+                    format!("
+  GPU kernel time per token {:.2} ms: {}", total / n, kt.iter().take(16)
+                        .map(|(k, ms, c)| format!("{k} {:.2} ms ({:.0}x)", ms / n, *c as f64 / n)).collect::<Vec<_>>().join(", "))
+                }
+            }
             + &self.prof.as_ref().map(|p| {
                 let n = self.tokens.len().max(1) as f64;
                 let total: f64 = p.phases.iter().map(|x| x.1).sum();

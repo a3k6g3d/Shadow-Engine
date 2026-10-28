@@ -303,6 +303,10 @@ pub struct Module<'c> {
 }
 
 impl<'c> Module<'c> {
+    pub fn ctx(&self) -> &'c Context {
+        self.ctx
+    }
+
     /// An entry point by its unmangled (`extern "C"`) name.
     pub fn function(&self, name: &str) -> Result<RawFunction<'_>, CudaError> {
         self.ctx.bind()?;

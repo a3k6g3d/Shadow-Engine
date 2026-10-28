@@ -282,13 +282,16 @@ pub struct Program<'c> {
     pub file: &'static File,
     pub module: Module<'c>,
     pub compiled: nvrtc::Compiled,
+    /// `SHADOW_KTIME=1`: every launch between two events, for `kernel_times` (profiling only: events cost time).
+    timed: Option<std::cell::RefCell<Vec<(&'static str, crate::driver::Event<'c>, crate::driver::Event<'c>)>>>,
 }
 
 impl<'c> Program<'c> {
     pub fn load(ctx: &'c Context, file: &'static File) -> Result<Program<'c>, String> {
         let compiled = nvrtc::compile(file.file, &program_source(file), ctx.cc, &nvrtc::cache_dir())?;
         let module = ctx.load_module(&compiled.image).map_err(|e| e.to_string())?;
-        Ok(Program { file, module, compiled })
+        let timed = std::env::var("SHADOW_KTIME").is_ok_and(|v| v == "1").then(Default::default);
+        Ok(Program { file, module, compiled, timed })
     }
 
     /// Launches `name` with `args`, after checking them against the registry.  Safe to call: the count and the types
@@ -322,11 +325,42 @@ impl<'c> Program<'c> {
         let f = self.module.function(name).map_err(|e: CudaError| e.to_string())?;
         // SAFETY: the count and the types were checked against the registry (little-endian: a 4-byte parameter reads
         // the low half of its 8-byte slot); the pointers' sizes are the caller's promise.
+        let ev = match self.timed.as_ref() {
+            Some(_) => {
+                let ctx = self.module.ctx();
+                let (a, b) = (ctx.event().map_err(|e| e.to_string())?, ctx.event().map_err(|e| e.to_string())?);
+                a.record(stream).map_err(|e| e.to_string())?;
+                Some((a, b))
+            }
+            None => None,
+        };
         let r = unsafe { f.launch(grid, block, shared, stream, &mut ptrs) }.map_err(|e| e.to_string());
+        if let (Some((a, b)), Some(t)) = (ev, self.timed.as_ref()) {
+            b.record(stream).map_err(|e| e.to_string())?;
+            t.borrow_mut().push((entry.name, a, b));
+        }
         use std::sync::atomic::Ordering::Relaxed;
         LAUNCHES.0.fetch_add(1, Relaxed);
         LAUNCHES.1.fetch_add(t0.elapsed().as_nanos() as u64, Relaxed);
         r
+    }
+}
+
+impl Program<'_> {
+    /// With `SHADOW_KTIME=1`: GPU milliseconds and launches per kernel since the start, largest first (waits for the
+    /// device).
+    pub fn kernel_times(&self) -> Vec<(&'static str, f64, usize)> {
+        let Some(t) = self.timed.as_ref() else { return vec![] };
+        let _ = self.module.ctx().synchronize();
+        let mut sum: std::collections::HashMap<&'static str, (f64, usize)> = Default::default();
+        for (name, a, b) in t.borrow().iter() {
+            let e = sum.entry(*name).or_default();
+            e.0 += b.since(a).unwrap_or(0.0) as f64;
+            e.1 += 1;
+        }
+        let mut v: Vec<_> = sum.into_iter().map(|(n, (ms, c))| (n, ms, c)).collect();
+        v.sort_by(|a, b| b.1.total_cmp(&a.1));
+        v
     }
 }
 

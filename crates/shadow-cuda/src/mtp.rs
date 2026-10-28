@@ -1,19 +1,16 @@
-//! The Multi-Token Prediction (MTP) draft layer on the GPU.
+//! The Multi-Token Prediction (MTP) draft layer's weights: `models/mtp-basalt-ft1` (`dense.txt` + `dense.bin`, the
+//! 512 routed experts in `experts.bin`, the draft head's token subset in `draft_vocab.bin`), ~830 MB of VRAM, and its
+//! buffers.  The layer itself runs in `session::mtp_layer`, on the session's kernels.
 //!
-//! Loads the tuned MTP head from `models/mtp-basalt-ft1` (`dense.bin`, `dense.txt`, `experts.bin`, and optional
-//! `draft_vocab.bin`) into GPU memory (~824 MB VRAM).
-//!
-//! The MTP draft block predicts candidate tokens at position t+2 given residual R_t and token t+1:
-//!   e = fc_embedding(rms(embed(tok)) * (1+w))
-//!   h = fc_hidden(rms_10240(R) * (1+w))
-//!   R_mtp = h + e  ->  attention hyper-connection  ->  QSA self-attention  ->  MLP hyper-connection  ->
-//!   MoE (512 experts, top-10, shared expert)  ->  final mixer  ->  head -> draft token
-//!
-//! Because speculative decoding verifies candidate tokens against the base model's greedy output, the emitted
-//! tokens are guaranteed bit-for-bit identical to the base model while decoding 2x-3x faster.
+//! Drafter cell c is computed from the main model's final residual streams at position c and the token at c + 1:
+//!   R = fc_hidden(rms(R_c)) + fc_embedding(rms(embed(x_{c+1})))  ->  hc read  ->  gated attention over its own K/V
+//!   (q/k norm, RoPE at c)  ->  hc write + read  ->  MoE (512 experts, top 10, gated shared expert)  ->  hc write
+//!   ->  final mixer  ->  the main model's head  ->  a guess at x_{c+2}.
+//! A chain feeds the layer's own R and its guess back in for the next cell.  The verify pass checks every draft
+//! against the main model, so speculation built on it cannot change an answer.  Layout and semantics follow Strata's
+//! `src/core/mtp.cpp` (`record_front` / `record_rest`, `prefill`, `draft`).
 
 use crate::driver::{Context, DeviceBuffer};
-use crate::kernels::{Arg as KArg, Program};
 use std::collections::HashMap;
 use std::path::Path;
 
@@ -39,8 +36,10 @@ pub struct DenseTensor {
     pub bytes: usize,
 }
 
+/// The draft layer's device buffers (one row at a time).
 pub struct MtpBuffers<'c> {
-    pub r_mtp: DeviceBuffer<'c>,
+    /// The layer's residual streams (after a full row: the input of the next chained draft).
+    pub r: DeviceBuffer<'c>,
     pub rn: DeviceBuffer<'c>,
     pub down: DeviceBuffer<'c>,
     pub up: DeviceBuffer<'c>,
@@ -48,43 +47,50 @@ pub struct MtpBuffers<'c> {
     pub inj: DeviceBuffer<'c>,
     pub inj2: DeviceBuffer<'c>,
     pub en: DeviceBuffer<'c>,
-    pub hn: DeviceBuffer<'c>,
     pub e2: DeviceBuffer<'c>,
+    pub hn: DeviceBuffer<'c>,
     pub h2: DeviceBuffer<'c>,
     pub qg: DeviceBuffer<'c>,
     pub q: DeviceBuffer<'c>,
     pub gate: DeviceBuffer<'c>,
-    pub k: DeviceBuffer<'c>,
-    pub v: DeviceBuffer<'c>,
+    pub kk: DeviceBuffer<'c>,
+    /// The layer's own K/V, one cell per position of the main model.
     pub kv_k: DeviceBuffer<'c>,
     pub kv_v: DeviceBuffer<'c>,
-    pub attn: DeviceBuffer<'c>,
+    pub ao: DeviceBuffer<'c>,
     pub scratch: DeviceBuffer<'c>,
     pub bo: DeviceBuffer<'c>,
-    pub seg: DeviceBuffer<'c>,
-    pub seu: DeviceBuffer<'c>,
-    pub sact: DeviceBuffer<'c>,
-    pub sh_out: DeviceBuffer<'c>,
+    pub sg: DeviceBuffer<'c>,
+    pub su: DeviceBuffer<'c>,
+    pub sa: DeviceBuffer<'c>,
+    pub so: DeviceBuffer<'c>,
     pub rl: DeviceBuffer<'c>,
+    pub sgl: DeviceBuffer<'c>,
+    /// gate and up of the routed experts (2 x TOP_K rows of EXPERT_FF), their activations, their outputs
     pub eg: DeviceBuffer<'c>,
-    pub eu: DeviceBuffer<'c>,
     pub act: DeviceBuffer<'c>,
     pub eo: DeviceBuffer<'c>,
     pub tab: DeviceBuffer<'c>,
-    pub sgl: DeviceBuffer<'c>,
     pub y: DeviceBuffer<'c>,
     pub sample: DeviceBuffer<'c>,
-    pub logits: DeviceBuffer<'c>,
+    /// The main model's final residual streams at the last position it read (`MtpModel::pending`).
+    pub last_r: DeviceBuffer<'c>,
 }
 
 pub struct MtpModel<'c> {
     pub dense_weights: DeviceBuffer<'c>,
     pub tensors: HashMap<String, DenseTensor>,
+    /// The 512 routed experts unpacked to Q2_0, gate | up | down rows each (BLOB_BYTES an expert).
     pub experts: DeviceBuffer<'c>,
+    /// The token ids the draft head picks from (draft_vocab.bin), or the whole vocabulary.
     pub draft_vocab: Option<Vec<u32>>,
     pub bufs: MtpBuffers<'c>,
     pub cap: usize,
-    pub cs: usize,
+    /// Whether `bufs.last_r` holds the residual of the session's last position, whose drafter K/V cell waits for the
+    /// token after it.
+    pub pending: bool,
+    /// Drafts made and drafts the main model agreed with (`SHADOW_MTP_PROBE`, the speculation loop).
+    pub stats: (u64, u64),
 }
 
 /// Unpacks a 1,382,400-byte split-layout expert blob into standard contiguous Q2_0 rows:
@@ -188,390 +194,27 @@ impl<'c> MtpModel<'c> {
             None
         };
 
-        // 5. Allocate MTP scratch buffers
-        let h = HIDDEN;
-        let cs = STREAMS;
-        let r_mtp = ctx.alloc(h * cs * 4).map_err(e)?;
-        let rn = ctx.alloc(h * cs * 4).map_err(e)?;
-        let down = ctx.alloc(320 * 4).map_err(e)?;
-        let up = ctx.alloc(h * cs * 4).map_err(e)?;
-        let u = ctx.alloc(h * 4).map_err(e)?;
-        let inj = ctx.alloc(cs * 4).map_err(e)?;
-        let inj2 = ctx.alloc(cs * 4).map_err(e)?;
-        let en = ctx.alloc(h * 4).map_err(e)?;
-        let hn = ctx.alloc(h * cs * 4).map_err(e)?;
-        let e2 = ctx.alloc(h * 4).map_err(e)?;
-        let h2 = ctx.alloc(h * cs * 4).map_err(e)?;
-        let qg = ctx.alloc(N_HEAD * 2 * HEAD_DIM * 4).map_err(e)?;
-        let q = ctx.alloc(N_HEAD * HEAD_DIM * 4).map_err(e)?;
-        let gate = ctx.alloc(N_HEAD * HEAD_DIM * 4).map_err(e)?;
-        let k = ctx.alloc(N_HEAD_KV * HEAD_DIM * 4).map_err(e)?;
-        let v = ctx.alloc(N_HEAD_KV * HEAD_DIM * 4).map_err(e)?;
-        let kv_k = ctx.alloc(cap * N_HEAD_KV * HEAD_DIM * 4).map_err(e)?;
-        let kv_v = ctx.alloc(cap * N_HEAD_KV * HEAD_DIM * 4).map_err(e)?;
-        let attn = ctx.alloc(N_HEAD * HEAD_DIM * 4).map_err(e)?;
-        let scratch = ctx.alloc(N_HEAD * cap * 8).map_err(e)?; // double for scratch in attention_heads
-        let bo = ctx.alloc(h * 4).map_err(e)?;
-        let seg = ctx.alloc(EXPERT_FF * 4).map_err(e)?;
-        let seu = ctx.alloc(EXPERT_FF * 4).map_err(e)?;
-        let sact = ctx.alloc(EXPERT_FF * 4).map_err(e)?;
-        let sh_out = ctx.alloc(h * 4).map_err(e)?;
-        let rl = ctx.alloc(N_EXPERTS * 4).map_err(e)?;
-        let eg = ctx.alloc(TOP_K * EXPERT_FF * 4).map_err(e)?;
-        let eu = ctx.alloc(TOP_K * EXPERT_FF * 4).map_err(e)?;
-        let act = ctx.alloc(TOP_K * EXPERT_FF * 4).map_err(e)?;
-        let eo = ctx.alloc(TOP_K * h * 4).map_err(e)?;
-        let tab = ctx.alloc(TOP_K * 3 * 8 + TOP_K * 4).map_err(e)?; // 3 ptrs + 1 weight per top_k expert
-        let sgl = ctx.alloc(h * 4).map_err(e)?;
-        let y = ctx.alloc(h * 4).map_err(e)?;
-        let sample = ctx.alloc(h * 4).map_err(e)?;
-        let logits = ctx.alloc(vocab_size * 4).map_err(e)?;
-
-        Ok(Self {
-            dense_weights,
-            tensors,
-            experts,
-            draft_vocab,
-            bufs: MtpBuffers {
-                r_mtp, rn, down, up, u, inj, inj2, en, hn, e2, h2, qg, q, gate, k, v,
-                kv_k, kv_v, attn, scratch, bo, seg, seu, sact, sh_out, rl, eg, eu, act,
-                eo, tab, sgl, y, sample, logits,
-            },
-            cap,
-            cs,
-        })
+        // 5. The layer's buffers
+        let (h, cs) = (HIDDEN, STREAMS);
+        let a = |n: usize| ctx.alloc(n.max(1) * 4).map_err(e);
+        let bufs = MtpBuffers {
+            r: a(h * cs)?, rn: a(h * cs)?, down: a(320)?, up: a(h * cs)?, u: a(h)?, inj: a(cs)?, inj2: a(cs)?,
+            en: a(h)?, e2: a(h)?, hn: a(h * cs)?, h2: a(h * cs)?, qg: a(N_HEAD * 2 * HEAD_DIM)?,
+            q: a(N_HEAD * HEAD_DIM)?, gate: a(N_HEAD * HEAD_DIM)?, kk: a(N_HEAD_KV * HEAD_DIM)?,
+            kv_k: a(cap * N_HEAD_KV * HEAD_DIM)?, kv_v: a(cap * N_HEAD_KV * HEAD_DIM)?, ao: a(N_HEAD * HEAD_DIM)?,
+            scratch: ctx.alloc(N_HEAD * cap * 8).map_err(e)?, bo: a(h)?, sg: a(EXPERT_FF)?, su: a(EXPERT_FF)?,
+            sa: a(EXPERT_FF)?, so: a(h)?, rl: a(N_EXPERTS)?, sgl: a(1)?, eg: a(2 * TOP_K * EXPERT_FF)?,
+            act: a(TOP_K * EXPERT_FF)?, eo: a(TOP_K * h)?, tab: a(TOP_K * 7)?, y: a(h)?, sample: a(h)?,
+            last_r: a(h * cs)?,
+        };
+        let _ = vocab_size;
+        Ok(Self { dense_weights, tensors, experts, draft_vocab, bufs, cap, pending: false, stats: (0, 0) })
     }
 
     pub fn tensor_ptr(&self, name: &str) -> Option<u64> {
         self.tensors.get(name).map(|t| self.dense_weights.ptr + t.offset as u64)
     }
 
-    /// Single draft prediction step.
-    /// Takes base model's final residual `r_base` at position `pos`, and the token emitted for position `pos+1`.
-    /// Emits the predicted draft token at `pos+2`.
-    #[allow(clippy::too_many_arguments)] // the base session's programs, weights and positions, passed rather than owned
-    pub fn draft_step(
-        &mut self,
-        mvp: &Program<'c>,
-        fw: &Program<'c>,
-        token_embd_weights: u64,
-        token_embd_ty: &str,
-        token_embd_cols: usize,
-        output_weights: u64,
-        output_ty: &str,
-        output_rows: usize,
-        r_in: u64,
-        token: u32,
-        pos: usize,
-    ) -> Result<u32, String> {
-        let h = HIDDEN;
-        let cs = STREAMS;
-        let b = &self.bufs;
-
-        // ---- 1. Embedding and pre-FC projections
-        // Dequantize or matvec token embedding
-        if token_embd_ty == "BF16" || token_embd_ty == "F32" {
-            let row_bytes = if token_embd_ty == "BF16" { token_embd_cols * 2 } else { token_embd_cols * 4 };
-            let row_ptr = token_embd_weights + (token as usize * row_bytes) as u64;
-            if token_embd_ty == "BF16" {
-                unsafe {
-                    fw.launch("convert", (h.div_ceil(256) as u32, 1, 1), (256, 1, 1), 0, None,
-                              &[KArg::Ptr(row_ptr), KArg::Ptr(b.en.ptr), KArg::U32(h as u32)]).map_err(|e| e.to_string())?;
-                }
-            }
-        }
-
-        // Pre-FC norm on embedding -> en
-        let pre_emb_norm = self.tensor_ptr("pre_fc_norm_embedding.weight").ok_or("pre_fc_norm_embedding missing")?;
-        unsafe {
-            fw.launch("rmsnorm_groups", (1, 1, 1), (256, 1, 1), 0, None,
-                      &[KArg::Ptr(b.en.ptr), KArg::Ptr(pre_emb_norm), KArg::Ptr(b.en.ptr), KArg::U32(h as u32), KArg::F32(EPS)])
-                .map_err(|e| e.to_string())?;
-        }
-
-        // fc_embedding.weight (q8_0, 2560x2560) -> e2
-        let fc_emb = self.tensor_ptr("fc_embedding.weight").ok_or("fc_embedding missing")?;
-        unsafe {
-            mvp.launch("matvec_fast_q8_0", ((h.div_ceil(8)) as u32, 1, 1), (256, 1, 1), 0, None,
-                       &[KArg::Ptr(fc_emb), KArg::Ptr(b.en.ptr), KArg::Ptr(b.e2.ptr), KArg::U32(h as u32), KArg::U32(h as u32)])
-                .map_err(|e| e.to_string())?;
-        }
-
-        // Pre-FC norm on hidden residual (1 group of 10,240 floats) -> hn
-        let pre_hid_norm = self.tensor_ptr("pre_fc_norm_hidden.weight").ok_or("pre_fc_norm_hidden missing")?;
-        unsafe {
-            fw.launch("rmsnorm_groups", (1, 1, 1), (256, 1, 1), 0, None,
-                      &[KArg::Ptr(r_in), KArg::Ptr(pre_hid_norm), KArg::Ptr(b.hn.ptr), KArg::U32((h * cs) as u32), KArg::F32(EPS)])
-                .map_err(|e| e.to_string())?;
-        }
-
-        // fc_hidden.weight (q8_0, 2560x2560) on each stream -> h2
-        let fc_hid = self.tensor_ptr("fc_hidden.weight").ok_or("fc_hidden missing")?;
-        for s in 0..cs {
-            let hn_s = b.hn.ptr + (s * h * 4) as u64;
-            let h2_s = b.h2.ptr + (s * h * 4) as u64;
-            unsafe {
-                mvp.launch("matvec_fast_q8_0", ((h.div_ceil(8)) as u32, 1, 1), (256, 1, 1), 0, None,
-                           &[KArg::Ptr(fc_hid), KArg::Ptr(hn_s), KArg::Ptr(h2_s), KArg::U32(h as u32), KArg::U32(h as u32)])
-                    .map_err(|e| e.to_string())?;
-            }
-        }
-
-        // Add streams: r_mtp[s] = h2[s] + e2
-        for s in 0..cs {
-            let r_s = b.r_mtp.ptr + (s * h * 4) as u64;
-            let h2_s = b.h2.ptr + (s * h * 4) as u64;
-            unsafe {
-                fw.launch("copy", ((h.div_ceil(256)) as u32, 1, 1), (256, 1, 1), 0, None,
-                          &[KArg::Ptr(r_s), KArg::Ptr(h2_s), KArg::U32(h as u32)]).map_err(|e| e.to_string())?;
-                fw.launch("add", ((h.div_ceil(256)) as u32, 1, 1), (256, 1, 1), 0, None,
-                          &[KArg::Ptr(r_s), KArg::Ptr(b.e2.ptr), KArg::U32(h as u32)]).map_err(|e| e.to_string())?;
-            }
-        }
-
-        // ---- 2. Attention Hyper-Connection
-        let attn_hc_norm = self.tensor_ptr("attn_hyper_connection.hc_norm.weight").ok_or("attn hc norm missing")?;
-        unsafe {
-            fw.launch("rmsnorm_groups", (cs as u32, 1, 1), (256, 1, 1), 0, None,
-                      &[KArg::Ptr(b.r_mtp.ptr), KArg::Ptr(attn_hc_norm), KArg::Ptr(b.rn.ptr), KArg::U32(h as u32), KArg::F32(EPS)])
-                .map_err(|e| e.to_string())?;
-        }
-
-        let attn_down = self.tensor_ptr("attn_hyper_connection.input_mix_weight_down.weight").ok_or("attn down missing")?;
-        let attn_inj = self.tensor_ptr("attn_hyper_connection.block_inject_weight.weight").ok_or("attn inj missing")?;
-        unsafe {
-            mvp.launch("hc_down_inject_bf16", (((320 + cs) as u32).div_ceil(8), 1, 1), (256, 1, 1), 0, None,
-                       &[KArg::Ptr(attn_down), KArg::Ptr(b.down.ptr), KArg::U32(320),
-                         KArg::Ptr(attn_inj), KArg::Ptr(b.inj.ptr), KArg::U32(cs as u32),
-                         KArg::Ptr(b.rn.ptr), KArg::U32((h * cs) as u32), KArg::F32(cs as f32)])
-                .map_err(|e| e.to_string())?;
-        }
-
-        let attn_up = self.tensor_ptr("attn_hyper_connection.input_mix_weight_up.weight").ok_or("attn up missing")?;
-        unsafe {
-            mvp.launch("matvec_fast_bf16", (((h * cs) as u32).div_ceil(8), 1, 1), (256, 1, 1), 0, None,
-                       &[KArg::Ptr(attn_up), KArg::Ptr(b.down.ptr), KArg::Ptr(b.up.ptr), KArg::U32((h * cs) as u32), KArg::U32(320)])
-                .map_err(|e| e.to_string())?;
-            fw.launch("hc_mix", (h as u32, 1, 1), (1, 1, 1), 0, None,
-                      &[KArg::Ptr(b.rn.ptr), KArg::Ptr(b.up.ptr), KArg::Ptr(b.u.ptr), KArg::U32(h as u32), KArg::U32(cs as u32)])
-                .map_err(|e| e.to_string())?;
-        }
-
-        // ---- 3. Self-Attention (QSA)
-        let q_proj = self.tensor_ptr("self_attn.q_proj.weight").ok_or("self_attn.q_proj missing")?;
-        let k_proj = self.tensor_ptr("self_attn.k_proj.weight").ok_or("self_attn.k_proj missing")?;
-        let v_proj = self.tensor_ptr("self_attn.v_proj.weight").ok_or("self_attn.v_proj missing")?;
-        let o_proj = self.tensor_ptr("self_attn.o_proj.weight").ok_or("self_attn.o_proj missing")?;
-
-        let slot = (pos * N_HEAD_KV * HEAD_DIM * 4) as u64;
-        unsafe {
-            mvp.launch("matvec_fast_q8_0", (((N_HEAD * 2 * HEAD_DIM) as u32).div_ceil(8), 1, 1), (256, 1, 1), 0, None,
-                       &[KArg::Ptr(q_proj), KArg::Ptr(b.u.ptr), KArg::Ptr(b.qg.ptr), KArg::U32((N_HEAD * 2 * HEAD_DIM) as u32), KArg::U32(h as u32)])
-                .map_err(|e| e.to_string())?;
-            mvp.launch("matvec_fast_q8_0", (((N_HEAD_KV * HEAD_DIM) as u32).div_ceil(8), 1, 1), (256, 1, 1), 0, None,
-                       &[KArg::Ptr(k_proj), KArg::Ptr(b.u.ptr), KArg::Ptr(b.k.ptr), KArg::U32((N_HEAD_KV * HEAD_DIM) as u32), KArg::U32(h as u32)])
-                .map_err(|e| e.to_string())?;
-            mvp.launch("matvec_fast_q8_0", (((N_HEAD_KV * HEAD_DIM) as u32).div_ceil(8), 1, 1), (256, 1, 1), 0, None,
-                       &[KArg::Ptr(v_proj), KArg::Ptr(b.u.ptr), KArg::Ptr(b.kv_v.ptr + slot), KArg::U32((N_HEAD_KV * HEAD_DIM) as u32), KArg::U32(h as u32)])
-                .map_err(|e| e.to_string())?;
-        }
-
-        let q_norm = self.tensor_ptr("self_attn.q_norm.weight").ok_or("self_attn.q_norm missing")?;
-        let k_norm = self.tensor_ptr("self_attn.k_norm.weight").ok_or("self_attn.k_norm missing")?;
-        unsafe {
-            fw.launch("head_norm_rope_qgk", ((N_HEAD + N_HEAD_KV) as u32, 1, 1), (128, 1, 1), 0, None,
-                      &[KArg::Ptr(b.qg.ptr), KArg::Ptr(b.q.ptr), KArg::Ptr(b.gate.ptr), KArg::Ptr(q_norm),
-                        KArg::Ptr(b.k.ptr), KArg::Ptr(b.kv_k.ptr + slot), KArg::Ptr(k_norm),
-                        KArg::U32(N_HEAD as u32), KArg::U32(HEAD_DIM as u32), KArg::F32(EPS),
-                        KArg::U32(pos as u32), KArg::U32(ROPE_DIMS as u32), KArg::F32(10000000.0)])
-                .map_err(|e| e.to_string())?;
-        }
-
-        let ntok = pos + 1;
-        unsafe {
-            fw.launch("attention_heads", (N_HEAD as u32, 1, 1), (256, 1, 1), 0, None,
-                      &[KArg::Ptr(b.q.ptr), KArg::Ptr(b.kv_k.ptr), KArg::Ptr(b.kv_v.ptr), KArg::Ptr(0), KArg::U32(ntok as u32),
-                        KArg::Ptr(b.gate.ptr), KArg::Ptr(b.attn.ptr), KArg::Ptr(b.scratch.ptr), KArg::U32(self.cap as u32),
-                        KArg::U32(N_HEAD_KV as u32), KArg::U32(HEAD_DIM as u32), KArg::U32((N_HEAD / N_HEAD_KV) as u32)])
-                .map_err(|e| e.to_string())?;
-            mvp.launch("matvec_fast_q8_0", ((h.div_ceil(8)) as u32, 1, 1), (256, 1, 1), 0, None,
-                       &[KArg::Ptr(o_proj), KArg::Ptr(b.attn.ptr), KArg::Ptr(b.bo.ptr), KArg::U32(h as u32), KArg::U32((N_HEAD * HEAD_DIM) as u32)])
-                .map_err(|e| e.to_string())?;
-        }
-
-        // ---- 4. MLP Hyper-Connection
-        unsafe {
-            fw.launch("hc_write", ((h * cs) as u32, 1, 1), (1, 1, 1), 0, None,
-                      &[KArg::Ptr(b.r_mtp.ptr), KArg::Ptr(b.inj.ptr), KArg::Ptr(b.bo.ptr), KArg::U32(h as u32), KArg::U32(cs as u32)])
-                .map_err(|e| e.to_string())?;
-        }
-
-        let mlp_hc_norm = self.tensor_ptr("mlp_hyper_connection.hc_norm.weight").ok_or("mlp hc norm missing")?;
-        unsafe {
-            fw.launch("rmsnorm_groups", (cs as u32, 1, 1), (256, 1, 1), 0, None,
-                      &[KArg::Ptr(b.r_mtp.ptr), KArg::Ptr(mlp_hc_norm), KArg::Ptr(b.rn.ptr), KArg::U32(h as u32), KArg::F32(EPS)])
-                .map_err(|e| e.to_string())?;
-        }
-
-        let mlp_down = self.tensor_ptr("mlp_hyper_connection.input_mix_weight_down.weight").ok_or("mlp down missing")?;
-        let mlp_inj = self.tensor_ptr("mlp_hyper_connection.block_inject_weight.weight").ok_or("mlp inj missing")?;
-        unsafe {
-            mvp.launch("hc_down_inject_bf16", (((320 + cs) as u32).div_ceil(8), 1, 1), (256, 1, 1), 0, None,
-                       &[KArg::Ptr(mlp_down), KArg::Ptr(b.down.ptr), KArg::U32(320),
-                         KArg::Ptr(mlp_inj), KArg::Ptr(b.inj2.ptr), KArg::U32(cs as u32),
-                         KArg::Ptr(b.rn.ptr), KArg::U32((h * cs) as u32), KArg::F32(cs as f32)])
-                .map_err(|e| e.to_string())?;
-        }
-
-        let mlp_up = self.tensor_ptr("mlp_hyper_connection.input_mix_weight_up.weight").ok_or("mlp up missing")?;
-        unsafe {
-            mvp.launch("matvec_fast_bf16", (((h * cs) as u32).div_ceil(8), 1, 1), (256, 1, 1), 0, None,
-                       &[KArg::Ptr(mlp_up), KArg::Ptr(b.down.ptr), KArg::Ptr(b.up.ptr), KArg::U32((h * cs) as u32), KArg::U32(320)])
-                .map_err(|e| e.to_string())?;
-            fw.launch("hc_mix", (h as u32, 1, 1), (1, 1, 1), 0, None,
-                      &[KArg::Ptr(b.rn.ptr), KArg::Ptr(b.up.ptr), KArg::Ptr(b.u.ptr), KArg::U32(h as u32), KArg::U32(cs as u32)])
-                .map_err(|e| e.to_string())?;
-        }
-
-        // ---- 5. MoE: Shared Expert + Routed Experts
-        let sh_gate = self.tensor_ptr("mlp.shared_expert.gate_proj.weight").ok_or("sh gate missing")?;
-        let sh_up = self.tensor_ptr("mlp.shared_expert.up_proj.weight").ok_or("sh up missing")?;
-        let sh_down = self.tensor_ptr("mlp.shared_expert.down_proj.weight").ok_or("sh down missing")?;
-        unsafe {
-            mvp.launch("matvec_fast_q8_0", ((EXPERT_FF.div_ceil(8)) as u32, 1, 1), (256, 1, 1), 0, None,
-                       &[KArg::Ptr(sh_gate), KArg::Ptr(b.u.ptr), KArg::Ptr(b.seg.ptr), KArg::U32(EXPERT_FF as u32), KArg::U32(h as u32)])
-                .map_err(|e| e.to_string())?;
-            mvp.launch("matvec_fast_q8_0", ((EXPERT_FF.div_ceil(8)) as u32, 1, 1), (256, 1, 1), 0, None,
-                       &[KArg::Ptr(sh_up), KArg::Ptr(b.u.ptr), KArg::Ptr(b.seu.ptr), KArg::U32(EXPERT_FF as u32), KArg::U32(h as u32)])
-                .map_err(|e| e.to_string())?;
-            fw.launch("swiglu", (EXPERT_FF as u32, 1, 1), (1, 1, 1), 0, None,
-                      &[KArg::Ptr(b.seg.ptr), KArg::Ptr(b.seu.ptr), KArg::Ptr(b.sact.ptr), KArg::U32(EXPERT_FF as u32)])
-                .map_err(|e| e.to_string())?;
-            mvp.launch("matvec_fast_q8_0", ((h.div_ceil(8)) as u32, 1, 1), (256, 1, 1), 0, None,
-                       &[KArg::Ptr(sh_down), KArg::Ptr(b.sact.ptr), KArg::Ptr(b.sh_out.ptr), KArg::U32(h as u32), KArg::U32(EXPERT_FF as u32)])
-                .map_err(|e| e.to_string())?;
-        }
-
-        // Router: mlp.gate.weight (bf16, 512x2560) -> rl
-        let router_gate = self.tensor_ptr("mlp.gate.weight").ok_or("mlp.gate missing")?;
-        unsafe {
-            mvp.launch("matvec_fast_bf16", ((N_EXPERTS.div_ceil(8)) as u32, 1, 1), (256, 1, 1), 0, None,
-                       &[KArg::Ptr(router_gate), KArg::Ptr(b.u.ptr), KArg::Ptr(b.rl.ptr), KArg::U32(N_EXPERTS as u32), KArg::U32(h as u32)])
-                .map_err(|e| e.to_string())?;
-        }
-
-        let mut r_logits = vec![0u8; N_EXPERTS * 4];
-        b.rl.download(&mut r_logits).map_err(|e| e.to_string())?;
-        let r_floats: Vec<f32> = r_logits.as_chunks::<4>().0.iter().map(|c| f32::from_le_bytes(*c)).collect();
-        let routed = route_sigmoid(&r_floats, TOP_K);
-
-        // Populate table for matvec_batch_q2_0
-        let mut tab_bytes = Vec::with_capacity(TOP_K * 3 * 8 + TOP_K * 4);
-        for &(e, _) in &routed {
-            let base = self.experts.ptr + (e * BLOB_BYTES) as u64;
-            tab_bytes.extend((base).to_le_bytes()); // gate
-            tab_bytes.extend((base + 460_800).to_le_bytes()); // up
-            tab_bytes.extend((base + 921_600).to_le_bytes()); // down
-        }
-        for &(_, w) in &routed {
-            tab_bytes.extend(w.to_le_bytes());
-        }
-        b.tab.upload(&tab_bytes).map_err(|e| e.to_string())?;
-
-        // Batch launch for routed experts
-        // gate and up: 2 * TOP_K matrices (640 rows x 2560 cols)
-        let tab_gate = b.tab.ptr;
-        let tab_down = b.tab.ptr + (TOP_K * 2 * 8) as u64;
-        let tab_w = b.tab.ptr + (TOP_K * 3 * 8) as u64;
-        unsafe {
-            mvp.launch("matvec_batch_q2_0", ((EXPERT_FF.div_ceil(8)) as u32, (2 * TOP_K) as u32, 1), (256, 1, 1), 0, None,
-                       &[KArg::Ptr(tab_gate), KArg::Ptr(b.u.ptr), KArg::U32(0), KArg::Ptr(b.eg.ptr), KArg::U32(EXPERT_FF as u32),
-                         KArg::U32(EXPERT_FF as u32), KArg::U32(h as u32)])
-                .map_err(|e| e.to_string())?;
-            fw.launch("swiglu", ((TOP_K * EXPERT_FF) as u32, 1, 1), (1, 1, 1), 0, None,
-                      &[KArg::Ptr(b.eg.ptr), KArg::Ptr(b.eg.ptr + (TOP_K * EXPERT_FF * 4) as u64), KArg::Ptr(b.act.ptr), KArg::U32((TOP_K * EXPERT_FF) as u32)])
-                .map_err(|e| e.to_string())?;
-            mvp.launch("matvec_batch_q2_0", ((h.div_ceil(8)) as u32, TOP_K as u32, 1), (256, 1, 1), 0, None,
-                       &[KArg::Ptr(tab_down), KArg::Ptr(b.act.ptr), KArg::U32(EXPERT_FF as u32), KArg::Ptr(b.eo.ptr), KArg::U32(h as u32),
-                         KArg::U32(h as u32), KArg::U32(EXPERT_FF as u32)])
-                .map_err(|e| e.to_string())?;
-            fw.launch("moe_combine_qwen", (h as u32, 1, 1), (1, 1, 1), 0, None,
-                      &[KArg::Ptr(b.y.ptr), KArg::Ptr(b.eo.ptr), KArg::Ptr(tab_w), KArg::Ptr(b.sh_out.ptr), KArg::Ptr(b.sgl.ptr),
-                        KArg::U32(h as u32), KArg::U32(TOP_K as u32)])
-                .map_err(|e| e.to_string())?;
-        }
-
-        // ---- 6. Final Mixer
-        unsafe {
-            fw.launch("hc_write", ((h * cs) as u32, 1, 1), (1, 1, 1), 0, None,
-                      &[KArg::Ptr(b.r_mtp.ptr), KArg::Ptr(b.inj2.ptr), KArg::Ptr(b.y.ptr), KArg::U32(h as u32), KArg::U32(cs as u32)])
-                .map_err(|e| e.to_string())?;
-        }
-
-        let mix_norm = self.tensor_ptr("hyper_connection_mixer.hc_norm.weight").ok_or("mixer norm missing")?;
-        unsafe {
-            fw.launch("rmsnorm_groups", (cs as u32, 1, 1), (256, 1, 1), 0, None,
-                      &[KArg::Ptr(b.r_mtp.ptr), KArg::Ptr(mix_norm), KArg::Ptr(b.rn.ptr), KArg::U32(h as u32), KArg::F32(EPS)])
-                .map_err(|e| e.to_string())?;
-        }
-
-        let mix_down = self.tensor_ptr("hyper_connection_mixer.input_mix_weight_down.weight").ok_or("mixer down missing")?;
-        unsafe {
-            mvp.launch("hc_down_inject_bf16", (320u32.div_ceil(8), 1, 1), (256, 1, 1), 0, None,
-                       &[KArg::Ptr(mix_down), KArg::Ptr(b.down.ptr), KArg::U32(320),
-                         KArg::Ptr(0), KArg::Ptr(0), KArg::U32(0),
-                         KArg::Ptr(b.rn.ptr), KArg::U32((h * cs) as u32), KArg::F32(cs as f32)])
-                .map_err(|e| e.to_string())?;
-        }
-
-        let mix_up = self.tensor_ptr("hyper_connection_mixer.input_mix_weight_up.weight").ok_or("mixer up missing")?;
-        unsafe {
-            mvp.launch("matvec_fast_bf16", (((h * cs) as u32).div_ceil(8), 1, 1), (256, 1, 1), 0, None,
-                       &[KArg::Ptr(mix_up), KArg::Ptr(b.down.ptr), KArg::Ptr(b.up.ptr), KArg::U32((h * cs) as u32), KArg::U32(320)])
-                .map_err(|e| e.to_string())?;
-            fw.launch("hc_mix", (h as u32, 1, 1), (1, 1, 1), 0, None,
-                      &[KArg::Ptr(b.rn.ptr), KArg::Ptr(b.up.ptr), KArg::Ptr(b.sample.ptr), KArg::U32(h as u32), KArg::U32(cs as u32)])
-                .map_err(|e| e.to_string())?;
-        }
-
-        // ---- 7. Output Head & Argmax
-        let kernel_name = format!("matvec_fast_{}", output_ty.to_lowercase());
-        unsafe {
-            mvp.launch(&kernel_name, ((output_rows.div_ceil(8)) as u32, 1, 1), (256, 1, 1), 0, None,
-                       &[KArg::Ptr(output_weights), KArg::Ptr(b.sample.ptr), KArg::Ptr(b.logits.ptr),
-                         KArg::U32(output_rows as u32), KArg::U32(h as u32)])
-                .map_err(|e| e.to_string())?;
-        }
-
-        let mut logits_bytes = vec![0u8; output_rows * 4];
-        b.logits.download(&mut logits_bytes).map_err(|e| e.to_string())?;
-        let l_floats: Vec<f32> = logits_bytes.as_chunks::<4>().0.iter().map(|c| f32::from_le_bytes(*c)).collect();
-
-        // Argmax: if draft_vocab is present, search over subset; otherwise search full vocab
-        let best_id = if let Some(ref dv) = self.draft_vocab {
-            dv.iter().copied()
-                .filter(|&id| (id as usize) < l_floats.len())
-                .max_by(|&a, &b| l_floats[a as usize].partial_cmp(&l_floats[b as usize]).unwrap())
-                .unwrap_or(0)
-        } else {
-            l_floats.iter().enumerate().max_by(|a, b| a.1.partial_cmp(b.1).unwrap()).map(|(i, _)| i as u32).unwrap()
-        };
-
-        Ok(best_id)
-    }
-}
-
-fn route_sigmoid(logits: &[f32], k: usize) -> Vec<(usize, f32)> {
-    let mut pairs: Vec<(usize, f32)> = logits.iter().enumerate().map(|(i, &v)| (i, 1.0 / (1.0 + (-v).exp()))).collect();
-    pairs.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
-    pairs.truncate(k);
-    let sum: f32 = pairs.iter().map(|p| p.1).sum();
-    if sum > 0.0 {
-        for p in &mut pairs {
-            p.1 /= sum;
-        }
-    }
-    pairs
 }
 
 #[cfg(test)]

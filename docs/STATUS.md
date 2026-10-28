@@ -498,3 +498,30 @@ Single-prompt runs, "Write a Rust function that parses a comma separated list...
   committed position from the main model's final residual rows); then expert-grouped prefill. Shadow's `mtp.rs` reads
   its routed-expert table in the wrong order, never computes the shared expert's gate, routes by sigmoid, and never
   fills its KV for prompt positions.
+
+## 2026-10-28 (night): the MTP draft layer, ported from Strata - drafts right 95%; speculation not yet a win
+
+- **Port** (`crates/shadow-cuda/src/session_mtp.rs`, `mtp.rs` keeps the loader): the layer as Strata's
+  `src/core/mtp.cpp` runs it, on Shadow's kernels - pre-FC norms + `fc_embedding` / `fc_hidden` (Q8_0), the hc read,
+  k/v (and q, gate) projections, q/k norm + RoPE at the cell, gated attention over its own K/V, the MLP hc, router
+  (BF16) + top 10 of the 512 VRAM-resident Q2_0 experts + the gated shared expert, the final mixer, the main head,
+  argmax over `draft_vocab.bin`. Its K/V is filled for every position the main model reads (prompt and verify
+  passes, from the final residual rows; `mtp_observe`), its pending residual is in snapshots (and its K/V with
+  `snapshot(true)`). The old `mtp.rs` step is gone: it read its expert table in the wrong order, never computed the
+  shared expert's gate, routed by sigmoid, never filled its K/V, and its `eg` buffer was half the size the gate+up
+  launch wrote - the overflow is the likely source of the NaNs it left in the base model. Its expert unpack (S2 blob
+  -> Q2_0, gate/up rows interleaved, fp16 scale per 64) checks out against Strata's `expert.hpp`.
+- **Drafts are right:** `SHADOW_MTP_PROBE=1` (one draft before every step, against the step's own argmax), the Rust
+  prompt, 104 tokens: **98 of 103 (95.1%)**, and the generated tokens are identical to a run without `--mtp`.
+- **Speculation with it** (`shadow serve --mtp models/mtp-basalt-ft1 [--spec K]`, K = 3 by default with `--mtp`):
+  exact (0 answer differences), ~3 tokens a pass (55 of 84 drafts accepted - a chain drifts, the first draft is
+  right 95%), but **34% slower** in a 2-run check (14.3 vs 20.1 tok/s). Per pass: drafting 8 ms, the verify pass
+  (`step_batch` of 4) **152 ms**, the rollback (restore + re-reading the kept tokens) 31 ms - against 48 ms for one
+  plain step. Kept opt-in.
+- **Why the 4-token pass costs 3 steps** (`SHADOW_KTIME=1`, CUDA events around every launch, GPU ms per token, the
+  hash-table prompt read 4 vs 1 at a time): all kernels 21.9 vs 31.9; `hc_down_inject_cols_bf16` 2.53 vs 2.15 (324
+  rows at 4 a warp: 81 warps), `delta_step` 2.10 vs 3.46 (each token re-reads and re-writes the 3 MB states), routed
+  experts 5.35 vs 6.0 (per token), dense projections 3.1 vs 6.3. **Next, by what each saves a pass:** a rollback that
+  replays only the recurrences from inputs the verify pass kept (~29 ms), one row per warp in the batched hc kernel
+  (~8 ms), a multi-token `delta_step` holding each state in registers (~6 ms), the copy overlap and grouped experts
+  in `moe_batch`.
