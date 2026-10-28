@@ -10,5 +10,6 @@ pub mod nfc_table;
 pub mod placement;
 pub mod quant;
 pub mod quant_tables;
+pub mod readpool;
 pub mod tokenizer;
 pub mod unicode_table;

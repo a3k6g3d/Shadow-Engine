@@ -137,6 +137,11 @@ router top-10 on the host 1%. That is why the RAM tier came before moving the ro
      real expert reads repeat, and buffered reads are served from Windows' file cache at memory speed while
      unbuffered ones always go to the NVMe. Untried: overlapped *buffered* reads (queue depth and the cache), and
      reading into pinned staging buffers.
+  3. **Kept (0.1.23):** what lost in (1) was the shared handle, not the threads. `shadow-model::readpool` keeps 8
+     worker threads, each with its own buffered handles on every shard; a layer's drive misses are queued by
+     `fetch_expert` and read together by `read_drive` (256 KiB pieces, straight into the pinned ring / staging buffer).
+     `bench/readpool-2026-10-27`, 8 interleaved launches per arm: `decode_warm` median 17.37 -> **18.52 tok/s**
+     (p90 16.85 -> 18.42), paired +5.3% median, +2.9% worst, all 40 pairs faster, 0 answer differences.
 
 ## Stage 4: HTTP server (`shadow-serve`), `shadow-bench`, and Shadow's noise floor
 

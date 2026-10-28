@@ -156,10 +156,21 @@ pub struct GpuSession<'c, 'm> {
     #[allow(dead_code)]
     copy_event: Event<'c>,
     staging: Option<PinnedRegion<'c>>,
+    /// This layer's drive reads, put off until all its misses are known so `read_drive` can issue them together.
+    pending: Vec<PendingRead>,
     /// How often each (layer, expert) was routed to by this session (`--record-routing` saves it).
     pub routing: RoutingCounts,
     prof: Option<Prof>,
     pub mtp: Option<crate::mtp::MtpModel<'c>>,
+}
+
+/// An expert to read from the file into pinned memory and then copy to `dst`: into `RamTier`'s region at `off` when
+/// `ring`, else into the staging buffer at `off`.
+struct PendingRead {
+    e: usize,
+    ring: bool,
+    off: usize,
+    dst: [u64; 3],
 }
 
 /// Sizes and placement of the expert tiers below VRAM's dense weights.
@@ -664,7 +675,7 @@ impl<'c, 'm> GpuSession<'c, 'm> {
         Ok(GpuSession {
             ctx, m, mvp, fw, w, v, b, delta, attn, ple_state, tokens: vec![], cap, trace: None, stop_after: None,
             resident_bytes, expert_uploads: 0, cache, ram, copy_stream, copy_event, staging,
-            routing: RoutingCounts::new(c.n_layer, c.n_expert),
+            pending: vec![], routing: RoutingCounts::new(c.n_layer, c.n_expert),
             prof: std::env::var("SHADOW_PROFILE").is_ok_and(|v| v == "1")
                 .then(|| Prof { last: std::time::Instant::now(), phases: vec![] }),
             mtp,
@@ -1274,7 +1285,8 @@ impl<'c, 'm> GpuSession<'c, 'm> {
 
     /// Puts expert e of layer l (its gate, up and down slices) at the three device addresses: a DMA copy from the
     /// pinned RAM tier if it holds the expert, otherwise read from the file (promoting into `RamTier`'s Clock ring if
-    /// active, else into the pinned staging buffer) and copied on `copy_stream`.
+    /// active, else into the pinned staging buffer) and copied on `copy_stream`.  Those file reads wait in `pending`
+    /// for `read_drive`.
     fn fetch_expert(&mut self, l: usize, e: usize, slot_idx: usize, names: &[String; 3], sizes: &[usize], dst: [u64; 3]) {
         let stream = self.copy_stream.raw();
         let contiguous = dst[1] == dst[0] + sizes[0] as u64 && dst[2] == dst[1] + sizes[1] as u64;
@@ -1295,43 +1307,9 @@ impl<'c, 'm> GpuSession<'c, 'm> {
             self.ram.served += 1;
             self.mark("expert upload (pinned RAM)");
         } else if let Some(off) = self.ram.promote_slot((l, e), total.next_multiple_of(256)) {
-            {
-                let buf = &mut self.ram.region.as_mut().unwrap().as_mut_slice()[off..off + total];
-                for &i in &[2usize, 0, 1] {
-                    self.m.expert_into(&names[i], e, &mut buf[part_offs[i]..part_offs[i] + sizes[i]]);
-                }
-            }
-            self.mark("expert read (file)");
-            let src = &self.ram.region.as_ref().unwrap().as_slice()[off..off + total];
-            if contiguous {
-                self.upload_pinned_on(dst[0], src, stream);
-            } else {
-                for i in 0..3 {
-                    self.upload_pinned_on(dst[i], &src[part_offs[i]..part_offs[i] + sizes[i]], stream);
-                }
-            }
-            self.ram.drive += 1;
-            self.mark("expert upload (pageable)");
-        } else if let Some(st) = self.staging.as_mut() {
-            let base_off = slot_idx * self.cache.slot_bytes;
-            // Read in file-offset order (`ffn_down_exps` @ part 2, `ffn_gate_exps` @ part 0, `ffn_up_exps` @ part 1).
-            {
-                let buf = &mut st.as_mut_slice()[base_off..base_off + total];
-                for &i in &[2usize, 0, 1] {
-                    self.m.expert_into(&names[i], e, &mut buf[part_offs[i]..part_offs[i] + sizes[i]]);
-                }
-            }
-            self.mark("expert read (file)");
-            let src = &self.staging.as_ref().unwrap().as_slice()[base_off..base_off + total];
-            if contiguous {
-                self.upload_pinned_on(dst[0], src, stream);
-            } else {
-                for i in 0..3 {
-                    self.upload_pinned_on(dst[i], &src[part_offs[i]..part_offs[i] + sizes[i]], stream);
-                }
-            }
-            self.ram.drive += 1;
-            self.mark("expert upload (pageable)");
+            self.pending.push(PendingRead { e, ring: true, off, dst });
+        } else if self.staging.is_some() {
+            self.pending.push(PendingRead { e, ring: false, off: slot_idx * self.cache.slot_bytes, dst });
         } else {
             let slices: Vec<Vec<u8>> = names.iter().map(|n| self.m.expert(n, e).1).collect();
             self.mark("expert read (file)");
@@ -1343,6 +1321,57 @@ impl<'c, 'm> GpuSession<'c, 'm> {
         }
         self.expert_uploads += 3;
     }
+    /// Reads every pending expert of this layer from the file at once (`Model::experts_into_many`), then queues their
+    /// copies to the device on `copy_stream`.
+    fn read_drive(&mut self, names: &[String; 3], sizes: &[usize]) {
+        if self.pending.is_empty() {
+            return;
+        }
+        let pending = std::mem::take(&mut self.pending);
+        let total = sizes[0] + sizes[1] + sizes[2];
+        let part_offs = [0usize, sizes[0], sizes[0] + sizes[1]];
+        {
+            let ring = self.ram.region.as_mut().map(|r| r.as_mut_slice());
+            let staging = self.staging.as_mut().map(|r| r.as_mut_slice());
+            let mut jobs: Vec<(&str, usize, &mut [u8])> = Vec::with_capacity(3 * pending.len());
+            for (from_ring, buf) in [(true, ring), (false, staging)] {
+                let Some(mut rest) = buf else { continue };
+                let mut mine: Vec<&PendingRead> = pending.iter().filter(|p| p.ring == from_ring).collect();
+                mine.sort_by_key(|p| p.off);
+                let mut at = 0usize;
+                for p in mine {
+                    // carve the expert's bytes off the front of what is left; the offsets are distinct slots
+                    let (_, tail) = std::mem::take(&mut rest).split_at_mut(p.off - at);
+                    let (mut slot, tail) = tail.split_at_mut(total);
+                    rest = tail;
+                    at = p.off + total;
+                    // file-offset order: `ffn_down_exps` @ part 2, `ffn_gate_exps` @ part 0, `ffn_up_exps` @ part 1
+                    let (gate, more) = std::mem::take(&mut slot).split_at_mut(sizes[0]);
+                    let (up, down) = more.split_at_mut(sizes[1]);
+                    jobs.push((&names[2], p.e, down));
+                    jobs.push((&names[0], p.e, gate));
+                    jobs.push((&names[1], p.e, up));
+                }
+            }
+            self.m.experts_into_many(&mut jobs);
+        }
+        self.mark("expert read (file)");
+        let stream = self.copy_stream.raw();
+        for p in &pending {
+            let region = if p.ring { self.ram.region.as_ref() } else { self.staging.as_ref() };
+            let src = &region.unwrap().as_slice()[p.off..p.off + total];
+            if p.dst[1] == p.dst[0] + sizes[0] as u64 && p.dst[2] == p.dst[1] + sizes[1] as u64 {
+                self.upload_pinned_on(p.dst[0], src, stream);
+            } else {
+                for i in 0..3 {
+                    self.upload_pinned_on(p.dst[i], &src[part_offs[i]..part_offs[i] + sizes[i]], stream);
+                }
+            }
+            self.ram.drive += 1;
+        }
+        self.mark("expert upload (pageable)");
+    }
+
     fn moe(&mut self, l: usize) {
         let c = &self.m.cfg;
         let p = format!("blk.{l}");
@@ -1433,6 +1462,7 @@ impl<'c, 'm> GpuSession<'c, 'm> {
                 at.push(dst);
             }
         }
+        self.read_drive(&names, &sizes);
         if layer_misses > 0 {
             self.copy_stream.synchronize().unwrap();
         }

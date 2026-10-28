@@ -63,6 +63,10 @@ them changes the prompt; the fixture records the ids, so it stays valid as a fix
     unique experts across `VRAM U RAM`, startup `45 s -> 32 s`), and `RamTier`'s Clock promotion ring raised 8-launch
     `decode_warm` to **16.92 tok/s (`+65.9%` over baseline, `+10.3%` over `0.1.12`)** (`bench/stage5-tiers-2026-10-27`,
     floor `0.8%` median / `2.3%` p90 / `3.3%` worst, single-prompt decode `18.5 tok/s`).
+  - `0.1.23`: drive-tier expert reads in parallel on `shadow-model::readpool` (8 workers, own handles, buffered):
+    `decode_warm` **17.37 -> 18.52 tok/s, +5.3% paired, all 40 pairs faster** (`bench/readpool-2026-10-27`). Profile
+    before it (synchronized, 99 steps, 70.6 ms/step): file reads 27%, pinned-RAM uploads 26% (~22 GB/s, the PCIe 4 x16
+    limit on this RTX 5070), mixers/norms/glue 25%, routed matvecs 9%. Uploads can only shrink by moving fewer bytes.
 - Cleanup done (0.1.4): `shadow-abi`, `include/shadow/c/abi.h`, `shadow-host/src/ffi.rs` and `protocol.rs` are
   removed. Still owed: copy the model under `J:\\Shadow\\models\\` and record its SHA-256 (the plan
   says the model file is the only input; it is still read from `J:\Strata-work\models\swift15\IQ3_S\`).

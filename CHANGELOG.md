@@ -2,6 +2,17 @@
 
 All notable changes to Shadow will be documented in this file.
 
+## [0.1.23] — 2026-10-27
+### Changed
+- **Parallel drive-tier expert reads (`shadow-model::readpool`)**: a layer's experts that miss VRAM and the pinned RAM
+  tier are no longer read one at a time on `Model`'s single file handle. `GpuSession::fetch_expert` queues them, and
+  `read_drive` reads them all at once in 256 KiB pieces on 8 persistent workers, each with its own handles (Windows
+  serializes I/O on one synchronous handle). Reads stay buffered, so repeats still come from the file cache.
+  8 interleaved launches per arm (`bench/readpool-2026-10-27`, `--ctx 8192 --ram-tier-gib 30 --placement
+  profiles/routing-6prompts.shrc`): `decode_warm` median **17.37 -> 18.52 tok/s**, paired **+5.3%** median, faster in
+  all 40 pairs (worst +2.9%), 0 answer differences. Reference tests and the 48-layer compare are unchanged (cosine 1.000).
+- `shadow-bench run --arm-exe NAME=EXE` runs an arm on another build, for A/B tests of two binaries.
+
 ## [0.1.22] — 2026-10-27
 ### Fixed
 - **Stop Button Availability During Active Reasoning**:

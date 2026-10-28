@@ -11,11 +11,15 @@
 
 use crate::gguf::{block_index, Gguf, TensorInfo, Value};
 use crate::quant::dequantize;
+use crate::readpool::ReadPool;
 use std::collections::HashMap;
 use std::fs::File;
 
 /// The longest sequence a session takes: the KV cache is f32, 48 KiB per position over the 12 attention layers.
 pub const MAX_POSITIONS: usize = 32768;
+
+/// Threads behind `Model::experts_into_many`, each with its own file handles.
+pub const READ_WORKERS: usize = 8;
 
 /// The shapes, from the file's key-values (ARCH.md, "Shapes").
 #[derive(Debug, Clone)]
@@ -208,7 +212,7 @@ impl Config {
 }
 
 /// Positional reads, safe from several threads at once.
-fn read_at(f: &File, buf: &mut [u8], offset: u64) -> std::io::Result<()> {
+pub(crate) fn read_at(f: &File, buf: &mut [u8], offset: u64) -> std::io::Result<()> {
     #[cfg(windows)]
     {
         use std::os::windows::fs::FileExt;
@@ -344,6 +348,8 @@ pub struct Model {
     pub g: Gguf,
     pub cfg: Config,
     files: Vec<File>,
+    /// Parallel reads for the routed experts that miss every tier (`experts_into_many`).
+    pool: ReadPool,
     dense: HashMap<String, Vec<u8>>,
     ple_cache: std::sync::RwLock<HashMap<i64, Vec<f32>>>,
 }
@@ -363,7 +369,9 @@ impl Model {
             read_at(&files[t.shard], &mut b, t.offset).map_err(|e| format!("{}: {e}", t.name))?;
             dense.insert(t.name.clone(), b);
         }
-        Ok(Model { g, cfg, files, dense, ple_cache: std::sync::RwLock::new(HashMap::new()) })
+        let paths: Vec<_> = g.shards.iter().map(|s| s.path.clone()).collect();
+        let pool = ReadPool::new(&paths, READ_WORKERS)?;
+        Ok(Model { g, cfg, files, pool, dense, ple_cache: std::sync::RwLock::new(HashMap::new()) })
     }
 
     /// The companion `.scale` f32 multiplier of a 2-D tensor (1.0 when the model has no `.scale` tensor).
@@ -432,6 +440,18 @@ impl Model {
         let per = (t.nbytes() / t.dims[2]) as usize;
         assert_eq!(out.len(), per, "{name}: {} bytes for a {per}-byte expert slice", out.len());
         read_at(&self.files[t.shard], out, t.offset + (e * per) as u64).unwrap();
+    }
+
+    /// Several experts' slices at once, `(tensor name, expert, out)`, each `out` exactly `expert_bytes(name)` long:
+    /// the same bytes as `expert_into` one by one, read in parallel on the model's read pool.
+    pub fn experts_into_many(&self, jobs: &mut [(&str, usize, &mut [u8])]) {
+        let mut reads: Vec<(usize, u64, &mut [u8])> = jobs.iter_mut().map(|(name, e, out)| {
+            let t = self.g.tensor(name).unwrap_or_else(|| panic!("no tensor {name}"));
+            let per = (t.nbytes() / t.dims[2]) as usize;
+            assert_eq!(out.len(), per, "{name}: {} bytes for a {per}-byte expert slice", out.len());
+            (t.shard, t.offset + (*e * per) as u64, &mut **out)
+        }).collect();
+        self.pool.read_many(&mut reads).unwrap();
     }
 
     /// One row of the n-gram table (ple_head_dim weights), cached in RAM.

@@ -13,11 +13,12 @@
 //!
 //! ```text
 //! shadow-bench run --model M --out DIR --arm NAME=FLAGS [--arm NAME=FLAGS ...] [--runs 8] [--turns 6]
-//!                  [--tokens 96] [--port 8091]
+//!                  [--tokens 96] [--port 8091] [--arm-exe NAME=EXE ...]
 //! shadow-bench summary DIR
 //! ```
 
 use serde_json::{json, Value};
+use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -87,6 +88,10 @@ fn run(a: &[String]) {
     let arms: Vec<(String, String)> = a.iter().enumerate().filter(|(_, x)| *x == "--arm")
         .filter_map(|(i, _)| a.get(i + 1)?.split_once('=').map(|(n, f)| (n.to_string(), f.to_string())))
         .collect();
+    // an arm runs target/release/shadow.exe unless --arm-exe gives it another build (A/B of two binaries)
+    let arm_exe: HashMap<String, PathBuf> = a.iter().enumerate().filter(|(_, x)| *x == "--arm-exe")
+        .filter_map(|(i, _)| a.get(i + 1)?.split_once('=').map(|(n, p)| (n.to_string(), PathBuf::from(p))))
+        .collect();
     if arms.is_empty() {
         usage();
     }
@@ -101,7 +106,8 @@ fn run(a: &[String]) {
     let results = out.join("results.jsonl");
     std::fs::write(out.join("plan.json"), json!({
         "model": model, "runs": runs, "turns": turns, "tokens": tokens, "port": port,
-        "arms": arms.iter().map(|(n, f)| json!({"name": n, "flags": f})).collect::<Vec<_>>(),
+        "arms": arms.iter().map(|(n, f)| json!({"name": n, "flags": f, "exe": arm_exe.get(n).unwrap_or(&exe)}))
+            .collect::<Vec<_>>(),
         "prompts": &TURNS[..turns], "started": now(),
     }).to_string()).unwrap();
     println!("{} arms x {runs} runs x {turns} turns, {tokens} tokens per turn; results in {}", arms.len(), results.display());
@@ -117,7 +123,7 @@ fn run(a: &[String]) {
             let log = out.join(format!("{name}-run{i}.log"));
             let args = format!("serve {model} --port {port} {flags}");
             let launch = format!("& '{}' -CapGiB {cap} -Out '{}' -Exe '{}' -Arguments '{}'", capped.display(),
-                                 log.display(), exe.display(), args);
+                                 log.display(), arm_exe.get(name).unwrap_or(&exe).display(), args);
             let rec = one_run(name, i, port, &launch, turns, tokens);
             println!("run {i} {name}: {}", rec.get("line").and_then(Value::as_str).unwrap_or(""));
             let mut f = std::fs::OpenOptions::new().create(true).append(true).open(&results).unwrap();
