@@ -264,6 +264,9 @@ pub struct GpuSession<'c, 'm> {
     /// on first use on `gstream`, which orders with the default stream.  `SHADOW_GRAPHS=0`: none.
     graphs: HashMap<(usize, bool), Graph<'c>>,
     graphs_on: bool,
+    /// `Tiers::tail_skip` (0: off), and how many routed experts it has skipped.
+    tail_skip: usize,
+    pub tail_skipped: u64,
     /// `routed_overlapped` instead of waiting on the host for a layer's copies (`SHADOW_OVERLAP=0`: off).
     overlap: bool,
     gstream: Stream<'c>,
@@ -391,6 +394,10 @@ pub struct Tiers {
     /// slots a layer; `None` (the default): every slot is LRU.  On real routing, LRU over a layer's slots hits more:
     /// 70.7% vs 56.6% with N = 12 (docs/STATUS.md, tools/cache_sim.py).
     pub pin_margin: Option<usize>,
+    /// `--tail-skip R` (inexact, off by default; Strata's STRATA_ROUTE_TAIL_SKIP): a routed expert that is not in VRAM
+    /// and that every token of a step or verify pass routes only at rank >= R (0-based, of the top 10) is neither
+    /// copied nor computed - its contribution is zero and the others keep their weights.  Changes answers.
+    pub tail_skip: usize,
 }
 
 impl Tiers {
@@ -426,6 +433,7 @@ impl Tiers {
         Ok(Tiers { vram_cache: gib("--expert-cache-gib")?, ram_bytes, ram_auto, order, mtp_dir,
                    cpu_experts: num("--cpu-experts", 0)?, cpu_threads: num("--cpu-threads", 8)?,
                    pregate: num("--pregate", 0)?,
+                   tail_skip: num("--tail-skip", 0)?,
                    pin_margin: flag("--pin-margin").map(|v| v.parse().map_err(|_| format!("--pin-margin: not a number: {v}")))
                        .transpose()? })
     }
@@ -623,9 +631,8 @@ struct GroupedPlan {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn grouped_plan(tops: &[Vec<(usize, f64)>], start: usize, end: usize, set: &[usize], up: usize,
+fn grouped_plan(tops: &[Vec<(usize, f64)>], start: usize, end: usize, set: &[usize], k: usize, up: usize,
                 addr: impl Fn(usize) -> u64, copied: impl Fn(usize) -> bool, part: [u64; 3]) -> GroupedPlan {
-    let k = tops[start].len();
     // (expert, [(token, rank)]) per phase, at most 8 tokens a group
     let mut groups: [Vec<(usize, Vec<(usize, usize)>)>; 2] = [vec![], vec![]];
     for &e in set {
@@ -666,8 +673,9 @@ fn grouped_plan(tops: &[Vec<(usize, f64)>], start: usize, end: usize, set: &[usi
     }
     let weights = bytes.len() as u64;
     for top in tops.iter().take(end) {
-        for &(_, w) in top {
-            bytes.extend_from_slice(&(w as f32).to_le_bytes());
+        for i in 0..k {
+            let w = top.get(i).map_or(0.0, |&(_, w)| w as f32);
+            bytes.extend_from_slice(&w.to_le_bytes());
         }
     }
     let phase = spans.map(|(n, a, r)| (n, a as u64, (rec_at + 4 * r) as u64));
@@ -1025,6 +1033,8 @@ impl<'c, 'm> GpuSession<'c, 'm> {
             mtp_probe: std::env::var("SHADOW_MTP_PROBE").is_ok_and(|v| v == "1").then_some((0, 0)),
             mtp,
             graphs: HashMap::new(),
+            tail_skip: tiers.tail_skip,
+            tail_skipped: 0,
             graphs_on: std::env::var("SHADOW_GRAPHS").map_or(true, |v| v != "0")
                 && !std::env::var("SHADOW_KTIME").is_ok_and(|v| v == "1"),
             overlap: std::env::var("SHADOW_OVERLAP").map_or(true, |v| v != "0"),
@@ -2680,7 +2690,7 @@ impl<'c, 'm> GpuSession<'c, 'm> {
             self.k1("swiglu", m * sff, &[Arg::Ptr(bb.sg.ptr), Arg::Ptr(bb.su.ptr), Arg::Ptr(bb.sa.ptr), Arg::U32((m * sff) as u32)]);
             self.mv_cols(&format!("{p}.ffn_down_shexp.weight"), bb.sa.ptr, sff, bb.so.ptr, h, m);
         }
-        let tops: Vec<Vec<(usize, f64)>> = logits.iter().map(|lg| route(lg, k)).collect();
+        let mut tops: Vec<Vec<(usize, f64)>> = logits.iter().map(|lg| route(lg, k)).collect();
         for (j, top) in tops.iter().enumerate() {
             for &(e, _) in top {
                 self.routing.add(l, e);
@@ -2688,6 +2698,21 @@ impl<'c, 'm> GpuSession<'c, 'm> {
             if self.route_log.is_some() {
                 logs[j].push(l as u16);
                 logs[j].extend(top.iter().map(|&(e, _)| e as u16));
+            }
+        }
+        if self.tail_skip > 0 && m <= MAX_VERIFY {
+            // --tail-skip over the whole pass: an expert not in VRAM that every token routes only at rank >= R
+            let mut low: HashMap<usize, bool> = HashMap::new();
+            for top in &tops {
+                for (i, &(e, _)) in top.iter().enumerate() {
+                    let tail = low.entry(e).or_insert(true);
+                    *tail &= i >= self.tail_skip;
+                }
+            }
+            for top in tops.iter_mut() {
+                let before = top.len();
+                top.retain(|&(e, _)| !low[&e] || self.cache.map.contains_key(&(l, e)));
+                self.tail_skipped += (before - top.len()) as u64;
             }
         }
         let names = [format!("{p}.ffn_gate_exps.weight"), format!("{p}.ffn_up_exps.weight"), format!("{p}.ffn_down_exps.weight")];
@@ -2761,7 +2786,7 @@ impl<'c, 'm> GpuSession<'c, 'm> {
                     None => extra.iter().find(|x| x.0 == e).expect("a routed expert neither cached nor fetched").1,
                 };
                 let copied = |e: usize| copying.iter().any(|c| c.0 == e);
-                let p = grouped_plan(&tops, start, end, &set, MAX_BATCH * k, addr, copied, part);
+                let p = grouped_plan(&tops, start, end, &set, k, MAX_BATCH * k, addr, copied, part);
                 assert!(p.bytes.len() <= self.bb.gtab.bytes, "grouped experts: {} bytes of tables", p.bytes.len());
                 self.upload_to(self.bb.gtab.ptr, &p.bytes);
                 self.routed_grouped(&p, 0, start, end, &infos);
@@ -2791,7 +2816,8 @@ impl<'c, 'm> GpuSession<'c, 'm> {
                 for j in start..end {
                     self.k1("moe_combine_qwen", h, &[
                         Arg::Ptr(row(&bb.y, h, j)), Arg::Ptr(row(&bb.eo, k * h, j)), Arg::Ptr(bb.gtab.ptr + p.weights + (j * k * 4) as u64),
-                        Arg::Ptr(row(&bb.so, h, j)), Arg::Ptr(row(&bb.sgl, 1, j)), Arg::U32(h as u32), Arg::U32(k as u32)]);
+                        Arg::Ptr(row(&bb.so, h, j)), Arg::Ptr(row(&bb.sgl, 1, j)), Arg::U32(h as u32),
+                        Arg::U32(tops[j].len() as u32)]);
                 }
             } else {
                 if !copying.is_empty() {
@@ -2890,6 +2916,17 @@ impl<'c, 'm> GpuSession<'c, 'm> {
     /// order (`perm`), so y is `moe`'s to the bit.
     fn routed_overlapped(&mut self, l: usize, top: &[(usize, f64)], names: &[String; 3], infos: &[TensorInfo],
                          sizes: &[usize]) {
+        // --tail-skip: the low-ranked experts that are not in VRAM drop out (zero contribution, weights unchanged)
+        let kept: Vec<(usize, f64)>;
+        let top = if self.tail_skip > 0 {
+            kept = top.iter().enumerate()
+                .filter(|&(i, &(e, _))| i < self.tail_skip || self.cache.map.contains_key(&(l, e)))
+                .map(|(_, &x)| x).collect();
+            self.tail_skipped += (top.len() - kept.len()) as u64;
+            &kept[..]
+        } else {
+            top
+        };
         let c = &self.m.cfg;
         let (h, ff, n) = (c.hidden, c.expert_ff, top.len());
         let arena = self.cache.arena.as_ref().unwrap().ptr;
@@ -2962,7 +2999,8 @@ impl<'c, 'm> GpuSession<'c, 'm> {
         let b = &self.b;
         self.k1("moe_combine_qwen_perm", h, &[
             Arg::Ptr(b.y.ptr), Arg::Ptr(b.eo.ptr), Arg::Ptr(b.tab.ptr + 24 * n as u64), Arg::Ptr(b.tab.ptr + 28 * n as u64),
-            Arg::Ptr(b.eo.ptr + (n * h * 4) as u64), Arg::Ptr(b.sgl.ptr), Arg::U32(h as u32), Arg::U32(n as u32)]);
+            // the shared expert's output is row n_expert_used of eo (`moe` launches it there), whatever n is
+            Arg::Ptr(b.eo.ptr + (c.n_expert_used * h * 4) as u64), Arg::Ptr(b.sgl.ptr), Arg::U32(h as u32), Arg::U32(n as u32)]);
     }
 
     /// The n-gram memory at layer l, into gv (the caller adds it to r).
@@ -3043,6 +3081,7 @@ impl Stepper for GpuSession<'_, '_> {
                        self.ram.fill_secs, self.ram.served, self.ram.drive)
             + &self.cpu.as_ref().map(|c| format!("; CPU experts: up to {} per layer, {} computed", c.1, self.cpu_served))
                 .unwrap_or_default()
+            + &(if self.tail_skip > 0 { format!("; tail skip (rank >= {}): {} routed experts skipped", self.tail_skip, self.tail_skipped) } else { String::new() })
             + &format!("; host waits per step: router {:.1} ms, copies {:.1} ms, file {:.1} ms",
                        1e3 * self.waits[0] / self.tokens.len().max(1) as f64, 1e3 * self.waits[1] / self.tokens.len().max(1) as f64,
                        1e3 * self.waits[2] / self.tokens.len().max(1) as f64)

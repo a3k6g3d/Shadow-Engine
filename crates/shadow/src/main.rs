@@ -43,6 +43,9 @@ fn main() -> ExitCode {
     if args.first().map(String::as_str) == Some("generate") && args.len() >= 3 {
         return generate(&PathBuf::from(&args[1]), &args[2], &args[3..]);
     }
+    if args.first().map(String::as_str) == Some("ppl") && args.len() >= 3 {
+        return ppl(&PathBuf::from(&args[1]), &args[2], &args[3..]);
+    }
     if args.first().map(String::as_str) == Some("serve") && args.len() >= 2 {
         return serve(&PathBuf::from(&args[1]), &args[2..]);
     }
@@ -147,6 +150,54 @@ fn mode(args: &[String]) -> Mode {
 }
 
 /// The positions a GPU session is made for: the prompt plus what is generated, rounded up, at least 4,096.
+/// `shadow ppl MODEL TEXT|@FILE [tier flags]`: the text's perplexity on the GPU session, one token at a time
+/// (teacher forced: each step's logits scored against the next token), with how often the argmax is that token.
+/// What --tail-skip and the like cost in quality.
+fn ppl(path: &std::path::Path, text: &str, rest: &[String]) -> ExitCode {
+    use shadow_model::forward::{check_layout, Model};
+    use shadow_model::tokenizer::Tokenizer;
+    let text = match text.strip_prefix('@').map(std::fs::read_to_string) {
+        Some(Ok(t)) => t,
+        Some(Err(e)) => {
+            eprintln!("shadow ppl: {text}: {e}");
+            return ExitCode::FAILURE;
+        }
+        None => text.to_string(),
+    };
+    let g = Gguf::open(path).expect("model");
+    let tok = Tokenizer::from_gguf(&g).expect("tokenizer");
+    let model = Model::load(g).expect("model");
+    check_layout(&model.g, &model.cfg).expect("layout");
+    let ids = tok.encode(&text, true);
+    let ctx = shadow_cuda::Context::new(0).expect("GPU");
+    let tiers = match shadow_cuda::session::Tiers::from_args(rest) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("shadow ppl: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let mut s = shadow_cuda::session::GpuSession::with_tiers(&ctx, &model, gpu_capacity(ids.len()), tiers).expect("session");
+    let (mut nll, mut top1, mut n) = (0f64, 0usize, 0usize);
+    let t0 = std::time::Instant::now();
+    for w in ids.windows(2) {
+        let l = s.step(w[0]);
+        let mx = l.iter().cloned().fold(f32::MIN, f32::max) as f64;
+        let z: f64 = l.iter().map(|&v| (v as f64 - mx).exp()).sum();
+        nll += z.ln() + mx - l[w[1] as usize] as f64;
+        let am = l.iter().enumerate().max_by(|a, b| a.1.total_cmp(b.1)).map(|(i, _)| i as u32).unwrap();
+        top1 += (am == w[1]) as usize;
+        n += 1;
+    }
+    println!("{n} tokens: perplexity {:.4}, mean NLL {:.5}, argmax = next token {:.2}% ({:.1} s)", (nll / n as f64).exp(),
+             nll / n as f64, 100.0 * top1 as f64 / n as f64, t0.elapsed().as_secs_f64());
+    {
+        use shadow_model::forward::Stepper;
+        eprintln!("{}", s.report());
+    }
+    ExitCode::SUCCESS
+}
+
 fn gpu_capacity(n: usize) -> usize {
     (n + 64).max(4096).next_multiple_of(1024)
 }
