@@ -309,3 +309,44 @@ router top-10 on the host 1%. That is why the RAM tier came before moving the ro
   offloaded MoE where every extra position moves more experts.
 - **Prompt/history lookup (n-gram) drafting loses:** 1.21-1.24 tokens per pass while verifying 2.0-4.6 positions
   over all 5 prompts; even the code-edit prompt (mostly copying) gets 1.6-1.9 tokens per pass at 2.7-7.3 positions.
+
+## Night of 2026-10-27: CPU experts, pre-gated prefetch, host overhead (all measured; what lost stays opt-in)
+
+Single-prompt runs, "Write a Rust function that parses a comma separated list...", 128 tokens, `--ram-tier-gib 30
+--placement profiles/routing-6prompts.shrc`; baseline 0.049-0.051 s/token. Same greedy tokens in every arm below.
+
+- **Where a step goes now (unsynchronized host timers, `host waits per step` in the report):** ~17 ms waiting for
+  the GPU to finish a layer (router logits), ~13.5 ms waiting for `copy_stream`, ~5 ms waiting on the drive, and
+  ~11-14 ms of host work. `SHADOW_TIMING_NO_COPIES=1` (skips every expert copy, wrong output, timing only) runs at
+  **0.028 s/token**: copies cost ~22 ms a token on the critical path.
+- **Hybrid CPU experts (`--cpu-experts N --cpu-threads T`, `shadow-model::cpu_expert`): loses.** AVX2+FMA kernels
+  for every routed-expert type (IQ2_S, IQ3_XXS, IQ3_S, IQ4_XS, IQ4_NL, Q2_0): weights decoded to the exact int8 x scale
+  factors `dequantize` uses (unit-tested), f32 activations, a spinning work-stealing pool. On real experts
+  (`cargo run --release -p shadow-model --example cpu_expert_bench`): 1 thread ~1.0 ms/expert (2 GB/s), 8 threads
+  0.26 ms, 15 threads 0.20-0.27 ms (~8-11 GB/s) - against ~0.09 ms for a PCIe copy. End to end: 1 expert/layer
+  0.051-0.053, 2: 0.058, 4: 0.080 s/token (vs 0.049-0.051), same tokens, cosine 1.000 on the 48-layer compare.
+  One CPU expert takes longer than the GPU's whole copy for the layer, and CPU-computed experts never enter the
+  VRAM cache. A 3-4x faster kernel (int8 activations, AVX-512) would only reach parity on this i7-11700K/DDR4-2933.
+- **Pre-gated prefetch (`--pregate K`): no gain.** Layer l+1's router on layer l's MoE input (`SHADOW_PREGATE_PROBE=1`)
+  catches 64-67% of l+1's experts in its top 10, 77-80% in its top 16, ~72% of the misses in its top 16. Copying the
+  top K's misses ahead on `copy_stream` raises hits (61.5% -> 69-77%) and cuts the copy wait (13.3 -> 8.6 ms at K=8),
+  but the GPU-wait grows by the same amount (16.9 -> 20.2 ms): with the copies skipped and only prefetch DMA running,
+  GPU time per step went from 17 to 24 ms. The DMA slows the layer's own work (small per-layer transfers queue behind
+  it), so the wait moves instead of disappearing. K=16 also runs a layer's 12-slot LRU dry (now guarded).
+- **Kept, default on, exact:** router logits read through mapped pinned memory by a copy kernel (no DtoH memcpy in the
+  copy engine); small uploads (embedding, expert tables, n-gram rows) staged in mapped memory and moved by
+  `copy_words`; `Gguf::tensor` indexed (it was a linear scan of ~1,500 names per matvec); `route` keeps the top k by
+  insertion instead of sorting 512 (unit-tested bit-for-bit against the full sort). Speed-neutral on their own
+  (0.050 s/token); they remove copy-engine traffic and host work that a future overlap would otherwise hit.
+- **What would move it:** fewer bytes over PCIe per token (a bigger RAM tier only cuts the drive's 5 ms), or
+  amortizing a step over several tokens. That is batched forward: prefill (still one token at a time, 0.059
+  s/token) and the verify pass speculative decoding needs. Dense tensors are BF16, F32, IQ4_NL, IQ4_XS, Q4_K, Q5_K,
+  Q6_K - multi-column versions of those matvecs are the first piece.
+- **First piece of batched forward: `matvec_cols_*` (kernels/matvec.cu, all 13 fast types).** y_j = W x_j for up to 8
+  inputs per launch. Each `Fast<Q>` has a `dotm<M>` next to its `dot8` (a mechanical copy: decode 8 weights once,
+  accumulate into M sums with the same operations in the same order), so the outputs are bit-identical to
+  `matvec_fast_*` per input (`tests/matvec.rs::several_inputs_at_once_match_one_at_a_time`, m = 1..8). 8 inputs at once
+  vs 8 launches: the expert-sized IQ2_S/IQ3_XXS/IQ3_S/IQ4_XS/IQ4_NL/Q2_0 matrices **2.8-4.2x**, BF16 and the F32
+  router ~2.2x; the big attention matrices (Q4_K/Q5_K/Q6_K, 6144-10240 x 2560) only 0.9-1.4x, because every warp
+  re-reads all 8 inputs from L2 per row (~800 MB of L2 traffic for a 10240-row matrix). Next for those: several rows per
+  warp and the inputs staged in shared memory. Timings taken while a CPU test ran; treat them as rough.

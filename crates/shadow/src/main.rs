@@ -38,7 +38,7 @@ fn main() -> ExitCode {
         return dump(&PathBuf::from(&args[1]), &args[2], &PathBuf::from(&args[3]), &args[4..]);
     }
     if args.first().map(String::as_str) == Some("compare") && args.len() >= 3 {
-        return compare(&PathBuf::from(&args[1]), &PathBuf::from(&args[2]), mode(&args));
+        return compare(&PathBuf::from(&args[1]), &PathBuf::from(&args[2]), mode(&args), &args[3..]);
     }
     if args.first().map(String::as_str) == Some("generate") && args.len() >= 3 {
         return generate(&PathBuf::from(&args[1]), &args[2], &args[3..]);
@@ -152,7 +152,7 @@ fn gpu_capacity(n: usize) -> usize {
 }
 
 /// The stage 1 gate: the reference fixture's prompt through Shadow's forward pass, stream by stream.
-fn compare(path: &std::path::Path, fixture: &std::path::Path, mode: Mode) -> ExitCode {
+fn compare(path: &std::path::Path, fixture: &std::path::Path, mode: Mode, rest: &[String]) -> ExitCode {
     use shadow::reference::{compare, compare_stepper, print, Fixture};
     use shadow_model::forward::{CpuBackend, Model};
     let fx = match Fixture::load(fixture) {
@@ -181,7 +181,10 @@ fn compare(path: &std::path::Path, fixture: &std::path::Path, mode: Mode) -> Exi
         }
         Mode::Gpu => {
             let ctx = shadow_cuda::Context::new(0).expect("--gpu");
-            let mut s = shadow_cuda::session::GpuSession::new(&ctx, &model, gpu_capacity(fx.ids.len())).expect("gpu session");
+            // tier flags (--ram-tier-gib, --placement, --cpu-experts ...) put the fixture through those paths too
+            let tiers = shadow_cuda::session::Tiers::from_args(rest).expect("tier flags");
+            let mut s = shadow_cuda::session::GpuSession::with_tiers(&ctx, &model, gpu_capacity(fx.ids.len()), tiers)
+                .expect("gpu session");
             compare_stepper(&mut s, &fx)
         }
     };

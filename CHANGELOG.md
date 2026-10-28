@@ -2,6 +2,23 @@
 
 All notable changes to Shadow will be documented in this file.
 
+## [0.1.24] — 2026-10-27
+### Changed (default on, exact)
+- Router logits read through mapped pinned memory by a copy kernel; small uploads (embedding, expert tables, n-gram
+  rows) staged in mapped memory and moved by `copy_words`, so neither queues in the copy engine behind expert DMA.
+- `Gguf::tensor` uses a name index (was a linear scan per matvec); `route` keeps the top k by insertion (unit-tested
+  bit-for-bit against the full sort).
+- `bench/night-2026-10-27`, 8 interleaved launches per arm against 0.1.23: `decode_warm` median **18.53 -> 18.85
+  tok/s, +1.5% paired, all 40 pairs faster** (worst +0.4%), 0 answer differences.
+### Added (opt-in, measured, not faster on this PC; docs/STATUS.md)
+- `--cpu-experts N --cpu-threads T`: hybrid MoE, a layer's lowest-weight RAM-tier misses computed on the CPU
+  (`shadow-model::cpu_expert`, AVX2 kernels for every routed-expert type). Slower at every N tried.
+- `--pregate K`: pre-gated prefetch of the next layer's likeliest experts. A tie.
+- `matvec_cols_*` kernels with `dotm<M>`: up to 8 inputs per weight read, bit-identical to `matvec_fast_*`; the first
+  piece of batched prefill / speculative verification.
+- Probes: `SHADOW_ROUTE_LOG`, `SHADOW_MTP_PROBE`, `SHADOW_PREGATE_PROBE`, `SHADOW_TIMING_NO_COPIES`,
+  `tools/spec_probe.py`; host wait timers in the session report; `shadow compare` takes tier flags.
+
 ## [0.1.23] — 2026-10-27
 ### Changed
 - **Parallel drive-tier expert reads (`shadow-model::readpool`)**: a layer's experts that miss VRAM and the pinned RAM

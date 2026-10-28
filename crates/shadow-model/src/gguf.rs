@@ -214,6 +214,8 @@ pub struct Gguf {
     pub shards: Vec<Shard>,
     pub kv: BTreeMap<String, Value>,
     pub tensors: Vec<TensorInfo>,
+    /// Where each name is in `tensors`, built by `open` (the forward pass looks tensors up by name per matvec).
+    index: std::collections::HashMap<String, usize>,
 }
 
 #[derive(Debug)]
@@ -436,7 +438,8 @@ impl Gguf {
                 return Err(Error::Format(path.to_path_buf(), format!("split.tensors.count {n}, read {}", tensors.len())));
             }
         }
-        Ok(Gguf { shards, kv, tensors })
+        let index = tensors.iter().enumerate().map(|(i, t)| (t.name.clone(), i)).collect();
+        Ok(Gguf { shards, kv, tensors, index })
     }
 
     pub fn get(&self, key: &str) -> Option<&Value> {
@@ -450,7 +453,11 @@ impl Gguf {
     }
 
     pub fn tensor(&self, name: &str) -> Option<&TensorInfo> {
-        self.tensors.iter().find(|t| t.name == name)
+        // `tensors` is public, so check the index's answer and scan if someone changed the table since `open`
+        match self.index.get(name).and_then(|&i| self.tensors.get(i)) {
+            Some(t) if t.name == name => Some(t),
+            _ => self.tensors.iter().find(|t| t.name == name),
+        }
     }
 
     /// The sum of every tensor's size.

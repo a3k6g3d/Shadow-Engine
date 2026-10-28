@@ -144,6 +144,12 @@ extern "C" __global__ void copy(float* dst, const float* src, unsigned int n) {
     if (i < n) dst[i] = src[i];
 }
 
+// 32-bit words, bit for bit (tables of addresses and weights, staged in mapped host memory)
+extern "C" __global__ void copy_words(unsigned int* dst, const unsigned int* src, unsigned int n) {
+    unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) dst[i] = src[i];
+}
+
 // x[i] *= s
 extern "C" __global__ void scale_vec(float* x, unsigned int n, float s) {
     unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;

@@ -1008,9 +1008,18 @@ pub fn route(logits: &[f32], k: usize) -> Vec<(usize, f64)> {
     let mx = logits.iter().cloned().fold(f32::MIN, f32::max);
     let ex: Vec<f64> = logits.iter().map(|&v| ((v - mx) as f64).exp()).collect();
     let z: f64 = ex.iter().sum();
-    let mut idx: Vec<usize> = (0..logits.len()).collect();
-    idx.sort_by(|&a, &b| ex[b].partial_cmp(&ex[a]).unwrap().then(a.cmp(&b)));
-    let top = &idx[..k];
+    // the first k of a full sort by (ex descending, index ascending), kept by insertion: k is 10 of 512
+    let before = |a: usize, b: usize| ex[a].partial_cmp(&ex[b]).unwrap().reverse().then(a.cmp(&b)).is_lt();
+    let mut top: Vec<usize> = Vec::with_capacity(k + 1);
+    for i in 0..ex.len() {
+        if top.len() == k && !before(i, top[k - 1]) {
+            continue;
+        }
+        let at = top.partition_point(|&t| before(t, i));
+        top.insert(at, i);
+        top.truncate(k);
+    }
+    let top = &top[..];
     let tz: f64 = top.iter().map(|&e| ex[e] / z).sum();
     top.iter().map(|&e| (e, (ex[e] / z) / tz)).collect()
 }
@@ -1123,4 +1132,37 @@ pub fn check_layout(g: &Gguf, c: &Config) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod route_tests {
+    use super::route;
+
+    /// The insertion top-k against the full sort it replaced, ties included.
+    #[test]
+    fn route_matches_a_full_sort() {
+        let mut s = 0x2545_f491_4f6c_dd1du64;
+        for trial in 0..500 {
+            let logits: Vec<f32> = (0..512).map(|_| {
+                s ^= s << 13;
+                s ^= s >> 7;
+                s ^= s << 17;
+                // coarse values on some trials, so ties are common
+                if trial % 2 == 0 { (s % 16) as f32 * 0.5 } else { (s % 100_000) as f32 / 7919.0 - 6.0 }
+            }).collect();
+            let mx = logits.iter().cloned().fold(f32::MIN, f32::max);
+            let ex: Vec<f64> = logits.iter().map(|&v| ((v - mx) as f64).exp()).collect();
+            let z: f64 = ex.iter().sum();
+            let mut idx: Vec<usize> = (0..512).collect();
+            idx.sort_by(|&a, &b| ex[b].partial_cmp(&ex[a]).unwrap().then(a.cmp(&b)));
+            let tz: f64 = idx[..10].iter().map(|&e| ex[e] / z).sum();
+            let want: Vec<(usize, f64)> = idx[..10].iter().map(|&e| (e, (ex[e] / z) / tz)).collect();
+            let got = route(&logits, 10);
+            assert_eq!(got.len(), 10);
+            for (g, w) in got.iter().zip(&want) {
+                assert_eq!(g.0, w.0, "trial {trial}");
+                assert_eq!(g.1.to_bits(), w.1.to_bits(), "trial {trial}");
+            }
+        }
+    }
 }

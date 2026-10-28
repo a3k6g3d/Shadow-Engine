@@ -128,6 +128,13 @@ pub const PAIR2_KERNELS: &[(&str, &str, &str)] = &[
     ("IQ4_XS", "Q6_K", "matvec_pair_iq4_xs_q6_k"),
 ];
 
+/// matvec_cols_*: w, x, x stride, y, y stride, rows, cols, inputs.
+const MATVEC_COLS: &[P] = &[P::ConstPtr, P::ConstPtr, P::U32, P::Ptr, P::U32, P::U32, P::U32, P::U32];
+
+const fn cols(name: &'static str) -> Entry {
+    Entry { name, params: MATVEC_COLS }
+}
+
 const fn batch(name: &'static str) -> Entry {
     Entry { name, params: MATVEC_BATCH }
 }
@@ -196,6 +203,9 @@ pub const FILES: &[File] = &[
             e("matvec_pair_bf16", &[C, W, U, C, W, U, C, U]),
             e("hc_down_inject_bf16", &[C, W, U, C, W, U, C, U, F]),
             matvec("matvec_fast_f32"), batch("matvec_batch_f32"),
+            cols("matvec_cols_q4_k"), cols("matvec_cols_q5_k"), cols("matvec_cols_q6_k"), cols("matvec_cols_iq4_nl"), cols("matvec_cols_iq4_xs"),
+            cols("matvec_cols_nvfp4"), cols("matvec_cols_q2_0"), cols("matvec_cols_q8_0"), cols("matvec_cols_iq2_s"), cols("matvec_cols_iq3_xxs"),
+            cols("matvec_cols_iq3_s"), cols("matvec_cols_bf16"), cols("matvec_cols_f32"),
             pair("matvec_pair_q4_k"), pair("matvec_pair_q5_k"), pair("matvec_pair_q6_k"),
             pair("matvec_pair_iq4_nl"), pair("matvec_pair_iq4_xs"), pair("matvec_pair_nvfp4"),
             pair("matvec_pair_q2_0"), pair("matvec_pair_q8_0"), pair("matvec_pair_iq2_s"), pair("matvec_pair_iq3_xxs"),
@@ -218,6 +228,7 @@ pub const FILES: &[File] = &[
             e("broadcast", &[C, W, U, U]),
             e("add", &[W, C, U]),
             e("copy", &[W, C, U]),
+            e("copy_words", &[W, C, U]),
             e("scale_vec", &[W, U, F]),
             e("conv_silu_step", &[C, W, C, W, U, U]),
             e("l2norm_heads", &[W, U, F]),

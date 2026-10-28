@@ -58,6 +58,11 @@ impl ExpertCache<'_> {
 
     /// A slot in layer `l` for a new expert: a free one, else the least recently used evictable slot not used by the
     /// current token.
+    /// Whether layer l has a slot `victim` may take now.
+    fn has_victim(&self, l: usize) -> bool {
+        self.evict_range[l].clone().any(|i| self.owner[i].is_none() || self.stamp[i] < self.clock)
+    }
+
     fn victim(&mut self, l: usize) -> usize {
         let r = self.evict_range[l].clone();
         let s = r
@@ -153,7 +158,6 @@ pub struct GpuSession<'c, 'm> {
     cache: ExpertCache<'c>,
     ram: RamTier<'c>,
     copy_stream: Stream<'c>,
-    #[allow(dead_code)]
     copy_event: Event<'c>,
     staging: Option<PinnedRegion<'c>>,
     /// This layer's drive reads, put off until all its misses are known so `read_drive` can issue them together.
@@ -164,10 +168,50 @@ pub struct GpuSession<'c, 'm> {
     /// `SHADOW_ROUTE_LOG=FILE`: every MoE layer's routed experts, in order, written with the tokens when the session
     /// drops (tools/spec_probe.py reads it).
     route_log: Option<(String, Vec<u16>)>,
+    /// The hybrid MoE's CPU side (`Tiers::cpu_experts`), and how many experts it has computed.
+    cpu: Option<(shadow_model::cpu_expert::ExpertPool, usize)>,
+    pub cpu_served: u64,
+    prefetch: Option<Prefetch<'c>>,
+    /// Mapped pinned memory the router logits are copied into by a kernel, and the event the host waits on for them:
+    /// a device-to-host memcpy would queue in the copy engine behind `copy_stream`'s uploads.
+    mapped: PinnedRegion<'c>,
+    mapped_event: Event<'c>,
+    /// Small uploads (embeddings, expert tables, n-gram rows) go through here: the host writes them into this mapped
+    /// region and `copy_words` moves them on the default stream, so they never queue in the copy engine behind
+    /// `copy_stream`.  `stage_at` is reset whenever the host has seen the default stream drain.
+    stage: PinnedRegion<'c>,
+    stage_ptr: *mut u8,
+    stage_at: std::cell::Cell<usize>,
+    /// Seconds the host spent waiting: for router logits, for `copy_stream`, and on the file (unsynchronized timing).
+    pub waits: [f64; 3],
+    /// `SHADOW_PREGATE_PROBE=1`: layer l+1's router applied to layer l's MoE input, against l+1's real choice.
+    pregate: Option<Pregate<'c>>,
     /// `SHADOW_MTP_PROBE=1` with `--mtp`: every step drafts first and counts (drafts, hits) against its own argmax.
     mtp_probe: Option<(u64, u64)>,
     pub mtp: Option<crate::mtp::MtpModel<'c>>,
 }
+
+/// What the pre-gating probe has seen: the prediction waiting for each layer, and per-layer counts of (real experts,
+/// predicted in the top 10, in the top 16, real misses, misses predicted in the top 16).
+pub struct Pregate<'c> {
+    buf: DeviceBuffer<'c>,
+    pred: Vec<Option<Vec<usize>>>,
+    pub counts: Vec<[u64; 5]>,
+}
+
+/// The pre-gated prefetch (`Tiers::pregate`): the next layer's router logits, what was copied up ahead and not yet
+/// routed to, and whether the default stream still has to wait for `copy_event` before the next layer's experts run.
+struct Prefetch<'c> {
+    k: usize,
+    buf: DeviceBuffer<'c>,
+    ahead: std::collections::HashSet<(usize, usize)>,
+    wait: bool,
+    issued: u64,
+    used: u64,
+}
+
+/// The mapped staging region for small uploads (`GpuSession::upload_to`).
+const STAGE_BYTES: usize = 4 << 20;
 
 /// An expert to read from the file into pinned memory and then copy to `dst`: into `RamTier`'s region at `off` when
 /// `ring`, else into the staging buffer at `off`.
@@ -192,6 +236,13 @@ pub struct Tiers {
     pub order: Option<Vec<(usize, usize)>>,
     /// Path to tuned MTP head directory (e.g. models/mtp-basalt-ft1).
     pub mtp_dir: Option<std::path::PathBuf>,
+    /// Hybrid MoE: up to this many of a layer's misses that the RAM tier holds are computed on the CPU instead of
+    /// copied to the GPU (0: off), on `cpu_threads` workers.
+    pub cpu_experts: usize,
+    pub cpu_threads: usize,
+    /// Pre-gated prefetch: layer l+1's router applied to layer l's MoE input; its top `pregate` experts that the RAM
+    /// tier holds and VRAM does not are copied up while layer l computes (0: off).
+    pub pregate: usize,
 }
 
 impl Tiers {
@@ -221,7 +272,12 @@ impl Tiers {
             Some(p) => Some(std::path::PathBuf::from(p)),
             None => None,
         };
-        Ok(Tiers { vram_cache: gib("--expert-cache-gib")?, ram_bytes, ram_auto, order, mtp_dir })
+        let num = |f: &str, d: usize| -> Result<usize, String> {
+            flag(f).map_or(Ok(d), |v| v.parse().map_err(|_| format!("{f}: not a number: {v}")))
+        };
+        Ok(Tiers { vram_cache: gib("--expert-cache-gib")?, ram_bytes, ram_auto, order, mtp_dir,
+                   cpu_experts: num("--cpu-experts", 0)?, cpu_threads: num("--cpu-threads", 8)?,
+                   pregate: num("--pregate", 0)? })
     }
 }
 
@@ -677,16 +733,37 @@ impl<'c, 'm> GpuSession<'c, 'm> {
         } else {
             None
         };
-        Ok(GpuSession {
+        let mut s = GpuSession {
             ctx, m, mvp, fw, w, v, b, delta, attn, ple_state, tokens: vec![], cap, trace: None, stop_after: None,
             resident_bytes, expert_uploads: 0, cache, ram, copy_stream, copy_event, staging,
             pending: vec![], routing: RoutingCounts::new(c.n_layer, c.n_expert),
             prof: std::env::var("SHADOW_PROFILE").is_ok_and(|v| v == "1")
                 .then(|| Prof { last: std::time::Instant::now(), phases: vec![] }),
             route_log: std::env::var("SHADOW_ROUTE_LOG").ok().map(|p| (p, vec![])),
+            cpu: (tiers.cpu_experts > 0 && tiers.cpu_threads > 0)
+                .then(|| (shadow_model::cpu_expert::ExpertPool::new(tiers.cpu_threads), tiers.cpu_experts)),
+            cpu_served: 0,
+            mapped: PinnedRegion::new(ctx, 2 * c.n_expert * 4)?,
+            mapped_event: ctx.event().map_err(e)?,
+            waits: [0.0; 3],
+            stage_ptr: std::ptr::null_mut(),
+            stage: PinnedRegion::new(ctx, STAGE_BYTES)?,
+            stage_at: std::cell::Cell::new(0),
+            prefetch: match tiers.pregate {
+                0 => None,
+                k => Some(Prefetch { k, buf: ctx.alloc(c.n_expert * 4).map_err(e)?, ahead: Default::default(), wait: false,
+                                     issued: 0, used: 0 }),
+            },
+            pregate: match std::env::var("SHADOW_PREGATE_PROBE").is_ok_and(|v| v == "1") {
+                true => Some(Pregate { buf: ctx.alloc(c.n_expert * 4).map_err(e)?, pred: vec![None; c.n_layer],
+                                       counts: vec![[0; 5]; c.n_layer] }),
+                false => None,
+            },
             mtp_probe: std::env::var("SHADOW_MTP_PROBE").is_ok_and(|v| v == "1").then_some((0, 0)),
             mtp,
-        })
+        };
+        s.stage_ptr = s.stage.as_mut_slice().as_mut_ptr();
+        Ok(s)
     }
 
     /// Charges the time since the last mark to `phase` (profiling only; synchronizes the device first).
@@ -876,15 +953,49 @@ impl<'c, 'm> GpuSession<'c, 'm> {
     }
 
     /// Copies `out.len()` bytes from device address `ptr` (any offset into a buffer).
+    /// Device floats to the host without the copy engine: a copy kernel writes each `(ptr, n)` into the mapped region
+    /// (one after another), the host waits for the default stream's event and reads them back.
+    fn download_mapped(&self, srcs: &[(u64, usize)]) -> Vec<Vec<f32>> {
+        let mut at = 0usize;
+        for &(ptr, n) in srcs {
+            assert!((at + n) * 4 <= self.mapped.len(), "mapped download too big");
+            self.k1("copy", n, &[Arg::Ptr(self.mapped.dev_ptr + (at * 4) as u64), Arg::Ptr(ptr), Arg::U32(n as u32)]);
+            at += n;
+        }
+        self.mapped_event.record(None).unwrap();
+        self.mapped_event.synchronize().unwrap();
+        self.stage_at.set(0); // the default stream has drained: every staged upload has been copied
+        let base = self.mapped.as_slice().as_ptr() as *const f32;
+        let mut at = 0usize;
+        srcs.iter().map(|&(_, n)| {
+            // SAFETY: the kernels above wrote n floats at base + at, and finished before the event completed; the
+            // device writes nothing there now, and volatile reads keep the compiler from assuming the bytes unchanged.
+            let v = (0..n).map(|i| unsafe { std::ptr::read_volatile(base.add(at + i)) }).collect();
+            at += n;
+            v
+        }).collect()
+    }
+
     fn download(&self, ptr: u64, out: &mut [u8]) {
         let api = self.ctx.api;
         self.ctx.bind().unwrap();
         // SAFETY: the address range lies inside a buffer of this session (the callers pass its sizes).
         let r = unsafe { (api.cuMemcpyDtoH)(out.as_mut_ptr() as *mut std::ffi::c_void, ptr, out.len()) };
         assert_eq!(r, 0, "cuMemcpyDtoH failed ({r})");
+        self.stage_at.set(0); // synchronous on the default stream: everything staged before has been copied
     }
 
     fn upload_to(&self, ptr: u64, data: &[u8]) {
+        let at = self.stage_at.get();
+        if data.len().is_multiple_of(4) && !data.is_empty() && at + data.len() <= STAGE_BYTES && !self.stage_ptr.is_null() {
+            // SAFETY: [at, at + len) is inside the staging region and not yet handed to a kernel since the last drain
+            // (stage_at only grows until then), so nothing reads it while the host writes.
+            unsafe { std::ptr::copy_nonoverlapping(data.as_ptr(), self.stage_ptr.add(at), data.len()) };
+            self.stage_at.set((at + data.len()).next_multiple_of(256));
+            let n = data.len() / 4;
+            self.k1("copy_words", n, &[Arg::Ptr(ptr), Arg::Ptr(self.stage.dev_ptr + at as u64), Arg::U32(n as u32)]);
+            return;
+        }
         let api = self.ctx.api;
         self.ctx.bind().unwrap();
         // SAFETY: as download.  For small buffers (<= 64 KiB: embedding row, tab, toks) cuMemcpyHtoDAsync stages into
@@ -1306,6 +1417,9 @@ impl<'c, 'm> GpuSession<'c, 'm> {
     /// active, else into the pinned staging buffer) and copied on `copy_stream`.  Those file reads wait in `pending`
     /// for `read_drive`.
     fn fetch_expert(&mut self, l: usize, e: usize, slot_idx: usize, names: &[String; 3], sizes: &[usize], dst: [u64; 3]) {
+        if std::env::var_os("SHADOW_TIMING_NO_COPIES").is_some() {
+            return; // timing experiment only: the slot keeps whatever it held, so the output is wrong
+        }
         let stream = self.copy_stream.raw();
         let contiguous = dst[1] == dst[0] + sizes[0] as u64 && dst[2] == dst[1] + sizes[1] as u64;
         let total = sizes[0] + sizes[1] + sizes[2];
@@ -1371,7 +1485,9 @@ impl<'c, 'm> GpuSession<'c, 'm> {
                     jobs.push((&names[1], p.e, up));
                 }
             }
+            let t_wait = std::time::Instant::now();
             self.m.experts_into_many(&mut jobs);
+            self.waits[2] += t_wait.elapsed().as_secs_f64();
         }
         self.mark("expert read (file)");
         let stream = self.copy_stream.raw();
@@ -1390,6 +1506,47 @@ impl<'c, 'm> GpuSession<'c, 'm> {
         self.mark("expert upload (pageable)");
     }
 
+    /// Copies layer `l`'s likeliest experts (by its router's `logits` on the previous layer's input) from the RAM tier
+    /// into VRAM cache slots on `copy_stream`, without waiting: the cache treats them as resident from now on, and
+    /// layer l waits for `copy_event` (or for `copy_stream`) before its experts run.
+    fn prefetch_next(&mut self, l: usize, logits: &[f32]) {
+        let k = self.prefetch.as_ref().unwrap().k;
+        let names = ["gate", "up", "down"].map(|p| format!("blk.{l}.ffn_{p}_exps.weight"));
+        let sizes: Vec<usize> = names.iter().map(|n| self.m.expert_bytes(n)).collect();
+        let total: usize = sizes.iter().sum();
+        let stream = self.copy_stream.raw();
+        let mut n = 0u64;
+        for (e, _) in route(logits, k) {
+            if self.cache.map.contains_key(&(l, e)) {
+                continue;
+            }
+            let Some(&off) = self.ram.at.get(&(l, e)) else { continue };
+            if !self.cache.has_victim(l) {
+                break;
+            }
+            if let Some(&r) = self.ram.ring_by_off.get(&off) {
+                self.ram.ring_ref[r] = true;
+            }
+            let s = self.cache.victim(l);
+            let base = self.cache.arena.as_ref().unwrap().ptr + self.cache.slot_offset[s];
+            let src = &self.ram.region.as_ref().unwrap().as_slice()[off..off + total];
+            self.upload_pinned_on(base, src, stream);
+            self.cache.owner[s] = Some((l, e));
+            self.cache.map.insert((l, e), s);
+            self.cache.stamp[s] = self.cache.clock;
+            self.prefetch.as_mut().unwrap().ahead.insert((l, e));
+            n += 1;
+        }
+        if n > 0 {
+            self.copy_event.record(Some(&self.copy_stream)).unwrap();
+            let pf = self.prefetch.as_mut().unwrap();
+            pf.wait = true;
+            pf.issued += n;
+            self.ram.served += n;
+            self.expert_uploads += 3 * n as usize;
+        }
+    }
+
     fn moe(&mut self, l: usize) {
         let c = &self.m.cfg;
         let p = format!("blk.{l}");
@@ -1406,8 +1563,20 @@ impl<'c, 'm> GpuSession<'c, 'm> {
         } else {
             self.mv(&format!("{p}.ffn_gate_inp.weight"), self.b.u.ptr, self.b.rl.ptr);
         }
-        let mut lb = vec![0u8; c.n_expert * 4];
-        self.download(self.b.rl.ptr, &mut lb);
+        let pf_next = !is_flint && self.cache.slots > 0 && l + 1 < c.n_layer && c.is_moe(l + 1) && self.prefetch.is_some();
+        if pf_next {
+            let buf = self.prefetch.as_ref().unwrap().buf.ptr;
+            self.mv(&format!("blk.{}.ffn_gate_inp.weight", l + 1), self.b.u.ptr, buf);
+        }
+        let mut srcs = vec![(self.b.rl.ptr, c.n_expert)];
+        if pf_next {
+            srcs.push((self.prefetch.as_ref().unwrap().buf.ptr, c.n_expert));
+        }
+        let t_wait = std::time::Instant::now();
+        let mut got = self.download_mapped(&srcs).into_iter();
+        self.waits[0] += t_wait.elapsed().as_secs_f64();
+        let logits = got.next().unwrap();
+        let next_logits = got.next();
         // Launch Qwen's shared expert on stream 0 immediately so the GPU SMs compute it while the CPU runs `route`
         // and `copy_stream` DMAs any missing routed experts.
         let sh_launched_early = !is_flint && self.prof.is_none();
@@ -1422,9 +1591,9 @@ impl<'c, 'm> GpuSession<'c, 'm> {
             self.mv(&format!("{p}.ffn_down_shexp.weight"), sh_act, sh_out);
         }
         let top = if is_flint {
-            route_sigmoid(&floats(&lb), c.n_expert_used)
+            route_sigmoid(&logits, c.n_expert_used)
         } else {
-            route(&floats(&lb), c.n_expert_used)
+            route(&logits, c.n_expert_used)
         };
         self.mark("router (logits down, top-10)");
         for &(e, _) in &top {
@@ -1442,18 +1611,91 @@ impl<'c, 'm> GpuSession<'c, 'm> {
             let t = self.m.g.tensor(n).unwrap();
             (t.nbytes() / t.dims[2]) as usize
         }).collect();
+        if !is_flint {
+            if let Some(pred) = self.pregate.as_ref().and_then(|pg| pg.pred[l].clone()) {
+                let real: Vec<usize> = top.iter().map(|&(e, _)| e).collect();
+                let misses: Vec<usize> = real.iter().copied().filter(|e| !self.cache.map.contains_key(&(l, *e))).collect();
+                if let Some(pg) = self.pregate.as_mut() {
+                    let k = &mut pg.counts[l];
+                    k[0] += real.len() as u64;
+                    k[1] += real.iter().filter(|e| pred[..10].contains(e)).count() as u64;
+                    k[2] += real.iter().filter(|e| pred.contains(e)).count() as u64;
+                    k[3] += misses.len() as u64;
+                    k[4] += misses.iter().filter(|e| pred.contains(e)).count() as u64;
+                }
+            }
+            if let Some(buf) = self.pregate.as_ref().map(|pg| pg.buf.ptr).filter(|_| l + 1 < c.n_layer && c.is_moe(l + 1)) {
+                self.mv(&format!("blk.{}.ffn_gate_inp.weight", l + 1), self.b.u.ptr, buf);
+                let mut pb = vec![0u8; c.n_expert * 4];
+                self.download(buf, &mut pb);
+                let pred: Vec<usize> = route(&floats(&pb), 16).into_iter().map(|(e, _)| e).collect();
+                if let Some(pg) = self.pregate.as_mut() {
+                    pg.pred[l + 1] = Some(pred);
+                }
+            }
+        }
+        // Hybrid MoE: up to `cpu_experts` of the lowest-weight misses that the RAM tier holds are computed on the CPU,
+        // from the pinned bytes, while the GPU copies and runs the rest.  `top` becomes [GPU experts.., CPU experts..].
+        let mut top = top;
+        let mut cpu_offs: Vec<usize> = vec![];
+        if let Some(&(_, max)) = self.cpu.as_ref().filter(|_| !is_flint && self.cache.slots > 0) {
+            let mut cpu_set: Vec<(usize, f64, usize)> = vec![];
+            for &(e, w) in top.iter().rev() {
+                if cpu_set.len() == max {
+                    break;
+                }
+                if !self.cache.map.contains_key(&(l, e)) {
+                    if let Some(&off) = self.ram.at.get(&(l, e)) {
+                        cpu_set.push((e, w, off));
+                    }
+                }
+            }
+            if !cpu_set.is_empty() {
+                let mut ub = vec![0u8; h * 4];
+                self.download(self.b.u.ptr, &mut ub);
+                let base = self.ram.region.as_ref().unwrap().as_slice().as_ptr();
+                let refs: Vec<shadow_model::cpu_expert::ExpertRef> = cpu_set.iter().map(|&(_, _, off)| {
+                    // SAFETY: the RAM tier holds this expert's [gate | up | down] at off, inside the region.
+                    unsafe {
+                        shadow_model::cpu_expert::ExpertRef { gate: base.add(off), up: base.add(off + sizes[0]),
+                                                              down: base.add(off + sizes[0] + sizes[1]) }
+                    }
+                }).collect();
+                for &(_, _, off) in &cpu_set {
+                    if let Some(&r) = self.ram.ring_by_off.get(&off) {
+                        self.ram.ring_ref[r] = true; // keep the Clock hand off it this layer
+                    }
+                }
+                let shape = shadow_model::cpu_expert::ExpertShape {
+                    hidden: h, ff, gate_ty: infos[0].ty.name(), up_ty: infos[1].ty.name(), down_ty: infos[2].ty.name(),
+                };
+                let pool = &mut self.cpu.as_mut().unwrap().0;
+                // SAFETY: the region lives as long as the session, and nothing rewrites these experts' bytes before
+                // `wait` below: read_drive waits first if it is about to reuse one of their ring slots.
+                unsafe { pool.submit(&shape, refs, &floats(&ub)) };
+                self.cpu_served += cpu_set.len() as u64;
+                top.retain(|&(e, _)| !cpu_set.iter().any(|c| c.0 == e));
+                top.extend(cpu_set.iter().map(|&(e, w, _)| (e, w)));
+                cpu_offs = cpu_set.iter().map(|c| c.2).collect();
+            }
+        }
+        let ng = top.len() - cpu_offs.len();
+        let mut cpu_out: Option<Vec<f32>> = None;
         // where each expert's three slices are on the device this time
         let mut at: Vec<[u64; 3]> = Vec::with_capacity(top.len());
         let mut layer_misses = 0usize;
         if self.cache.slots > 0 {
             self.cache.clock += 1;
-            for &(e, _) in &top {
+            for &(e, _) in &top[..ng] {
                 self.cache.touch((l, e)); // protect this token's resident experts from its own misses
             }
-            for (i, &(e, _)) in top.iter().enumerate() {
+            for (i, &(e, _)) in top[..ng].iter().enumerate() {
                 let slot = match self.cache.touch((l, e)) {
                     Some(s) => {
                         self.cache.hits += 1;
+                        if let Some(pf) = self.prefetch.as_mut() {
+                            pf.used += pf.ahead.remove(&(l, e)) as u64;
+                        }
                         s
                     }
                     None => {
@@ -1484,15 +1726,30 @@ impl<'c, 'm> GpuSession<'c, 'm> {
                 at.push(dst);
             }
         }
+        if self.pending.iter().any(|p| p.ring && cpu_offs.contains(&p.off)) {
+            cpu_out = Some(self.cpu.as_mut().unwrap().0.wait());
+        }
         self.read_drive(&names, &sizes);
         if layer_misses > 0 {
+            let t_wait = std::time::Instant::now();
             self.copy_stream.synchronize().unwrap();
+            self.waits[1] += t_wait.elapsed().as_secs_f64();
+        } else if self.prefetch.as_ref().is_some_and(|p| p.wait) {
+            // this layer's experts may have been copied ahead: the GPU waits for those copies, the host does not
+            self.ctx.stream_wait_event(None, &self.copy_event).unwrap();
+        }
+        if let Some(pf) = self.prefetch.as_mut() {
+            pf.wait = false;
+            pf.ahead.retain(|&(pl, _)| pl > l);
+        }
+        if let Some(nl) = next_logits {
+            self.prefetch_next(l + 1, &nl);
         }
         // one table per layer - every expert's gate, up and down address, then the weights (and scales for NVFP4) -
         // and one launch per projection for all of them (with gate+up fused, and Flint's shared expert gate+up fused in too)
         let n = top.len();
         let fuse_shexp = is_flint && sff == 2 * ff && infos[0].ty == infos[1].ty && infos[0].dims == infos[1].dims;
-        let n_gu = if fuse_shexp { n + 2 } else { n };
+        let n_gu = if fuse_shexp { ng + 2 } else { ng };
         let mut tab = Vec::with_capacity(n_gu * 40);
         for part in 0..2 {
             for a in &at {
@@ -1544,28 +1801,35 @@ impl<'c, 'm> GpuSession<'c, 'm> {
             }
             .unwrap_or_else(|err| panic!("{}: {err}", t.name));
         };
-        let eu_ptr = if infos[0].ty == infos[1].ty && infos[0].dims == infos[1].dims {
-            // gate and up share the same input vector u and have identical type/dimensions: launch all 2 * n_gu at once
-            batch(&infos[0], 0, 2 * n_gu, b.u.ptr, 0, b.eg.ptr, ff);
-            b.eg.ptr + (n_gu * ff * 4) as u64
-        } else {
-            batch(&infos[0], 0, n_gu, b.u.ptr, 0, b.eg.ptr, ff);
-            batch(&infos[1], 8 * n_gu as u64, n_gu, b.u.ptr, 0, b.eu.ptr, ff);
-            b.eu.ptr
-        };
         let down_tab_off = 16 * n_gu as u64;
-        let w_off = down_tab_off + 8 * n as u64;
+        let w_off = down_tab_off + 8 * ng as u64;
         let gs_off = w_off + 4 * n as u64;
         let us_off = gs_off + 4 * n_gu as u64;
         let ds_off = us_off + 4 * n_gu as u64;
-        if is_flint {
-            self.k1("swiglu_scaled", n_gu * ff, &[
-                Arg::Ptr(b.eg.ptr), Arg::Ptr(eu_ptr), Arg::Ptr(b.tab.ptr + gs_off),
-                Arg::Ptr(b.tab.ptr + us_off), Arg::Ptr(b.act.ptr), Arg::U32(ff as u32), Arg::U32(n_gu as u32)]);
-        } else {
-            self.k1("swiglu", n * ff, &[Arg::Ptr(b.eg.ptr), Arg::Ptr(eu_ptr), Arg::Ptr(b.act.ptr), Arg::U32((n * ff) as u32)]);
+        if ng > 0 {
+            let eu_ptr = if infos[0].ty == infos[1].ty && infos[0].dims == infos[1].dims {
+                // gate and up share the same input vector u and have identical type/dimensions: launch all 2 * n_gu at once
+                batch(&infos[0], 0, 2 * n_gu, b.u.ptr, 0, b.eg.ptr, ff);
+                b.eg.ptr + (n_gu * ff * 4) as u64
+            } else {
+                batch(&infos[0], 0, n_gu, b.u.ptr, 0, b.eg.ptr, ff);
+                batch(&infos[1], 8 * n_gu as u64, n_gu, b.u.ptr, 0, b.eu.ptr, ff);
+                b.eu.ptr
+            };
+            if is_flint {
+                self.k1("swiglu_scaled", n_gu * ff, &[
+                    Arg::Ptr(b.eg.ptr), Arg::Ptr(eu_ptr), Arg::Ptr(b.tab.ptr + gs_off),
+                    Arg::Ptr(b.tab.ptr + us_off), Arg::Ptr(b.act.ptr), Arg::U32(ff as u32), Arg::U32(n_gu as u32)]);
+            } else {
+                self.k1("swiglu", ng * ff, &[Arg::Ptr(b.eg.ptr), Arg::Ptr(eu_ptr), Arg::Ptr(b.act.ptr), Arg::U32((ng * ff) as u32)]);
+            }
+            batch(&infos[2], down_tab_off, ng, b.act.ptr, ff, b.eo.ptr, h);
         }
-        batch(&infos[2], down_tab_off, n, b.act.ptr, ff, b.eo.ptr, h);
+        if ng < n {
+            // the CPU's experts, unweighted, into eo's rows after the GPU's
+            let out = cpu_out.take().unwrap_or_else(|| self.cpu.as_mut().unwrap().0.wait());
+            self.upload_to(self.b.eo.ptr + (ng * h * 4) as u64, &f32s(&out));
+        }
         self.mark("routed expert matvecs");
         let b = &self.b;
         let sh_out_ptr = b.eo.ptr + (n * h * 4) as u64;
@@ -1659,6 +1923,19 @@ impl Stepper for GpuSession<'_, '_> {
             + &format!("; RAM tier: {} experts, {:.2} GiB pinned (filled in {:.1} s), misses served {} from RAM, {} from the file",
                        self.ram.at.len(), self.ram.region.as_ref().map_or(0, |r| r.len()) as f64 / (1u64 << 30) as f64,
                        self.ram.fill_secs, self.ram.served, self.ram.drive)
+            + &self.cpu.as_ref().map(|c| format!("; CPU experts: up to {} per layer, {} computed", c.1, self.cpu_served))
+                .unwrap_or_default()
+            + &format!("; host waits per step: router {:.1} ms, copies {:.1} ms, file {:.1} ms",
+                       1e3 * self.waits[0] / self.tokens.len().max(1) as f64, 1e3 * self.waits[1] / self.tokens.len().max(1) as f64,
+                       1e3 * self.waits[2] / self.tokens.len().max(1) as f64)
+            + &self.prefetch.as_ref().map(|p| format!("; pre-gated prefetch: top {}, {} copied ahead, {} used ({:.1}%)", p.k,
+                                                       p.issued, p.used, 100.0 * p.used as f64 / p.issued.max(1) as f64))
+                .unwrap_or_default()
+            + &self.pregate.as_ref().map(|p| {
+                let t = p.counts.iter().fold([0u64; 5], |a, k| std::array::from_fn(|i| a[i] + k[i]));
+                let pc = |a: u64, b: u64| 100.0 * a as f64 / b.max(1) as f64;
+                format!("; pre-gating probe: top-10 {:.1}%, top-16 {:.1}% of routed experts; {:.1}% of misses in the top 16                          ({} misses)", pc(t[1], t[0]), pc(t[2], t[0]), pc(t[4], t[3]), t[3])
+            }).unwrap_or_default()
             + &self.mtp_probe.map(|(n, hit)| format!("; MTP probe: {hit}/{n} drafts right ({:.1}%)",
                                                        100.0 * hit as f64 / n.max(1) as f64)).unwrap_or_default()
             + if self.mtp.is_some() { "; MTP: active (speculative decoding with tuned basalt head)" } else { "" }

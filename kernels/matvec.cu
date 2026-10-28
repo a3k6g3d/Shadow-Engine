@@ -37,12 +37,23 @@ extern "C" __global__ void matvec_f32(const u8* w, const float* x, float* y, uns
 // weight.  Only the order of the f32 sum differs from the reference kernel.  Lane l of a warp takes chunks l, l+32, ...
 // of its row, so neighbouring lanes read neighbouring bytes.  Needs cols % 8 == 0 (the host falls back otherwise).
 
+// dotm<M>: dot8 for M inputs at once (x_j = x + j * xs), each weight decoded once; acc[j] += that input's dot8, with
+// the same operations in the same order per input, so the sums are dot8's to the bit.  Written from each dot8 below.
+#define DOTM_ACC(a, b) { float w_ = (a); _Pragma("unroll") for (unsigned int j_ = 0; j_ < M; j_++) s[j_] += w_ * x[(u64) j_ * xs + (b)]; }
+
 template <typename Q> struct Fast {
     static __device__ __forceinline__ float dot8(const u8* r, unsigned int i, const float* x) {
         float s = 0.0f;
 #pragma unroll
         for (unsigned int k = 0; k < 8; k++) s += Q::at(r + ((i + k) / Q::QK) * Q::BYTES, (i + k) % Q::QK) * x[k];
         return s;
+    }
+    template <unsigned int M>
+    static __device__ __forceinline__ void dotm(const u8* r, unsigned int i, const float* x, unsigned int xs, float* acc) {
+        float s[M] = {};
+#pragma unroll
+        for (unsigned int k = 0; k < 8; k++) DOTM_ACC(Q::at(r + ((i + k) / Q::QK) * Q::BYTES, (i + k) % Q::QK), k);
+        for (unsigned int j = 0; j < M; j++) acc[j] += s[j];
     }
 };
 
@@ -66,6 +77,28 @@ template <> struct Fast<Q4K> {
             s += __fsub_rn(__fmul_rn(ds, (float) v), dm) * x[4 + k];
         }
         return s;
+    }
+    template <unsigned int M>
+    static __device__ __forceinline__ void dotm(const u8* r, unsigned int i, const float* x, unsigned int xs, float* acc) {
+        const u8* b = r + (i / 256) * 144;
+        unsigned int e0 = i % 256, ig = e0 / 32, c0 = e0 % 32, sh = (ig % 2) * 4;
+        u8 sc, mn;
+        q_scale_min_k4(b + 4, ig, &sc, &mn);
+        float ds = __fmul_rn(qf16(b), (float) sc), dm = __fmul_rn(qf16(b + 2), (float) mn);
+        float s[M] = {};
+        const u8* q = b + 16 + (ig / 2) * 32 + c0;
+        u32 q0 = *(const u32*) q, q1 = *(const u32*) (q + 4);
+#pragma unroll
+        for (unsigned int k = 0; k < 4; k++) {
+            u8 v = (u8) ((q0 >> (8 * k + sh)) & 0x0f);
+            DOTM_ACC(__fsub_rn(__fmul_rn(ds, (float) v), dm), k);
+        }
+#pragma unroll
+        for (unsigned int k = 0; k < 4; k++) {
+            u8 v = (u8) ((q1 >> (8 * k + sh)) & 0x0f);
+            DOTM_ACC(__fsub_rn(__fmul_rn(ds, (float) v), dm), 4 + k);
+        }
+        for (unsigned int j = 0; j < M; j++) acc[j] += s[j];
     }
 };
 
@@ -92,6 +125,30 @@ template <> struct Fast<Q5K> {
         }
         return s;
     }
+    template <unsigned int M>
+    static __device__ __forceinline__ void dotm(const u8* r, unsigned int i, const float* x, unsigned int xs, float* acc) {
+        const u8* b = r + (i / 256) * 176;
+        unsigned int e0 = i % 256, ig = e0 / 32, c0 = e0 % 32, sh = (ig % 2) * 4;
+        u8 sc, mn;
+        q_scale_min_k4(b + 4, ig, &sc, &mn);
+        float ds = __fmul_rn(qf16(b), (float) sc), dm = __fmul_rn(qf16(b + 2), (float) mn);
+        float s[M] = {};
+        const u8* ql = b + 48 + (ig / 2) * 32 + c0;
+        const u8* qh = b + 16 + c0;
+        u32 ql0 = *(const u32*) ql, ql1 = *(const u32*) (ql + 4);
+        u32 qh0 = *(const u32*) qh, qh1 = *(const u32*) (qh + 4);
+#pragma unroll
+        for (unsigned int k = 0; k < 4; k++) {
+            u8 v = (u8) (((ql0 >> (8 * k + sh)) & 0x0f) | (((qh0 >> (8 * k + ig)) & 1u) << 4));
+            DOTM_ACC(__fsub_rn(__fmul_rn(ds, (float) v), dm), k);
+        }
+#pragma unroll
+        for (unsigned int k = 0; k < 4; k++) {
+            u8 v = (u8) (((ql1 >> (8 * k + sh)) & 0x0f) | (((qh1 >> (8 * k + ig)) & 1u) << 4));
+            DOTM_ACC(__fsub_rn(__fmul_rn(ds, (float) v), dm), 4 + k);
+        }
+        for (unsigned int j = 0; j < M; j++) acc[j] += s[j];
+    }
 };
 
 template <> struct Fast<Q6K> {
@@ -114,6 +171,27 @@ template <> struct Fast<Q6K> {
         }
         return s;
     }
+    template <unsigned int M>
+    static __device__ __forceinline__ void dotm(const u8* r, unsigned int i, const float* x, unsigned int xs, float* acc) {
+        const u8* b = r + (i / 256) * 210;
+        unsigned int e0 = i % 256, r_idx = e0 / 32, c0 = e0 % 32;
+        unsigned int g = r_idx / 4, h = (r_idx % 4) / 2, k_idx = r_idx % 2, s_idx = r_idx % 4;
+        float d = __fmul_rn(qf16(b + 208), (float) (signed char) b[192 + e0 / 16]);
+        float s[M] = {};
+        const u16* ql = (const u16*) (b + g * 64 + k_idx * 32 + c0);
+        const u16* qh = (const u16*) (b + 128 + g * 32 + c0);
+#pragma unroll
+        for (unsigned int k = 0; k < 4; k++) {
+            u16 wl = ql[k], wh = qh[k];
+            u8 lo0 = (wl >> (h * 4)) & 0x0f, hi0 = (wh >> (2 * s_idx)) & 0x03;
+            u8 lo1 = (wl >> (8 + h * 4)) & 0x0f, hi1 = (wh >> (8 + 2 * s_idx)) & 0x03;
+            int q0 = (int) (signed char) (u8) (lo0 | (hi0 << 4)) - 32;
+            int q1 = (int) (signed char) (u8) (lo1 | (hi1 << 4)) - 32;
+            DOTM_ACC(__fmul_rn(d, (float) q0), 2 * k);
+            DOTM_ACC(__fmul_rn(d, (float) q1), 2 * k + 1);
+        }
+        for (unsigned int j = 0; j < M; j++) acc[j] += s[j];
+    }
 };
 
 template <> struct Fast<IQ4NL> {
@@ -129,6 +207,21 @@ template <> struct Fast<IQ4NL> {
             s += __fmul_rn(d, iq4nl_val((w >> (8 + sh)) & 0x0f)) * x[2 * k + 1];
         }
         return s;
+    }
+    template <unsigned int M>
+    static __device__ __forceinline__ void dotm(const u8* r, unsigned int i, const float* x, unsigned int xs, float* acc) {
+        const u8* b = r + (i / 32) * 18;
+        unsigned int e0 = i % 32, sh = (e0 >= 16) ? 4u : 0u;
+        float d = qf16(b);
+        float s[M] = {};
+        const u16* q = (const u16*) (b + 2 + (e0 & 15));
+#pragma unroll
+        for (unsigned int k = 0; k < 4; k++) {
+            u16 w = q[k];
+            DOTM_ACC(__fmul_rn(d, iq4nl_val((w >> sh) & 0x0f)), 2 * k);
+            DOTM_ACC(__fmul_rn(d, iq4nl_val((w >> (8 + sh)) & 0x0f)), 2 * k + 1);
+        }
+        for (unsigned int j = 0; j < M; j++) acc[j] += s[j];
     }
 };
 
@@ -153,6 +246,28 @@ template <> struct Fast<IQ4XS> {
         }
         return s;
     }
+    template <unsigned int M>
+    static __device__ __forceinline__ void dotm(const u8* r, unsigned int i, const float* x, unsigned int xs, float* acc) {
+        const u8* b = r + (i / 256) * 136;
+        unsigned int e0 = i % 256, g = e0 / 32, c0 = e0 % 32, sh_nib = (c0 >= 16) ? 4u : 0u;
+        u32 hdr = *(const u32*) b;
+        u16 sh = (u16) (hdr >> 16);
+        u8 lo = (b[4 + g / 2] >> (4 * (g % 2))) & 0x0f;
+        u8 hi = (sh >> (2 * g)) & 3;
+        float dl = __fmul_rn(f16_to_f32((u16) hdr), (float) ((int) (u8) (lo | (hi << 4)) - 32));
+        float s[M] = {};
+        const u8* q = b + 8 + g * 16 + (c0 & 15);
+        u32 q0 = *(const u32*) q, q1 = *(const u32*) (q + 4);
+#pragma unroll
+        for (unsigned int k = 0; k < 4; k++) {
+            DOTM_ACC(__fmul_rn(dl, iq4nl_val((q0 >> (8 * k + sh_nib)) & 0x0f)), k);
+        }
+#pragma unroll
+        for (unsigned int k = 0; k < 4; k++) {
+            DOTM_ACC(__fmul_rn(dl, iq4nl_val((q1 >> (8 * k + sh_nib)) & 0x0f)), 4 + k);
+        }
+        for (unsigned int j = 0; j < M; j++) acc[j] += s[j];
+    }
 };
 
 template <> struct Fast<Q20> {
@@ -168,6 +283,20 @@ template <> struct Fast<Q20> {
         }
         return s;
     }
+    template <unsigned int M>
+    static __device__ __forceinline__ void dotm(const u8* r, unsigned int i, const float* x, unsigned int xs, float* acc) {
+        const u8* b = r + (i / 64) * 18;
+        unsigned int e0 = i % 64;
+        float d = qf16(b);
+        float s[M] = {};
+        u16 q16 = *(const u16*) (b + 2 + e0 / 4);
+#pragma unroll
+        for (unsigned int k = 0; k < 8; k++) {
+            u8 q = (q16 >> (2 * k)) & 0x03;
+            DOTM_ACC(__fmul_rn((float) ((int) q - 1), d), k);
+        }
+        for (unsigned int j = 0; j < M; j++) acc[j] += s[j];
+    }
 };
 
 template <> struct Fast<Q80> {
@@ -178,6 +307,16 @@ template <> struct Fast<Q80> {
 #pragma unroll
         for (unsigned int k = 0; k < 8; k++) s += (float) q[k] * x[k];
         return __fmul_rn(d, s);
+    }
+    template <unsigned int M>
+    static __device__ __forceinline__ void dotm(const u8* r, unsigned int i, const float* x, unsigned int xs, float* acc) {
+        const u8* b = r + (i / 32) * 34;
+        float d = qf16(b);
+        float s[M] = {};
+        const signed char* q = (const signed char*) (b + 2 + (i % 32));
+#pragma unroll
+        for (unsigned int k = 0; k < 8; k++) DOTM_ACC((float) q[k], k);
+        for (unsigned int j = 0; j < M; j++) acc[j] += __fmul_rn(d, s[j]);
     }
 };
 
@@ -200,6 +339,26 @@ template <> struct Fast<NVFP4> {
         }
         return s;
     }
+    template <unsigned int M>
+    static __device__ __forceinline__ void dotm(const u8* r, unsigned int i, const float* x, unsigned int xs, float* acc) {
+        const u8* b = r + (i / 64) * 36;
+        unsigned int e0 = i % 64, g = e0 / 16, hi = (e0 & 8) >> 1;
+        float d = ue4m3_half(b[g]);
+        float s[M] = {};
+        const u8* q = b + 4 + g * 8;
+        u32 q0 = *(const u32*) q, q1 = *(const u32*) (q + 4);
+#pragma unroll
+        for (unsigned int k = 0; k < 4; k++) {
+            u8 v0 = (u8) ((q0 >> (8 * k + hi)) & 0x0f);
+            DOTM_ACC(__fmul_rn(d, e2m1_double(v0)), k);
+        }
+#pragma unroll
+        for (unsigned int k = 0; k < 4; k++) {
+            u8 v1 = (u8) ((q1 >> (8 * k + hi)) & 0x0f);
+            DOTM_ACC(__fmul_rn(d, e2m1_double(v1)), 4 + k);
+        }
+        for (unsigned int j = 0; j < M; j++) acc[j] += s[j];
+    }
 };
 
 template <> struct Fast<IQ2S> {
@@ -215,6 +374,21 @@ template <> struct Fast<IQ2S> {
         for (unsigned int k = 0; k < 8; k++)
             s += qsign(__fmul_rn(db, (float) (u8) (row >> (8 * k))), signs >> k) * x[k];
         return s;
+    }
+    template <unsigned int M>
+    static __device__ __forceinline__ void dotm(const u8* r, unsigned int i, const float* x, unsigned int xs, float* acc) {
+        const u8* b = r + (i / 256) * 82;
+        unsigned int e0 = i % 256, j = e0 / 8;
+        unsigned int idx = b[2 + j] | (((b[66 + j / 4] >> (2 * (j % 4))) & 3) << 8);
+        unsigned int sc = (b[74 + e0 / 32] >> (4 * ((e0 / 16) % 2))) & 0x0f;
+        float db = __fmul_rn(__fmul_rn(qf16(b), __fadd_rn(0.5f, (float) sc)), 0.25f);
+        float s[M] = {};
+        u8 signs = b[34 + j];
+        u64 row = *(const u64*) kIQ2SGrid[idx];
+#pragma unroll
+        for (unsigned int k = 0; k < 8; k++)
+            DOTM_ACC(qsign(__fmul_rn(db, (float) (u8) (row >> (8 * k))), signs >> k), k);
+        for (unsigned int j = 0; j < M; j++) acc[j] += s[j];
     }
 };
 
@@ -234,6 +408,24 @@ template <> struct Fast<IQ3XXS> {
             s += qsign(__fmul_rn(db, (float) v), signs >> k) * x[k];
         }
         return s;
+    }
+    template <unsigned int M>
+    static __device__ __forceinline__ void dotm(const u8* r, unsigned int i, const float* x, unsigned int xs, float* acc) {
+        const u8* b = r + (i / 256) * 98;
+        unsigned int e0 = i % 256, g = e0 / 32, kk = (e0 % 32) / 8;
+        const u16* sp = (const u16*) (b + 66 + g * 4);
+        unsigned int s32 = (unsigned int) sp[0] | ((unsigned int) sp[1] << 16);
+        float db = __fmul_rn(__fmul_rn(qf16(b), __fadd_rn(0.5f, (float) (s32 >> 28))), 0.5f);
+        float s[M] = {};
+        u8 signs = kKSigns[(s32 >> (7 * kk)) & 0x7f];
+        u16 q2 = *(const u16*) (b + 2 + e0 / 4);
+        u32 r0 = *(const u32*) kIQ3XXSGrid[q2 & 0xff], r1 = *(const u32*) kIQ3XXSGrid[q2 >> 8];
+#pragma unroll
+        for (unsigned int k = 0; k < 8; k++) {
+            u8 v = (u8) ((k < 4 ? r0 : r1) >> (8 * (k % 4)));
+            DOTM_ACC(qsign(__fmul_rn(db, (float) v), signs >> k), k);
+        }
+        for (unsigned int j = 0; j < M; j++) acc[j] += s[j];
     }
 };
 
@@ -256,6 +448,27 @@ template <> struct Fast<IQ3S> {
             s += qsign(__fmul_rn(db, (float) v), signs >> k) * x[k];
         }
         return s;
+    }
+    template <unsigned int M>
+    static __device__ __forceinline__ void dotm(const u8* r, unsigned int i, const float* x, unsigned int xs, float* acc) {
+        const u8* b = r + (i / 256) * 110;
+        unsigned int e0 = i % 256, j0 = e0 / 4, g = e0 / 32;
+        unsigned int sc = (b[106 + g / 2] >> (4 * (g % 2))) & 0x0f;
+        float db = __fmul_rn(qf16(b), (float) (1 + 2 * sc));
+        float s[M] = {};
+        u8 signs = b[74 + e0 / 8], qh = b[66 + g];
+        u16 q2 = *(const u16*) (b + 2 + j0);
+        unsigned int sh0 = j0 % 8;
+        u32 rr[2] = {
+            *(const u32*) kIQ3SGrid[(q2 & 0xff) | (((qh >> sh0) & 1u) << 8)],
+            *(const u32*) kIQ3SGrid[(q2 >> 8) | (((qh >> (sh0 + 1)) & 1u) << 8)],
+        };
+#pragma unroll
+        for (unsigned int k = 0; k < 8; k++) {
+            u8 v = (u8) (rr[k / 4] >> (8 * (k % 4)));
+            DOTM_ACC(qsign(__fmul_rn(db, (float) v), signs >> k), k);
+        }
+        for (unsigned int j = 0; j < M; j++) acc[j] += s[j];
     }
 };
 
@@ -457,3 +670,58 @@ extern "C" __global__ void matvec_pair_f32(const u8* w0, float* y0, unsigned int
     for (int off = 16; off > 0; off >>= 1) acc += __shfl_down_sync(0xffffffffu, acc, off);
     if (lane == 0) y[row] = acc;
 }
+
+// ------------------------------------------------------------------------------------------- several inputs at once
+// y_j = W x_j for j < m <= 8 inputs (x_j at x + j * xs, y_j at y + j * ys): each warp reads and decodes its row's
+// weights once (dotm) and dots them with every input, so a batch of tokens (prefill, a speculative verify pass) pays
+// for the weights once.  Same per-input sums as matvec_fast_rows, bit for bit.
+// Launch: block = 256 threads (8 rows), grid = ceil(rows / 8).
+template <typename Q, unsigned int M>
+static __device__ __forceinline__ void matvec_cols_m(const u8* r, const float* x, unsigned int xs, float* y,
+                                                     unsigned int ys, unsigned int row, unsigned int lane,
+                                                     unsigned int cols) {
+    float acc[M];
+#pragma unroll
+    for (unsigned int j = 0; j < M; j++) acc[j] = 0.0f;
+    for (unsigned int c = lane; c < cols / 8; c += 32) Fast<Q>::template dotm<M>(r, c * 8, x + c * 8, xs, acc);
+#pragma unroll
+    for (unsigned int j = 0; j < M; j++) {
+        float a = acc[j];
+        for (int off = 16; off > 0; off >>= 1) a += __shfl_down_sync(0xffffffffu, a, off);
+        if (lane == 0) y[(u64) j * ys + row] = a;
+    }
+}
+
+template <typename Q>
+static __device__ __forceinline__ void matvec_cols_rows(const u8* w, const float* x, unsigned int xs, float* y,
+                                                        unsigned int ys, unsigned int rows, unsigned int cols,
+                                                        unsigned int m) {
+    unsigned int row = blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32, lane = threadIdx.x % 32;
+    if (row >= rows) return;
+    const u8* r = w + (u64) row * (cols / Q::QK) * Q::BYTES;
+    switch (m) {
+        case 1: matvec_cols_m<Q, 1>(r, x, xs, y, ys, row, lane, cols); break;
+        case 2: matvec_cols_m<Q, 2>(r, x, xs, y, ys, row, lane, cols); break;
+        case 3: matvec_cols_m<Q, 3>(r, x, xs, y, ys, row, lane, cols); break;
+        case 4: matvec_cols_m<Q, 4>(r, x, xs, y, ys, row, lane, cols); break;
+        case 5: matvec_cols_m<Q, 5>(r, x, xs, y, ys, row, lane, cols); break;
+        case 6: matvec_cols_m<Q, 6>(r, x, xs, y, ys, row, lane, cols); break;
+        case 7: matvec_cols_m<Q, 7>(r, x, xs, y, ys, row, lane, cols); break;
+        default: matvec_cols_m<Q, 8>(r, x, xs, y, ys, row, lane, cols); break;
+    }
+}
+
+#define COLS(name, Q) extern "C" __global__ void name(const u8* w, const float* x, unsigned int xs, float* y,     unsigned int ys, unsigned int rows, unsigned int cols, unsigned int m) { matvec_cols_rows<Q>(w, x, xs, y, ys, rows, cols, m); }
+COLS(matvec_cols_q4_k, Q4K)
+COLS(matvec_cols_q5_k, Q5K)
+COLS(matvec_cols_q6_k, Q6K)
+COLS(matvec_cols_iq4_nl, IQ4NL)
+COLS(matvec_cols_iq4_xs, IQ4XS)
+COLS(matvec_cols_nvfp4, NVFP4)
+COLS(matvec_cols_q2_0, Q20)
+COLS(matvec_cols_q8_0, Q80)
+COLS(matvec_cols_iq2_s, IQ2S)
+COLS(matvec_cols_iq3_xxs, IQ3XXS)
+COLS(matvec_cols_iq3_s, IQ3S)
+COLS(matvec_cols_bf16, BF16)
+COLS(matvec_cols_f32, F32)

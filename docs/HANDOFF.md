@@ -67,6 +67,17 @@ them changes the prompt; the fixture records the ids, so it stays valid as a fix
     `decode_warm` **17.37 -> 18.52 tok/s, +5.3% paired, all 40 pairs faster** (`bench/readpool-2026-10-27`). Profile
     before it (synchronized, 99 steps, 70.6 ms/step): file reads 27%, pinned-RAM uploads 26% (~22 GB/s, the PCIe 4 x16
     limit on this RTX 5070), mixers/norms/glue 25%, routed matvecs 9%. Uploads can only shrink by moving fewer bytes.
+  - Night of 2026-10-27 (docs/STATUS.md, last sections): speculation measured before building (verifying m tokens
+    moves the union of their experts, m2 1.66x, m4 2.74x: ~1.25-1.3x ceiling here; n-gram drafting loses; the `--mtp`
+    path never batches verification and its draft step leaves NaNs in the base model). Hybrid CPU experts
+    (`--cpu-experts`) and pre-gated prefetch (`--pregate`) built, exact, and both measured as losses or ties; kept
+    opt-in. Default-on and exact: mapped router reads, mapped staging for small uploads, `Gguf::tensor` index, top-k by
+    insertion. `matvec_cols_*` + `dotm<M>`: bit-identical multi-input matvecs, the first piece of batched forward.
+  - **Next, in order:** (1) row-tiled `matvec_cols` for the big K-quant matrices; (2) a layer-major batched step
+    (`step_batch(&[u32])`): dense matvecs through `matvec_cols`, per-token mixer kernels, one MoE pass over the union
+    of the batch's experts; gate it on prefill against token-by-token (identical logits) - prefill is 0.059 s/token
+    today; (3) DeltaNet/conv/PLE state snapshots so a verify pass can roll back; (4) only then a drafter, with
+    adaptive draft length from the measured union cost.
 - Cleanup done (0.1.4): `shadow-abi`, `include/shadow/c/abi.h`, `shadow-host/src/ffi.rs` and `protocol.rs` are
   removed. Still owed: copy the model under `J:\\Shadow\\models\\` and record its SHA-256 (the plan
   says the model file is the only input; it is still read from `J:\Strata-work\models\swift15\IQ3_S\`).

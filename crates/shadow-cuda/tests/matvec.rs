@@ -166,3 +166,96 @@ fn check(ty: &str, name: &str, yb: &[u8], cpu: &[f64], mag: &[f64]) -> f64 {
     }
     worst
 }
+
+/// matvec_cols_* (one weight read for up to 8 inputs) against matvec_fast_* run once per input: bit for bit, on a
+/// real tensor of every fast type, for m = 1..8; and the time for 8 inputs at once against 8 separate launches.
+#[test]
+fn several_inputs_at_once_match_one_at_a_time() {
+    let ctx = match Context::new(0) {
+        Ok(c) => c,
+        Err(e) => return eprintln!("SKIPPED, not passed: no CUDA device ({e})"),
+    };
+    if let Err(e) = nvrtc::version() {
+        return eprintln!("SKIPPED, not passed: no NVRTC ({e})");
+    }
+    let p = std::env::var("SHADOW_MODEL").unwrap_or_else(|_| MODEL.into());
+    if !std::path::Path::new(&p).is_file() {
+        return eprintln!("SKIPPED, not passed: no model at {p}");
+    }
+    let g = Gguf::open(std::path::Path::new(&p)).unwrap();
+    let prog = Program::load(&ctx, file("matvec.cu").unwrap()).unwrap();
+    let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+    let mut rnd = || {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        (seed >> 40) as f32 / (1u64 << 24) as f32 * 2.0 - 1.0
+    };
+    let mut tested = 0;
+    for &(ty, fast, _) in FAST_KERNELS {
+        let Some(t) = g.tensors.iter().filter(|t| t.ty.name() == ty && t.dims.len() >= 2 && t.dims[1] > 1)
+            .min_by_key(|t| (t.dims.len(), t.name.contains("token_embd") || t.name.contains("output.")))
+        else {
+            continue;
+        };
+        let cols_entry = format!("matvec_cols_{}", ty.to_lowercase());
+        let (cols, rows) = (t.dims[0] as usize, t.dims[1] as usize);
+        if cols % 8 != 0 {
+            continue;
+        }
+        let nbytes = (t.nbytes() / if t.dims.len() == 3 { t.dims[2] } else { 1 }) as usize;
+        let w = read(&g, t, nbytes);
+        let x: Vec<f32> = (0..8 * cols).map(|_| rnd()).collect();
+        let dw = ctx.alloc(w.len()).unwrap();
+        let dx = ctx.alloc(8 * cols * 4).unwrap();
+        let (dy1, dy8) = (ctx.alloc(8 * rows * 4).unwrap(), ctx.alloc(8 * rows * 4).unwrap());
+        dw.upload(&w).unwrap();
+        dx.upload(&x.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>()).unwrap();
+        let one = |j: usize| unsafe {
+            // SAFETY: rows x cols weights, input j of cols floats, output j of rows floats, all inside the buffers.
+            prog.launch(fast, ((rows as u32).div_ceil(8), 1, 1), (256, 1, 1), 0, None,
+                        &[Arg::Ptr(dw.ptr), Arg::Ptr(dx.ptr + (j * cols * 4) as u64),
+                          Arg::Ptr(dy1.ptr + (j * rows * 4) as u64), Arg::U32(rows as u32), Arg::U32(cols as u32)]).unwrap();
+        };
+        let many = |m: usize| unsafe {
+            // SAFETY: m inputs of cols floats at stride cols, m outputs of rows floats at stride rows.
+            prog.launch(&cols_entry, ((rows as u32).div_ceil(8), 1, 1), (256, 1, 1), 0, None,
+                        &[Arg::Ptr(dw.ptr), Arg::Ptr(dx.ptr), Arg::U32(cols as u32), Arg::Ptr(dy8.ptr), Arg::U32(rows as u32),
+                          Arg::U32(rows as u32), Arg::U32(cols as u32), Arg::U32(m as u32)]).unwrap();
+        };
+        for j in 0..8 {
+            one(j);
+        }
+        let mut want = vec![0u8; 8 * rows * 4];
+        ctx.synchronize().unwrap();
+        dy1.download(&mut want).unwrap();
+        for m in 1..=8 {
+            many(m);
+            ctx.synchronize().unwrap();
+            let mut got = vec![0u8; 8 * rows * 4];
+            dy8.download(&mut got).unwrap();
+            assert_eq!(&got[..m * rows * 4], &want[..m * rows * 4], "{cols_entry} m={m}: differs from {fast}");
+        }
+        let (start, end) = (ctx.event().unwrap(), ctx.event().unwrap());
+        start.record(None).unwrap();
+        for _ in 0..20 {
+            for j in 0..8 {
+                one(j);
+            }
+        }
+        end.record(None).unwrap();
+        end.synchronize().unwrap();
+        let t8 = end.since(&start).unwrap() / 20.0;
+        start.record(None).unwrap();
+        for _ in 0..20 {
+            many(8);
+        }
+        end.record(None).unwrap();
+        end.synchronize().unwrap();
+        let tc = end.since(&start).unwrap() / 20.0;
+        eprintln!("{ty:8} {} ({rows}x{cols}): 8 inputs {:.3} ms one at a time, {:.3} ms at once ({:.1}x)", t.name, t8, tc,
+                  t8 / tc);
+        tested += 1;
+    }
+    assert!(tested >= 6, "only {tested} types found");
+}

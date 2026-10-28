@@ -2,6 +2,7 @@
 //! forward pass as the stages land.  Nothing in here reads Strata's formats; the GGUF is the only input.
 
 pub mod chat;
+pub mod cpu_expert;
 pub mod forward;
 pub mod gguf;
 pub mod half;
