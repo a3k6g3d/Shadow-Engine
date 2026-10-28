@@ -219,9 +219,11 @@ impl Context {
         Ok(Event { ctx: self, event: e })
     }
 
-    pub fn stream_wait_event(&self, stream: *mut std::ffi::c_void, event: &Event) -> Result<(), CudaError> {
+    /// Makes `stream` (None: the default stream) wait for `event` before running anything queued after this.
+    pub fn stream_wait_event(&self, stream: Option<&Stream>, event: &Event) -> Result<(), CudaError> {
         self.bind()?;
-        call!(self.api, cuStreamWaitEvent(stream, event.event, 0))
+        let s = stream.map(|s| s.stream).unwrap_or(std::ptr::null_mut());
+        call!(self.api, cuStreamWaitEvent(s, event.event, 0))
     }
 }
 
@@ -329,7 +331,7 @@ impl Stream<'_> {
     }
 
     pub fn wait_event(&self, event: &Event) -> Result<(), CudaError> {
-        self.ctx.stream_wait_event(self.stream, event)
+        self.ctx.stream_wait_event(Some(self), event)
     }
 }
 

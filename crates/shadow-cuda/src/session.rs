@@ -617,9 +617,9 @@ impl<'c, 'm> GpuSession<'c, 'm> {
             cache.map.insert((l, ep), s);
         }
         // Pre-warm the remaining (evictable) VRAM expert cache slots from the RAM tier in placement order.
-        if cache.slots > 0 && ram.region.is_some() {
+        if let Some(region) = ram.region.as_ref().filter(|_| cache.slots > 0) {
             let names = |l: usize| ["ffn_gate_exps", "ffn_up_exps", "ffn_down_exps"].map(|r| format!("blk.{l}.{r}.weight"));
-            let src = ram.region.as_ref().unwrap().as_slice();
+            let src = region.as_slice();
             let mut global_s = 0usize;
             for (l, ep) in order {
                 if cache.map.contains_key(&(l, ep)) {
@@ -1459,9 +1459,9 @@ impl<'c, 'm> GpuSession<'c, 'm> {
             tab.extend_from_slice(&(wgt as f32).to_le_bytes());
         }
         if is_flint {
-            for part in 0..2 {
+            for (part, name) in names.iter().enumerate().take(2) {
                 for &(e, _) in &top {
-                    let s = self.m.expert_scale(&names[part], e);
+                    let s = self.m.expert_scale(name, e);
                     tab.extend_from_slice(&s.to_le_bytes());
                 }
                 if fuse_shexp {

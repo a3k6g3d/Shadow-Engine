@@ -182,10 +182,7 @@ impl<'c> MtpModel<'c> {
         // 4. Optional draft_vocab.bin
         let draft_vocab = if voc_path.exists() {
             let vb = std::fs::read(&voc_path).map_err(|err| err.to_string())?;
-            let mut u32s = Vec::with_capacity(vb.len() / 4);
-            for c in vb.chunks_exact(4) {
-                u32s.push(u32::from_le_bytes(c.try_into().unwrap()));
-            }
+            let u32s: Vec<u32> = vb.as_chunks::<4>().0.iter().map(|c| u32::from_le_bytes(*c)).collect();
             Some(u32s)
         } else {
             None
@@ -252,6 +249,7 @@ impl<'c> MtpModel<'c> {
     /// Single draft prediction step.
     /// Takes base model's final residual `r_base` at position `pos`, and the token emitted for position `pos+1`.
     /// Emits the predicted draft token at `pos+2`.
+    #[allow(clippy::too_many_arguments)] // the base session's programs, weights and positions, passed rather than owned
     pub fn draft_step(
         &mut self,
         mvp: &Program<'c>,
@@ -464,7 +462,7 @@ impl<'c> MtpModel<'c> {
 
         let mut r_logits = vec![0u8; N_EXPERTS * 4];
         b.rl.download(&mut r_logits).map_err(|e| e.to_string())?;
-        let r_floats: Vec<f32> = r_logits.chunks_exact(4).map(|c| f32::from_le_bytes(c.try_into().unwrap())).collect();
+        let r_floats: Vec<f32> = r_logits.as_chunks::<4>().0.iter().map(|c| f32::from_le_bytes(*c)).collect();
         let routed = route_sigmoid(&r_floats, TOP_K);
 
         // Populate table for matvec_batch_q2_0
@@ -519,7 +517,7 @@ impl<'c> MtpModel<'c> {
 
         let mix_down = self.tensor_ptr("hyper_connection_mixer.input_mix_weight_down.weight").ok_or("mixer down missing")?;
         unsafe {
-            mvp.launch("hc_down_inject_bf16", ((320 as u32).div_ceil(8), 1, 1), (256, 1, 1), 0, None,
+            mvp.launch("hc_down_inject_bf16", (320u32.div_ceil(8), 1, 1), (256, 1, 1), 0, None,
                        &[KArg::Ptr(mix_down), KArg::Ptr(b.down.ptr), KArg::U32(320),
                          KArg::Ptr(0), KArg::Ptr(0), KArg::U32(0),
                          KArg::Ptr(b.rn.ptr), KArg::U32((h * cs) as u32), KArg::F32(cs as f32)])
@@ -547,7 +545,7 @@ impl<'c> MtpModel<'c> {
 
         let mut logits_bytes = vec![0u8; output_rows * 4];
         b.logits.download(&mut logits_bytes).map_err(|e| e.to_string())?;
-        let l_floats: Vec<f32> = logits_bytes.chunks_exact(4).map(|c| f32::from_le_bytes(c.try_into().unwrap())).collect();
+        let l_floats: Vec<f32> = logits_bytes.as_chunks::<4>().0.iter().map(|c| f32::from_le_bytes(*c)).collect();
 
         // Argmax: if draft_vocab is present, search over subset; otherwise search full vocab
         let best_id = if let Some(ref dv) = self.draft_vocab {
@@ -584,17 +582,14 @@ mod tests {
     fn test_unpack_expert_roundtrip() {
         // Create synthetic blob where each segment has recognizable patterns
         let mut blob = vec![0u8; BLOB_BYTES];
-        for i in 0..819_200 {
-            blob[i] = (i % 251) as u8;
-        }
-        for i in 819_200..1_228_800 {
-            blob[i] = (i % 241) as u8;
-        }
-        for i in 1_228_800..1_331_200 {
-            blob[i] = (i % 239) as u8;
-        }
-        for i in 1_331_200..1_382_400 {
-            blob[i] = (i % 233) as u8;
+        for (i, b) in blob.iter_mut().enumerate() {
+            let m = match i {
+                0..819_200 => 251,
+                819_200..1_228_800 => 241,
+                1_228_800..1_331_200 => 239,
+                _ => 233,
+            };
+            *b = (i % m) as u8;
         }
 
         let mut unpacked = vec![0u8; BLOB_BYTES];

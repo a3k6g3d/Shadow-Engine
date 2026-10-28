@@ -64,8 +64,8 @@ fn gpu_matvec_matches_the_cpu_on_real_tensors() {
             mag[r] = row.iter().zip(&x).map(|(&a, &b)| (a as f64 * b as f64).abs()).sum();
         }
 
-        let mut dw = ctx.alloc(w.len()).unwrap();
-        let mut dx = ctx.alloc(cols * 4).unwrap();
+        let dw = ctx.alloc(w.len()).unwrap();
+        let dx = ctx.alloc(cols * 4).unwrap();
         let dy = ctx.alloc(rows * 4).unwrap();
         dw.upload(&w).unwrap();
         dx.upload(&x.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>()).unwrap();
@@ -124,7 +124,7 @@ fn gpu_matvec_matches_the_cpu_on_real_tensors() {
 
         // the batched kernel: 10 copies of the matrix, each output must match
         let n = 10usize;
-        let mut tab = ctx.alloc(n * 8).unwrap();
+        let tab = ctx.alloc(n * 8).unwrap();
         tab.upload(&(0..n).flat_map(|_| dw.ptr.to_le_bytes()).collect::<Vec<u8>>()).unwrap();
         let dyn_ = ctx.alloc(n * rows * 4).unwrap();
         let launch_batch = || {

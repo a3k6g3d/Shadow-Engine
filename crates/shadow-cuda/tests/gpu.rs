@@ -47,8 +47,8 @@ fn vector_add_cold_then_warm() {
         let a: Vec<f32> = (0..n).map(|i| i as f32 * 0.5).collect();
         let b: Vec<f32> = (0..n).map(|i| 3.0 - i as f32).collect();
         let bytes = |v: &[f32]| v.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>();
-        let mut da = ctx.alloc(n as usize * 4).unwrap();
-        let mut db = ctx.alloc(n as usize * 4).unwrap();
+        let da = ctx.alloc(n as usize * 4).unwrap();
+        let db = ctx.alloc(n as usize * 4).unwrap();
         let mut dout = ctx.alloc(n as usize * 4).unwrap();
         da.upload(&bytes(&a)).unwrap();
         db.upload(&bytes(&b)).unwrap();

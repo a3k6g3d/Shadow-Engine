@@ -71,6 +71,12 @@ pub struct NvmlGpu {
 unsafe impl Send for NvmlGpu {}
 unsafe impl Sync for NvmlGpu {}
 
+impl Default for NvmlGpu {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl NvmlGpu {
     pub fn new() -> Self {
         #[cfg(windows)]
@@ -146,6 +152,12 @@ pub struct SysMonitor {
     proc_cores_used: f64,
 }
 
+impl Default for SysMonitor {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl SysMonitor {
     pub fn new() -> Self {
         let mut m = Self {
@@ -216,6 +228,12 @@ impl SysMonitor {
 pub struct TelemetryService {
     monitor: Mutex<SysMonitor>,
     nvml: NvmlGpu,
+}
+
+impl Default for TelemetryService {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl TelemetryService {

@@ -80,13 +80,10 @@ fn config_path() -> PathBuf {
 }
 
 fn load_config(path: &PathBuf) -> Config {
-    let mut c = match std::fs::read_to_string(path)
+    let mut c = std::fs::read_to_string(path)
         .ok()
         .and_then(|t| serde_json::from_str::<Config>(t.trim_start_matches('\u{feff}')).ok())
-    {
-        Some(c) => c,
-        None => Config::default(),
-    };
+        .unwrap_or_default();
     if c.model_path.is_empty() {
         c.model_path = DEFAULT_MODEL.into();
     }

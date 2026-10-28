@@ -16,7 +16,7 @@ fn type_id(name: &str) -> u32 {
 }
 
 fn gpu(ctx: &Context, prog: &Program, entry: &str, per_block: u32, data: &[u8], n_blocks: u32) -> Vec<f32> {
-    let mut din = ctx.alloc(data.len()).unwrap();
+    let din = ctx.alloc(data.len()).unwrap();
     let n = (n_blocks * per_block) as usize;
     let dout = ctx.alloc(n * 4).unwrap();
     din.upload(data).unwrap();

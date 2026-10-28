@@ -66,7 +66,7 @@ fn the_gpu_copies_from_pinned_memory_exactly() {
     for (i, b) in r.as_mut_slice().iter_mut().enumerate() {
         *b = (i.wrapping_mul(2654435761) >> 13) as u8;
     }
-    let mut d = ctx.alloc(r.len()).unwrap();
+    let d = ctx.alloc(r.len()).unwrap();
     d.upload(r.as_slice()).unwrap();
     let mut back = vec![0u8; r.len()];
     d.download(&mut back).unwrap();

@@ -8,7 +8,7 @@ use shadow_model::half;
 
 fn run_u16_to_f32(ctx: &Context, prog: &Program, name: &str, input: &[u16]) -> Vec<f32> {
     let n = input.len();
-    let mut din = ctx.alloc(n * 2).unwrap();
+    let din = ctx.alloc(n * 2).unwrap();
     let dout = ctx.alloc(n * 4).unwrap();
     din.upload(&input.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>()).unwrap();
     // SAFETY: n u16 in, n f32 out, bounds-checked in the kernel.
@@ -24,7 +24,7 @@ fn run_u16_to_f32(ctx: &Context, prog: &Program, name: &str, input: &[u16]) -> V
 
 fn run_f32_to_u16(ctx: &Context, prog: &Program, name: &str, input: &[f32]) -> Vec<u16> {
     let n = input.len();
-    let mut din = ctx.alloc(n * 4).unwrap();
+    let din = ctx.alloc(n * 4).unwrap();
     let dout = ctx.alloc(n * 2).unwrap();
     din.upload(&input.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>()).unwrap();
     // SAFETY: n f32 in, n u16 out, bounds-checked in the kernel.
