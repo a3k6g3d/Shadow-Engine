@@ -59,8 +59,9 @@ impl<'c, 'm> GpuSession<'c, 'm> {
 
     /// One row of the draft layer: `rin` (h * streams floats: the main model's residual at position `cell`, or in a
     /// chain the layer's own) and the token after it.  Its K/V go into `cell`; with `full` the rest of the layer runs
-    /// and returns its guess at the token after that (the layer's residual stays in bufs.r for the next link).
-    fn mtp_row(&self, rin: u64, tok: u32, cell: usize, full: bool) -> Option<u32> {
+    /// and returns its guess at the token after that and the guess's probability over the draft vocabulary (the
+    /// layer's residual stays in bufs.r for the next link).
+    fn mtp_row(&self, rin: u64, tok: u32, cell: usize, full: bool) -> Option<(u32, f32)> {
         let c = &self.m.cfg;
         let (h, cs) = (c.hidden, c.streams);
         let ch = h * cs;
@@ -159,12 +160,22 @@ impl<'c, 'm> GpuSession<'c, 'm> {
         let mut out = vec![0u8; c.vocab * 4];
         self.download(self.b.logits.ptr, &mut out);
         let l = floats(&out);
-        let best = match &mt.draft_vocab {
-            Some(dv) => dv.iter().copied().filter(|&t| (t as usize) < l.len())
-                .max_by(|&a, &b| l[a as usize].total_cmp(&l[b as usize]).then(b.cmp(&a))).unwrap_or(0),
-            None => l.iter().enumerate().max_by(|a, b| a.1.total_cmp(b.1).then(b.0.cmp(&a.0))).map_or(0, |(i, _)| i as u32),
+        let ids: Box<dyn Iterator<Item = u32>> = match &mt.draft_vocab {
+            Some(dv) => Box::new(dv.iter().copied().filter(|&t| (t as usize) < l.len())),
+            None => Box::new(0..l.len() as u32),
         };
-        Some(best)
+        let (mut best, mut top, mut sum) = (0u32, f32::NEG_INFINITY, 0f64);
+        for t in ids {
+            // a running softmax denominator over the subset, rescaled when the maximum moves
+            let v = l[t as usize];
+            if v > top {
+                sum = sum * ((top - v) as f64).exp() + 1.0;
+                (best, top) = (t, v);
+            } else {
+                sum += ((v - top) as f64).exp();
+            }
+        }
+        Some((best, (1.0 / sum) as f32))
     }
 
     /// The main model has read positions p0 .. p0 + toks.len() (`toks`), their final residuals in rows (row j at
@@ -189,10 +200,11 @@ impl<'c, 'm> GpuSession<'c, 'm> {
     }
 
     /// Up to k drafts for the tokens after `next` (the token about to be stepped, which follows the session's last
-    /// position): a chain of the draft layer from the main model's last residual.  None without the layer or a
-    /// position to start from.  The cells the chain writes past the last position are rewritten when the main model
-    /// reads those positions.
-    pub fn mtp_draft(&mut self, next: u32, k: usize) -> Vec<u32> {
+    /// position): a chain of the draft layer from the main model's last residual, stopped after a draft the layer
+    /// gives less than `min_p` (the draft is kept: it is the chain's last).  None without the layer or a position to
+    /// start from.  The cells the chain writes past the last position are rewritten when the main model reads those
+    /// positions.
+    pub fn mtp_draft(&mut self, next: u32, k: usize, min_p: f32) -> Vec<u32> {
         let Some(mt) = self.mtp.as_ref().filter(|m| m.pending) else { return vec![] };
         let (last, r, cap) = (mt.bufs.last_r.ptr, mt.bufs.r.ptr, mt.cap);
         let cell0 = self.tokens.len() - 1;
@@ -200,8 +212,11 @@ impl<'c, 'm> GpuSession<'c, 'm> {
         let mut out = Vec::with_capacity(k);
         let (mut rin, mut tok) = (last, next);
         for j in 0..k {
-            let d = self.mtp_row(rin, tok, cell0 + j, true).unwrap();
+            let (d, p) = self.mtp_row(rin, tok, cell0 + j, true).unwrap();
             out.push(d);
+            if p < min_p {
+                break;
+            }
             (rin, tok) = (r, d);
         }
         out

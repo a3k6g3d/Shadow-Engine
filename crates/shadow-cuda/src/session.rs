@@ -146,6 +146,19 @@ struct Bufs<'c> {
 pub const MAX_BATCH: usize = 64;
 const COLS_MAX: usize = 8;
 
+/// The most tokens a speculative verify pass (`step_batch_verify`) keeps the recurrences' inputs of.
+pub const MAX_VERIFY: usize = 8;
+
+/// What `step_batch_verify` keeps so `rollback` can redo only the recurrences for the tokens it keeps: per DeltaNet
+/// layer each token's conv input and beta / alpha, each token's n-gram conv input, and (first position, tokens).
+struct Replay<'c> {
+    qkv: DeviceBuffer<'c>,
+    ba: DeviceBuffer<'c>,
+    ple: DeviceBuffer<'c>,
+    pass: Option<(usize, Vec<u32>)>,
+    on: std::cell::Cell<bool>,
+}
+
 /// Expert slots outside the cache for a batched step's misses beyond the layer's free cache slots (a layer keeps only
 /// a dozen evictable slots next to its pinned hot experts, and a prompt misses most of its experts); `SHADOW_BATCH_SCRATCH`
 /// overrides it.
@@ -162,6 +175,8 @@ struct BatchBufs<'c> {
     down: DeviceBuffer<'c>,
     up: DeviceBuffer<'c>,
     qkv: DeviceBuffer<'c>,
+    /// the conv's output, normalized: DeltaNet's q, k, v per token
+    x: DeviceBuffer<'c>,
     z: DeviceBuffer<'c>,
     beta: DeviceBuffer<'c>,
     alpha: DeviceBuffer<'c>,
@@ -188,6 +203,7 @@ pub struct GpuSession<'c, 'm> {
     v: HashMap<String, DeviceBuffer<'c>>,
     b: Bufs<'c>,
     bb: BatchBufs<'c>,
+    replay: Replay<'c>,
     delta: Vec<Option<(DeviceBuffer<'c>, DeviceBuffer<'c>)>>,
     attn: Vec<Option<Attn<'c>>>,
     ple_state: DeviceBuffer<'c>,
@@ -580,6 +596,13 @@ fn floats(b: &[u8]) -> Vec<f32> {
     b.chunks(4).map(|c| f32::from_le_bytes(c.try_into().unwrap())).collect()
 }
 
+/// Rows a block of a matvec_cols kernel covers (8 warps): the reference-order kernels take one row a warp below
+/// COLS_REF_SPLIT (2048) rows (matvec.cu), the others COLS_ROWS (4).
+fn cols_rows_per_block(entry: &str, rows: usize) -> u32 {
+    let reference = entry.starts_with("matvec_cols_ref") || entry.starts_with("hc_down_inject_cols");
+    if reference && rows < 2048 { 8 } else { 32 }
+}
+
 /// Row j of a [rows][stride] f32 buffer.
 fn row(b: &DeviceBuffer, stride: usize, j: usize) -> u64 {
     b.ptr + (j * stride * 4) as u64
@@ -667,9 +690,13 @@ impl<'c, 'm> GpuSession<'c, 'm> {
         let ab = |n: usize| a(MAX_BATCH * n);
         let bb = BatchBufs {
             r: ab(ch)?, rn: ab(ch)?, u: ab(h)?, g: ab(cs)?, y: ab(h)?, down: ab(c.hc_rank)?, up: ab(ch)?,
-            qkv: ab(2 * kd + vd)?, z: ab(vd)?, beta: ab(c.ssm_v_heads)?, alpha: ab(c.ssm_v_heads)?, o: ab(vd)?,
+            qkv: ab(2 * kd + vd)?, x: ab(2 * kd + vd)?, z: ab(vd)?, beta: ab(c.ssm_v_heads)?, alpha: ab(c.ssm_v_heads)?, o: ab(vd)?,
             qg: ab(2 * qd)?, kk: ab(kvd)?, iq: ab(c.idx_heads * id)?, ao: ab(qd)?, rl: ab(c.n_expert)?, sgl: ab(1)?,
             sg: ab(c.shared_ff)?, su: ab(c.shared_ff)?, sa: ab(c.shared_ff)?, so: ab(h)?, logits: a(COLS_MAX * c.vocab)?,
+        };
+        let replay = Replay {
+            qkv: a(c.n_layer * MAX_VERIFY * (2 * kd + vd))?, ba: a(c.n_layer * MAX_VERIFY * 2 * c.ssm_v_heads)?,
+            ple: a(MAX_VERIFY * ch)?, pass: None, on: std::cell::Cell::new(false),
         };
         let mut delta = Vec::new();
         let mut attn = Vec::new();
@@ -898,7 +925,7 @@ impl<'c, 'm> GpuSession<'c, 'm> {
             None
         };
         let mut s = GpuSession {
-            ctx, m, mvp, fw, w, v, b, bb, batch_scratch, delta, attn, ple_state, tokens: vec![], cap, trace: None, stop_after: None,
+            ctx, m, mvp, fw, w, v, b, bb, replay, batch_scratch, delta, attn, ple_state, tokens: vec![], cap, trace: None, stop_after: None,
             resident_bytes, expert_uploads: 0, cache, ram, copy_stream, copy_event, staging,
             pending: vec![], routing: RoutingCounts::new(c.n_layer, c.n_expert),
             prof: std::env::var("SHADOW_PROFILE").is_ok_and(|v| v == "1")
@@ -1339,7 +1366,7 @@ impl<'c, 'm> GpuSession<'c, 'm> {
     // -------------------------------------------------------------------------------------------- the forward pass
     pub fn step(&mut self, token: u32) -> Vec<f32> {
         let draft = if self.mtp_probe.is_some() {
-            self.mtp_draft(token, 1).first().copied()
+            self.mtp_draft(token, 1, 0.0).first().copied()
         } else {
             None
         };
@@ -2220,10 +2247,73 @@ impl<'c, 'm> GpuSession<'c, 'm> {
         self.step_batch_opt(tokens, false);
     }
 
+    /// Whether `step_batch` takes this session's tokens through the layers together (else one at a time).
+    fn batches(&self) -> bool {
+        !(self.m.cfg.arch == "flint" || self.trace.is_some() || self.stop_after.is_some() || self.cache.slots == 0
+          || self.cpu.is_some() || self.prefetch.is_some() || self.pregate.is_some() || self.mtp_probe.is_some())
+    }
+
+    /// `step_batch` for a speculative verify pass (2..=MAX_VERIFY tokens): it also keeps what `rollback` needs to
+    /// keep a prefix of them without reading it again.
+    pub fn step_batch_verify(&mut self, tokens: &[u32]) -> Vec<Vec<f32>> {
+        let p0 = self.tokens.len();
+        let keep = self.batches() && (2..=MAX_VERIFY.min(self.batch_max)).contains(&tokens.len());
+        self.replay.on.set(keep);
+        let out = self.step_batch(tokens);
+        self.replay.on.set(false);
+        self.replay.pass = keep.then(|| (p0, tokens.to_vec()));
+        out
+    }
+
+    /// Back to `snap` (taken just before the last `step_batch_verify`) plus the first tokens of that pass (`kept`):
+    /// the recurrent states restored and only their updates for those tokens redone, from what the pass kept (the KV
+    /// of those positions, the drafter cells and the final residuals are still the ones the pass wrote).  Without
+    /// such a pass, restore and read the tokens again.
+    pub fn rollback(&mut self, snap: &Snapshot<'c>, kept: &[u32]) -> Result<(), String> {
+        let pass = self.replay.pass.take();
+        let fits = pass.as_ref().is_some_and(|(p0, toks)| {
+            *p0 == snap.tokens.len() && !kept.is_empty() && kept.len() <= toks.len() && toks[..kept.len()] == *kept
+                && self.tokens.len() == p0 + toks.len()
+        });
+        self.restore(snap)?;
+        if !fits {
+            self.prefill_batch(kept);
+            return Ok(());
+        }
+        let c = &self.m.cfg;
+        let (kd, vh) = (c.ssm_k_heads * c.ssm_head_dim, c.ssm_v_heads);
+        let chd = 2 * kd + vh * c.ssm_head_dim;
+        let ch = c.hidden * c.streams;
+        for l in 0..c.n_layer {
+            if l == c.ple_layer {
+                let p = format!("blk.{l}");
+                for j in 0..kept.len() {
+                    self.k1("ple_conv_step", ch, &[Arg::Ptr(self.replay.ple.ptr + (j * ch * 4) as u64), Arg::Ptr(self.ple_state.ptr),
+                                                  Arg::Ptr(self.sv(&format!("{p}.ple_conv1d.weight"))), Arg::Ptr(self.b.gv.ptr),
+                                                  Arg::U32(ch as u32), Arg::U32(c.ple_conv_k as u32), Arg::U32(c.ple_ngram as u32)]);
+                }
+            }
+            if c.is_attention(l) {
+                continue;
+            }
+            let qkv = self.replay.qkv.ptr + (l * MAX_VERIFY * chd * 4) as u64;
+            let ba = self.replay.ba.ptr + (l * MAX_VERIFY * 2 * vh * 4) as u64;
+            for j in 0..kept.len() {
+                self.delta_mid(l, qkv + (j * chd * 4) as u64, self.b.z.ptr, ba + (j * vh * 4) as u64,
+                               ba + ((MAX_VERIFY + j) * vh * 4) as u64, self.b.o.ptr);
+            }
+        }
+        self.tokens.extend_from_slice(kept);
+        if let Some(mt) = self.mtp.as_mut() {
+            let last = mt.bufs.last_r.ptr;
+            mt.pending = true;
+            self.k1("copy", ch, &[Arg::Ptr(last), Arg::Ptr(row(&self.bb.r, ch, kept.len() - 1)), Arg::U32(ch as u32)]);
+        }
+        Ok(())
+    }
+
     pub fn step_batch_opt(&mut self, tokens: &[u32], with_logits: bool) -> Vec<Vec<f32>> {
-        let per_token = self.m.cfg.arch == "flint" || self.trace.is_some() || self.stop_after.is_some()
-            || self.cache.slots == 0 || self.cpu.is_some() || self.prefetch.is_some() || self.pregate.is_some()
-            || self.mtp_probe.is_some();
+        let per_token = !self.batches();
         let mut out = Vec::new();
         for chunk in tokens.chunks(self.batch_max) {
             if per_token || chunk.len() == 1 {
@@ -2268,6 +2358,10 @@ impl<'c, 'm> GpuSession<'c, 'm> {
                 for j in 0..m {
                     let r = row(&self.bb.r, ch, j);
                     self.ple_at(l, p0 + j + 1, r);
+                    if self.replay.on.get() {
+                        self.k1("copy", ch, &[Arg::Ptr(self.replay.ple.ptr + (j * ch * 4) as u64), Arg::Ptr(self.b.gvn.ptr),
+                                              Arg::U32(ch as u32)]);
+                    }
                     self.k1("add", ch, &[Arg::Ptr(r), Arg::Ptr(self.b.gv.ptr), Arg::U32(ch as u32)]);
                 }
                 rn_ready = false;
@@ -2344,7 +2438,7 @@ impl<'c, 'm> GpuSession<'c, 'm> {
             // outputs of `rows` floats at y + j * ys, inside this session's buffers (the callers' strides are their
             // sizes).
             unsafe {
-                self.mvp.launch(&entry, ((rows as u32).div_ceil(32), 1, 1), (256, 1, 1), 0, self.ls(),
+                self.mvp.launch(&entry, ((rows as u32).div_ceil(cols_rows_per_block(&entry, rows)), 1, 1), (256, 1, 1), 0, self.ls(),
                                 &[Arg::Ptr(wptr), Arg::Ptr(x), Arg::U32(xs as u32), Arg::Ptr(y), Arg::U32(ys as u32),
                                   Arg::U32(rows as u32), Arg::U32(t.dims[0] as u32), Arg::U32(n as u32)])
             }
@@ -2387,7 +2481,7 @@ impl<'c, 'm> GpuSession<'c, 'm> {
             // SAFETY: rank + r_inj rows of ch BF16 weights; n inputs of ch floats in rn, n outputs of rank (down) and
             // cs (g) floats, from row j0.
             unsafe {
-                self.mvp.launch("hc_down_inject_cols_bf16", ((rank as u32 + r_inj).div_ceil(32), 1, 1), (256, 1, 1), 0, self.ls(), &[
+                self.mvp.launch("hc_down_inject_cols_bf16", ((rank as u32 + r_inj).div_ceil(cols_rows_per_block("hc_down_inject_cols_bf16", rank + r_inj as usize)), 1, 1), (256, 1, 1), 0, self.ls(), &[
                     Arg::Ptr(self.w[&format!("{p}_down.weight")].ptr), Arg::Ptr(row(&bb.down, rank, j0)), Arg::U32(rank as u32),
                     Arg::U32(rank as u32), Arg::Ptr(w_inj), Arg::Ptr(row(&bb.g, cs, j0)), Arg::U32(r_inj), Arg::U32(cs as u32),
                     Arg::Ptr(row(&bb.rn, ch, j0)), Arg::U32(ch as u32), Arg::U32(ch as u32), Arg::F32(cs as f32),
@@ -2426,9 +2520,41 @@ impl<'c, 'm> GpuSession<'c, 'm> {
         self.mv_cols(&format!("{p}.attn_gate.weight"), bb.u.ptr, h, bb.z.ptr, vd, m);
         self.mv_cols(&format!("{p}.ssm_beta.weight"), bb.u.ptr, h, bb.beta.ptr, vh, m);
         self.mv_cols(&format!("{p}.ssm_alpha.weight"), bb.u.ptr, h, bb.alpha.ptr, vh, m);
-        for j in 0..m {
-            self.delta_mid(l, row(&bb.qkv, ch, j), row(&bb.z, vd, j), row(&bb.beta, vh, j), row(&bb.alpha, vh, j),
-                           row(&bb.o, vd, j));
+        if self.replay.on.get() {
+            let qkv = self.replay.qkv.ptr + (l * MAX_VERIFY * ch * 4) as u64;
+            let ba = self.replay.ba.ptr + (l * MAX_VERIFY * 2 * vh * 4) as u64;
+            for (dst, src, n) in [(qkv, bb.qkv.ptr, m * ch), (ba, bb.beta.ptr, m * vh),
+                                  (ba + (MAX_VERIFY * vh * 4) as u64, bb.alpha.ptr, m * vh)] {
+                self.k1("copy", n, &[Arg::Ptr(dst), Arg::Ptr(src), Arg::U32(n as u32)]);
+            }
+        }
+        if d == 128 {
+            // conv and norms token by token (the conv window moves), then the recurrence for all of them at once
+            let (s, conv) = self.delta[l].as_ref().unwrap();
+            let kh = c.ssm_k_heads;
+            for j in 0..m {
+                let x = row(&bb.x, ch, j);
+                self.k1("conv_silu_step", ch, &[Arg::Ptr(row(&bb.qkv, ch, j)), Arg::Ptr(conv.ptr),
+                                               Arg::Ptr(self.sv(&format!("{p}.ssm_conv1d.weight"))), Arg::Ptr(x),
+                                               Arg::U32(ch as u32), Arg::U32(c.conv_k as u32)]);
+                self.k("l2norm_qk_heads", (2 * kh) as u32, 128, &[Arg::Ptr(x), Arg::U32(kh as u32), Arg::U32(d as u32),
+                                                                Arg::F32((d as f32).sqrt())]);
+            }
+            self.k("delta_steps128", vh as u32, 128, &[
+                Arg::Ptr(bb.x.ptr), Arg::Ptr(bb.x.ptr + (kd * 4) as u64), Arg::Ptr(bb.x.ptr + (2 * kd * 4) as u64),
+                Arg::U32(ch as u32), Arg::Ptr(bb.beta.ptr), Arg::Ptr(bb.alpha.ptr), Arg::U32(vh as u32),
+                Arg::Ptr(self.sv(&format!("{p}.ssm_a"))), Arg::Ptr(self.sv(&format!("{p}.ssm_dt.bias"))), Arg::Ptr(s.ptr),
+                Arg::Ptr(bb.o.ptr), Arg::U32(vd as u32), Arg::U32(kh as u32), Arg::U32(m as u32)]);
+            for j in 0..m {
+                self.k("gated_rmsnorm_heads", vh as u32, 128, &[Arg::Ptr(row(&bb.o, vd, j)),
+                                                               Arg::Ptr(self.sv(&format!("{p}.ssm_norm.weight"))),
+                                                               Arg::Ptr(row(&bb.z, vd, j)), Arg::U32(d as u32), Arg::F32(c.eps)]);
+            }
+        } else {
+            for j in 0..m {
+                self.delta_mid(l, row(&bb.qkv, ch, j), row(&bb.z, vd, j), row(&bb.beta, vh, j), row(&bb.alpha, vh, j),
+                               row(&bb.o, vd, j));
+            }
         }
         self.mv_cols(&format!("{p}.ssm_out.weight"), bb.o.ptr, vd, bb.y.ptr, h, m);
     }

@@ -226,6 +226,46 @@ extern "C" __global__ void delta_step(const float* q, const float* k, const floa
     o[h * d + j] = (float) acc;
 }
 
+// delta_step for m consecutive tokens of one sequence, d = 128: each thread keeps its column of S in registers
+// between the tokens, so S is read and written once instead of m times.  Token t's q, k, v start at q / k / v +
+// t * xs, its b and a at + t * bs, its output at o + t * os.  The same operations in the same order as delta_step on
+// each token in turn, so the same bits.  grid = value heads, block = 128.
+extern "C" __global__ void delta_steps128(const float* q, const float* k, const float* v, unsigned int xs, const float* b,
+                                          const float* a, unsigned int bs, const float* A, const float* dtb, float* S,
+                                          float* o, unsigned int os, unsigned int kh, unsigned int m) {
+    const unsigned int d = 128;
+    __shared__ float qs[128], ks[128];
+    unsigned int h = blockIdx.x, j = threadIdx.x, kx = h % kh;
+    float* s = S + (u64) h * d * d;
+    float col[128];
+#pragma unroll
+    for (unsigned int i = 0; i < d; ++i) col[i] = s[i * d + j];
+    for (unsigned int t = 0; t < m; ++t) {
+        __syncthreads();
+        qs[j] = q[(u64) t * xs + kx * d + j];
+        ks[j] = k[(u64) t * xs + kx * d + j];
+        __syncthreads();
+        float beta = sigmoidf_ref(b[(u64) t * bs + h]);
+        float decay = (float) exp((double) A[h] * (double) softplusf_ref(a[(u64) t * bs + h] + dtb[h]));
+        double mem = 0.0;
+#pragma unroll
+        for (unsigned int i = 0; i < d; ++i) {
+            col[i] *= decay;
+            mem += (double) col[i] * (double) ks[i];
+        }
+        float delta = (float) (((double) v[(u64) t * xs + h * d + j] - mem) * (double) beta);
+        double acc = 0.0;
+#pragma unroll
+        for (unsigned int i = 0; i < d; ++i) {
+            col[i] += ks[i] * delta;
+            acc += (double) col[i] * (double) qs[i];
+        }
+        o[(u64) t * os + h * d + j] = (float) acc;
+    }
+#pragma unroll
+    for (unsigned int i = 0; i < d; ++i) s[i * d + j] = col[i];
+}
+
 // Each head: RMSNorm(o_h) * w * sigmoid(z_h).  grid = heads, block = 128.
 extern "C" __global__ void gated_rmsnorm_heads(float* o, const float* w, const float* z, unsigned int d, float eps) {
     float* h = o + (u64) blockIdx.x * d;

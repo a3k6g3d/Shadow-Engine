@@ -312,3 +312,36 @@ fn a_batched_step_matches_one_token_at_a_time_past_the_indexer() {
         assert!(g == w, "position {}: the batched logits differ from one token at a time", head.len() + i);
     }
 }
+
+/// A speculative verify pass rolled back to a prefix (`step_batch_verify` + `rollback`, which redoes only the
+/// recurrences from what the pass kept) continues exactly as reading that prefix one token at a time.
+#[test]
+fn a_rolled_back_verify_pass_continues_exactly() {
+    let p = std::env::var("SHADOW_MODEL").unwrap_or_else(|_| MODEL.into());
+    if !Path::new(&p).is_file() {
+        return eprintln!("SKIPPED, not passed: no model at {p}");
+    }
+    let Ok(ctx) = shadow_cuda::Context::new(0) else { return eprintln!("SKIPPED, not passed: no CUDA device") };
+    let model = Model::load(Gguf::open(Path::new(&p)).unwrap()).unwrap();
+    let prompt: Vec<u32> = vec![760, 6722, 314, 9338, 369, 11751, 13, 576, 6722, 314, 9294, 369];
+    let (pass, next) = ([13u32, 1059, 2101, 77], 4096u32);
+    let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<u32>>();
+
+    let mut one = shadow_cuda::session::GpuSession::new(&ctx, &model, 4096).unwrap();
+    for &t in &prompt {
+        one.step_prefill(t);
+    }
+    let first = bits(&one.step(pass[0]));
+    let second = bits(&one.step(pass[1]));
+    let want = bits(&one.step(next));
+    drop(one);
+
+    let mut s = shadow_cuda::session::GpuSession::new(&ctx, &model, 4096).unwrap();
+    s.prefill_batch(&prompt);
+    let snap = s.snapshot(false).unwrap();
+    let outs = s.step_batch_verify(&pass);
+    assert!(bits(&outs[0]) == first && bits(&outs[1]) == second, "the verify pass differs from one token at a time");
+    s.rollback(&snap, &pass[..2]).unwrap();
+    assert_eq!(s.tokens(), &[&prompt[..], &pass[..2]].concat()[..]);
+    assert!(bits(&s.step(next)) == want, "after the rollback the logits moved");
+}

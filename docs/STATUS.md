@@ -525,3 +525,14 @@ Single-prompt runs, "Write a Rust function that parses a comma separated list...
   replays only the recurrences from inputs the verify pass kept (~29 ms), one row per warp in the batched hc kernel
   (~8 ms), a multi-token `delta_step` holding each state in registers (~6 ms), the copy overlap and grouped experts
   in `moe_batch`.
+- **Then (same night), exact, 10/10 reference tests:** `step_batch_verify` + `rollback` (`tests/reference.rs::
+  a_rolled_back_verify_pass_continues_exactly`): a verify pass keeps each DeltaNet layer's conv inputs and beta /
+  alpha per token and the n-gram conv inputs; a rollback restores the states and redoes only those updates for the
+  kept tokens - **31 -> ~1.4 ms a pass**. `delta_steps128`: the recurrence for a batch's tokens with each state
+  column in registers between them (bit-identical to `delta_step` per token): 2.10 -> 0.90 ms a token at m = 4. The
+  reference-order batched kernels take one row a warp under 2,048 rows (`hc_down_inject_cols_bf16` 2.53 -> 1.80 ms
+  a token). Drafting stops after a draft the layer gives < 0.7 (`SHADOW_SPEC_MIN_P`, Strata's `--spec-min-p`).
+  2-run checks against plain decode (21.06 tok/s): **--spec 3 -14.1%, --spec 5 -14.9% paired**, 0 answer
+  differences; ~2.9 tokens a pass, the verify pass ~119 ms for 3.3 tokens against 47.5 ms a plain token. Still
+  opt-in. What is left in the pass: host-blocking expert copies in `moe_batch` (decode overlaps them), routed
+  experts per token, the per-token hc kernels (scalar BF16 loads for the reference sum order), no CUDA graphs.

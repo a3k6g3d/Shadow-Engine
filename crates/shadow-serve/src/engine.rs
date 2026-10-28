@@ -339,6 +339,8 @@ fn answer<'c>(arch: &str, req: &Request, tok: &Tokenizer, sess: &mut GpuSession<
     // drafts from the MTP layer when it is loaded (`--mtp DIR`, 3 a pass unless --spec says), else prompt lookup
     let has_mtp = sess.mtp.is_some();
     let spec = if has_mtp && spec == 0 { 3 } else { spec };
+    // a chain stops after a draft the layer is less sure of than this (`SHADOW_SPEC_MIN_P`)
+    let spec_min_p: f32 = std::env::var("SHADOW_SPEC_MIN_P").ok().and_then(|v| v.parse().ok()).unwrap_or(0.7);
     // speculation: the conversation so far (what prompt lookup drafts from), and (passes, drafted, accepted)
     let mut hist: Vec<u32> = if spec > 0 { ids.clone() } else { vec![] };
     let mut spec_n = (0usize, 0usize, 0usize);
@@ -360,7 +362,7 @@ fn answer<'c>(arch: &str, req: &Request, tok: &Tokenizer, sess: &mut GpuSession<
             hist.push(next);
             let k = spec.min(req.max_tokens - n);
             let t_d = Instant::now();
-            let draft = if has_mtp { sess.mtp_draft(next, k) } else { lookup(&hist, k) };
+            let draft = if has_mtp { sess.mtp_draft(next, k, spec_min_p) } else { lookup(&hist, k) };
             spec_t[0] += t_d.elapsed().as_secs_f64();
             if draft.is_empty() {
                 *last_logits = sess.step(next);
@@ -373,7 +375,7 @@ fn answer<'c>(arch: &str, req: &Request, tok: &Tokenizer, sess: &mut GpuSession<
             }
             let batch: Vec<u32> = std::iter::once(next).chain(draft.iter().copied()).collect();
             let t_v = Instant::now();
-            let mut outs = sess.step_batch(&batch);
+            let mut outs = sess.step_batch_verify(&batch);
             spec_t[1] += t_v.elapsed().as_secs_f64();
             let mut keep = 1; // the tokens of `batch` the session keeps
             let mut cancelled = false;
@@ -395,8 +397,7 @@ fn answer<'c>(arch: &str, req: &Request, tok: &Tokenizer, sess: &mut GpuSession<
             spec_n.2 += keep - 1;
             if keep < batch.len() {
                 let t_r = Instant::now();
-                sess.restore(snap.as_ref().unwrap())?;
-                sess.prefill_batch(&batch[..keep]);
+                sess.rollback(snap.as_ref().unwrap(), &batch[..keep])?;
                 spec_t[2] += t_r.elapsed().as_secs_f64();
             }
             *last_logits = outs.swap_remove(keep - 1);

@@ -236,6 +236,7 @@ pub const FILES: &[File] = &[
             e("l2norm_heads", &[W, U, F]),
             e("l2norm_qk_heads", &[W, U, U, F]),
             e("delta_step", &[C, C, C, C, C, C, C, W, W, U, U]),
+            e("delta_steps128", &[C, C, C, U, C, C, U, C, C, W, W, U, U, U]),
             e("gated_rmsnorm_heads", &[W, C, C, U, F]),
             e("head_norm_rope", &[C, U, W, U, C, U, F, U, U, F]),
             e("head_norm_rope_qk", &[C, W, C, C, W, C, U, U, F, U, U, F]),

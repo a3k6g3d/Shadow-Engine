@@ -755,20 +755,20 @@ extern "C" __global__ void matvec_cols_f32(const u8* w, const float* x, unsigned
 // that matches it bit for bit needs the same order: this is that order for m <= 8 inputs, COLS_ROWS rows per warp.
 // Rows [0, r0) are w0's (outputs y0 + j * ys0), rows [r0, r0 + r1) w1's (y1 + j * ys1).  mode 0 writes the sums; mode
 // 1 is hc_down_inject's epilogue (v = sum / div: w0's rows get v * sigmoid(v), w1's 2 * sigmoid(v)).
-template <typename Q, unsigned int M>
+template <typename Q, unsigned int M, unsigned int RW>
 static __device__ __forceinline__ void cols_ref_m(const u8* w0, float* y0, unsigned int r0, unsigned int ys0,
                                                   const u8* w1, float* y1, unsigned int ys1, const float* x,
                                                   unsigned int xs, unsigned int row0, unsigned int nr, unsigned int lane,
                                                   unsigned int cols, unsigned int mode, float div) {
-    const u8* wr[COLS_ROWS];
+    const u8* wr[RW];
 #pragma unroll
-    for (unsigned int k = 0; k < COLS_ROWS; k++) {
+    for (unsigned int k = 0; k < RW; k++) {
         unsigned int row = row0 + k;
         wr[k] = row < r0 ? w0 + (u64) row * cols * Q::BYTES : w1 + (u64) (row - r0) * cols * Q::BYTES;
     }
-    float acc[COLS_ROWS][M];
+    float acc[RW][M];
 #pragma unroll
-    for (unsigned int k = 0; k < COLS_ROWS; k++)
+    for (unsigned int k = 0; k < RW; k++)
 #pragma unroll
         for (unsigned int j = 0; j < M; j++) acc[k][j] = 0.0f;
     for (unsigned int i = lane; i < cols; i += 32) {
@@ -776,7 +776,7 @@ static __device__ __forceinline__ void cols_ref_m(const u8* w0, float* y0, unsig
 #pragma unroll
         for (unsigned int j = 0; j < M; j++) xr[j] = x[(u64) j * xs + i];
 #pragma unroll
-        for (unsigned int k = 0; k < COLS_ROWS; k++)
+        for (unsigned int k = 0; k < RW; k++)
             if (k < nr) {
                 float wv = Q::at(wr[k] + (u64) i * Q::BYTES, 0);
 #pragma unroll
@@ -784,7 +784,7 @@ static __device__ __forceinline__ void cols_ref_m(const u8* w0, float* y0, unsig
             }
     }
 #pragma unroll
-    for (unsigned int k = 0; k < COLS_ROWS; k++) {
+    for (unsigned int k = 0; k < RW; k++) {
         if (k >= nr) break;
         unsigned int row = row0 + k;
 #pragma unroll
@@ -803,16 +803,21 @@ static __device__ __forceinline__ void cols_ref_m(const u8* w0, float* y0, unsig
     }
 }
 
-// Launch: block = 256 threads (32 rows), grid = ceil((r0 + r1) / 32).
+// Rows a warp takes: COLS_ROWS, or 1 for a matrix of fewer than COLS_REF_SPLIT rows (so a short, wide one - the hc
+// down projections' 324 rows - still spreads over the GPU; each row's sum is the same either way).
+#define COLS_REF_SPLIT 2048
+// Launch: block = 256 threads, grid = ceil((r0 + r1) / (8 * rows a warp)).
 template <typename Q>
 static __device__ __forceinline__ void cols_ref_rows(const u8* w0, float* y0, unsigned int r0, unsigned int ys0,
                                                      const u8* w1, float* y1, unsigned int r1, unsigned int ys1,
                                                      const float* x, unsigned int xs, unsigned int cols,
                                                      unsigned int mode, float div, unsigned int m) {
-    unsigned int row0 = (blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32) * COLS_ROWS, lane = threadIdx.x % 32;
+    const bool one = r0 + r1 < COLS_REF_SPLIT;
+    const unsigned int rw = one ? 1 : COLS_ROWS;
+    unsigned int row0 = (blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32) * rw, lane = threadIdx.x % 32;
     if (row0 >= r0 + r1) return;
-    unsigned int nr = min(r0 + r1 - row0, (unsigned int) COLS_ROWS);
-#define CR(M) cols_ref_m<Q, M>(w0, y0, r0, ys0, w1, y1, ys1, x, xs, row0, nr, lane, cols, mode, div)
+    unsigned int nr = min(r0 + r1 - row0, rw);
+#define CR(M) do { if (one) cols_ref_m<Q, M, 1>(w0, y0, r0, ys0, w1, y1, ys1, x, xs, row0, nr, lane, cols, mode, div);                    else cols_ref_m<Q, M, COLS_ROWS>(w0, y0, r0, ys0, w1, y1, ys1, x, xs, row0, nr, lane, cols, mode, div); } while (0)
     switch (m) {
         case 1: CR(1); break;
         case 2: CR(2); break;
