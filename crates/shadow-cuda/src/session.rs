@@ -161,6 +161,11 @@ pub struct GpuSession<'c, 'm> {
     /// How often each (layer, expert) was routed to by this session (`--record-routing` saves it).
     pub routing: RoutingCounts,
     prof: Option<Prof>,
+    /// `SHADOW_ROUTE_LOG=FILE`: every MoE layer's routed experts, in order, written with the tokens when the session
+    /// drops (tools/spec_probe.py reads it).
+    route_log: Option<(String, Vec<u16>)>,
+    /// `SHADOW_MTP_PROBE=1` with `--mtp`: every step drafts first and counts (drafts, hits) against its own argmax.
+    mtp_probe: Option<(u64, u64)>,
     pub mtp: Option<crate::mtp::MtpModel<'c>>,
 }
 
@@ -678,6 +683,8 @@ impl<'c, 'm> GpuSession<'c, 'm> {
             pending: vec![], routing: RoutingCounts::new(c.n_layer, c.n_expert),
             prof: std::env::var("SHADOW_PROFILE").is_ok_and(|v| v == "1")
                 .then(|| Prof { last: std::time::Instant::now(), phases: vec![] }),
+            route_log: std::env::var("SHADOW_ROUTE_LOG").ok().map(|p| (p, vec![])),
+            mtp_probe: std::env::var("SHADOW_MTP_PROBE").is_ok_and(|v| v == "1").then_some((0, 0)),
             mtp,
         })
     }
@@ -931,7 +938,18 @@ impl<'c, 'm> GpuSession<'c, 'm> {
     }
 
     pub fn step(&mut self, token: u32) -> Vec<f32> {
-        self.step_opt(token, true)
+        let draft = if self.mtp_probe.is_some() && self.mtp.is_some() && !self.tokens.is_empty() {
+            self.step_draft(token).ok()
+        } else {
+            None
+        };
+        let logits = self.step_opt(token, true);
+        if let (Some(d), Some(p)) = (draft, self.mtp_probe.as_mut()) {
+            let top = logits.iter().enumerate().max_by(|a, b| a.1.partial_cmp(b.1).unwrap()).map(|(i, _)| i as u32);
+            p.0 += 1;
+            p.1 += (top == Some(d)) as u64;
+        }
+        logits
     }
 
     pub fn step_prefill(&mut self, token: u32) {
@@ -1412,6 +1430,10 @@ impl<'c, 'm> GpuSession<'c, 'm> {
         for &(e, _) in &top {
             self.routing.add(l, e);
         }
+        if let Some((_, log)) = self.route_log.as_mut() {
+            log.push(l as u16);
+            log.extend(top.iter().map(|&(e, _)| e as u16));
+        }
         self.rec_host(format!("layer{l}.route_idx"), &top.iter().map(|&(e, _)| e as f32).collect::<Vec<_>>());
         self.rec_host(format!("layer{l}.route_w"), &top.iter().map(|&(_, w)| w as f32).collect::<Vec<_>>());
         let names = [format!("{p}.ffn_gate_exps.weight"), format!("{p}.ffn_up_exps.weight"), format!("{p}.ffn_down_exps.weight")];
@@ -1593,6 +1615,22 @@ impl<'c, 'm> GpuSession<'c, 'm> {
     }
 }
 
+impl Drop for GpuSession<'_, '_> {
+    fn drop(&mut self) {
+        // little-endian: u32 token count, the tokens (u32), u32 record width k, then (layer, k expert ids) as u16s
+        if let Some((path, log)) = self.route_log.take() {
+            let k = self.m.cfg.n_expert_used as u32;
+            let mut b: Vec<u8> = (self.tokens.len() as u32).to_le_bytes().to_vec();
+            b.extend(self.tokens.iter().flat_map(|t| t.to_le_bytes()));
+            b.extend(k.to_le_bytes());
+            b.extend(log.iter().flat_map(|v| v.to_le_bytes()));
+            if let Err(e) = std::fs::write(&path, b) {
+                eprintln!("SHADOW_ROUTE_LOG {path}: {e}");
+            }
+        }
+    }
+}
+
 impl Stepper for GpuSession<'_, '_> {
     fn step(&mut self, token: u32) -> Vec<f32> {
         GpuSession::step(self, token)
@@ -1621,6 +1659,8 @@ impl Stepper for GpuSession<'_, '_> {
             + &format!("; RAM tier: {} experts, {:.2} GiB pinned (filled in {:.1} s), misses served {} from RAM, {} from the file",
                        self.ram.at.len(), self.ram.region.as_ref().map_or(0, |r| r.len()) as f64 / (1u64 << 30) as f64,
                        self.ram.fill_secs, self.ram.served, self.ram.drive)
+            + &self.mtp_probe.map(|(n, hit)| format!("; MTP probe: {hit}/{n} drafts right ({:.1}%)",
+                                                       100.0 * hit as f64 / n.max(1) as f64)).unwrap_or_default()
             + if self.mtp.is_some() { "; MTP: active (speculative decoding with tuned basalt head)" } else { "" }
             + &self.prof.as_ref().map(|p| {
                 let n = self.tokens.len().max(1) as f64;

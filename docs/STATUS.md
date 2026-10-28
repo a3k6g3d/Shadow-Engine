@@ -291,3 +291,21 @@ router top-10 on the host 1%. That is why the RAM tier came before moving the ro
   `eval/fixtures/**/*.bin` binary. After adding any binary fixture: `git show HEAD:path | cmp - path`.
 - Uncapped, llama.cpp's mmap load took available RAM from 55 to 0.73 GiB in 49 s. Always `tools/run_capped.ps1`.
 - `J:\Strata-work\RUN.md` records the three failed llama-embedding runs (HANDOFF.md's route); nothing there is needed.
+
+## Speculative decoding: what it can buy on this PC (2026-10-27, measured before building)
+
+- **The `--mtp` path (0.1.20) is not speculative decoding.** `shadow-serve` drafts a token, then checks it with two
+  ordinary one-token `step`s; there is no batched verify pass, so a draft only adds work. The head's KV cache is never
+  filled for prompt positions. `SHADOW_MTP_PROBE=1 shadow generate ... --mtp models/mtp-basalt-ft1` (counts drafts
+  that match the base model's argmax) panics on the first drafted step: NaN router logits in the base model (`route`,
+  forward.rs), so the draft step corrupts state somewhere. Unresolved; `--mtp` stays off by default.
+- **The cost side, `SHADOW_ROUTE_LOG` + `tools/spec_probe.py`, 5 prompts (explain, code edit, arithmetic, write
+  code, summarise; 53-256 generated tokens each):** checking m tokens in one pass needs the union of their routed
+  experts. Per layer, in units of one token's 10 experts: **m2 1.66, m3 2.22, m4 2.74, m5 3.21, m6 3.64, m8 4.45.**
+  Expert movement is ~70% of a step here (profile above), so a pass over m positions costs about
+  0.3 x (dense, ~1 if batched) + 0.7 x union(m): **~1.5x a step for m=2, ~2.3x for m=4.**
+- **Break-even:** a drafter has to land more tokens per pass than that. With per-token acceptance p = 0.8 the best
+  case is ~1.25-1.3x (K = 2-3); DFlash-style 5-6x numbers are for compute-bound dense models, not an
+  offloaded MoE where every extra position moves more experts.
+- **Prompt/history lookup (n-gram) drafting loses:** 1.21-1.24 tokens per pass while verifying 2.0-4.6 positions
+  over all 5 prompts; even the code-edit prompt (mostly copying) gets 1.6-1.9 tokens per pass at 2.7-7.3 positions.
