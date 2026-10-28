@@ -675,7 +675,8 @@ extern "C" __global__ void matvec_pair_f32(const u8* w0, float* y0, unsigned int
 // y_j = W x_j for j < m <= 8 inputs (x_j at x + j * xs, y_j at y + j * ys): each warp reads and decodes its row's
 // weights once (dotm) and dots them with every input, so a batch of tokens (prefill, a speculative verify pass) pays
 // for the weights once.  Same per-input sums as matvec_fast_rows, bit for bit.
-// Each warp takes COLS_ROWS consecutive rows, so every input chunk it loads serves COLS_ROWS rows.
+// Each warp takes COLS_ROWS consecutive rows, so every input chunk it loads serves COLS_ROWS rows.  The inputs must be
+// 16-byte aligned with xs a multiple of 4 (float4 loads).
 #define COLS_ROWS 4
 
 template <typename Q, unsigned int M>
@@ -689,9 +690,18 @@ static __device__ __forceinline__ void matvec_cols_m(const u8* w, const float* x
 #pragma unroll
         for (unsigned int j = 0; j < M; j++) acc[k][j] = 0.0f;
     for (unsigned int c = lane; c < cols / 8; c += 32) {
+        // this chunk of every input, loaded once into registers and used for all COLS_ROWS rows
+        float xr[M * 8];
+#pragma unroll
+        for (unsigned int j = 0; j < M; j++) {
+            const float4* p = (const float4*) (x + (u64) j * xs + c * 8);
+            float4 a = p[0], b = p[1];
+            xr[j * 8 + 0] = a.x; xr[j * 8 + 1] = a.y; xr[j * 8 + 2] = a.z; xr[j * 8 + 3] = a.w;
+            xr[j * 8 + 4] = b.x; xr[j * 8 + 5] = b.y; xr[j * 8 + 6] = b.z; xr[j * 8 + 7] = b.w;
+        }
 #pragma unroll
         for (unsigned int k = 0; k < COLS_ROWS; k++)
-            if (k < nr) Fast<Q>::template dotm<M>(w + (row0 + k) * rb, c * 8, x + c * 8, xs, acc[k]);
+            if (k < nr) Fast<Q>::template dotm<M>(w + (row0 + k) * rb, c * 8, xr, 8, acc[k]);
     }
 #pragma unroll
     for (unsigned int k = 0; k < COLS_ROWS; k++) {

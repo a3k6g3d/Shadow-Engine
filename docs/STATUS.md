@@ -370,3 +370,11 @@ Single-prompt runs, "Write a Rust function that parses a comma separated list...
   **59.5 s and 56.1 s -> 1.1 s and 1.0 s** (842 tokens restored), identical answers.
 - **Web UI:** model-loading state, live prompt-reading progress, readable errors, escape-first Markdown (it used to put
   model text into innerHTML unescaped), NVML VRAM while loading. `tools/serve_check.py` 16/16.
+
+- **`matvec_cols` fixed (2026-10-28): 5.6-6.8x on the big matrices.** The 4-rows-per-warp version still called `dotm`
+  per row, reloading every input chunk per row, so the row tiling reused nothing. Now each lane loads its 8-float
+  chunk of every input into registers once (float4 loads) and applies it to all 4 rows. Still bit-identical to
+  `matvec_fast_*` per input. 8 inputs at once vs 8 launches: Q4_K 6144x2560 6.5x, Q5_K 10240x2560 5.6x, Q6_K 10240x2560
+  **6.8x (0.071 ms for 8 inputs vs 0.06 ms for one)**, expert-sized IQ*/Q2_0/IQ4 3.4-6.4x, BF16 2.5x, F32 router 4.9x.
+  Dense weights are now close to free to batch: the cost of a multi-token pass is the union of its experts plus the
+  per-token small kernels. That is what batched prefill and speculative verification need.
