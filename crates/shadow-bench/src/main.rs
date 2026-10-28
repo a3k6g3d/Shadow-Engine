@@ -92,6 +92,11 @@ fn run(a: &[String]) {
     let arm_exe: HashMap<String, PathBuf> = a.iter().enumerate().filter(|(_, x)| *x == "--arm-exe")
         .filter_map(|(i, _)| a.get(i + 1)?.split_once('=').map(|(n, p)| (n.to_string(), PathBuf::from(p))))
         .collect();
+    // an arm can bring its own launch instead (another engine): a PowerShell command, `{port}` and `{log}` filled in;
+    // it must serve /health and /v1/chat/completions with llama.cpp's `timings`, and enforce the RAM floor itself
+    let arm_launch: HashMap<String, String> = a.iter().enumerate().filter(|(_, x)| *x == "--arm-launch")
+        .filter_map(|(i, _)| a.get(i + 1)?.split_once('=').map(|(n, c)| (n.to_string(), c.to_string())))
+        .collect();
     if arms.is_empty() {
         usage();
     }
@@ -122,8 +127,11 @@ fn run(a: &[String]) {
             };
             let log = out.join(format!("{name}-run{i}.log"));
             let args = format!("serve {model} --port {port} {flags}");
-            let launch = format!("& '{}' -CapGiB {cap} -Out '{}' -Exe '{}' -Arguments '{}'", capped.display(),
-                                 log.display(), arm_exe.get(name).unwrap_or(&exe).display(), args);
+            let launch = match arm_launch.get(name) {
+                Some(cmd) => cmd.replace("{port}", &port.to_string()).replace("{log}", &log.display().to_string()),
+                None => format!("& '{}' -CapGiB {cap} -Out '{}' -Exe '{}' -Arguments '{}'", capped.display(),
+                                log.display(), arm_exe.get(name).unwrap_or(&exe).display(), args),
+            };
             let rec = one_run(name, i, port, &launch, turns, tokens);
             println!("run {i} {name}: {}", rec.get("line").and_then(Value::as_str).unwrap_or(""));
             let mut f = std::fs::OpenOptions::new().create(true).append(true).open(&results).unwrap();
@@ -173,8 +181,11 @@ fn one_run(arm: &str, run: usize, port: u16, launch: &str, turns: usize, tokens:
         if let Ok(Some(_)) = child.try_wait() {
             break false;
         }
-        if let Ok((200, _)) = http(port, "GET", "/health", None, Duration::from_secs(5)) {
-            break true;
+        // a server that answers before its model is in says so (`"loaded": false`)
+        if let Ok((200, b)) = http(port, "GET", "/health", None, Duration::from_secs(5)) {
+            if !b.replace(' ', "").contains("\"loaded\":false") {
+                break true;
+            }
         }
         if t0.elapsed() > Duration::from_secs(900) {
             break false;
@@ -215,8 +226,17 @@ fn one_run(arm: &str, run: usize, port: u16, launch: &str, turns: usize, tokens:
         }
         sample(&mut min_ram, &mut max_gpu);
         let _ = http(port, "POST", "/shutdown", None, Duration::from_secs(5));
+        // a server without /shutdown: its whole process tree, after a minute
+        let t_end = Instant::now();
+        while child.try_wait().ok().flatten().is_none() && t_end.elapsed() < Duration::from_secs(60) {
+            std::thread::sleep(Duration::from_secs(1));
+        }
+        if child.try_wait().ok().flatten().is_none() {
+            let _ = std::process::Command::new("taskkill").args(["/T", "/F", "/PID", &child.id().to_string()]).output();
+        }
     } else {
         error = Some("the server never became ready".into());
+        let _ = std::process::Command::new("taskkill").args(["/T", "/F", "/PID", &child.id().to_string()]).output();
         let _ = child.kill();
     }
     let mut capped_out = String::new();

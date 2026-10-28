@@ -1,0 +1,62 @@
+{
+ "exe": "J:/Strata-work/build-0145/strata.exe",
+ "open_browser": false,
+ "args": [
+  "--pack",
+  "J:/Strata-work/models/swift15/pack",
+  "--native",
+  "J:/Strata-work/models/swift15/IQ3_S/Swift-Qwen3.8-Flash-Next-GSQ-RCO-abliterated-IQ3_S-00001-of-00002.gguf",
+  "--ple-gguf",
+  "J:/Strata-work/models/swift15/IQ3_S/Swift-Qwen3.8-Flash-Next-GSQ-RCO-abliterated-IQ3_S-00001-of-00002.gguf",
+  "--resident-budget-gib",
+  "36",
+  "--expert-profile",
+  "J:/Strata-work/profiles/expert-profile-swift-mixed-20261018.bin",
+  "--expert-cache",
+  "auto",
+  "--prefill",
+  "auto",
+  "--spec",
+  "4",
+  "--spec-min-p",
+  "0.7",
+  "--mtp",
+  "J:/Strata-work/models/mtp-basalt-ft1",
+  "--max-context",
+  "8192",
+  "--kv",
+  "int8",
+  "--ple-io",
+  "direct",
+  "--vram-reserve-mib",
+  "640",
+  "--adapt-swaps",
+  "48",
+  "--pcie-frac",
+  "0.35"
+ ],
+ "tokenizer": "J:/Strata-work/tokenizer",
+ "model_name": "qwen3.8-flash-next-swift15-abliterated-iq3s",
+ "log": "C:/Users/a3k6g/AppData/Local/Temp/claude/J--Shadow/95988fd8-569b-47c7-99ea-9f100d75d035/scratchpad/strata/strata-engine.log",
+ "effort_position": "end",
+ "reasoning_budget_tokens": 16000,
+ "reasoning_close_retry": true,
+ "eos_resample": true,
+ "discord": {
+  "enabled": false
+ },
+ "fit_max_tokens": true,
+ "sampling": {
+  "temperature": 0.0,
+  "top_p": 1.0,
+  "top_k": 1
+ },
+ "warmup": {
+  "enabled": true
+ },
+ "slot_save_path": "C:/Users/a3k6g/AppData/Local/Temp/claude/J--Shadow/95988fd8-569b-47c7-99ea-9f100d75d035/scratchpad/strata/slots",
+ "conversation_store": {
+  "enabled": false
+ },
+ "host": "127.0.0.1"
+}

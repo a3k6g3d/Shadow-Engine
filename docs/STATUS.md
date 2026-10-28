@@ -470,3 +470,31 @@ Single-prompt runs, "Write a Rust function that parses a comma separated list...
 - `bench/lru-2026-10-28`, 8 interleaved launches vs the overlap build: **+11.1% paired, 19.53 -> 21.06 tok/s**
   (p10 -1.5%, worst -1.9%, floor median 0.2%), 0 answer differences. Today's three decode changes together:
   **18.65 -> 21.06 tok/s (+12.9%)**.
+
+## 2026-10-28 (night): Shadow against Strata, same protocol (`bench/strata-2026-10-28`)
+
+- `shadow-bench` gained `--arm-launch NAME=CMD` (another engine's launch; `{port}`, `{log}` filled in), readiness that
+  waits for `"loaded": false` to go away, and a process-tree kill for servers without `/shutdown`. Strata ran from a
+  copy of the user's `strata.json` (`strata_bench_cfg.py`): same engine flags, but Discord, MCP tools, the
+  conversation store, the learned-profile save and the API key off, loopback only, slots and logs to scratch; and
+  matched to Shadow's bench: no vision, context 8192, greedy (temperature 0). Its launcher (`run_strata.ps1`) kills
+  the whole process tree below 4 GiB available.
+- **8 interleaved launches each, the same 6 turns x 96 tokens: Strata 48.55 tok/s `decode_warm`, Shadow (b431c16)
+  20.98 - Strata +135% paired** (p10 +104%, worst +76%). Prompt reading: **Strata 6.1 ms/token, Shadow 35.0**. Answers
+  differ in 18 of 48 turns (Strata is not exact against the reference; see below).
+- **Where Strata's speed comes from (its own log):**
+  1. A working MTP drafter (`mtp-basalt-ft1`, the head Shadow's broken `--mtp` loads) with `--spec 4`: drafts
+     accepted 49/58, 39/39, 24/26 ... (85-100% at greedy), verify windows of 1-6 tokens captured as CUDA graphs.
+  2. `STRATA_ROUTE_TAIL_SKIP=7` (default on): a missed expert that every token of a verify window routes at rank 7 or
+     lower is not computed (11,347 skipped in the first answer) - fewer bytes over PCIe, not exact.
+  3. `--pcie-frac 0.35`: part of the misses read by the GPU straight from pinned RAM instead of copied into the cache.
+  4. Its VRAM cache hits less than Shadow's now (46-48% vs ~71%); the cache is not where it wins.
+  5. Prompts: expert-grouped GEMMs (`src/prefill/moe_mmq.cu`), 1,771 cache slots lent to the prompt path, the CPU
+     taking part of the experts below 1,024-token chunks.
+- So the gap is speculation that works (exact once verified) plus approximations Shadow has not taken. Next, in that
+  order: port the MTP draft layer (Strata `src/core/mtp.cpp` `record_front` / `record_rest`: pre-FC norms + fc_embedding
+  / fc_hidden, hc read, gated attention over its own KV with q/k norm + RoPE, MoE over 512 VRAM-resident Q2_0
+  experts with a gated shared expert, final mixer, the main head over the draft vocabulary; its KV filled for every
+  committed position from the main model's final residual rows); then expert-grouped prefill. Shadow's `mtp.rs` reads
+  its routed-expert table in the wrong order, never computes the shared expert's gate, routes by sigmoid, and never
+  fills its KV for prompt positions.
