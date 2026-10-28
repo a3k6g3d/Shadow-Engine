@@ -360,6 +360,10 @@ pub struct Tiers {
     /// Pre-gated prefetch: layer l+1's router applied to layer l's MoE input; its top `pregate` experts that the RAM
     /// tier holds and VRAM does not are copied up while layer l computes (0: off).
     pub pregate: usize,
+    /// `--pin-margin N`: keep the placement's hottest experts pinned in VRAM (and out of the RAM tier), N evictable
+    /// slots a layer; `None` (the default): every slot is LRU.  On real routing, LRU over a layer's slots hits more:
+    /// 70.7% vs 56.6% with N = 12 (docs/STATUS.md, tools/cache_sim.py).
+    pub pin_margin: Option<usize>,
 }
 
 impl Tiers {
@@ -394,7 +398,9 @@ impl Tiers {
         };
         Ok(Tiers { vram_cache: gib("--expert-cache-gib")?, ram_bytes, ram_auto, order, mtp_dir,
                    cpu_experts: num("--cpu-experts", 0)?, cpu_threads: num("--cpu-threads", 8)?,
-                   pregate: num("--pregate", 0)? })
+                   pregate: num("--pregate", 0)?,
+                   pin_margin: flag("--pin-margin").map(|v| v.parse().map_err(|_| format!("--pin-margin: not a number: {v}")))
+                       .transpose()? })
     }
 }
 
@@ -800,7 +806,7 @@ impl<'c, 'm> GpuSession<'c, 'm> {
         // VRAM (keeping `margin` LRU slots per layer for transient misses) and exclude them from `RamTier` so `RamTier`
         // covers ~1,800+ additional experts without duplicating VRAM-pinned ones.
         if slots > 0 && per_layer_mode && ram_bytes >= (4usize << 30) {
-            let margin = (c.n_expert_used + 2).max(12);
+            let margin = tiers.pin_margin.unwrap_or(usize::MAX).max(c.n_expert_used + 2);
             let mut pin_end = vec![0usize; c.n_layer];
             for l in 0..c.n_layer {
                 let len = layer_range[l].len();

@@ -455,3 +455,18 @@ Single-prompt runs, "Write a Rust function that parses a comma separated list...
   1.4%), 0 answer differences. Reference suite 9/9 with both on (the batch test compares graphed, overlapped `step`
   with `step_batch` bit for bit).
 - Both together: **18.65 -> 19.47 tok/s, ~+4.4%** over 0.1.25.
+
+## 2026-10-28 (night): the VRAM expert cache is all LRU (default), `--pin-margin N` for the old pinning
+
+- **Simulated first** (`tools/cache_sim.py`: a `SHADOW_ROUTE_LOG` replayed through policies, per layer, with the
+  session's slot counts from `SHADOW_CACHE_DUMP`). Today's policy - the placement's hottest experts pinned, 12 LRU
+  slots a layer - replays at 59.1% hits on the Rust prompt's decode (measured: 59.5%, so the simulator is faithful).
+  Pure LRU over the same slots: **75.0%** (hash-table prompt 53.4 -> 68.9%, a 1,271-token prompt read 39.7 -> 63.8%);
+  margin 24: 65.5%, margin 48: 72.6%; a decayed-LFU with admission 71-73%. Locality inside a conversation beats
+  global popularity. More slots under LRU: +3 a layer +1 point, +20 +5.7 points.
+- **The cost:** pinned experts were kept out of the RAM tier; without pinning the tier holds them too, so it covers
+  ~2,300 fewer distinct experts and more misses go to the file (1,375 -> 2,232 of 104 tokens; file wait 6.5 -> 9.9 ms),
+  far outweighed by the misses saved (24,210 -> 15,971, hits 56.6 -> 70.7%).
+- `bench/lru-2026-10-28`, 8 interleaved launches vs the overlap build: **+11.1% paired, 19.53 -> 21.06 tok/s**
+  (p10 -1.5%, worst -1.9%, floor median 0.2%), 0 answer differences. Today's three decode changes together:
+  **18.65 -> 21.06 tok/s (+12.9%)**.

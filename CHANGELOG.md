@@ -9,6 +9,9 @@ All notable changes to Shadow will be documented in this file.
 - Overlapped expert copies: resident experts run while the misses copy, the GPU (not the host) waits for the copies,
   `moe_combine_qwen_perm` keeps the sum order (`SHADOW_OVERLAP=0`: off): `bench/overlap-2026-10-28` **+2.7% paired**.
   Together 18.65 -> 19.47 tok/s `decode_warm`, 0 answer differences.
+- The VRAM expert cache is LRU over every slot of a layer; the placement's hottest experts are no longer pinned (and
+  so stay in the RAM tier). `tools/cache_sim.py` predicted 59 -> 75% hits; measured 56.6 -> 70.7%, `bench/lru-2026-10-28`
+  **+11.1% paired** (19.53 -> 21.06 tok/s). `--pin-margin N` brings back pinning with N LRU slots a layer.
 ### Added
 - Kernel launch counts and host time in launches in the session report; `SHADOW_CACHE_DUMP=FILE` (per-layer slots and
   pinned experts, for `tools/cache_sim.py`).
