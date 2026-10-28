@@ -192,6 +192,11 @@ struct BatchBufs<'c> {
     sa: DeviceBuffer<'c>,
     so: DeviceBuffer<'c>,
     logits: DeviceBuffer<'c>,
+    /// per token: its overlapped routed-expert table (32 bytes an expert), gate+up outputs, activations, outputs
+    etab: DeviceBuffer<'c>,
+    eg: DeviceBuffer<'c>,
+    act: DeviceBuffer<'c>,
+    eo: DeviceBuffer<'c>,
 }
 
 pub struct GpuSession<'c, 'm> {
@@ -603,6 +608,33 @@ fn cols_rows_per_block(entry: &str, rows: usize) -> u32 {
     if reference && rows < 2048 { 8 } else { 32 }
 }
 
+/// One token's table for routed experts with their copies overlapped: [gate, up] of the resident ones, [gate, up] of
+/// those being copied (`copying`), down in that order, the routing weights in routing order, then perm (routing rank
+/// -> output row); and how many are resident.  `addr(e)` is expert e's slot; `part` its gate, up, down offsets.
+fn overlapped_tab(top: &[(usize, f64)], addr: impl Fn(usize) -> u64, copying: impl Fn(usize) -> bool, part: [u64; 3])
+                  -> (Vec<u8>, usize) {
+    let (hits, misses): (Vec<(usize, usize)>, Vec<(usize, usize)>) =
+        top.iter().enumerate().map(|(i, &(e, _))| (i, e)).partition(|&(_, e)| !copying(e));
+    let mut tab = Vec::with_capacity(top.len() * 32);
+    for group in [&hits, &misses] {
+        for p in &part[..2] {
+            for &(_, e) in group.iter() {
+                tab.extend_from_slice(&(addr(e) + p).to_le_bytes());
+            }
+        }
+    }
+    let mut perm = vec![0u32; top.len()];
+    for (r, &(i, e)) in hits.iter().chain(&misses).enumerate() {
+        tab.extend_from_slice(&(addr(e) + part[2]).to_le_bytes());
+        perm[i] = r as u32;
+    }
+    for &(_, w) in top {
+        tab.extend_from_slice(&(w as f32).to_le_bytes());
+    }
+    tab.extend(perm.iter().flat_map(|p| p.to_le_bytes()));
+    (tab, hits.len())
+}
+
 /// Row j of a [rows][stride] f32 buffer.
 fn row(b: &DeviceBuffer, stride: usize, j: usize) -> u64 {
     b.ptr + (j * stride * 4) as u64
@@ -693,6 +725,7 @@ impl<'c, 'm> GpuSession<'c, 'm> {
             qkv: ab(2 * kd + vd)?, x: ab(2 * kd + vd)?, z: ab(vd)?, beta: ab(c.ssm_v_heads)?, alpha: ab(c.ssm_v_heads)?, o: ab(vd)?,
             qg: ab(2 * qd)?, kk: ab(kvd)?, iq: ab(c.idx_heads * id)?, ao: ab(qd)?, rl: ab(c.n_expert)?, sgl: ab(1)?,
             sg: ab(c.shared_ff)?, su: ab(c.shared_ff)?, sa: ab(c.shared_ff)?, so: ab(h)?, logits: a(COLS_MAX * c.vocab)?,
+            etab: ab(8 * k)?, eg: ab(2 * k * c.expert_ff)?, act: ab(k * c.expert_ff)?, eo: ab(k * h)?,
         };
         let replay = Replay {
             qkv: a(c.n_layer * MAX_VERIFY * (2 * kd + vd))?, ba: a(c.n_layer * MAX_VERIFY * 2 * c.ssm_v_heads)?,
@@ -2176,7 +2209,7 @@ impl<'c, 'm> GpuSession<'c, 'm> {
         self.upload_to(self.b.tab.ptr, &tab);
         let b = &self.b;
         let batch = |t: &TensorInfo, tab_off: u64, count: usize, x: u64, xs: usize, y: u64, ys: usize| {
-            self.mv_batch(t, tab_off, count, x, xs, y, ys)
+            self.mv_batch(t, self.b.tab.ptr + tab_off, count, x, xs, y, ys)
         };
         let down_tab_off = 16 * n_gu as u64;
         let w_off = down_tab_off + 8 * ng as u64;
@@ -2446,20 +2479,20 @@ impl<'c, 'm> GpuSession<'c, 'm> {
         }
     }
 
-    /// `count` matrices of t's shape from the device table at tab + tab_off, one per blockIdx.y, on inputs x + n * xs
+    /// `count` matrices of t's shape from the device table at `tab`, one per blockIdx.y, on inputs x + n * xs
     /// (xs = 0: shared) into y + n * ys.
     #[allow(clippy::too_many_arguments)]
-    fn mv_batch(&self, t: &TensorInfo, tab_off: u64, count: usize, x: u64, xs: usize, y: u64, ys: usize) {
+    fn mv_batch(&self, t: &TensorInfo, tab: u64, count: usize, x: u64, xs: usize, y: u64, ys: usize) {
         let ty = t.ty.name();
         let entry = FAST_KERNELS.iter().find(|q| q.0 == ty).unwrap_or_else(|| panic!("{}: no batched kernel", t.name)).2;
         let (rows, cols) = (t.dims[1] as u32, t.dims[0] as u32);
         assert_eq!(cols % 8, 0, "{}: the batched kernel needs whole chunks of 8", t.name);
-        // SAFETY: `count` table entries from tab + tab_off, each a rows x cols matrix as stored; `count` inputs of
+        // SAFETY: `count` table entries from tab, each a rows x cols matrix as stored; `count` inputs of
         // cols floats (stride xs, or 0 when shared) and `count` outputs of rows floats (stride ys) inside this
         // session's buffers.
         unsafe {
             self.mvp.launch(entry, (rows.div_ceil(8), count as u32, 1), (256, 1, 1), 0, self.ls(),
-                            &[Arg::Ptr(self.b.tab.ptr + tab_off), Arg::Ptr(x), Arg::U32(xs as u32), Arg::Ptr(y),
+                            &[Arg::Ptr(tab), Arg::Ptr(x), Arg::U32(xs as u32), Arg::Ptr(y),
                               Arg::U32(ys as u32), Arg::U32(rows), Arg::U32(cols)])
         }
         .unwrap_or_else(|err| panic!("{}: {err}", t.name));
@@ -2656,7 +2689,8 @@ impl<'c, 'm> GpuSession<'c, 'm> {
             for &e in &set {
                 self.cache.touch((l, e));
             }
-            let (mut n_miss, mut n_file) = (0, 0);
+            // the group's misses get their slots (cache victims, else scratch) first
+            let mut copying: Vec<(usize, u64)> = Vec::new();
             let mut extra: Vec<(usize, u64)> = Vec::new();
             for &e in &set {
                 if self.cache.map.contains_key(&(l, e)) {
@@ -2675,24 +2709,84 @@ impl<'c, 'm> GpuSession<'c, 'm> {
                     extra.push((e, b));
                     b
                 };
-                let dst = [base, base + sizes[0] as u64, base + (sizes[0] + sizes[1]) as u64];
+                copying.push((e, base));
+            }
+            // overlapped: every token's resident experts run while the misses copy, and the GPU waits for the copies
+            let overlap = self.overlap && self.prof.is_none() && infos[0].ty == infos[1].ty && infos[0].dims == infos[1].dims;
+            let part = [0u64, sizes[0] as u64, (sizes[0] + sizes[1]) as u64];
+            let mut resident = vec![0usize; end - start];
+            if overlap {
+                let addr = |e: usize| match self.cache.map.get(&(l, e)) {
+                    Some(&s) => arena + self.cache.slot_offset[s],
+                    None => extra.iter().find(|x| x.0 == e).expect("a routed expert neither cached nor fetched").1,
+                };
+                let mut tabs = Vec::with_capacity((end - start) * 32 * k);
+                for (jj, top) in tops[start..end].iter().enumerate() {
+                    let (tab, nh) = overlapped_tab(top, &addr, |e| copying.iter().any(|c| c.0 == e), part);
+                    tabs.extend_from_slice(&tab);
+                    tabs.resize((jj + 1) * 32 * k, 0);
+                    resident[jj] = nh;
+                }
+                self.upload_to(row(&self.bb.etab, 8 * k, start), &tabs);
+                for (jj, &nh) in resident.iter().enumerate() {
+                    self.routed_rows(start + jj, &tops[start + jj], 0, nh, &infos);
+                }
+            }
+            let mut n_file = 0;
+            for &(e, base) in &copying {
                 let from_file = !self.ram.at.contains_key(&(l, e));
-                self.fetch_expert(l, e, n_file, &names, &sizes, dst);
+                self.fetch_expert(l, e, n_file, &names, &sizes, [base, base + part[1], base + part[2]]);
                 n_file += from_file as usize;
-                n_miss += 1;
             }
             self.read_drive(&names, &sizes);
-            if n_miss > 0 {
-                let t_wait = std::time::Instant::now();
-                self.copy_stream.synchronize().unwrap();
-                self.waits[1] += t_wait.elapsed().as_secs_f64();
-            }
-            self.mark("batch: shared expert + expert fetch");
-            for (j, top) in tops.iter().enumerate().take(end).skip(start) {
-                self.routed_qwen(l, j, top, &extra, &infos, &sizes);
+            if overlap {
+                if !copying.is_empty() {
+                    self.copy_event.record(Some(&self.copy_stream)).unwrap();
+                    self.ctx.stream_wait_event(None, &self.copy_event).unwrap();
+                }
+                for (jj, &nh) in resident.iter().enumerate() {
+                    let j = start + jj;
+                    let n = tops[j].len();
+                    self.routed_rows(j, &tops[j], nh, n - nh, &infos);
+                    let bb = &self.bb;
+                    let tab = row(&bb.etab, 8 * k, j);
+                    self.k1("moe_combine_qwen_perm", h, &[
+                        Arg::Ptr(row(&bb.y, h, j)), Arg::Ptr(row(&bb.eo, k * h, j)), Arg::Ptr(tab + 24 * n as u64),
+                        Arg::Ptr(tab + 28 * n as u64), Arg::Ptr(row(&bb.so, h, j)), Arg::Ptr(row(&bb.sgl, 1, j)),
+                        Arg::U32(h as u32), Arg::U32(n as u32)]);
+                }
+            } else {
+                if !copying.is_empty() {
+                    let t_wait = std::time::Instant::now();
+                    self.copy_stream.synchronize().unwrap();
+                    self.waits[1] += t_wait.elapsed().as_secs_f64();
+                }
+                self.mark("batch: shared expert + expert fetch");
+                for (j, top) in tops.iter().enumerate().take(end).skip(start) {
+                    self.routed_qwen(l, j, top, &extra, &infos, &sizes);
+                }
             }
             start = end;
         }
+    }
+
+    /// Rows first..first + cnt of token j's overlapped routed experts (its table in bb.etab, `overlapped_tab`'s layout):
+    /// gate+up, swiglu, down into its rows of bb.eo.
+    fn routed_rows(&self, j: usize, top: &[(usize, f64)], first: usize, cnt: usize, infos: &[TensorInfo]) {
+        if cnt == 0 {
+            return;
+        }
+        let c = &self.m.cfg;
+        let (h, ff, k, n) = (c.hidden, c.expert_ff, c.n_expert_used, top.len());
+        let bb = &self.bb;
+        let tab = row(&bb.etab, 8 * k, j);
+        let eg = row(&bb.eg, 2 * k * ff, j) + (2 * first * ff * 4) as u64;
+        let act = row(&bb.act, k * ff, j) + (first * ff * 4) as u64;
+        self.mv_batch(&infos[0], tab + 16 * first as u64, 2 * cnt, row(&bb.u, h, j), 0, eg, ff);
+        self.k1("swiglu", cnt * ff, &[Arg::Ptr(eg), Arg::Ptr(eg + (cnt * ff * 4) as u64), Arg::Ptr(act),
+                                      Arg::U32((cnt * ff) as u32)]);
+        self.mv_batch(&infos[2], tab + (16 * n + 8 * first) as u64, cnt, act, ff,
+                      row(&bb.eo, k * h, j) + (first * h * 4) as u64, h);
     }
 
     /// Token j's routed experts (resident in the cache, or at `extra`'s scratch addresses) and the combine with its
@@ -2725,15 +2819,15 @@ impl<'c, 'm> GpuSession<'c, 'm> {
         let b = &self.b;
         let u = row(&self.bb.u, h, j);
         let eu = if infos[0].ty == infos[1].ty && infos[0].dims == infos[1].dims {
-            self.mv_batch(&infos[0], 0, 2 * n, u, 0, b.eg.ptr, ff);
+            self.mv_batch(&infos[0], b.tab.ptr, 2 * n, u, 0, b.eg.ptr, ff);
             b.eg.ptr + (n * ff * 4) as u64
         } else {
-            self.mv_batch(&infos[0], 0, n, u, 0, b.eg.ptr, ff);
-            self.mv_batch(&infos[1], 8 * n as u64, n, u, 0, b.eu.ptr, ff);
+            self.mv_batch(&infos[0], b.tab.ptr, n, u, 0, b.eg.ptr, ff);
+            self.mv_batch(&infos[1], b.tab.ptr + 8 * n as u64, n, u, 0, b.eu.ptr, ff);
             b.eu.ptr
         };
         self.k1("swiglu", n * ff, &[Arg::Ptr(b.eg.ptr), Arg::Ptr(eu), Arg::Ptr(b.act.ptr), Arg::U32((n * ff) as u32)]);
-        self.mv_batch(&infos[2], 16 * n as u64, n, b.act.ptr, ff, b.eo.ptr, h);
+        self.mv_batch(&infos[2], b.tab.ptr + 16 * n as u64, n, b.act.ptr, ff, b.eo.ptr, h);
         self.k1("moe_combine_qwen", h, &[
             Arg::Ptr(row(&self.bb.y, h, j)), Arg::Ptr(b.eo.ptr), Arg::Ptr(b.tab.ptr + 24 * n as u64),
             Arg::Ptr(row(&self.bb.so, h, j)), Arg::Ptr(row(&self.bb.sgl, 1, j)), Arg::U32(h as u32), Arg::U32(n as u32)]);
@@ -2799,10 +2893,10 @@ impl<'c, 'm> GpuSession<'c, 'm> {
             let b = &s.b;
             let eg = b.eg.ptr + (2 * first * ff * 4) as u64;
             let act = b.act.ptr + (first * ff * 4) as u64;
-            s.mv_batch(&infos[0], 16 * first as u64, 2 * cnt, b.u.ptr, 0, eg, ff);
+            s.mv_batch(&infos[0], b.tab.ptr + 16 * first as u64, 2 * cnt, b.u.ptr, 0, eg, ff);
             s.k1("swiglu", cnt * ff, &[Arg::Ptr(eg), Arg::Ptr(eg + (cnt * ff * 4) as u64), Arg::Ptr(act),
                                       Arg::U32((cnt * ff) as u32)]);
-            s.mv_batch(&infos[2], (16 * n + 8 * first) as u64, cnt, act, ff, b.eo.ptr + (first * h * 4) as u64, h);
+            s.mv_batch(&infos[2], b.tab.ptr + (16 * n + 8 * first) as u64, cnt, act, ff, b.eo.ptr + (first * h * 4) as u64, h);
         };
         run(self, 0, nh);
         for &(i, e, base) in &misses {

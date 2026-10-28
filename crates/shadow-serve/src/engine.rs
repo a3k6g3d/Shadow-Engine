@@ -165,6 +165,9 @@ fn run(cfg: Config, rx: std::sync::mpsc::Receiver<Request>, status: &Mutex<Statu
         {
             use shadow_model::forward::Stepper;
             s.report = sess.report();
+            if std::env::var("SHADOW_REPORT").is_ok_and(|v| v == "1") {
+                eprintln!("shadow serve: after this answer: {}", s.report);
+            }
         }
         let (v_free, v_total) = sess.mem_info();
         let (slots, _, hits, misses) = sess.cache_stats();

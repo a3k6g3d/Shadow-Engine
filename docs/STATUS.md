@@ -536,3 +536,16 @@ Single-prompt runs, "Write a Rust function that parses a comma separated list...
   differences; ~2.9 tokens a pass, the verify pass ~119 ms for 3.3 tokens against 47.5 ms a plain token. Still
   opt-in. What is left in the pass: host-blocking expert copies in `moe_batch` (decode overlaps them), routed
   experts per token, the per-token hc kernels (scalar BF16 loads for the reference sum order), no CUDA graphs.
+- **Then:** the batched MoE overlaps its copies like decode does (`overlapped_tab` / `routed_rows`: every token's
+  resident experts run while the group's misses copy, the GPU waits for the copies, `moe_combine_qwen_perm` keeps
+  the sum order; 10/10 reference tests): host copy wait under speculation 10.5 -> 0.0 ms a token. `--spec 3`:
+  **-8.9% paired** (19.77 vs 20.95 tok/s, 2-run check), 0 answer differences. `SHADOW_REPORT=1` prints the session
+  report after every answer in `shadow serve`.
+- **Where it stands:** per committed token the GPU now does about what plain decode does (`SHADOW_KTIME`: 30.9 vs
+  29.3 ms) - a verify pass of ~3.3 positions shares only the dense weights, which at m = 3-4 the cols kernels
+  barely shrink (Q6_K 1.80 vs 2.35 ms a token), while routed experts (8.4 vs 6.9 ms a token, rejected positions
+  included) and the per-position hc / conv / swiglu kernels scale with positions. The drafter's 830 MB also come out
+  of the expert cache (2,504 vs 2,929 slots). Strata's verify is cheaper through inexact tail skipping, int8-activation
+  kernels and grouped experts. What would still move Shadow's: experts grouped across a pass's positions (each
+  union expert's weights read once), fusing the per-position small kernels, the drafter's experts in pinned RAM
+  instead of VRAM.
