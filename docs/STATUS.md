@@ -350,3 +350,8 @@ Single-prompt runs, "Write a Rust function that parses a comma separated list...
   router ~2.2x; the big attention matrices (Q4_K/Q5_K/Q6_K, 6144-10240 x 2560) only 0.9-1.4x, because every warp
   re-reads all 8 inputs from L2 per row (~800 MB of L2 traffic for a 10240-row matrix). Next for those: several rows per
   warp and the inputs staged in shared memory. Timings taken while a CPU test ran; treat them as rough.
+  Then 4 rows per warp (`COLS_ROWS`, grid = ceil(rows / 32)), still bit-identical, on a quiet GPU: Q4_K/Q5_K/Q6_K
+  attention matrices 1.2x, BF16 1.7x, expert-sized and router 1.9-2.4x for 8 inputs vs 8 launches. One input of a
+  10240 x 2560 Q6_K takes 0.06 ms (~360 GB/s); 8 take 0.40 ms, far above the bandwidth or FMA bound, so the kernel is
+  limited by something else (register spills from acc[4][8] or occupancy are the first suspects). Profile it before
+  building the batched step on it.

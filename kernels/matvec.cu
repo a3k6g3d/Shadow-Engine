@@ -675,39 +675,53 @@ extern "C" __global__ void matvec_pair_f32(const u8* w0, float* y0, unsigned int
 // y_j = W x_j for j < m <= 8 inputs (x_j at x + j * xs, y_j at y + j * ys): each warp reads and decodes its row's
 // weights once (dotm) and dots them with every input, so a batch of tokens (prefill, a speculative verify pass) pays
 // for the weights once.  Same per-input sums as matvec_fast_rows, bit for bit.
-// Launch: block = 256 threads (8 rows), grid = ceil(rows / 8).
+// Each warp takes COLS_ROWS consecutive rows, so every input chunk it loads serves COLS_ROWS rows.
+#define COLS_ROWS 4
+
 template <typename Q, unsigned int M>
-static __device__ __forceinline__ void matvec_cols_m(const u8* r, const float* x, unsigned int xs, float* y,
-                                                     unsigned int ys, unsigned int row, unsigned int lane,
-                                                     unsigned int cols) {
-    float acc[M];
+static __device__ __forceinline__ void matvec_cols_m(const u8* w, const float* x, unsigned int xs, float* y,
+                                                     unsigned int ys, unsigned int row0, unsigned int nr,
+                                                     unsigned int lane, unsigned int cols) {
+    const u64 rb = (u64) (cols / Q::QK) * Q::BYTES;
+    float acc[COLS_ROWS][M];
 #pragma unroll
-    for (unsigned int j = 0; j < M; j++) acc[j] = 0.0f;
-    for (unsigned int c = lane; c < cols / 8; c += 32) Fast<Q>::template dotm<M>(r, c * 8, x + c * 8, xs, acc);
+    for (unsigned int k = 0; k < COLS_ROWS; k++)
 #pragma unroll
-    for (unsigned int j = 0; j < M; j++) {
-        float a = acc[j];
-        for (int off = 16; off > 0; off >>= 1) a += __shfl_down_sync(0xffffffffu, a, off);
-        if (lane == 0) y[(u64) j * ys + row] = a;
+        for (unsigned int j = 0; j < M; j++) acc[k][j] = 0.0f;
+    for (unsigned int c = lane; c < cols / 8; c += 32) {
+#pragma unroll
+        for (unsigned int k = 0; k < COLS_ROWS; k++)
+            if (k < nr) Fast<Q>::template dotm<M>(w + (row0 + k) * rb, c * 8, x + c * 8, xs, acc[k]);
+    }
+#pragma unroll
+    for (unsigned int k = 0; k < COLS_ROWS; k++) {
+        if (k >= nr) break;
+#pragma unroll
+        for (unsigned int j = 0; j < M; j++) {
+            float a = acc[k][j];
+            for (int off = 16; off > 0; off >>= 1) a += __shfl_down_sync(0xffffffffu, a, off);
+            if (lane == 0) y[(u64) j * ys + row0 + k] = a;
+        }
     }
 }
 
+// Launch: block = 256 threads (8 warps x COLS_ROWS rows = 32 rows), grid = ceil(rows / 32).
 template <typename Q>
 static __device__ __forceinline__ void matvec_cols_rows(const u8* w, const float* x, unsigned int xs, float* y,
                                                         unsigned int ys, unsigned int rows, unsigned int cols,
                                                         unsigned int m) {
-    unsigned int row = blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32, lane = threadIdx.x % 32;
-    if (row >= rows) return;
-    const u8* r = w + (u64) row * (cols / Q::QK) * Q::BYTES;
+    unsigned int row0 = (blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32) * COLS_ROWS, lane = threadIdx.x % 32;
+    if (row0 >= rows) return;
+    unsigned int nr = min(rows - row0, (unsigned int) COLS_ROWS);
     switch (m) {
-        case 1: matvec_cols_m<Q, 1>(r, x, xs, y, ys, row, lane, cols); break;
-        case 2: matvec_cols_m<Q, 2>(r, x, xs, y, ys, row, lane, cols); break;
-        case 3: matvec_cols_m<Q, 3>(r, x, xs, y, ys, row, lane, cols); break;
-        case 4: matvec_cols_m<Q, 4>(r, x, xs, y, ys, row, lane, cols); break;
-        case 5: matvec_cols_m<Q, 5>(r, x, xs, y, ys, row, lane, cols); break;
-        case 6: matvec_cols_m<Q, 6>(r, x, xs, y, ys, row, lane, cols); break;
-        case 7: matvec_cols_m<Q, 7>(r, x, xs, y, ys, row, lane, cols); break;
-        default: matvec_cols_m<Q, 8>(r, x, xs, y, ys, row, lane, cols); break;
+        case 1: matvec_cols_m<Q, 1>(w, x, xs, y, ys, row0, nr, lane, cols); break;
+        case 2: matvec_cols_m<Q, 2>(w, x, xs, y, ys, row0, nr, lane, cols); break;
+        case 3: matvec_cols_m<Q, 3>(w, x, xs, y, ys, row0, nr, lane, cols); break;
+        case 4: matvec_cols_m<Q, 4>(w, x, xs, y, ys, row0, nr, lane, cols); break;
+        case 5: matvec_cols_m<Q, 5>(w, x, xs, y, ys, row0, nr, lane, cols); break;
+        case 6: matvec_cols_m<Q, 6>(w, x, xs, y, ys, row0, nr, lane, cols); break;
+        case 7: matvec_cols_m<Q, 7>(w, x, xs, y, ys, row0, nr, lane, cols); break;
+        default: matvec_cols_m<Q, 8>(w, x, xs, y, ys, row0, nr, lane, cols); break;
     }
 }
 
