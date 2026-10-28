@@ -558,3 +558,10 @@ Single-prompt runs, "Write a Rust function that parses a comma separated list...
   (-10%, a 2-run check: at ~3 positions a pass few experts are shared). Also fixed: a 64-token group's RAM-tier
   misses could lose their ring slots to the group's own promotions and overrun the staging slots (`read_drive`
   panicked); the group now claims them first.
+- **Where exact speculation tops out on this PC (measured):** the drafter's 830 MB of VRAM cost plain decode 2.9%
+  (`--expert-cache-gib 4.5` vs auto: 20.27 vs 21.10 tok/s, 2-run check); a pass verifies ~3.3 positions for ~2.9
+  tokens kept (~15% of positions wasted); drafting is ~8 ms a pass (~6%); and per committed token the GPU does about
+  what plain decode does, because at 3-4 positions only the dense weights are shared, and they are a small part of a
+  step here. Fixing all of those lands near break-even, not near Strata's +135%: Strata's gain comes with its
+  inexact tail skipping (missed rank >= 7 experts not computed in a verify window), which shrinks each position's
+  expert traffic. `--mtp --spec K` stays opt-in at about -10%.
