@@ -476,6 +476,16 @@ extern "C" __global__ void moe_combine_qwen(float* y, const float* eo, const flo
     y[i] = acc + sigmoidf_ref(gl[0]) * sh_eo[i];
 }
 
+// moe_combine_qwen with eo's rows in another order: expert j's output is row perm[j] (the sum still runs over j).
+extern "C" __global__ void moe_combine_qwen_perm(float* y, const float* eo, const float* w, const unsigned int* perm,
+                                                 const float* sh_eo, const float* gl, unsigned int n, unsigned int k) {
+    unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    float acc = 0.0f;
+    for (unsigned int j = 0; j < k; j++) acc += w[j] * eo[(u64) perm[j] * n + i];
+    y[i] = acc + sigmoidf_ref(gl[0]) * sh_eo[i];
+}
+
 // ------------------------------------------------------------------------------------------------ PLE
 // Per stream s (one block each): g = (key_s . qry_s) / sqrt(h) in double, signed square root, sigmoid; gv_s = sg * val.
 extern "C" __global__ void ple_gate(const float* key, const float* qry, const float* val, float* gv, unsigned int h) {

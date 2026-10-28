@@ -12,7 +12,7 @@
 //! holding one expert's gate, up and down slices; a miss reads the slices from the file and uploads them into the
 //! least recently used slot.  The experts the current token routes to are never the victims of its own misses.
 
-use crate::driver::{Context, DeviceBuffer, Event, Stream};
+use crate::driver::{Context, DeviceBuffer, Event, Graph, Stream};
 use crate::kernels::{file, Arg, Program, FAST_KERNELS, PAIR2_KERNELS, PAIR_KERNELS, QUANT_KERNELS};
 use crate::pinned::PinnedRegion;
 use shadow_model::forward::{ple_rows, route, route_sigmoid, Model, Stepper};
@@ -234,6 +234,15 @@ pub struct GpuSession<'c, 'm> {
     /// The most tokens `step_batch` takes through the layers together: `MAX_BATCH`, or `SHADOW_BATCH=n` (1: one token
     /// at a time, for comparisons).
     pub batch_max: usize,
+    /// CUDA graphs of the launches between two router reads that do not depend on the position (a DeltaNet layer's
+    /// hc glue, mixer and router), keyed by (layer, whether its first norm was fused into the previous write); captured
+    /// on first use on `gstream`, which orders with the default stream.  `SHADOW_GRAPHS=0`: none.
+    graphs: HashMap<(usize, bool), Graph<'c>>,
+    graphs_on: bool,
+    /// `routed_overlapped` instead of waiting on the host for a layer's copies (`SHADOW_OVERLAP=0`: off).
+    overlap: bool,
+    gstream: Stream<'c>,
+    capturing: std::cell::Cell<bool>,
 }
 
 /// What the pre-gating probe has seen: the prediction waiting for each layer, and per-layer counts of (real experts,
@@ -819,6 +828,18 @@ impl<'c, 'm> GpuSession<'c, 'm> {
             cache.owner[s] = Some((l, ep));
             cache.map.insert((l, ep), s);
         }
+        if let Ok(path) = std::env::var("SHADOW_CACHE_DUMP") {
+            // per layer: slots, evictable slots, then the pinned experts (tools/cache_sim.py reads it)
+            let lines: Vec<String> = (0..c.n_layer).map(|l| {
+                let pinned: Vec<String> = cache.layer_range[l].clone().filter(|s| !cache.evict_range[l].contains(s))
+                    .filter_map(|s| cache.owner[s].map(|(_, e)| e.to_string())).collect();
+                format!("{} {} {} {}", l, cache.layer_range[l].len(), cache.evict_range[l].len(), pinned.join(","))
+            }).collect();
+            if let Err(err) = std::fs::write(&path, lines.join("
+")) {
+                eprintln!("SHADOW_CACHE_DUMP {path}: {err}");
+            }
+        }
         // Pre-warm the remaining (evictable) VRAM expert cache slots from the RAM tier in placement order.
         if let Some(region) = ram.region.as_ref().filter(|_| cache.slots > 0) {
             let names = |l: usize| ["ffn_gate_exps", "ffn_up_exps", "ffn_down_exps"].map(|r| format!("blk.{l}.{r}.weight"));
@@ -893,6 +914,11 @@ impl<'c, 'm> GpuSession<'c, 'm> {
             },
             mtp_probe: std::env::var("SHADOW_MTP_PROBE").is_ok_and(|v| v == "1").then_some((0, 0)),
             mtp,
+            graphs: HashMap::new(),
+            graphs_on: std::env::var("SHADOW_GRAPHS").map_or(true, |v| v != "0"),
+            overlap: std::env::var("SHADOW_OVERLAP").map_or(true, |v| v != "0"),
+            gstream: ctx.blocking_stream().map_err(e)?,
+            capturing: std::cell::Cell::new(false),
             batch_max: std::env::var("SHADOW_BATCH").ok().and_then(|v| v.parse().ok()).unwrap_or(MAX_BATCH).clamp(1, MAX_BATCH),
         };
         s.stage_ptr = s.stage.as_mut_slice().as_mut_ptr();
@@ -1069,10 +1095,29 @@ impl<'c, 'm> GpuSession<'c, 'm> {
     }
 
     // -------------------------------------------------------------------------------------------- launch helpers
+    /// The stream launches go to: the graph stream while a graph is being captured, else the default stream.
+    fn ls(&self) -> Option<&Stream<'c>> {
+        self.capturing.get().then_some(&self.gstream)
+    }
+
+    /// Runs `f`'s launches as the graph `key`: captured from `f` the first time, replayed after.  `f` must launch the
+    /// same kernels with the same arguments every time (no host decisions, uploads or reads inside).
+    fn graph_segment(&mut self, key: (usize, bool), f: impl FnOnce(&Self)) {
+        if !self.graphs.contains_key(&key) {
+            self.gstream.begin_capture().unwrap();
+            self.capturing.set(true);
+            f(self);
+            self.capturing.set(false);
+            let g = self.gstream.end_capture().unwrap_or_else(|e| panic!("graph capture of layer {}: {e}", key.0));
+            self.graphs.insert(key, g);
+        }
+        self.graphs[&key].launch(&self.gstream).unwrap();
+    }
+
     fn k(&self, name: &str, grid: u32, block: u32, args: &[Arg]) {
         // SAFETY: every pointer passed is a buffer of this session sized for the dimensions passed beside it (the
         // registry checks the argument types and count).
-        unsafe { self.fw.launch(name, (grid, 1, 1), (block, 1, 1), 0, None, args) }
+        unsafe { self.fw.launch(name, (grid, 1, 1), (block, 1, 1), 0, self.ls(), args) }
             .unwrap_or_else(|err| panic!("{name}: {err}"));
     }
 
@@ -1091,7 +1136,7 @@ impl<'c, 'm> GpuSession<'c, 'm> {
         };
         // SAFETY: `rows` whole rows of t.dims[0] weights at wptr; x holds t.dims[0] floats, y `rows`.
         unsafe {
-            self.mvp.launch(entry, ((rows as u32).div_ceil(8), 1, 1), (256, 1, 1), 0, None,
+            self.mvp.launch(entry, ((rows as u32).div_ceil(8), 1, 1), (256, 1, 1), 0, self.ls(),
                             &[Arg::Ptr(wptr), Arg::Ptr(x), Arg::Ptr(y), Arg::U32(rows as u32), Arg::U32(t.dims[0] as u32)])
         }
         .unwrap_or_else(|err| panic!("{}: {err}", t.name));
@@ -1106,7 +1151,7 @@ impl<'c, 'm> GpuSession<'c, 'm> {
         let s = self.m.scale(name);
         if s != 1.0 && t.ty.name() == "NVFP4" && t.dims[0].is_multiple_of(8) {
             unsafe {
-                self.mvp.launch("matvec_fast_nvfp4_s", ((rows as u32).div_ceil(8), 1, 1), (256, 1, 1), 0, None,
+                self.mvp.launch("matvec_fast_nvfp4_s", ((rows as u32).div_ceil(8), 1, 1), (256, 1, 1), 0, self.ls(),
                                 &[Arg::Ptr(wptr), Arg::Ptr(x), Arg::Ptr(y), Arg::U32(rows as u32),
                                   Arg::U32(t.dims[0] as u32), Arg::F32(s)])
             }
@@ -1138,7 +1183,7 @@ impl<'c, 'm> GpuSession<'c, 'm> {
                 let w0 = self.w.get(name0).unwrap_or_else(|| panic!("{name0} is not resident")).ptr;
                 let w1 = self.w.get(name1).unwrap_or_else(|| panic!("{name1} is not resident")).ptr;
                 unsafe {
-                    self.mvp.launch(entry, (((r0 + r1) as u32).div_ceil(8), 1, 1), (256, 1, 1), 0, None,
+                    self.mvp.launch(entry, (((r0 + r1) as u32).div_ceil(8), 1, 1), (256, 1, 1), 0, self.ls(),
                                     &[Arg::Ptr(w0), Arg::Ptr(y0), Arg::U32(r0 as u32),
                                       Arg::Ptr(w1), Arg::Ptr(y1), Arg::U32(r1 as u32),
                                       Arg::Ptr(x), Arg::U32(t0.dims[0] as u32)])
@@ -1158,7 +1203,7 @@ impl<'c, 'm> GpuSession<'c, 'm> {
                 let w0 = self.w.get(name0).unwrap_or_else(|| panic!("{name0} is not resident")).ptr;
                 let w1 = self.w.get(name1).unwrap_or_else(|| panic!("{name1} is not resident")).ptr;
                 unsafe {
-                    self.mvp.launch(entry, (((r0 + r1) as u32).div_ceil(8), 1, 1), (256, 1, 1), 0, None,
+                    self.mvp.launch(entry, (((r0 + r1) as u32).div_ceil(8), 1, 1), (256, 1, 1), 0, self.ls(),
                                     &[Arg::Ptr(w0), Arg::Ptr(y0), Arg::U32(r0 as u32),
                                       Arg::Ptr(w1), Arg::Ptr(y1), Arg::U32(r1 as u32),
                                       Arg::Ptr(x), Arg::U32(t0.dims[0] as u32)])
@@ -1329,6 +1374,9 @@ impl<'c, 'm> GpuSession<'c, 'm> {
         self.rec_host("embed".into(), &emb);
         self.mark("embedding");
 
+        let graphs = self.graphs_on && self.trace.is_none() && self.stop_after.is_none() && self.prof.is_none()
+            && self.cpu.is_none() && self.prefetch.is_none() && self.pregate.is_none() && self.mtp.is_none()
+            && self.cache.slots > 0;
         let mut rn_ready = false;
         for l in 0..c.n_layer {
             if self.stop_after == Some(l) {
@@ -1342,18 +1390,30 @@ impl<'c, 'm> GpuSession<'c, 'm> {
                 self.rec(format!("layer{l}.ple"), self.b.gv.ptr, h * cs);
                 rn_ready = false;
             }
-            self.hc_read(&format!("blk.{l}.hc_attn"), true, rn_ready);
-            self.rec(format!("layer{l}.attn_hc_u"), self.b.u.ptr, h);
-            if c.is_attention(l) {
-                self.attention(l);
+            if graphs && !c.is_attention(l) && l != c.ple_layer {
+                // everything up to the router read is the same launches every token: one graph
+                self.graph_segment((l, rn_ready), |s| {
+                    s.hc_read(&format!("blk.{l}.hc_attn"), true, rn_ready);
+                    s.delta_net(l);
+                    s.hc_write_norm(&format!("blk.{l}.hc_ffn_norm.weight"));
+                    s.hc_read(&format!("blk.{l}.hc_ffn"), true, true);
+                    s.moe_router(l);
+                });
+                self.moe(l, true);
             } else {
-                self.delta_net(l);
+                self.hc_read(&format!("blk.{l}.hc_attn"), true, rn_ready);
+                self.rec(format!("layer{l}.attn_hc_u"), self.b.u.ptr, h);
+                if c.is_attention(l) {
+                    self.attention(l);
+                } else {
+                    self.delta_net(l);
+                }
+                self.rec(format!("layer{l}.mixer"), self.b.y.ptr, h);
+                self.hc_write_norm(&format!("blk.{l}.hc_ffn_norm.weight"));
+                self.hc_read(&format!("blk.{l}.hc_ffn"), true, true);
+                self.rec(format!("layer{l}.mlp_hc_u"), self.b.u.ptr, h);
+                self.moe(l, false);
             }
-            self.rec(format!("layer{l}.mixer"), self.b.y.ptr, h);
-            self.hc_write_norm(&format!("blk.{l}.hc_ffn_norm.weight"));
-            self.hc_read(&format!("blk.{l}.hc_ffn"), true, true);
-            self.rec(format!("layer{l}.mlp_hc_u"), self.b.u.ptr, h);
-            self.moe(l);
             self.rec(format!("layer{l}.moe"), self.b.y.ptr, h);
             if l + 1 == c.ple_layer {
                 self.hc_write();
@@ -1424,7 +1484,7 @@ impl<'c, 'm> GpuSession<'c, 'm> {
                                              Arg::Ptr(self.b.u.ptr), Arg::U32(h as u32), Arg::F32(c.eps)]);
             self.rec(format!("layer{l}.mlp_hc_u"), self.b.u.ptr, h);
             if c.is_moe(l) {
-                self.moe(l);
+                self.moe(l, false);
             } else {
                 self.mlp_flint(l);
             }
@@ -1472,7 +1532,7 @@ impl<'c, 'm> GpuSession<'c, 'm> {
             (0, 0)
         };
         unsafe {
-            self.mvp.launch("hc_down_inject_bf16", ((r_down + r_inj).div_ceil(8), 1, 1), (256, 1, 1), 0, None, &[
+            self.mvp.launch("hc_down_inject_bf16", ((r_down + r_inj).div_ceil(8), 1, 1), (256, 1, 1), 0, self.ls(), &[
                 Arg::Ptr(self.w[&format!("{p}_down.weight")].ptr), Arg::Ptr(b.down.ptr), Arg::U32(r_down),
                 Arg::Ptr(w_inj), Arg::Ptr(b.g.ptr), Arg::U32(r_inj),
                 Arg::Ptr(b.rn.ptr), Arg::U32(h * cs), Arg::F32(cs as f32),
@@ -1658,7 +1718,7 @@ impl<'c, 'm> GpuSession<'c, 'm> {
         let (qn, kn, vn) = (format!("{p}.attn_q.weight"), format!("{p}.attn_k.weight"), format!("{p}.attn_v.weight"));
         let (rq, rk, rv) = ((nh * hd) as u32, (nkv * hd) as u32, (nkv * hd) as u32);
         unsafe {
-            self.mvp.launch("matvec_qkv_nvfp4", ((rq + rk + rv).div_ceil(8), 1, 1), (256, 1, 1), 0, None, &[
+            self.mvp.launch("matvec_qkv_nvfp4", ((rq + rk + rv).div_ceil(8), 1, 1), (256, 1, 1), 0, self.ls(), &[
                 Arg::Ptr(self.w[&qn].ptr), Arg::F32(self.m.scale(&qn)), Arg::Ptr(b.qg.ptr), Arg::U32(rq),
                 Arg::Ptr(self.w[&kn].ptr), Arg::F32(self.m.scale(&kn)), Arg::Ptr(b.kk.ptr), Arg::U32(rk),
                 Arg::Ptr(self.w[&vn].ptr), Arg::F32(self.m.scale(&vn)), Arg::Ptr(at.v.ptr + slot), Arg::U32(rv),
@@ -1825,7 +1885,19 @@ impl<'c, 'm> GpuSession<'c, 'm> {
         }
     }
 
-    fn moe(&mut self, l: usize) {
+    /// The router's logits (and the shared expert's gate logit) for layer l into rl (and sgl).
+    fn moe_router(&self, l: usize) {
+        let p = format!("blk.{l}");
+        if self.m.cfg.arch != "flint" {
+            self.mv_pair(&format!("{p}.ffn_gate_inp.weight"), self.b.rl.ptr,
+                         &format!("{p}.ffn_gate_inp_shexp.weight"), self.b.sgl.ptr, self.b.u.ptr);
+        } else {
+            self.mv(&format!("{p}.ffn_gate_inp.weight"), self.b.u.ptr, self.b.rl.ptr);
+        }
+    }
+
+    /// The MoE of layer l on u into y (`router_done`: its router already ran, in a graph).
+    fn moe(&mut self, l: usize, router_done: bool) {
         self.ram.claimed.clear(); // the previous layer's copies were waited for
         let c = &self.m.cfg;
         let p = format!("blk.{l}");
@@ -1836,11 +1908,8 @@ impl<'c, 'm> GpuSession<'c, 'm> {
         let sh_g_name = format!("{p}.ffn_gate_shexp.weight");
         let sh_u_name = format!("{p}.ffn_up_shexp.weight");
         self.mark("mixers, norms, hc glue, ple");
-        if !is_flint {
-            self.mv_pair(&format!("{p}.ffn_gate_inp.weight"), self.b.rl.ptr,
-                         &format!("{p}.ffn_gate_inp_shexp.weight"), self.b.sgl.ptr, self.b.u.ptr);
-        } else {
-            self.mv(&format!("{p}.ffn_gate_inp.weight"), self.b.u.ptr, self.b.rl.ptr);
+        if !router_done {
+            self.moe_router(l);
         }
         let pf_next = !is_flint && self.cache.slots > 0 && l + 1 < c.n_layer && c.is_moe(l + 1) && self.prefetch.is_some();
         if pf_next {
@@ -1957,6 +2026,12 @@ impl<'c, 'm> GpuSession<'c, 'm> {
                 top.extend(cpu_set.iter().map(|&(e, w, _)| (e, w)));
                 cpu_offs = cpu_set.iter().map(|c| c.2).collect();
             }
+        }
+        if !is_flint && sh_launched_early && self.cache.slots > 0 && cpu_offs.is_empty() && self.prefetch.is_none()
+            && infos[0].ty == infos[1].ty && infos[0].dims == infos[1].dims && self.overlap
+        {
+            self.routed_overlapped(l, &top, &names, &infos, &sizes);
+            return;
         }
         let ng = top.len() - cpu_offs.len();
         let mut cpu_out: Option<Vec<f32>> = None;
@@ -2256,7 +2331,7 @@ impl<'c, 'm> GpuSession<'c, 'm> {
             // outputs of `rows` floats at y + j * ys, inside this session's buffers (the callers' strides are their
             // sizes).
             unsafe {
-                self.mvp.launch(&entry, ((rows as u32).div_ceil(32), 1, 1), (256, 1, 1), 0, None,
+                self.mvp.launch(&entry, ((rows as u32).div_ceil(32), 1, 1), (256, 1, 1), 0, self.ls(),
                                 &[Arg::Ptr(wptr), Arg::Ptr(x), Arg::U32(xs as u32), Arg::Ptr(y), Arg::U32(ys as u32),
                                   Arg::U32(rows as u32), Arg::U32(t.dims[0] as u32), Arg::U32(n as u32)])
             }
@@ -2276,7 +2351,7 @@ impl<'c, 'm> GpuSession<'c, 'm> {
         // cols floats (stride xs, or 0 when shared) and `count` outputs of rows floats (stride ys) inside this
         // session's buffers.
         unsafe {
-            self.mvp.launch(entry, (rows.div_ceil(8), count as u32, 1), (256, 1, 1), 0, None,
+            self.mvp.launch(entry, (rows.div_ceil(8), count as u32, 1), (256, 1, 1), 0, self.ls(),
                             &[Arg::Ptr(self.b.tab.ptr + tab_off), Arg::Ptr(x), Arg::U32(xs as u32), Arg::Ptr(y),
                               Arg::U32(ys as u32), Arg::U32(rows), Arg::U32(cols)])
         }
@@ -2299,7 +2374,7 @@ impl<'c, 'm> GpuSession<'c, 'm> {
             // SAFETY: rank + r_inj rows of ch BF16 weights; n inputs of ch floats in rn, n outputs of rank (down) and
             // cs (g) floats, from row j0.
             unsafe {
-                self.mvp.launch("hc_down_inject_cols_bf16", ((rank as u32 + r_inj).div_ceil(32), 1, 1), (256, 1, 1), 0, None, &[
+                self.mvp.launch("hc_down_inject_cols_bf16", ((rank as u32 + r_inj).div_ceil(32), 1, 1), (256, 1, 1), 0, self.ls(), &[
                     Arg::Ptr(self.w[&format!("{p}_down.weight")].ptr), Arg::Ptr(row(&bb.down, rank, j0)), Arg::U32(rank as u32),
                     Arg::U32(rank as u32), Arg::Ptr(w_inj), Arg::Ptr(row(&bb.g, cs, j0)), Arg::U32(r_inj), Arg::U32(cs as u32),
                     Arg::Ptr(row(&bb.rn, ch, j0)), Arg::U32(ch as u32), Arg::U32(ch as u32), Arg::F32(cs as f32),
@@ -2523,6 +2598,87 @@ impl<'c, 'm> GpuSession<'c, 'm> {
             Arg::Ptr(row(&self.bb.so, h, j)), Arg::Ptr(row(&self.bb.sgl, 1, j)), Arg::U32(h as u32), Arg::U32(n as u32)]);
     }
 
+    /// One token's routed experts with their copies overlapped: the resident ones run at once, the misses' copies go
+    /// out on copy_stream, and the default stream - not the host - waits for them before the misses run, so the host
+    /// goes on queueing the layer meanwhile.  eo's rows come out resident first; the combine reads them in routing
+    /// order (`perm`), so y is `moe`'s to the bit.
+    fn routed_overlapped(&mut self, l: usize, top: &[(usize, f64)], names: &[String; 3], infos: &[TensorInfo],
+                         sizes: &[usize]) {
+        let c = &self.m.cfg;
+        let (h, ff, n) = (c.hidden, c.expert_ff, top.len());
+        let arena = self.cache.arena.as_ref().unwrap().ptr;
+        self.cache.clock += 1;
+        for &(e, _) in top {
+            self.cache.touch((l, e)); // protect this token's resident experts from its own misses
+        }
+        // (rank in `top`, expert, slot address)
+        let (mut hits, mut misses): (Vec<(usize, usize, u64)>, Vec<(usize, usize, u64)>) = (vec![], vec![]);
+        for (i, &(e, _)) in top.iter().enumerate() {
+            match self.cache.touch((l, e)) {
+                Some(s) => {
+                    self.cache.hits += 1;
+                    hits.push((i, e, arena + self.cache.slot_offset[s]));
+                }
+                None => {
+                    self.cache.misses += 1;
+                    let s = self.cache.victim(l);
+                    self.cache.owner[s] = Some((l, e));
+                    self.cache.map.insert((l, e), s);
+                    self.cache.stamp[s] = self.cache.clock;
+                    misses.push((i, e, arena + self.cache.slot_offset[s]));
+                }
+            }
+        }
+        let nh = hits.len();
+        let part = [0u64, sizes[0] as u64, (sizes[0] + sizes[1]) as u64];
+        // [gate, up] of the resident ones, [gate, up] of the misses, down in that order, weights in routing order, perm
+        let mut tab = Vec::with_capacity(n * 32);
+        for group in [&hits, &misses] {
+            for p in &part[..2] {
+                for x in group.iter() {
+                    tab.extend_from_slice(&(x.2 + p).to_le_bytes());
+                }
+            }
+        }
+        let mut perm = vec![0u32; n];
+        for (row, x) in hits.iter().chain(&misses).enumerate() {
+            tab.extend_from_slice(&(x.2 + part[2]).to_le_bytes());
+            perm[x.0] = row as u32;
+        }
+        for &(_, w) in top {
+            tab.extend_from_slice(&(w as f32).to_le_bytes());
+        }
+        tab.extend(perm.iter().flat_map(|p| p.to_le_bytes()));
+        self.upload_to(self.b.tab.ptr, &tab);
+        // rows first..first + cnt of eo: gate+up, swiglu, down
+        let run = |s: &Self, first: usize, cnt: usize| {
+            if cnt == 0 {
+                return;
+            }
+            let b = &s.b;
+            let eg = b.eg.ptr + (2 * first * ff * 4) as u64;
+            let act = b.act.ptr + (first * ff * 4) as u64;
+            s.mv_batch(&infos[0], 16 * first as u64, 2 * cnt, b.u.ptr, 0, eg, ff);
+            s.k1("swiglu", cnt * ff, &[Arg::Ptr(eg), Arg::Ptr(eg + (cnt * ff * 4) as u64), Arg::Ptr(act),
+                                      Arg::U32((cnt * ff) as u32)]);
+            s.mv_batch(&infos[2], (16 * n + 8 * first) as u64, cnt, act, ff, b.eo.ptr + (first * h * 4) as u64, h);
+        };
+        run(self, 0, nh);
+        for &(i, e, base) in &misses {
+            self.fetch_expert(l, e, i, names, sizes, [base, base + part[1], base + part[2]]);
+        }
+        self.read_drive(names, sizes);
+        if !misses.is_empty() {
+            self.copy_event.record(Some(&self.copy_stream)).unwrap();
+            self.ctx.stream_wait_event(None, &self.copy_event).unwrap();
+        }
+        run(self, nh, misses.len());
+        let b = &self.b;
+        self.k1("moe_combine_qwen_perm", h, &[
+            Arg::Ptr(b.y.ptr), Arg::Ptr(b.eo.ptr), Arg::Ptr(b.tab.ptr + 24 * n as u64), Arg::Ptr(b.tab.ptr + 28 * n as u64),
+            Arg::Ptr(b.eo.ptr + (n * h * 4) as u64), Arg::Ptr(b.sgl.ptr), Arg::U32(h as u32), Arg::U32(n as u32)]);
+    }
+
     /// The n-gram memory at layer l, into gv (the caller adds it to r).
     fn ple(&self, l: usize) {
         self.ple_at(l, self.tokens.len(), self.b.r.ptr);
@@ -2604,6 +2760,12 @@ impl Stepper for GpuSession<'_, '_> {
             + &format!("; host waits per step: router {:.1} ms, copies {:.1} ms, file {:.1} ms",
                        1e3 * self.waits[0] / self.tokens.len().max(1) as f64, 1e3 * self.waits[1] / self.tokens.len().max(1) as f64,
                        1e3 * self.waits[2] / self.tokens.len().max(1) as f64)
+            + &{
+                use std::sync::atomic::Ordering::Relaxed;
+                let n = self.tokens.len().max(1) as f64;
+                format!("; kernel launches per step {:.0}, {:.1} ms of host time in them",
+                        crate::kernels::LAUNCHES.0.load(Relaxed) as f64 / n, crate::kernels::LAUNCHES.1.load(Relaxed) as f64 / 1e6 / n)
+            }
             + &self.prefetch.as_ref().map(|p| format!("; pre-gated prefetch: top {}, {} copied ahead, {} used ({:.1}%)", p.k,
                                                        p.issued, p.used, 100.0 * p.used as f64 / p.issued.max(1) as f64))
                 .unwrap_or_default()

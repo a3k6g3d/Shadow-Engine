@@ -252,6 +252,7 @@ pub const FILES: &[File] = &[
             e("axpy_many_scaled", &[W, C, C, C, U, U]),
             e("moe_combine_flint", &[W, C, C, C, C, U, U]),
             e("moe_combine_qwen", &[W, C, C, C, C, U, U]),
+            e("moe_combine_qwen_perm", &[W, C, C, C, C, C, U, U]),
             e("axpy_sigmoid", &[W, C, C, U]),
             e("ple_gate", &[C, C, C, W, U]),
             e("ple_conv_step", &[C, W, C, W, U, U, U]),
@@ -271,6 +272,10 @@ pub fn program_source(f: &File) -> String {
     }
     s + &format!("\n#line 1 \"{}\"\n{}", f.file, f.source)
 }
+
+/// Kernel launches through `Program::launch` since the process started, and the host nanoseconds spent in them.
+pub static LAUNCHES: (std::sync::atomic::AtomicU64, std::sync::atomic::AtomicU64) =
+    (std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0));
 
 /// One file compiled and loaded on one GPU.
 pub struct Program<'c> {
@@ -295,6 +300,7 @@ impl<'c> Program<'c> {
     /// writes at this grid size.
     pub unsafe fn launch(&self, name: &str, grid: (u32, u32, u32), block: (u32, u32, u32), shared: u32,
                          stream: Option<&Stream>, args: &[Arg]) -> Result<(), String> {
+        let t0 = std::time::Instant::now();
         let entry = self.file.entries.iter().find(|e| e.name == name)
             .ok_or_else(|| format!("{} has no entry point {name} in the registry", self.file.file))?;
         if entry.params.len() != args.len() {
@@ -316,7 +322,11 @@ impl<'c> Program<'c> {
         let f = self.module.function(name).map_err(|e: CudaError| e.to_string())?;
         // SAFETY: the count and the types were checked against the registry (little-endian: a 4-byte parameter reads
         // the low half of its 8-byte slot); the pointers' sizes are the caller's promise.
-        unsafe { f.launch(grid, block, shared, stream, &mut ptrs) }.map_err(|e| e.to_string())
+        let r = unsafe { f.launch(grid, block, shared, stream, &mut ptrs) }.map_err(|e| e.to_string());
+        use std::sync::atomic::Ordering::Relaxed;
+        LAUNCHES.0.fetch_add(1, Relaxed);
+        LAUNCHES.1.fetch_add(t0.elapsed().as_nanos() as u64, Relaxed);
+        r
     }
 }
 

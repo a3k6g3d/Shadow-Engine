@@ -91,6 +91,12 @@ table! {
     cuEventRecord: fn(H, H) = ["cuEventRecord"];
     cuEventSynchronize: fn(H) = ["cuEventSynchronize"];
     cuEventElapsedTime: fn(*mut f32, H, H) = ["cuEventElapsedTime_v2", "cuEventElapsedTime"];
+    cuStreamBeginCapture: fn(H, c_uint) = ["cuStreamBeginCapture_v2", "cuStreamBeginCapture"];
+    cuStreamEndCapture: fn(H, *mut H) = ["cuStreamEndCapture"];
+    cuGraphInstantiateWithFlags: fn(*mut H, H, u64) = ["cuGraphInstantiateWithFlags"];
+    cuGraphLaunch: fn(H, H) = ["cuGraphLaunch"];
+    cuGraphExecDestroy: fn(H) = ["cuGraphExecDestroy"];
+    cuGraphDestroy: fn(H) = ["cuGraphDestroy"];
 }
 
 static API: OnceLock<Result<Api, String>> = OnceLock::new();
@@ -210,6 +216,16 @@ impl Context {
         self.bind()?;
         let mut s: H = std::ptr::null_mut();
         call!(self.api, cuStreamCreate(&mut s, 1))?; // CU_STREAM_NON_BLOCKING
+        Ok(Stream { ctx: self, stream: s })
+    }
+
+    /// A stream that orders with the legacy default stream both ways (work on it waits for the default stream's earlier
+    /// work, and the default stream for its), unlike `stream`; what a CUDA graph is captured and launched on, so the
+    /// graph's kernels fall in line with everything launched on the default stream.
+    pub fn blocking_stream(&self) -> Result<Stream<'_>, CudaError> {
+        self.bind()?;
+        let mut s: H = std::ptr::null_mut();
+        call!(self.api, cuStreamCreate(&mut s, 0))?; // CU_STREAM_DEFAULT
         Ok(Stream { ctx: self, stream: s })
     }
 
@@ -343,6 +359,56 @@ impl Stream<'_> {
 
     pub fn wait_event(&self, event: &Event) -> Result<(), CudaError> {
         self.ctx.stream_wait_event(Some(self), event)
+    }
+
+    /// Starts recording this stream's launches into a graph instead of running them (relaxed mode: other threads may
+    /// use the driver meanwhile).  Nothing may touch the default stream until `end_capture`.
+    pub fn begin_capture(&self) -> Result<(), CudaError> {
+        self.ctx.bind()?;
+        call!(self.ctx.api, cuStreamBeginCapture(self.stream, 2)) // CU_STREAM_CAPTURE_MODE_RELAXED
+    }
+
+}
+
+impl<'c> Stream<'c> {
+    /// The launches recorded since `begin_capture`, instantiated.
+    pub fn end_capture(&self) -> Result<Graph<'c>, CudaError> {
+        self.ctx.bind()?;
+        let mut g: H = std::ptr::null_mut();
+        call!(self.ctx.api, cuStreamEndCapture(self.stream, &mut g))?;
+        let mut exec: H = std::ptr::null_mut();
+        if let Err(e) = call!(self.ctx.api, cuGraphInstantiateWithFlags(&mut exec, g, 0)) {
+            // SAFETY: the graph cuStreamEndCapture made.
+            unsafe { (self.ctx.api.cuGraphDestroy)(g) };
+            return Err(e);
+        }
+        Ok(Graph { ctx: self.ctx, graph: g, exec })
+    }
+}
+
+/// A captured, instantiated sequence of launches (`Stream::end_capture`), replayed with one call.
+pub struct Graph<'c> {
+    ctx: &'c Context,
+    graph: H,
+    exec: H,
+}
+
+impl Graph<'_> {
+    pub fn launch(&self, stream: &Stream) -> Result<(), CudaError> {
+        self.ctx.bind()?;
+        call!(self.ctx.api, cuGraphLaunch(self.exec, stream.stream))
+    }
+}
+
+impl Drop for Graph<'_> {
+    fn drop(&mut self) {
+        if self.ctx.bind().is_ok() {
+            // SAFETY: the executable and graph `end_capture` made for this value.
+            unsafe {
+                (self.ctx.api.cuGraphExecDestroy)(self.exec);
+                (self.ctx.api.cuGraphDestroy)(self.graph);
+            }
+        }
     }
 }
 

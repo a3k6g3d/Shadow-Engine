@@ -2,6 +2,17 @@
 
 All notable changes to Shadow will be documented in this file.
 
+## [0.1.26] — 2026-10-28
+### Changed (default on, exact)
+- CUDA graphs for each DeltaNet layer's launches from its hc read to its router (`SHADOW_GRAPHS=0`: off):
+  `bench/graphs-2026-10-28` **+2.1% paired** decode.
+- Overlapped expert copies: resident experts run while the misses copy, the GPU (not the host) waits for the copies,
+  `moe_combine_qwen_perm` keeps the sum order (`SHADOW_OVERLAP=0`: off): `bench/overlap-2026-10-28` **+2.7% paired**.
+  Together 18.65 -> 19.47 tok/s `decode_warm`, 0 answer differences.
+### Added
+- Kernel launch counts and host time in launches in the session report; `SHADOW_CACHE_DUMP=FILE` (per-layer slots and
+  pinned experts, for `tools/cache_sim.py`).
+
 ## [0.1.25] — 2026-10-28
 ### Added (default on, exact)
 - **Batched step**: `GpuSession::step_batch` / `prefill_batch`, up to 64 tokens through the layers together (Qwen):

@@ -432,3 +432,26 @@ Single-prompt runs, "Write a Rust function that parses a comma separated list...
   VRAM, ~20 MB a layer); larger prefill unions (m = 128: 1.63 experts a token a layer) by streaming the union through
   the scratch slots expert by expert; the ~11 ms a token the host waits for the GPU in a batched pass (per-token small
   kernels: hc glue, the recurrences, routed matvecs).
+
+## 2026-10-28 (evening): CUDA graphs and overlapped expert copies in decode (both default on, exact)
+
+- **Measured first:** a decode step (104 tokens of the Rust prompt, prompt steps subtracted) made **~1,245 kernel
+  launches and spent 5.75 ms of host time in them** (now counted in the session report), of ~52 ms; host waits: router
+  17.3 ms, copies 14.6 ms, file 7.5 ms; the rest (~7 ms) host work. So graphs could reach at most the launch share plus
+  the GPU's inter-kernel gaps.
+- **CUDA graphs** (`SHADOW_GRAPHS=0`: off): every DeltaNet layer's launches from its hc read to its router (hc glue,
+  mixer, hc glue, router: ~15 kernels, nothing position-dependent) captured once per (layer, fused-norm) and replayed
+  on a blocking stream (`Context::blocking_stream`, so it orders with the legacy default stream both ways; driver
+  bindings `cuStreamBeginCapture`/`EndCapture`/`cuGraphInstantiateWithFlags`/`cuGraphLaunch`). Attention layers and
+  the PLE layer keep direct launches. Launches per step 1,139 -> 722, host time in them 5.4 -> 3.6 ms; the router wait
+  grew ~1 ms (the GPU is the bottleneck in that phase). `bench/graphs-2026-10-28`, 8 interleaved launches vs 0.1.25:
+  **+2.1% paired** (18.65 -> 19.00 tok/s, p10 +0.8%, base floor median 0.2% / p90 1.1%), 0 answer differences.
+- **Overlapped copies** (`routed_overlapped`, `SHADOW_OVERLAP=0`: off): after routing, the resident experts' matvecs
+  launch at once, the misses' copies go out on `copy_stream`, and the default stream (not the host) waits for them
+  (`copy_event` + `cuStreamWaitEvent`) before the misses' matvecs; eo's rows come out resident-first and
+  `moe_combine_qwen_perm` sums them in routing order, so y is bit-identical. The host queues the rest of the layer
+  while the copies run: host copy wait 13.3 -> 2.0 ms, router wait 16.2 -> 25.6 ms, net ~4 ms a step.
+  `bench/overlap-2026-10-28` vs the graphs build: **+2.7% paired** (18.96 -> 19.47 tok/s; p10 -2.3%, floor median
+  1.4%), 0 answer differences. Reference suite 9/9 with both on (the batch test compares graphed, overlapped `step`
+  with `step_batch` bit for bit).
+- Both together: **18.65 -> 19.47 tok/s, ~+4.4%** over 0.1.25.
