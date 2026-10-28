@@ -549,3 +549,12 @@ Single-prompt runs, "Write a Rust function that parses a comma separated list...
   kernels and grouped experts. What would still move Shadow's: experts grouped across a pass's positions (each
   union expert's weights read once), fusing the per-position small kernels, the drafter's experts in pinned RAM
   instead of VRAM.
+- **Grouped routed experts** (`matvec_grouped_*`, `grouped_plan` / `routed_grouped`): in a batched step each union
+  expert runs once on all of a group's tokens that route to it (up to 8 inputs a launch, `dotm`, so each output is
+  `matvec_fast_rows`' bit for bit, landing at (token, routing rank) so the plain combine keeps the sum order), the
+  resident ones while the misses copy, the copied ones after the GPU-side wait. 10/10 reference tests. Prompt
+  reading (`bench/prefill-grouped-2026-10-28`, 1,262 tokens, 8 interleaved runs, `SHADOW_OVERLAP=0` vs default on
+  one binary): **0.0334 -> 0.0308 s/token, -7.7% paired, all 8 pairs**, identical tokens. Speculation unchanged
+  (-10%, a 2-run check: at ~3 positions a pass few experts are shared). Also fixed: a 64-token group's RAM-tier
+  misses could lose their ring slots to the group's own promotions and overrun the staging slots (`read_drive`
+  panicked); the group now claims them first.

@@ -1,0 +1,16 @@
+﻿run 0 arm pertoken | exit 0, wall 77 s, min available 10.1 GiB, peak working set 35.6 GiB (cap 44) | prompt read in 43.5 s (0.034 s/token) | generated 16 tokens [..] in 0.9 s (0.055 s/token) | tokens#428794834
+run 0 arm grouped | exit 0, wall 73 s, min available 10.3 GiB, peak working set 35.6 GiB (cap 44) | prompt read in 38.9 s (0.031 s/token) | generated 16 tokens [..] in 0.8 s (0.052 s/token) | tokens#428794834
+run 1 arm pertoken | exit 0, wall 75 s, min available 10.3 GiB, peak working set 35.6 GiB (cap 44) | prompt read in 42.1 s (0.033 s/token) | generated 16 tokens [..] in 0.9 s (0.053 s/token) | tokens#428794834
+run 1 arm grouped | exit 0, wall 71 s, min available 10.3 GiB, peak working set 35.6 GiB (cap 44) | prompt read in 38.9 s (0.031 s/token) | generated 16 tokens [..] in 0.8 s (0.052 s/token) | tokens#428794834
+run 2 arm pertoken | exit 0, wall 75 s, min available 10.2 GiB, peak working set 35.6 GiB (cap 44) | prompt read in 42.2 s (0.033 s/token) | generated 16 tokens [..] in 0.9 s (0.053 s/token) | tokens#428794834
+run 2 arm grouped | exit 0, wall 71 s, min available 10.3 GiB, peak working set 35.6 GiB (cap 44) | prompt read in 38.9 s (0.031 s/token) | generated 16 tokens [..] in 0.8 s (0.052 s/token) | tokens#428794834
+run 3 arm pertoken | exit 0, wall 75 s, min available 10.3 GiB, peak working set 35.6 GiB (cap 44) | prompt read in 42.3 s (0.033 s/token) | generated 16 tokens [..] in 0.9 s (0.053 s/token) | tokens#428794834
+run 3 arm grouped | exit 0, wall 71 s, min available 10.3 GiB, peak working set 35.6 GiB (cap 44) | prompt read in 39.1 s (0.031 s/token) | generated 16 tokens [..] in 0.8 s (0.052 s/token) | tokens#428794834
+run 4 arm pertoken | exit 0, wall 75 s, min available 10.5 GiB, peak working set 35.6 GiB (cap 44) | prompt read in 42.2 s (0.033 s/token) | generated 16 tokens [..] in 0.9 s (0.059 s/token) | tokens#428794834
+run 4 arm grouped | exit 0, wall 75 s, min available 10.6 GiB, peak working set 35.6 GiB (cap 44) | prompt read in 38.9 s (0.031 s/token) | generated 16 tokens [..] in 0.8 s (0.052 s/token) | tokens#428794834
+run 5 arm pertoken | exit 0, wall 75 s, min available 10.7 GiB, peak working set 35.6 GiB (cap 44) | prompt read in 42.2 s (0.033 s/token) | generated 16 tokens [..] in 0.9 s (0.053 s/token) | tokens#428794834
+run 5 arm grouped | exit 0, wall 70 s, min available 10.6 GiB, peak working set 35.6 GiB (cap 44) | prompt read in 38.9 s (0.031 s/token) | generated 16 tokens [..] in 0.8 s (0.052 s/token) | tokens#428794834
+run 6 arm pertoken | exit 0, wall 75 s, min available 10.7 GiB, peak working set 35.6 GiB (cap 44) | prompt read in 42.2 s (0.033 s/token) | generated 16 tokens [..] in 0.9 s (0.053 s/token) | tokens#428794834
+run 6 arm grouped | exit 0, wall 70 s, min available 10.6 GiB, peak working set 35.6 GiB (cap 44) | prompt read in 39.0 s (0.031 s/token) | generated 16 tokens [..] in 0.8 s (0.052 s/token) | tokens#428794834
+run 7 arm pertoken | exit 0, wall 75 s, min available 10.7 GiB, peak working set 35.6 GiB (cap 44) | prompt read in 42.2 s (0.033 s/token) | generated 16 tokens [..] in 0.8 s (0.053 s/token) | tokens#428794834
+run 7 arm grouped | exit 0, wall 70 s, min available 10.7 GiB, peak working set 35.6 GiB (cap 44) | prompt read in 39.0 s (0.031 s/token) | generated 16 tokens [..] in 0.8 s (0.052 s/token) | tokens#428794834

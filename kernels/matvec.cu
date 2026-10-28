@@ -840,3 +840,83 @@ extern "C" __global__ void hc_down_inject_cols_bf16(const u8* w_down, float* dow
                                                     unsigned int m) {
     cols_ref_rows<BF16>(w_down, down, r_down, ds, w_inj, g, r_inj, gs, rn, rs, cols, 1, div, m);
 }
+
+// ------------------------------------------------------------------------------------- matrices on their own inputs
+// A batch's routed experts: group g = blockIdx.y is matrix wtab[g] on its own inputs.  gtab[17 g] = n (<= 8), then
+// 8 input rows and 8 output rows: input j at x + xi[j] * xs, output j at y + yi[j] * ys.  Same sums as
+// matvec_cols_m (dotm), so each one is matvec_fast_rows' on that input, bit for bit.  The inputs must be 16-byte
+// aligned with xs a multiple of 4.  Launch: block = 256 threads (32 rows), grid = (ceil(rows / 32), groups).
+template <typename Q, unsigned int M>
+static __device__ __forceinline__ void grouped_m(const u8* w, const float* x, unsigned int xs, float* y,
+                                                 unsigned int ys, const unsigned int* gi, unsigned int row0,
+                                                 unsigned int nr, unsigned int lane, unsigned int cols) {
+    const u64 rb = (u64) (cols / Q::QK) * Q::BYTES;
+    const float* xp[M];
+    float* yp[M];
+#pragma unroll
+    for (unsigned int j = 0; j < M; j++) {
+        xp[j] = x + (u64) gi[1 + j] * xs;
+        yp[j] = y + (u64) gi[9 + j] * ys;
+    }
+    float acc[COLS_ROWS][M];
+#pragma unroll
+    for (unsigned int k = 0; k < COLS_ROWS; k++)
+#pragma unroll
+        for (unsigned int j = 0; j < M; j++) acc[k][j] = 0.0f;
+    for (unsigned int c = lane; c < cols / 8; c += 32) {
+        float xr[M * 8];
+#pragma unroll
+        for (unsigned int j = 0; j < M; j++) {
+            const float4* p = (const float4*) (xp[j] + c * 8);
+            float4 a = p[0], b = p[1];
+            xr[j * 8 + 0] = a.x; xr[j * 8 + 1] = a.y; xr[j * 8 + 2] = a.z; xr[j * 8 + 3] = a.w;
+            xr[j * 8 + 4] = b.x; xr[j * 8 + 5] = b.y; xr[j * 8 + 6] = b.z; xr[j * 8 + 7] = b.w;
+        }
+#pragma unroll
+        for (unsigned int k = 0; k < COLS_ROWS; k++)
+            if (k < nr) Fast<Q>::template dotm<M>(w + (row0 + k) * rb, c * 8, xr, 8, acc[k]);
+    }
+#pragma unroll
+    for (unsigned int k = 0; k < COLS_ROWS; k++) {
+        if (k >= nr) break;
+#pragma unroll
+        for (unsigned int j = 0; j < M; j++) {
+            float a = acc[k][j];
+            for (int off = 16; off > 0; off >>= 1) a += __shfl_down_sync(0xffffffffu, a, off);
+            if (lane == 0) yp[j][row0 + k] = a;
+        }
+    }
+}
+
+template <typename Q>
+static __device__ __forceinline__ void grouped_rows(const u64* wtab, const unsigned int* gtab, const float* x,
+                                                    unsigned int xs, float* y, unsigned int ys, unsigned int rows,
+                                                    unsigned int cols) {
+    const unsigned int* gi = gtab + (u64) blockIdx.y * 17;
+    const u8* w = (const u8*) wtab[blockIdx.y];
+    unsigned int row0 = (blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32) * COLS_ROWS, lane = threadIdx.x % 32;
+    if (row0 >= rows) return;
+    unsigned int nr = min(rows - row0, (unsigned int) COLS_ROWS);
+    switch (gi[0]) {
+        case 1: grouped_m<Q, 1>(w, x, xs, y, ys, gi, row0, nr, lane, cols); break;
+        case 2: grouped_m<Q, 2>(w, x, xs, y, ys, gi, row0, nr, lane, cols); break;
+        case 3: grouped_m<Q, 3>(w, x, xs, y, ys, gi, row0, nr, lane, cols); break;
+        case 4: grouped_m<Q, 4>(w, x, xs, y, ys, gi, row0, nr, lane, cols); break;
+        case 5: grouped_m<Q, 5>(w, x, xs, y, ys, gi, row0, nr, lane, cols); break;
+        case 6: grouped_m<Q, 6>(w, x, xs, y, ys, gi, row0, nr, lane, cols); break;
+        case 7: grouped_m<Q, 7>(w, x, xs, y, ys, gi, row0, nr, lane, cols); break;
+        default: grouped_m<Q, 8>(w, x, xs, y, ys, gi, row0, nr, lane, cols); break;
+    }
+}
+
+extern "C" __global__ void matvec_grouped_q4_k(const u64* wtab, const unsigned int* gtab, const float* x, unsigned int xs, float* y, unsigned int ys, unsigned int rows, unsigned int cols) { grouped_rows<Q4K>(wtab, gtab, x, xs, y, ys, rows, cols); }
+extern "C" __global__ void matvec_grouped_q5_k(const u64* wtab, const unsigned int* gtab, const float* x, unsigned int xs, float* y, unsigned int ys, unsigned int rows, unsigned int cols) { grouped_rows<Q5K>(wtab, gtab, x, xs, y, ys, rows, cols); }
+extern "C" __global__ void matvec_grouped_q6_k(const u64* wtab, const unsigned int* gtab, const float* x, unsigned int xs, float* y, unsigned int ys, unsigned int rows, unsigned int cols) { grouped_rows<Q6K>(wtab, gtab, x, xs, y, ys, rows, cols); }
+extern "C" __global__ void matvec_grouped_iq4_nl(const u64* wtab, const unsigned int* gtab, const float* x, unsigned int xs, float* y, unsigned int ys, unsigned int rows, unsigned int cols) { grouped_rows<IQ4NL>(wtab, gtab, x, xs, y, ys, rows, cols); }
+extern "C" __global__ void matvec_grouped_iq4_xs(const u64* wtab, const unsigned int* gtab, const float* x, unsigned int xs, float* y, unsigned int ys, unsigned int rows, unsigned int cols) { grouped_rows<IQ4XS>(wtab, gtab, x, xs, y, ys, rows, cols); }
+extern "C" __global__ void matvec_grouped_nvfp4(const u64* wtab, const unsigned int* gtab, const float* x, unsigned int xs, float* y, unsigned int ys, unsigned int rows, unsigned int cols) { grouped_rows<NVFP4>(wtab, gtab, x, xs, y, ys, rows, cols); }
+extern "C" __global__ void matvec_grouped_q2_0(const u64* wtab, const unsigned int* gtab, const float* x, unsigned int xs, float* y, unsigned int ys, unsigned int rows, unsigned int cols) { grouped_rows<Q20>(wtab, gtab, x, xs, y, ys, rows, cols); }
+extern "C" __global__ void matvec_grouped_q8_0(const u64* wtab, const unsigned int* gtab, const float* x, unsigned int xs, float* y, unsigned int ys, unsigned int rows, unsigned int cols) { grouped_rows<Q80>(wtab, gtab, x, xs, y, ys, rows, cols); }
+extern "C" __global__ void matvec_grouped_iq2_s(const u64* wtab, const unsigned int* gtab, const float* x, unsigned int xs, float* y, unsigned int ys, unsigned int rows, unsigned int cols) { grouped_rows<IQ2S>(wtab, gtab, x, xs, y, ys, rows, cols); }
+extern "C" __global__ void matvec_grouped_iq3_xxs(const u64* wtab, const unsigned int* gtab, const float* x, unsigned int xs, float* y, unsigned int ys, unsigned int rows, unsigned int cols) { grouped_rows<IQ3XXS>(wtab, gtab, x, xs, y, ys, rows, cols); }
+extern "C" __global__ void matvec_grouped_iq3_s(const u64* wtab, const unsigned int* gtab, const float* x, unsigned int xs, float* y, unsigned int ys, unsigned int rows, unsigned int cols) { grouped_rows<IQ3S>(wtab, gtab, x, xs, y, ys, rows, cols); }

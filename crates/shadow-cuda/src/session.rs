@@ -192,8 +192,9 @@ struct BatchBufs<'c> {
     sa: DeviceBuffer<'c>,
     so: DeviceBuffer<'c>,
     logits: DeviceBuffer<'c>,
-    /// per token: its overlapped routed-expert table (32 bytes an expert), gate+up outputs, activations, outputs
-    etab: DeviceBuffer<'c>,
+    /// the grouped routed experts' tables (`moe_batch`), and per (token, routing rank): gate+up outputs,
+    /// activations, outputs
+    gtab: DeviceBuffer<'c>,
     eg: DeviceBuffer<'c>,
     act: DeviceBuffer<'c>,
     eo: DeviceBuffer<'c>,
@@ -608,31 +609,69 @@ fn cols_rows_per_block(entry: &str, rows: usize) -> u32 {
     if reference && rows < 2048 { 8 } else { 32 }
 }
 
-/// One token's table for routed experts with their copies overlapped: [gate, up] of the resident ones, [gate, up] of
-/// those being copied (`copying`), down in that order, the routing weights in routing order, then perm (routing rank
-/// -> output row); and how many are resident.  `addr(e)` is expert e's slot; `part` its gate, up, down offsets.
-fn overlapped_tab(top: &[(usize, f64)], addr: impl Fn(usize) -> u64, copying: impl Fn(usize) -> bool, part: [u64; 3])
-                  -> (Vec<u8>, usize) {
-    let (hits, misses): (Vec<(usize, usize)>, Vec<(usize, usize)>) =
-        top.iter().enumerate().map(|(i, &(e, _))| (i, e)).partition(|&(_, e)| !copying(e));
-    let mut tab = Vec::with_capacity(top.len() * 32);
-    for group in [&hits, &misses] {
-        for p in &part[..2] {
-            for &(_, e) in group.iter() {
-                tab.extend_from_slice(&(addr(e) + p).to_le_bytes());
+/// `moe_batch`'s grouped routed experts for tokens start..end, as one upload: per phase (0: experts resident before
+/// this group's copies, 1: the ones being copied) the groups - an expert and up to 8 of its tokens - as matrix
+/// addresses [gate.., up.., down..] and 17-u32 records [gate.., up.., down..] (count, input rows, output rows), then
+/// each token's routing weights.  Pair (token j, rank i) is row j * k + i of eg's gate half, of eg's up half (`up`
+/// rows on), of act and of eo; gate and up read token j's row of u, down reads the pair's row of act.
+struct GroupedPlan {
+    bytes: Vec<u8>,
+    /// per phase: (groups, byte offset of its matrix addresses, byte offset of its records)
+    phase: [(usize, u64, u64); 2],
+    /// byte offset of the routing weights (k f32 per token, from token 0)
+    weights: u64,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn grouped_plan(tops: &[Vec<(usize, f64)>], start: usize, end: usize, set: &[usize], up: usize,
+                addr: impl Fn(usize) -> u64, copied: impl Fn(usize) -> bool, part: [u64; 3]) -> GroupedPlan {
+    let k = tops[start].len();
+    // (expert, [(token, rank)]) per phase, at most 8 tokens a group
+    let mut groups: [Vec<(usize, Vec<(usize, usize)>)>; 2] = [vec![], vec![]];
+    for &e in set {
+        let users: Vec<(usize, usize)> = (start..end)
+            .filter_map(|j| tops[j].iter().position(|&(x, _)| x == e).map(|i| (j, i)))
+            .collect();
+        for chunk in users.chunks(8) {
+            groups[copied(e) as usize].push((e, chunk.to_vec()));
+        }
+    }
+    let mut addrs: Vec<u8> = vec![];
+    let mut recs: Vec<u32> = vec![];
+    let mut spans = [(0usize, 0usize, 0usize); 2];
+    for (ph, gs) in groups.iter().enumerate() {
+        spans[ph] = (gs.len(), addrs.len(), recs.len());
+        for (pi, p) in part.iter().enumerate() {
+            for (e, users) in gs {
+                addrs.extend_from_slice(&(addr(*e) + p).to_le_bytes());
+                let mut r = [0u32; 17];
+                r[0] = users.len() as u32;
+                for (u, &(j, i)) in users.iter().enumerate() {
+                    let pair = (j * k + i) as u32;
+                    (r[1 + u], r[9 + u]) = match pi {
+                        0 => (j as u32, pair),
+                        1 => (j as u32, up as u32 + pair),
+                        _ => (pair, pair),
+                    };
+                }
+                recs.extend_from_slice(&r);
             }
         }
     }
-    let mut perm = vec![0u32; top.len()];
-    for (r, &(i, e)) in hits.iter().chain(&misses).enumerate() {
-        tab.extend_from_slice(&(addr(e) + part[2]).to_le_bytes());
-        perm[i] = r as u32;
+    let rec_at = addrs.len();
+    let mut bytes = addrs;
+    bytes.extend(recs.iter().flat_map(|r| r.to_le_bytes()));
+    while bytes.len() % 4 != 0 {
+        bytes.push(0);
     }
-    for &(_, w) in top {
-        tab.extend_from_slice(&(w as f32).to_le_bytes());
+    let weights = bytes.len() as u64;
+    for top in tops.iter().take(end) {
+        for &(_, w) in top {
+            bytes.extend_from_slice(&(w as f32).to_le_bytes());
+        }
     }
-    tab.extend(perm.iter().flat_map(|p| p.to_le_bytes()));
-    (tab, hits.len())
+    let phase = spans.map(|(n, a, r)| (n, a as u64, (rec_at + 4 * r) as u64));
+    GroupedPlan { bytes, phase, weights }
 }
 
 /// Row j of a [rows][stride] f32 buffer.
@@ -725,7 +764,7 @@ impl<'c, 'm> GpuSession<'c, 'm> {
             qkv: ab(2 * kd + vd)?, x: ab(2 * kd + vd)?, z: ab(vd)?, beta: ab(c.ssm_v_heads)?, alpha: ab(c.ssm_v_heads)?, o: ab(vd)?,
             qg: ab(2 * qd)?, kk: ab(kvd)?, iq: ab(c.idx_heads * id)?, ao: ab(qd)?, rl: ab(c.n_expert)?, sgl: ab(1)?,
             sg: ab(c.shared_ff)?, su: ab(c.shared_ff)?, sa: ab(c.shared_ff)?, so: ab(h)?, logits: a(COLS_MAX * c.vocab)?,
-            etab: ab(8 * k)?, eg: ab(2 * k * c.expert_ff)?, act: ab(k * c.expert_ff)?, eo: ab(k * h)?,
+            gtab: ab(64 * k)?, eg: ab(2 * k * c.expert_ff)?, act: ab(k * c.expert_ff)?, eo: ab(k * h)?,
         };
         let replay = Replay {
             qkv: a(c.n_layer * MAX_VERIFY * (2 * kd + vd))?, ba: a(c.n_layer * MAX_VERIFY * 2 * c.ssm_v_heads)?,
@@ -2711,25 +2750,28 @@ impl<'c, 'm> GpuSession<'c, 'm> {
                 };
                 copying.push((e, base));
             }
-            // overlapped: every token's resident experts run while the misses copy, and the GPU waits for the copies
+            // grouped and overlapped: each union expert once, on all of the group's tokens that route to it - the
+            // resident ones while the misses copy, then (the GPU waiting for the copies) the copied ones
             let overlap = self.overlap && self.prof.is_none() && infos[0].ty == infos[1].ty && infos[0].dims == infos[1].dims;
             let part = [0u64, sizes[0] as u64, (sizes[0] + sizes[1]) as u64];
-            let mut resident = vec![0usize; end - start];
+            let mut plan = None;
             if overlap {
                 let addr = |e: usize| match self.cache.map.get(&(l, e)) {
                     Some(&s) => arena + self.cache.slot_offset[s],
                     None => extra.iter().find(|x| x.0 == e).expect("a routed expert neither cached nor fetched").1,
                 };
-                let mut tabs = Vec::with_capacity((end - start) * 32 * k);
-                for (jj, top) in tops[start..end].iter().enumerate() {
-                    let (tab, nh) = overlapped_tab(top, &addr, |e| copying.iter().any(|c| c.0 == e), part);
-                    tabs.extend_from_slice(&tab);
-                    tabs.resize((jj + 1) * 32 * k, 0);
-                    resident[jj] = nh;
-                }
-                self.upload_to(row(&self.bb.etab, 8 * k, start), &tabs);
-                for (jj, &nh) in resident.iter().enumerate() {
-                    self.routed_rows(start + jj, &tops[start + jj], 0, nh, &infos);
+                let copied = |e: usize| copying.iter().any(|c| c.0 == e);
+                let p = grouped_plan(&tops, start, end, &set, MAX_BATCH * k, addr, copied, part);
+                assert!(p.bytes.len() <= self.bb.gtab.bytes, "grouped experts: {} bytes of tables", p.bytes.len());
+                self.upload_to(self.bb.gtab.ptr, &p.bytes);
+                self.routed_grouped(&p, 0, start, end, &infos);
+                plan = Some(p);
+            }
+            // the group's RAM-tier misses keep their ring slots: a promotion for one of its file reads must not
+            // evict an expert the group is about to copy (it would turn into a file read past the staging slots)
+            for &(e, _) in &copying {
+                if let Some(&off) = self.ram.at.get(&(l, e)).filter(|off| self.ram.ring_by_off.contains_key(off)) {
+                    self.ram.claimed.insert(off);
                 }
             }
             let mut n_file = 0;
@@ -2739,21 +2781,17 @@ impl<'c, 'm> GpuSession<'c, 'm> {
                 n_file += from_file as usize;
             }
             self.read_drive(&names, &sizes);
-            if overlap {
+            if let Some(p) = plan.as_ref() {
                 if !copying.is_empty() {
                     self.copy_event.record(Some(&self.copy_stream)).unwrap();
                     self.ctx.stream_wait_event(None, &self.copy_event).unwrap();
                 }
-                for (jj, &nh) in resident.iter().enumerate() {
-                    let j = start + jj;
-                    let n = tops[j].len();
-                    self.routed_rows(j, &tops[j], nh, n - nh, &infos);
-                    let bb = &self.bb;
-                    let tab = row(&bb.etab, 8 * k, j);
-                    self.k1("moe_combine_qwen_perm", h, &[
-                        Arg::Ptr(row(&bb.y, h, j)), Arg::Ptr(row(&bb.eo, k * h, j)), Arg::Ptr(tab + 24 * n as u64),
-                        Arg::Ptr(tab + 28 * n as u64), Arg::Ptr(row(&bb.so, h, j)), Arg::Ptr(row(&bb.sgl, 1, j)),
-                        Arg::U32(h as u32), Arg::U32(n as u32)]);
+                self.routed_grouped(p, 1, start, end, &infos);
+                let bb = &self.bb;
+                for j in start..end {
+                    self.k1("moe_combine_qwen", h, &[
+                        Arg::Ptr(row(&bb.y, h, j)), Arg::Ptr(row(&bb.eo, k * h, j)), Arg::Ptr(bb.gtab.ptr + p.weights + (j * k * 4) as u64),
+                        Arg::Ptr(row(&bb.so, h, j)), Arg::Ptr(row(&bb.sgl, 1, j)), Arg::U32(h as u32), Arg::U32(k as u32)]);
                 }
             } else {
                 if !copying.is_empty() {
@@ -2770,23 +2808,36 @@ impl<'c, 'm> GpuSession<'c, 'm> {
         }
     }
 
-    /// Rows first..first + cnt of token j's overlapped routed experts (its table in bb.etab, `overlapped_tab`'s layout):
-    /// gate+up, swiglu, down into its rows of bb.eo.
-    fn routed_rows(&self, j: usize, top: &[(usize, f64)], first: usize, cnt: usize, infos: &[TensorInfo]) {
-        if cnt == 0 {
+    /// Phase `ph` (0: the resident experts, 1: the copied ones) of `grouped_plan`'s routed experts for tokens
+    /// start..end: gate+up grouped, swiglu over the tokens' rows, down grouped, into bb.eo row (token, rank).
+    fn routed_grouped(&self, p: &GroupedPlan, ph: usize, start: usize, end: usize, infos: &[TensorInfo]) {
+        let c = &self.m.cfg;
+        let (h, ff, k) = (c.hidden, c.expert_ff, c.n_expert_used);
+        let bb = &self.bb;
+        let (n, w, g) = p.phase[ph];
+        if n == 0 {
             return;
         }
-        let c = &self.m.cfg;
-        let (h, ff, k, n) = (c.hidden, c.expert_ff, c.n_expert_used, top.len());
-        let bb = &self.bb;
-        let tab = row(&bb.etab, 8 * k, j);
-        let eg = row(&bb.eg, 2 * k * ff, j) + (2 * first * ff * 4) as u64;
-        let act = row(&bb.act, k * ff, j) + (first * ff * 4) as u64;
-        self.mv_batch(&infos[0], tab + 16 * first as u64, 2 * cnt, row(&bb.u, h, j), 0, eg, ff);
-        self.k1("swiglu", cnt * ff, &[Arg::Ptr(eg), Arg::Ptr(eg + (cnt * ff * 4) as u64), Arg::Ptr(act),
-                                      Arg::U32((cnt * ff) as u32)]);
-        self.mv_batch(&infos[2], tab + (16 * n + 8 * first) as u64, cnt, act, ff,
-                      row(&bb.eo, k * h, j) + (first * h * 4) as u64, h);
+        let up = (MAX_BATCH * k * ff * 4) as u64;
+        let grouped = |t: &TensorInfo, wt: u64, gt: u64, count: usize, x: u64, xs: usize, y: u64, ys: usize| {
+            let ty = t.ty.name().to_lowercase();
+            let (rows, cols) = (t.dims[1] as u32, t.dims[0] as u32);
+            // SAFETY: `count` table entries at gtab + wt (matrix addresses) and + gt (17 u32 each: count, input rows,
+            // output rows), each a rows x cols matrix in the cache or the scratch slots; the rows they name are inside
+            // the batch's buffers at the strides given.
+            unsafe {
+                self.mvp.launch(&format!("matvec_grouped_{ty}"), (rows.div_ceil(32), count as u32, 1), (256, 1, 1), 0, self.ls(),
+                                &[Arg::Ptr(bb.gtab.ptr + wt), Arg::Ptr(bb.gtab.ptr + gt), Arg::Ptr(x), Arg::U32(xs as u32),
+                                  Arg::Ptr(y), Arg::U32(ys as u32), Arg::U32(rows), Arg::U32(cols)])
+            }
+            .unwrap_or_else(|err| panic!("{}: {err}", t.name));
+        };
+        grouped(&infos[0], w, g, 2 * n, bb.u.ptr, h, bb.eg.ptr, ff);
+        let rows = (start * k * ff * 4) as u64;
+        let len = (end - start) * k * ff;
+        self.k1("swiglu", len, &[Arg::Ptr(bb.eg.ptr + rows), Arg::Ptr(bb.eg.ptr + up + rows), Arg::Ptr(bb.act.ptr + rows),
+                                 Arg::U32(len as u32)]);
+        grouped(&infos[2], w + 16 * n as u64, g + (2 * n * 68) as u64, n, bb.act.ptr, ff, bb.eo.ptr, h);
     }
 
     /// Token j's routed experts (resident in the cache, or at `extra`'s scratch addresses) and the combine with its
