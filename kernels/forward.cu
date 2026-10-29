@@ -265,16 +265,25 @@ extern "C" __global__ void delta_step(const float* q, const float* k, const floa
     float beta = sigmoidf_ref(b[h]);
     float decay = (float) exp((double) A[h] * (double) softplusf_ref(a[h] + dtb[h]));
     float* s = S + (u64) h * d * d;
+    // the 128-term sums: float FMAs in runs of 16 (FP64 runs at 1/64 of FP32 on this GPU), the runs added in double
     double mem = 0.0;
-    for (unsigned int i = 0; i < d; ++i) {
-        s[i * d + j] *= decay;
-        mem += (double) s[i * d + j] * (double) ks[i];
+    for (unsigned int i0 = 0; i0 < d; i0 += 16) {
+        float part = 0.0f;
+        for (unsigned int i = i0; i < i0 + 16 && i < d; ++i) {
+            s[i * d + j] *= decay;
+            part = fmaf(s[i * d + j], ks[i], part);
+        }
+        mem += (double) part;
     }
     float delta = (float) (((double) v[h * d + j] - mem) * (double) beta);
     double acc = 0.0;
-    for (unsigned int i = 0; i < d; ++i) {
-        s[i * d + j] += ks[i] * delta;
-        acc += (double) s[i * d + j] * (double) qs[i];
+    for (unsigned int i0 = 0; i0 < d; i0 += 16) {
+        float part = 0.0f;
+        for (unsigned int i = i0; i < i0 + 16 && i < d; ++i) {
+            s[i * d + j] += ks[i] * delta;
+            part = fmaf(s[i * d + j], qs[i], part);
+        }
+        acc += (double) part;
     }
     o[h * d + j] = (float) acc;
 }
@@ -302,16 +311,26 @@ extern "C" __global__ void delta_steps128(const float* q, const float* k, const 
         float decay = (float) exp((double) A[h] * (double) softplusf_ref(a[(u64) t * bs + h] + dtb[h]));
         double mem = 0.0;
 #pragma unroll
-        for (unsigned int i = 0; i < d; ++i) {
-            col[i] *= decay;
-            mem += (double) col[i] * (double) ks[i];
+        for (unsigned int i0 = 0; i0 < d; i0 += 16) {
+            float part = 0.0f;
+#pragma unroll
+            for (unsigned int i = i0; i < i0 + 16; ++i) {
+                col[i] *= decay;
+                part = fmaf(col[i], ks[i], part);
+            }
+            mem += (double) part;
         }
         float delta = (float) (((double) v[(u64) t * xs + h * d + j] - mem) * (double) beta);
         double acc = 0.0;
 #pragma unroll
-        for (unsigned int i = 0; i < d; ++i) {
-            col[i] += ks[i] * delta;
-            acc += (double) col[i] * (double) qs[i];
+        for (unsigned int i0 = 0; i0 < d; i0 += 16) {
+            float part = 0.0f;
+#pragma unroll
+            for (unsigned int i = i0; i < i0 + 16; ++i) {
+                col[i] += ks[i] * delta;
+                part = fmaf(col[i], qs[i], part);
+            }
+            acc += (double) part;
         }
         o[(u64) t * os + h * d + j] = (float) acc;
     }
