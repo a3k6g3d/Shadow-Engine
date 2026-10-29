@@ -17,6 +17,7 @@ import json
 import math
 import os
 import re
+import zlib
 import subprocess
 import sys
 
@@ -27,8 +28,8 @@ BASE = {
     "--placement": "J:\\Shadow\\profiles\\routing-6prompts.shrc",
     "--tail-skip": 4,
     "--verify-resident": True,
-    "--dflash": "J:\\Shadow\\models\\dflash2",
-    "--spec": 3,
+    "--dflash": "J:\\Shadow\\models\\dflash2-ft2",
+    "--spec": 5,
 }
 SPACE = {
     "--spec": [3, 4, 5, 6, 7],
@@ -130,7 +131,7 @@ def main():
                     variants.append(c)
             if not variants:
                 continue
-            name = f"p{p}-{knob.strip('-')}-{abs(hash(key(best))) % 10**6}"
+            name = f"p{p}-{knob.strip('-')}-{zlib.crc32(key(best).encode()) % 10**6}"
             res = round_(args, name, best, variants, log)
             if res is None:
                 continue
