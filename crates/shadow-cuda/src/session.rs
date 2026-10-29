@@ -270,12 +270,16 @@ pub struct GpuSession<'c, 'm> {
     /// on first use on `gstream`, which orders with the default stream.  `SHADOW_GRAPHS=0`: none.
     graphs: HashMap<(usize, bool), Graph<'c>>,
     graphs_on: bool,
+    /// BF16 / F32 matrices in the 8-at-a-time sum order the quantized ones use (vector loads; one token and a batch
+    /// still agree bit for bit); `SHADOW_REF_ORDER=1`: the reference kernels' order.
+    fast_order: bool,
     /// Verify passes: count, tokens, seconds, of them waiting for the GPU (router reads) and the file, host seconds
     /// in kernel launches, launches.
     verify_stats: [f64; 7],
     /// `Tiers::tail_skip` (0: off), and how many routed experts it has skipped.
     tail_skip: usize,
     pub tail_skipped: u64,
+    verify_resident: bool,
     /// `routed_overlapped` instead of waiting on the host for a layer's copies (`SHADOW_OVERLAP=0`: off).
     overlap: bool,
     gstream: Stream<'c>,
@@ -407,6 +411,9 @@ pub struct Tiers {
     /// and that every token of a step or verify pass routes only at rank >= R (0-based, of the top 10) is neither
     /// copied nor computed - its contribution is zero and the others keep their weights.  Changes answers.
     pub tail_skip: usize,
+    /// `--verify-resident` (inexact; AcceptMoE, arXiv 2608.02989): in a speculative verify pass, the drafted positions
+    /// (all but the first) use only the routed experts already in VRAM, so the pass copies about what one step does.
+    pub verify_resident: bool,
 }
 
 impl Tiers {
@@ -443,6 +450,7 @@ impl Tiers {
                    cpu_experts: num("--cpu-experts", 0)?, cpu_threads: num("--cpu-threads", 8)?,
                    pregate: num("--pregate", 0)?,
                    tail_skip: num("--tail-skip", 0)?,
+                   verify_resident: args.iter().any(|a| a == "--verify-resident"),
                    pin_margin: flag("--pin-margin").map(|v| v.parse().map_err(|_| format!("--pin-margin: not a number: {v}")))
                        .transpose()? })
     }
@@ -1048,8 +1056,10 @@ impl<'c, 'm> GpuSession<'c, 'm> {
             mtp_probe: std::env::var("SHADOW_MTP_PROBE").is_ok_and(|v| v == "1").then_some((0, 0)),
             mtp,
             graphs: HashMap::new(),
+            fast_order: !std::env::var("SHADOW_REF_ORDER").is_ok_and(|v| v == "1"),
             verify_stats: [0.0; 7],
             tail_skip: tiers.tail_skip,
+            verify_resident: tiers.verify_resident,
             tail_skipped: 0,
             graphs_on: std::env::var("SHADOW_GRAPHS").map_or(true, |v| v != "0")
                 && !std::env::var("SHADOW_KTIME").is_ok_and(|v| v == "1"),
@@ -1298,8 +1308,9 @@ impl<'c, 'm> GpuSession<'c, 'm> {
 
     fn matvec(&self, t: &TensorInfo, wptr: u64, rows: usize, x: u64, y: u64) {
         let ty = t.ty.name();
-        // the 8-at-a-time kernel where tests/matvec.rs measured it faster than the reference one (every block-quantized type)
-        let fast = !matches!(ty.as_str(), "BF16" | "F32") && t.dims[0].is_multiple_of(8);
+        // the 8-at-a-time kernel where tests/matvec.rs measured it faster than the reference one (every block-quantized
+        // type), and for BF16 / F32 too unless the reference sum order is asked for (`fast_order`)
+        let fast = (self.fast_order || !matches!(ty.as_str(), "BF16" | "F32")) && t.dims[0].is_multiple_of(8);
         let entry = if fast {
             FAST_KERNELS.iter().find(|q| q.0 == ty).unwrap().1
         } else {
@@ -1341,6 +1352,12 @@ impl<'c, 'm> GpuSession<'c, 'm> {
         let (t0, b0) = self.m.dense(name0);
         let (t1, b1) = self.m.dense(name1);
         let ty = t0.ty.name();
+        if self.fast_order && matches!(ty.as_str(), "BF16" | "F32") {
+            // the pair kernels for these types sum in the reference order
+            self.mv(name0, x, y0);
+            self.mv(name1, x, y1);
+            return;
+        }
         let (qk, qb) = t0.ty.block().unwrap();
         let (qk1, qb1) = t1.ty.block().unwrap();
         let r0 = b0.len() / (t0.dims[0] / qk * qb) as usize;
@@ -1672,7 +1689,8 @@ impl<'c, 'm> GpuSession<'c, 'm> {
             (0, 0)
         };
         unsafe {
-            self.mvp.launch("hc_down_inject_bf16", ((r_down + r_inj).div_ceil(8), 1, 1), (256, 1, 1), 0, self.ls(), &[
+            self.mvp.launch(if self.fast_order { "hc_down_inject_fast_bf16" } else { "hc_down_inject_bf16" },
+                            ((r_down + r_inj).div_ceil(8), 1, 1), (256, 1, 1), 0, self.ls(), &[
                 Arg::Ptr(self.w[&format!("{p}_down.weight")].ptr), Arg::Ptr(b.down.ptr), Arg::U32(r_down),
                 Arg::Ptr(w_inj), Arg::Ptr(b.g.ptr), Arg::U32(r_inj),
                 Arg::Ptr(b.rn.ptr), Arg::U32(h * cs), Arg::F32(cs as f32),
@@ -2554,8 +2572,7 @@ impl<'c, 'm> GpuSession<'c, 'm> {
         let entry = match ty.as_str() {
             _ if self.m.scale(name) != 1.0 => None,
             // `mv` runs these in the reference order, and so do the _ref kernels
-            "BF16" => Some("matvec_cols_ref_bf16".to_string()),
-            "F32" => Some("matvec_cols_ref_f32".to_string()),
+            "BF16" | "F32" if !self.fast_order => Some(format!("matvec_cols_ref_{}", ty.to_lowercase())),
             _ if t.dims[0].is_multiple_of(8) && xs.is_multiple_of(4) && x.is_multiple_of(16) => {
                 Some(format!("matvec_cols_{}", ty.to_lowercase()))
             }
@@ -2617,7 +2634,12 @@ impl<'c, 'm> GpuSession<'c, 'm> {
             // SAFETY: rank + r_inj rows of ch BF16 weights; n inputs of ch floats in rn, n outputs of rank (down) and
             // cs (g) floats, from row j0.
             unsafe {
-                self.mvp.launch("hc_down_inject_cols_bf16", ((rank as u32 + r_inj).div_ceil(cols_rows_per_block("hc_down_inject_cols_bf16", rank + r_inj as usize)), 1, 1), (256, 1, 1), 0, self.ls(), &[
+                let (entry, per_block) = if self.fast_order {
+                    ("hc_down_inject_cols_fast_bf16", 8)
+                } else {
+                    ("hc_down_inject_cols_bf16", cols_rows_per_block("hc_down_inject_cols_bf16", rank + r_inj as usize))
+                };
+                self.mvp.launch(entry, ((rank as u32 + r_inj).div_ceil(per_block), 1, 1), (256, 1, 1), 0, self.ls(), &[
                     Arg::Ptr(self.w[&format!("{p}_down.weight")].ptr), Arg::Ptr(row(&bb.down, rank, j0)), Arg::U32(rank as u32),
                     Arg::U32(rank as u32), Arg::Ptr(w_inj), Arg::Ptr(row(&bb.g, cs, j0)), Arg::U32(r_inj), Arg::U32(cs as u32),
                     Arg::Ptr(row(&bb.rn, ch, j0)), Arg::U32(ch as u32), Arg::U32(ch as u32), Arg::F32(cs as f32),
@@ -2778,6 +2800,14 @@ impl<'c, 'm> GpuSession<'c, 'm> {
             if self.route_log.is_some() {
                 logs[j].push(l as u16);
                 logs[j].extend(top.iter().map(|&(e, _)| e as u16));
+            }
+        }
+        if self.verify_resident && self.replay.on.get() {
+            // a verify pass: the drafted positions keep only their resident experts
+            for top in tops.iter_mut().skip(1) {
+                let before = top.len();
+                top.retain(|&(e, _)| self.cache.map.contains_key(&(l, e)));
+                self.tail_skipped += (before - top.len()) as u64;
             }
         }
         if self.tail_skip > 0 && m <= MAX_VERIFY {

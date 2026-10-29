@@ -920,3 +920,88 @@ extern "C" __global__ void matvec_grouped_q8_0(const u64* wtab, const unsigned i
 extern "C" __global__ void matvec_grouped_iq2_s(const u64* wtab, const unsigned int* gtab, const float* x, unsigned int xs, float* y, unsigned int ys, unsigned int rows, unsigned int cols) { grouped_rows<IQ2S>(wtab, gtab, x, xs, y, ys, rows, cols); }
 extern "C" __global__ void matvec_grouped_iq3_xxs(const u64* wtab, const unsigned int* gtab, const float* x, unsigned int xs, float* y, unsigned int ys, unsigned int rows, unsigned int cols) { grouped_rows<IQ3XXS>(wtab, gtab, x, xs, y, ys, rows, cols); }
 extern "C" __global__ void matvec_grouped_iq3_s(const u64* wtab, const unsigned int* gtab, const float* x, unsigned int xs, float* y, unsigned int ys, unsigned int rows, unsigned int cols) { grouped_rows<IQ3S>(wtab, gtab, x, xs, y, ys, rows, cols); }
+
+// ------------------------------------------------------------------------- BF16 hc projections in the dot8 order
+// hc_down_inject_bf16 with matvec_fast_rows' sums (dot8 over 8 consecutive weights a lane) instead of the reference
+// order: vector loads, same math, only the float sum order differs.  One row a warp; grid = ceil((r_down + r_inj) / 8).
+static __device__ __forceinline__ float hc_epilogue(float a, float div, bool inj) {
+    float v = a / div;
+    float sig = (float) (1.0 / (1.0 + exp(-(double) v)));
+    return inj ? 2.0f * sig : v * sig;
+}
+
+extern "C" __global__ void hc_down_inject_fast_bf16(const u8* w_down, float* down, unsigned int r_down,
+                                                    const u8* w_inj, float* g, unsigned int r_inj,
+                                                    const float* rn, unsigned int cols, float div) {
+    unsigned int row = blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32, lane = threadIdx.x % 32;
+    bool inj = false;
+    const u8* w;
+    if (row < r_down) {
+        w = w_down;
+    } else if (row < r_down + r_inj) {
+        row -= r_down; w = w_inj; inj = true;
+    } else {
+        return;
+    }
+    const u8* r = w + (u64) row * cols * BF16::BYTES;
+    float acc = 0.0f;
+    for (unsigned int c = lane; c < cols / 8; c += 32) acc += Fast<BF16>::dot8(r, c * 8, rn + c * 8);
+    for (int off = 16; off > 0; off >>= 1) acc += __shfl_down_sync(0xffffffffu, acc, off);
+    if (lane == 0) (inj ? g : down)[row] = hc_epilogue(acc, div, inj);
+}
+
+// The same for m <= 8 inputs (rn + j * rs; down + j * ds, g + j * gs), dotm so each input's sums are the one-input
+// kernel's bit for bit.  One row a warp; grid = ceil((r_down + r_inj) / 8).
+template <unsigned int M>
+static __device__ __forceinline__ void hc_cols_fast_m(const u8* r, const float* rn, unsigned int rs, unsigned int cols,
+                                                      unsigned int lane, float* acc) {
+#pragma unroll
+    for (unsigned int j = 0; j < M; j++) acc[j] = 0.0f;
+    for (unsigned int c = lane; c < cols / 8; c += 32) {
+        float xr[M * 8];
+#pragma unroll
+        for (unsigned int j = 0; j < M; j++) {
+            const float4* p = (const float4*) (rn + (u64) j * rs + c * 8);
+            float4 a = p[0], b = p[1];
+            xr[j * 8 + 0] = a.x; xr[j * 8 + 1] = a.y; xr[j * 8 + 2] = a.z; xr[j * 8 + 3] = a.w;
+            xr[j * 8 + 4] = b.x; xr[j * 8 + 5] = b.y; xr[j * 8 + 6] = b.z; xr[j * 8 + 7] = b.w;
+        }
+        Fast<BF16>::template dotm<M>(r, c * 8, xr, 8, acc);
+    }
+#pragma unroll
+    for (unsigned int j = 0; j < M; j++)
+        for (int off = 16; off > 0; off >>= 1) acc[j] += __shfl_down_sync(0xffffffffu, acc[j], off);
+}
+
+extern "C" __global__ void hc_down_inject_cols_fast_bf16(const u8* w_down, float* down, unsigned int r_down, unsigned int ds,
+                                                         const u8* w_inj, float* g, unsigned int r_inj, unsigned int gs,
+                                                         const float* rn, unsigned int rs, unsigned int cols, float div,
+                                                         unsigned int m) {
+    unsigned int row = blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32, lane = threadIdx.x % 32;
+    bool inj = false;
+    const u8* w;
+    if (row < r_down) {
+        w = w_down;
+    } else if (row < r_down + r_inj) {
+        row -= r_down; w = w_inj; inj = true;
+    } else {
+        return;
+    }
+    const u8* r = w + (u64) row * cols * BF16::BYTES;
+    float acc[8];
+    switch (m) {
+        case 1: hc_cols_fast_m<1>(r, rn, rs, cols, lane, acc); break;
+        case 2: hc_cols_fast_m<2>(r, rn, rs, cols, lane, acc); break;
+        case 3: hc_cols_fast_m<3>(r, rn, rs, cols, lane, acc); break;
+        case 4: hc_cols_fast_m<4>(r, rn, rs, cols, lane, acc); break;
+        case 5: hc_cols_fast_m<5>(r, rn, rs, cols, lane, acc); break;
+        case 6: hc_cols_fast_m<6>(r, rn, rs, cols, lane, acc); break;
+        case 7: hc_cols_fast_m<7>(r, rn, rs, cols, lane, acc); break;
+        default: hc_cols_fast_m<8>(r, rn, rs, cols, lane, acc); break;
+    }
+    if (lane != 0) return;
+    for (unsigned int j = 0; j < m && j < 8; j++) {
+        if (inj) g[(u64) j * gs + row] = hc_epilogue(acc[j], div, true);
+        else down[(u64) j * ds + row] = hc_epilogue(acc[j], div, false);
+    }
+}

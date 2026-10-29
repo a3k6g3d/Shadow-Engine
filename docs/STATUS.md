@@ -611,3 +611,16 @@ Single-prompt runs, "Write a Rust function that parses a comma separated list...
   (1 run, same tokens); a tail4 verify pass 77 -> 72 ms; `--tail-skip 4 --mtp --spec 3` +2.7%, `--spec 5` +6.6%
   paired over tail4 alone (2-run checks, worst pairs -18% / -38%). The session report now breaks verify passes down
   (wall, GPU waits, file, launches, host time in launches).
+- **Speculation research (2026-10-29)**, arXiv / Hugging Face: AcceptMoE (2608.02989: resident-only experts for
+  uncommitted verify positions, -74..77% H2D, 2.06x under offloading), SpecFit (2610.15417: verify subtree by predicted
+  throughput, expert-union cost), Lan (2610.34440: dedup pays from 5-8 tokens a pass), DFlash 2 (a 0.6B block-diffusion
+  drafter for this model: acceptance 2.8-3.3 vs MTP 2.5-3.1 per pass, 1.2 GB), S2-MoE / DraftExpert / SpecMoE
+  (expert-sparse self-drafts: a full dense pass per draft, too slow here), suffix decoding (code editing).
+- **`--verify-resident`** (inexact, AcceptMoE's idea): drafted positions of a verify pass keep only their resident
+  experts. With tail skip 4 and MTP: K=5 +4.6%, K=3 -5% over tail4 alone (2-run checks); a pass 72 -> 64 ms - copies
+  were a small part of it; GPU work (37-44 ms) and host work (~25 ms, 1,834 launches) are the rest.
+- **BF16 / F32 in the 8-at-a-time sum order, default** (`SHADOW_REF_ORDER=1` for the reference order): the
+  reference-order kernels forced scalar loads (`hc_down_inject_cols_bf16` was ~120 GB/s). New
+  `hc_down_inject_fast_bf16` / `hc_down_inject_cols_fast_bf16` (one row a warp, dot8 / dotm); one token and a batch
+  still agree bit for bit; 10/10 reference tests (the fixtures' tolerances). 2-run checks: exact +3.2%; the fastest
+  mode (`--tail-skip 4 --mtp --spec 5 --verify-resident`) 30.1 -> **31.9 tok/s**, +53.9% paired over exact.

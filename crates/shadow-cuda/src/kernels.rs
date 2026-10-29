@@ -209,6 +209,8 @@ pub const FILES: &[File] = &[
             cols("matvec_cols_ref_bf16"), cols("matvec_cols_ref_f32"),
             e("matvec_grouped_q4_k", &[C, C, C, U, W, U, U, U]), e("matvec_grouped_q5_k", &[C, C, C, U, W, U, U, U]), e("matvec_grouped_q6_k", &[C, C, C, U, W, U, U, U]), e("matvec_grouped_iq4_nl", &[C, C, C, U, W, U, U, U]), e("matvec_grouped_iq4_xs", &[C, C, C, U, W, U, U, U]), e("matvec_grouped_nvfp4", &[C, C, C, U, W, U, U, U]), e("matvec_grouped_q2_0", &[C, C, C, U, W, U, U, U]), e("matvec_grouped_q8_0", &[C, C, C, U, W, U, U, U]), e("matvec_grouped_iq2_s", &[C, C, C, U, W, U, U, U]), e("matvec_grouped_iq3_xxs", &[C, C, C, U, W, U, U, U]), e("matvec_grouped_iq3_s", &[C, C, C, U, W, U, U, U]),
             e("hc_down_inject_cols_bf16", &[C, W, U, U, C, W, U, U, C, U, U, F, U]),
+            e("hc_down_inject_fast_bf16", &[C, W, U, C, W, U, C, U, F]),
+            e("hc_down_inject_cols_fast_bf16", &[C, W, U, U, C, W, U, U, C, U, U, F, U]),
             pair("matvec_pair_q4_k"), pair("matvec_pair_q5_k"), pair("matvec_pair_q6_k"),
             pair("matvec_pair_iq4_nl"), pair("matvec_pair_iq4_xs"), pair("matvec_pair_nvfp4"),
             pair("matvec_pair_q2_0"), pair("matvec_pair_q8_0"), pair("matvec_pair_iq2_s"), pair("matvec_pair_iq3_xxs"),
