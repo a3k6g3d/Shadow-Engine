@@ -603,3 +603,11 @@ Single-prompt runs, "Write a Rust function that parses a comma separated list...
   (`SHADOW_TIMING_NO_COPIES`, wrong output) 25 ms. Strata's 48.5 tok/s is 20.6 ms a token: single steps cannot get
   there on copies alone; the verify pass (now ~77 ms for 3.1 positions with tail skip, against 34 ms a plain step)
   has to get cheap. `--tail-skip 4 --mtp --spec 3`: +2.4% over tail4 alone (2-run check).
+- **Multi-row kernels in the batched step** (bit-identical; 13/13 reference tests including the ignored long ones):
+  `hc_mix_rows`, `hc_write_rmsnorm_rows`, `conv_silu_steps` (each channel walks the batch's tokens in order),
+  `l2norm_qk_rows`, `gated_rmsnorm_rows`, `head_norm_rope_qgk_rows` + `attention_heads_rows` (whenever no token needs
+  the sparse selection; 8 rows of scores at a time), `moe_combine_qwen_rows` (per-token expert counts, for tail
+  skip): one launch per step instead of one per token. First checks: prompt reading 0.0308 -> **0.023 s/token**
+  (1 run, same tokens); a tail4 verify pass 77 -> 72 ms; `--tail-skip 4 --mtp --spec 3` +2.7%, `--spec 5` +6.6%
+  paired over tail4 alone (2-run checks, worst pairs -18% / -38%). The session report now breaks verify passes down
+  (wall, GPU waits, file, launches, host time in launches).

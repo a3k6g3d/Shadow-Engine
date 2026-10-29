@@ -90,12 +90,23 @@ extern "C" __global__ void sigmoid_div(const float* x, float* y, unsigned int n,
 }
 
 // u[i] = (sum over streams of sigmoid(up[s*h+i]) * rn[s*h+i]) / streams, summed in stream order as the reference does
-extern "C" __global__ void hc_mix(const float* rn, const float* up, float* u, unsigned int h, unsigned int streams) {
+static __device__ __forceinline__ void hc_mix_one(const float* rn, const float* up, float* u, unsigned int h,
+                                                  unsigned int streams) {
     unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= h) return;
     float acc = 0.0f;
     for (unsigned int s = 0; s < streams; ++s) acc += sigmoidf_ref(up[s * h + i]) * rn[s * h + i];
     u[i] = acc / (float) streams;
+}
+
+extern "C" __global__ void hc_mix(const float* rn, const float* up, float* u, unsigned int h, unsigned int streams) {
+    hc_mix_one(rn, up, u, h, streams);
+}
+
+// hc_mix for rows y = blockIdx.y: rn and up rows h * streams apart, u rows h apart.  grid = (ceil(h / 256), rows).
+extern "C" __global__ void hc_mix_rows(const float* rn, const float* up, float* u, unsigned int h, unsigned int streams) {
+    const u64 y = blockIdx.y, rs = (u64) h * streams;
+    hc_mix_one(rn + y * rs, up + y * rs, u + y * h, h, streams);
 }
 
 // r[s*h+i] += g[s] * y[i]
@@ -107,9 +118,8 @@ extern "C" __global__ void hc_write(float* r, const float* g, const float* y, un
 
 // Fuses hc_write (r[s*h+i] += g[s] * y[i]) and the next hc_read's rmsnorm_groups (rn[s*h+i] = rmsnorm(r_s, w_s)).
 // grid = streams, block = 256.
-extern "C" __global__ void hc_write_rmsnorm_groups(float* r, const float* g, const float* y, const float* w, float* rn,
-                                                   unsigned int group, float eps) {
-    unsigned int s = blockIdx.x;
+static __device__ __forceinline__ void hc_write_rmsnorm_one(float* r, const float* g, const float* y, const float* w,
+                                                            float* rn, unsigned int group, float eps, unsigned int s) {
     float gs = g[s];
     float* rs = r + (u64) s * group;
     const float* ws = w + (u64) s * group;
@@ -125,6 +135,18 @@ extern "C" __global__ void hc_write_rmsnorm_groups(float* r, const float* g, con
     for (unsigned int i = threadIdx.x; i < group; i += blockDim.x) {
         ys[i] = (float) ((double) rs[i] * scale) * ws[i];
     }
+}
+
+extern "C" __global__ void hc_write_rmsnorm_groups(float* r, const float* g, const float* y, const float* w, float* rn,
+                                                   unsigned int group, float eps) {
+    hc_write_rmsnorm_one(r, g, y, w, rn, group, eps, blockIdx.x);
+}
+
+// For rows j = blockIdx.y (r and rn rows streams * group apart, g rows streams, y rows group); grid = (streams, rows).
+extern "C" __global__ void hc_write_rmsnorm_rows(float* r, const float* g, const float* y, const float* w, float* rn,
+                                                 unsigned int group, float eps, unsigned int streams) {
+    const u64 j = blockIdx.y, rs = (u64) streams * group;
+    hc_write_rmsnorm_one(r + j * rs, g + j * streams, y + j * group, w, rn + j * rs, group, eps, blockIdx.x);
 }
 
 // r[s*h+i] = x[i]
@@ -170,6 +192,22 @@ extern "C" __global__ void conv_silu_step(const float* x, float* state, const fl
     state[(k - 2) * ch + i] = x[i];
 }
 
+// conv_silu_step for m consecutive tokens (x and out rows ch apart): each channel walks the tokens in order, so the
+// window and the outputs are conv_silu_step's on each token in turn.
+extern "C" __global__ void conv_silu_steps(const float* x, float* state, const float* w, float* out, unsigned int ch,
+                                           unsigned int k, unsigned int m) {
+    unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= ch) return;
+    for (unsigned int j = 0; j < m; ++j) {
+        const float xi = x[(u64) j * ch + i];
+        double acc = (double) w[i * k + (k - 1)] * (double) xi;
+        for (unsigned int t = 0; t + 1 < k; ++t) acc += (double) w[i * k + t] * (double) state[t * ch + i];
+        out[(u64) j * ch + i] = siluf_ref((float) acc);
+        for (unsigned int t = 0; t + 2 < k; ++t) state[t * ch + i] = state[(t + 1) * ch + i];
+        state[(k - 2) * ch + i] = xi;
+    }
+}
+
 // Each `d`-wide head: x = x / sqrt(sum x^2 + 1e-6), then x /= div.  grid = heads, block = 128.
 extern "C" __global__ void l2norm_heads(float* x, unsigned int d, float div) {
     float* h = x + (u64) blockIdx.x * d;
@@ -183,8 +221,23 @@ extern "C" __global__ void l2norm_heads(float* x, unsigned int d, float div) {
 }
 
 // Blocks 0..kh-1 normalize Q heads (divided by q_div); blocks kh..2*kh-1 normalize K heads (div = 1.0).
+extern "C" __global__ void l2norm_qk_rows(float* x, unsigned int kh, unsigned int d, float q_div, unsigned int xs);
+
 extern "C" __global__ void l2norm_qk_heads(float* x, unsigned int kh, unsigned int d, float q_div) {
     float* h = x + (u64) blockIdx.x * d;
+    float div = blockIdx.x < kh ? q_div : 1.0f;
+    double ss = 0.0;
+    for (unsigned int i = threadIdx.x; i < d; i += blockDim.x) ss += (double) h[i] * (double) h[i];
+    double n = 1.0 / sqrt(block_sum(ss) + 1e-6);
+    for (unsigned int i = threadIdx.x; i < d; i += blockDim.x) {
+        float v = (float) ((double) h[i] * n);
+        h[i] = div == 1.0f ? v : v / div;
+    }
+}
+
+// l2norm_qk_heads on rows y = blockIdx.y, xs apart; grid = (2 kh, rows).
+extern "C" __global__ void l2norm_qk_rows(float* x, unsigned int kh, unsigned int d, float q_div, unsigned int xs) {
+    float* h = x + (u64) blockIdx.y * xs + (u64) blockIdx.x * d;
     float div = blockIdx.x < kh ? q_div : 1.0f;
     double ss = 0.0;
     for (unsigned int i = threadIdx.x; i < d; i += blockDim.x) ss += (double) h[i] * (double) h[i];
@@ -276,6 +329,17 @@ extern "C" __global__ void gated_rmsnorm_heads(float* o, const float* w, const f
     for (unsigned int i = threadIdx.x; i < d; i += blockDim.x) h[i] = (float) ((double) h[i] * r) * w[i] * sigmoidf_ref(zh[i]);
 }
 
+// gated_rmsnorm_heads on rows y = blockIdx.y (o and z rows os apart); grid = (heads, rows).
+extern "C" __global__ void gated_rmsnorm_rows(float* o, const float* w, const float* z, unsigned int d, float eps,
+                                              unsigned int os) {
+    float* h = o + (u64) blockIdx.y * os + (u64) blockIdx.x * d;
+    const float* zh = z + (u64) blockIdx.y * os + (u64) blockIdx.x * d;
+    double ss = 0.0;
+    for (unsigned int i = threadIdx.x; i < d; i += blockDim.x) ss += (double) h[i] * (double) h[i];
+    double r = 1.0 / sqrt(block_sum(ss) / (double) d + (double) eps);
+    for (unsigned int i = threadIdx.x; i < d; i += blockDim.x) h[i] = (float) ((double) h[i] * r) * w[i] * sigmoidf_ref(zh[i]);
+}
+
 // ------------------------------------------------------------------------------------------------ attention
 // Each head of `in` (head h starts at in + h*in_stride): RMSNorm with w, then RoPE on the first rope_dims at pos,
 // written to out + h*out_stride.  grid = heads, block = 128.
@@ -305,11 +369,11 @@ extern "C" __global__ void head_norm_rope_qk(const float* qg, float* q, const fl
 
 // Qwen gated attention: blocks 0..nh-1 normalize+RoPE query heads (qg[h*2*d..h*2*d+d] -> q[h*d..]) AND split the gate
 // half (qg[h*2*d+d..h*2*d+2*d] -> gate[h*d..]); blocks nh..nh+nkv-1 normalize+RoPE key heads (kk -> kc).
-extern "C" __global__ void head_norm_rope_qgk(const float* qg, float* q, float* gate, const float* wq,
-                                              const float* kk, float* kc, const float* wk,
-                                              unsigned int nh, unsigned int d, float eps,
-                                              unsigned int pos, unsigned int rope_dims, float theta) {
-    unsigned int b = blockIdx.x;
+static __device__ __forceinline__ void head_norm_rope_qgk_one(const float* qg, float* q, float* gate, const float* wq,
+                                                              const float* kk, float* kc, const float* wk,
+                                                              unsigned int nh, unsigned int d, float eps,
+                                                              unsigned int pos, unsigned int rope_dims, float theta,
+                                                              unsigned int b) {
     if (b < nh) {
         const float* x = qg + (u64) b * 2 * d;
         float* y = q + (u64) b * d;
@@ -328,6 +392,24 @@ extern "C" __global__ void head_norm_rope_qgk(const float* qg, float* q, float* 
     }
 }
 
+extern "C" __global__ void head_norm_rope_qgk(const float* qg, float* q, float* gate, const float* wq,
+                                              const float* kk, float* kc, const float* wk,
+                                              unsigned int nh, unsigned int d, float eps,
+                                              unsigned int pos, unsigned int rope_dims, float theta) {
+    head_norm_rope_qgk_one(qg, q, gate, wq, kk, kc, wk, nh, d, eps, pos, rope_dims, theta, blockIdx.x);
+}
+
+// For tokens j = blockIdx.y at positions pos0 + j: qg rows 2 nh d apart, q and gate rows nh d, kk rows nkv d, and the
+// keys into the cache at kc + (pos0 + j) * nkv * d.  grid = (nh + nkv, rows).
+extern "C" __global__ void head_norm_rope_qgk_rows(const float* qg, float* q, float* gate, const float* wq,
+                                                   const float* kk, float* kc, const float* wk, unsigned int nh,
+                                                   unsigned int nkv, unsigned int d, float eps, unsigned int pos0,
+                                                   unsigned int rope_dims, float theta) {
+    const u64 j = blockIdx.y, qd = (u64) nh * d, kd = (u64) nkv * d;
+    head_norm_rope_qgk_one(qg + j * 2 * qd, q + j * qd, gate + j * qd, wq, kk + j * kd, kc + (pos0 + j) * kd, wk,
+                           nh, d, eps, pos0 + (unsigned int) j, rope_dims, theta, blockIdx.x);
+}
+
 // gate[h*hd + j] = qg[h*2*hd + hd + j]: the gate half of each query head
 extern "C" __global__ void split_gate(const float* qg, float* gate, unsigned int heads, unsigned int hd) {
     unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -338,10 +420,11 @@ extern "C" __global__ void split_gate(const float* qg, float* gate, unsigned int
 // Softmax attention of each query head over the positions in `toks` (all 0..ntok-1 when toks is null), GQA, then
 // times sigmoid(gate).  Scores, exponentials and the weighted sum in double, as the reference.  grid = heads,
 // block = 256; `scratch` holds heads x stride doubles.
-extern "C" __global__ void attention_heads(const float* q, const float* kc, const float* vc, const u32* toks,
-                                           unsigned int ntok, const float* gate, float* o, double* scratch,
-                                           unsigned int stride, unsigned int nkv, unsigned int hd, unsigned int group) {
-    unsigned int h = blockIdx.x, g = h / group;
+static __device__ __forceinline__ void attention_head(const float* q, const float* kc, const float* vc, const u32* toks,
+                                                      unsigned int ntok, const float* gate, float* o, double* scratch,
+                                                      unsigned int stride, unsigned int nkv, unsigned int hd,
+                                                      unsigned int group, unsigned int h) {
+    unsigned int g = h / group;
     const float* qh = q + (u64) h * hd;
     double* sc = scratch + (u64) h * stride;
     double scale = 1.0 / sqrt((double) hd);
@@ -372,6 +455,22 @@ extern "C" __global__ void attention_heads(const float* q, const float* kc, cons
         }
         o[h * hd + j] = (float) (acc / z) * sigmoidf_ref(gate[h * hd + j]);
     }
+}
+
+extern "C" __global__ void attention_heads(const float* q, const float* kc, const float* vc, const u32* toks,
+                                           unsigned int ntok, const float* gate, float* o, double* scratch,
+                                           unsigned int stride, unsigned int nkv, unsigned int hd, unsigned int group) {
+    attention_head(q, kc, vc, toks, ntok, gate, o, scratch, stride, nkv, hd, group, blockIdx.x);
+}
+
+// Tokens j = blockIdx.y attending over positions 0 .. ntok0 + j (all of them: no sparse selection): q, gate and o rows
+// nh * hd apart, scratch rows nh * stride doubles.  grid = (nh, rows).
+extern "C" __global__ void attention_heads_rows(const float* q, const float* kc, const float* vc, unsigned int ntok0,
+                                                const float* gate, float* o, double* scratch, unsigned int stride,
+                                                unsigned int nkv, unsigned int hd, unsigned int group, unsigned int nh) {
+    const u64 j = blockIdx.y, qd = (u64) nh * hd;
+    attention_head(q + j * qd, kc, vc, nullptr, ntok0 + (unsigned int) j, gate + j * qd, o + j * qd,
+                   scratch + j * nh * stride, stride, nkv, hd, group, blockIdx.x);
 }
 
 // Softmax attention of each query head over positions start_pos .. start_pos + ntok, GQA, with a learned per-head
@@ -514,6 +613,20 @@ extern "C" __global__ void moe_combine_qwen(float* y, const float* eo, const flo
     float acc = 0.0f;
     for (unsigned int j = 0; j < k; j++) acc += w[j] * eo[(u64) j * n + i];
     y[i] = acc + sigmoidf_ref(gl[0]) * sh_eo[i];
+}
+
+// moe_combine_qwen for tokens j = blockIdx.y: y rows n apart, eo rows k * n, weights rows k, shared rows n, gate
+// logits rows 1, and token j's expert count cnt[j] (<= k).  grid = (ceil(n / 256), rows).
+extern "C" __global__ void moe_combine_qwen_rows(float* y, const float* eo, const float* w, const float* sh_eo,
+                                                 const float* gl, const unsigned int* cnt, unsigned int n, unsigned int k) {
+    const u64 j = blockIdx.y;
+    unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    const float* e = eo + j * k * n;
+    const float* wj = w + j * k;
+    float acc = 0.0f;
+    for (unsigned int t = 0; t < cnt[j]; t++) acc += wj[t] * e[(u64) t * n + i];
+    y[j * n + i] = acc + sigmoidf_ref(gl[j]) * sh_eo[j * n + i];
 }
 
 // moe_combine_qwen with eo's rows in another order: expert j's output is row perm[j] (the sum still runs over j).

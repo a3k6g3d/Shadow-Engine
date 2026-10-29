@@ -145,6 +145,8 @@ struct Bufs<'c> {
 /// token needs 5.95 experts of its 10 a layer in groups of 8, 3.60 in groups of 32, 2.51 in groups of 64.
 pub const MAX_BATCH: usize = 64;
 const COLS_MAX: usize = 8;
+/// Tokens a batched attention launch takes (its score scratch is per token).
+const ATT_ROWS: usize = 8;
 
 /// The most tokens a speculative verify pass (`step_batch_verify`) keeps the recurrences' inputs of.
 pub const MAX_VERIFY: usize = 8;
@@ -182,9 +184,13 @@ struct BatchBufs<'c> {
     alpha: DeviceBuffer<'c>,
     o: DeviceBuffer<'c>,
     qg: DeviceBuffer<'c>,
+    q: DeviceBuffer<'c>,
+    gate: DeviceBuffer<'c>,
     kk: DeviceBuffer<'c>,
     iq: DeviceBuffer<'c>,
     ao: DeviceBuffer<'c>,
+    /// attention_heads_rows' scores for ATT_ROWS tokens (heads x cap doubles each)
+    att: DeviceBuffer<'c>,
     rl: DeviceBuffer<'c>,
     sgl: DeviceBuffer<'c>,
     sg: DeviceBuffer<'c>,
@@ -264,6 +270,9 @@ pub struct GpuSession<'c, 'm> {
     /// on first use on `gstream`, which orders with the default stream.  `SHADOW_GRAPHS=0`: none.
     graphs: HashMap<(usize, bool), Graph<'c>>,
     graphs_on: bool,
+    /// Verify passes: count, tokens, seconds, of them waiting for the GPU (router reads) and the file, host seconds
+    /// in kernel launches, launches.
+    verify_stats: [f64; 7],
     /// `Tiers::tail_skip` (0: off), and how many routed experts it has skipped.
     tail_skip: usize,
     pub tail_skipped: u64,
@@ -628,6 +637,8 @@ struct GroupedPlan {
     phase: [(usize, u64, u64); 2],
     /// byte offset of the routing weights (k f32 per token, from token 0)
     weights: u64,
+    /// byte offset of each token's expert count (u32, from token 0)
+    counts: u64,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -678,8 +689,12 @@ fn grouped_plan(tops: &[Vec<(usize, f64)>], start: usize, end: usize, set: &[usi
             bytes.extend_from_slice(&w.to_le_bytes());
         }
     }
+    let counts = bytes.len() as u64;
+    for top in tops.iter().take(end) {
+        bytes.extend_from_slice(&(top.len() as u32).to_le_bytes());
+    }
     let phase = spans.map(|(n, a, r)| (n, a as u64, (rec_at + 4 * r) as u64));
-    GroupedPlan { bytes, phase, weights }
+    GroupedPlan { bytes, phase, weights, counts }
 }
 
 /// Row j of a [rows][stride] f32 buffer.
@@ -770,7 +785,7 @@ impl<'c, 'm> GpuSession<'c, 'm> {
         let bb = BatchBufs {
             r: ab(ch)?, rn: ab(ch)?, u: ab(h)?, g: ab(cs)?, y: ab(h)?, down: ab(c.hc_rank)?, up: ab(ch)?,
             qkv: ab(2 * kd + vd)?, x: ab(2 * kd + vd)?, z: ab(vd)?, beta: ab(c.ssm_v_heads)?, alpha: ab(c.ssm_v_heads)?, o: ab(vd)?,
-            qg: ab(2 * qd)?, kk: ab(kvd)?, iq: ab(c.idx_heads * id)?, ao: ab(qd)?, rl: ab(c.n_expert)?, sgl: ab(1)?,
+            qg: ab(2 * qd)?, q: ab(qd)?, gate: ab(qd)?, att: ctx.alloc(ATT_ROWS * c.n_head * cap * 8).map_err(e)?, kk: ab(kvd)?, iq: ab(c.idx_heads * id)?, ao: ab(qd)?, rl: ab(c.n_expert)?, sgl: ab(1)?,
             sg: ab(c.shared_ff)?, su: ab(c.shared_ff)?, sa: ab(c.shared_ff)?, so: ab(h)?, logits: a(COLS_MAX * c.vocab)?,
             gtab: ab(64 * k)?, eg: ab(2 * k * c.expert_ff)?, act: ab(k * c.expert_ff)?, eo: ab(k * h)?,
         };
@@ -1033,6 +1048,7 @@ impl<'c, 'm> GpuSession<'c, 'm> {
             mtp_probe: std::env::var("SHADOW_MTP_PROBE").is_ok_and(|v| v == "1").then_some((0, 0)),
             mtp,
             graphs: HashMap::new(),
+            verify_stats: [0.0; 7],
             tail_skip: tiers.tail_skip,
             tail_skipped: 0,
             graphs_on: std::env::var("SHADOW_GRAPHS").map_or(true, |v| v != "0")
@@ -1266,6 +1282,13 @@ impl<'c, 'm> GpuSession<'c, 'm> {
         // SAFETY: every pointer passed is a buffer of this session sized for the dimensions passed beside it (the
         // registry checks the argument types and count).
         unsafe { self.fw.launch(name, (grid, 1, 1), (block, 1, 1), 0, self.ls(), args) }
+            .unwrap_or_else(|err| panic!("{name}: {err}"));
+    }
+
+    /// A launch over (gx, gy) blocks: gy = the batch's rows for the `_rows` kernels.
+    fn k2(&self, name: &str, gx: u32, gy: u32, block: u32, args: &[Arg]) {
+        // SAFETY: as `k`; the `_rows` kernels' row strides are the batch buffers' (BatchBufs).
+        unsafe { self.fw.launch(name, (gx, gy, 1), (block, 1, 1), 0, self.ls(), args) }
             .unwrap_or_else(|err| panic!("{name}: {err}"));
     }
 
@@ -2356,7 +2379,23 @@ impl<'c, 'm> GpuSession<'c, 'm> {
         let p0 = self.tokens.len();
         let keep = self.batches() && (2..=MAX_VERIFY.min(self.batch_max)).contains(&tokens.len());
         self.replay.on.set(keep);
+        let (t0, w0) = (std::time::Instant::now(), self.waits);
+        let (n0, ns0) = {
+            use std::sync::atomic::Ordering::Relaxed;
+            (crate::kernels::LAUNCHES.0.load(Relaxed), crate::kernels::LAUNCHES.1.load(Relaxed))
+        };
         let out = self.step_batch(tokens);
+        {
+            use std::sync::atomic::Ordering::Relaxed;
+            let v = &mut self.verify_stats;
+            v[0] += 1.0;
+            v[1] += tokens.len() as f64;
+            v[2] += t0.elapsed().as_secs_f64();
+            v[3] += self.waits[0] - w0[0];
+            v[4] += self.waits[2] - w0[2];
+            v[5] += (crate::kernels::LAUNCHES.1.load(Relaxed) - ns0) as f64 * 1e-9;
+            v[6] += (crate::kernels::LAUNCHES.0.load(Relaxed) - n0) as f64;
+        }
         self.replay.on.set(false);
         self.replay.pass = keep.then(|| (p0, tokens.to_vec()));
         out
@@ -2587,9 +2626,8 @@ impl<'c, 'm> GpuSession<'c, 'm> {
             }
         }
         self.mv_cols(&format!("{p}_up.weight"), bb.down.ptr, rank, bb.up.ptr, ch, m);
-        for j in 0..m {
-            self.hc_mix(row(&bb.rn, ch, j), row(&bb.up, ch, j), row(&bb.u, h, j));
-        }
+        self.k2("hc_mix_rows", (h as u32).div_ceil(256), m as u32, 256, &[Arg::Ptr(bb.rn.ptr), Arg::Ptr(bb.up.ptr), Arg::Ptr(bb.u.ptr),
+                                                                         Arg::U32(h as u32), Arg::U32(cs as u32)]);
     }
 
     /// `hc_write_norm` (with the next norm) or `hc_write` (without) for the batch's m tokens.
@@ -2597,12 +2635,14 @@ impl<'c, 'm> GpuSession<'c, 'm> {
         let c = &self.m.cfg;
         let (h, cs) = (c.hidden, c.streams);
         let bb = &self.bb;
+        if let Some(n) = next_norm {
+            self.k2("hc_write_rmsnorm_rows", cs as u32, m as u32, 256, &[
+                Arg::Ptr(bb.r.ptr), Arg::Ptr(bb.g.ptr), Arg::Ptr(bb.y.ptr), Arg::Ptr(self.sv(n)), Arg::Ptr(bb.rn.ptr),
+                Arg::U32(h as u32), Arg::F32(c.eps), Arg::U32(cs as u32)]);
+            return;
+        }
         for j in 0..m {
-            let (r, g, y) = (row(&bb.r, h * cs, j), row(&bb.g, cs, j), row(&bb.y, h, j));
-            match next_norm {
-                Some(n) => self.hc_write_norm_at(n, r, g, y, row(&bb.rn, h * cs, j)),
-                None => self.hc_write_at(r, g, y),
-            }
+            self.hc_write_at(row(&bb.r, h * cs, j), row(&bb.g, cs, j), row(&bb.y, h, j));
         }
     }
 
@@ -2629,24 +2669,19 @@ impl<'c, 'm> GpuSession<'c, 'm> {
             // conv and norms token by token (the conv window moves), then the recurrence for all of them at once
             let (s, conv) = self.delta[l].as_ref().unwrap();
             let kh = c.ssm_k_heads;
-            for j in 0..m {
-                let x = row(&bb.x, ch, j);
-                self.k1("conv_silu_step", ch, &[Arg::Ptr(row(&bb.qkv, ch, j)), Arg::Ptr(conv.ptr),
-                                               Arg::Ptr(self.sv(&format!("{p}.ssm_conv1d.weight"))), Arg::Ptr(x),
-                                               Arg::U32(ch as u32), Arg::U32(c.conv_k as u32)]);
-                self.k("l2norm_qk_heads", (2 * kh) as u32, 128, &[Arg::Ptr(x), Arg::U32(kh as u32), Arg::U32(d as u32),
-                                                                Arg::F32((d as f32).sqrt())]);
-            }
+            self.k1("conv_silu_steps", ch, &[Arg::Ptr(bb.qkv.ptr), Arg::Ptr(conv.ptr),
+                                            Arg::Ptr(self.sv(&format!("{p}.ssm_conv1d.weight"))), Arg::Ptr(bb.x.ptr),
+                                            Arg::U32(ch as u32), Arg::U32(c.conv_k as u32), Arg::U32(m as u32)]);
+            self.k2("l2norm_qk_rows", (2 * kh) as u32, m as u32, 128, &[Arg::Ptr(bb.x.ptr), Arg::U32(kh as u32), Arg::U32(d as u32),
+                                                                       Arg::F32((d as f32).sqrt()), Arg::U32(ch as u32)]);
             self.k("delta_steps128", vh as u32, 128, &[
                 Arg::Ptr(bb.x.ptr), Arg::Ptr(bb.x.ptr + (kd * 4) as u64), Arg::Ptr(bb.x.ptr + (2 * kd * 4) as u64),
                 Arg::U32(ch as u32), Arg::Ptr(bb.beta.ptr), Arg::Ptr(bb.alpha.ptr), Arg::U32(vh as u32),
                 Arg::Ptr(self.sv(&format!("{p}.ssm_a"))), Arg::Ptr(self.sv(&format!("{p}.ssm_dt.bias"))), Arg::Ptr(s.ptr),
                 Arg::Ptr(bb.o.ptr), Arg::U32(vd as u32), Arg::U32(kh as u32), Arg::U32(m as u32)]);
-            for j in 0..m {
-                self.k("gated_rmsnorm_heads", vh as u32, 128, &[Arg::Ptr(row(&bb.o, vd, j)),
-                                                               Arg::Ptr(self.sv(&format!("{p}.ssm_norm.weight"))),
-                                                               Arg::Ptr(row(&bb.z, vd, j)), Arg::U32(d as u32), Arg::F32(c.eps)]);
-            }
+            self.k2("gated_rmsnorm_rows", vh as u32, m as u32, 128, &[Arg::Ptr(bb.o.ptr), Arg::Ptr(self.sv(&format!("{p}.ssm_norm.weight"))),
+                                                                     Arg::Ptr(bb.z.ptr), Arg::U32(d as u32), Arg::F32(c.eps),
+                                                                     Arg::U32(vd as u32)]);
         } else {
             for j in 0..m {
                 self.delta_mid(l, row(&bb.qkv, ch, j), row(&bb.z, vd, j), row(&bb.beta, vh, j), row(&bb.alpha, vh, j),
@@ -2673,10 +2708,40 @@ impl<'c, 'm> GpuSession<'c, 'm> {
             self.mv_cols(&format!("{p}.indexer.q_proj.weight"), bb.u.ptr, h, bb.iq.ptr, iqd, m);
             self.mv_cols(&format!("{p}.indexer.k_proj.weight"), bb.u.ptr, h, at.raw.ptr + (p0 * id * 4) as u64, id, m);
         }
-        for j in 0..m {
+        let ratio = c.compress[l].max(1);
+        if (p0 + m) / ratio <= c.idx_budget / ratio && self.trace.is_none() {
+            // no token needs the sparse selection: everything per token in one launch per step, in token order
+            let (nh, nkv, hd) = (c.n_head, c.n_kv_head, c.head_dim);
+            let (rd, th, eps) = (c.rope_dims as u32, c.rope_theta as f32, c.eps);
+            let done = self.attn[l].as_ref().unwrap().nblocks;
+            for blk in done..(p0 + m) / ratio {
+                let at = self.attn[l].as_ref().unwrap();
+                self.k("pool_block", 1, 128, &[
+                    Arg::Ptr(at.raw.ptr), Arg::Ptr(at.blocks.ptr), Arg::Ptr(self.sv(&format!("{p}.indexer.k_norm.weight"))),
+                    Arg::U32(blk as u32), Arg::U32(ratio as u32), Arg::U32(id as u32), Arg::F32(eps), Arg::U32(rd), Arg::F32(th)]);
+            }
+            self.attn[l].as_mut().unwrap().nblocks = (p0 + m) / ratio;
             let bb = &self.bb;
-            let (qg, kk, iq, ao) = (row(&bb.qg, 2 * qd, j), row(&bb.kk, kvd, j), row(&bb.iq, iqd, j), row(&bb.ao, qd, j));
-            self.attention_mid(l, p0 + j, qg, kk, iq, ao);
+            let at = self.attn[l].as_ref().unwrap();
+            self.k2("head_norm_rope_qgk_rows", (nh + nkv) as u32, m as u32, 128, &[
+                Arg::Ptr(bb.qg.ptr), Arg::Ptr(bb.q.ptr), Arg::Ptr(bb.gate.ptr), Arg::Ptr(self.sv(&format!("{p}.attn_q_norm.weight"))),
+                Arg::Ptr(bb.kk.ptr), Arg::Ptr(at.k.ptr), Arg::Ptr(self.sv(&format!("{p}.attn_k_norm.weight"))),
+                Arg::U32(nh as u32), Arg::U32(nkv as u32), Arg::U32(hd as u32), Arg::F32(eps), Arg::U32(p0 as u32),
+                Arg::U32(rd), Arg::F32(th)]);
+            for j0 in (0..m).step_by(ATT_ROWS) {
+                let n = (m - j0).min(ATT_ROWS);
+                self.k2("attention_heads_rows", nh as u32, n as u32, 256, &[
+                    Arg::Ptr(row(&bb.q, qd, j0)), Arg::Ptr(at.k.ptr), Arg::Ptr(at.v.ptr), Arg::U32((p0 + j0 + 1) as u32),
+                    Arg::Ptr(row(&bb.gate, qd, j0)), Arg::Ptr(row(&bb.ao, qd, j0)), Arg::Ptr(bb.att.ptr),
+                    Arg::U32(self.cap as u32), Arg::U32(nkv as u32), Arg::U32(hd as u32), Arg::U32((nh / nkv) as u32),
+                    Arg::U32(nh as u32)]);
+            }
+        } else {
+            for j in 0..m {
+                let bb = &self.bb;
+                let (qg, kk, iq, ao) = (row(&bb.qg, 2 * qd, j), row(&bb.kk, kvd, j), row(&bb.iq, iqd, j), row(&bb.ao, qd, j));
+                self.attention_mid(l, p0 + j, qg, kk, iq, ao);
+            }
         }
         self.mv_cols(&format!("{p}.attn_output.weight"), self.bb.ao.ptr, qd, self.bb.y.ptr, h, m);
     }
@@ -2828,12 +2893,11 @@ impl<'c, 'm> GpuSession<'c, 'm> {
                 }
                 self.routed_grouped(p, 1, start, end, &infos);
                 let bb = &self.bb;
-                for j in start..end {
-                    self.k1("moe_combine_qwen", h, &[
-                        Arg::Ptr(row(&bb.y, h, j)), Arg::Ptr(row(&bb.eo, k * h, j)), Arg::Ptr(bb.gtab.ptr + p.weights + (j * k * 4) as u64),
-                        Arg::Ptr(row(&bb.so, h, j)), Arg::Ptr(row(&bb.sgl, 1, j)), Arg::U32(h as u32),
-                        Arg::U32(tops[j].len() as u32)]);
-                }
+                self.k2("moe_combine_qwen_rows", (h as u32).div_ceil(256), (end - start) as u32, 256, &[
+                    Arg::Ptr(row(&bb.y, h, start)), Arg::Ptr(row(&bb.eo, k * h, start)),
+                    Arg::Ptr(bb.gtab.ptr + p.weights + (start * k * 4) as u64), Arg::Ptr(row(&bb.so, h, start)),
+                    Arg::Ptr(row(&bb.sgl, 1, start)), Arg::Ptr(bb.gtab.ptr + p.counts + (start * 4) as u64),
+                    Arg::U32(h as u32), Arg::U32(k as u32)]);
             } else {
                 if !copying.is_empty() {
                     let t_wait = std::time::Instant::now();
@@ -3094,6 +3158,15 @@ impl Stepper for GpuSession<'_, '_> {
                        self.ram.fill_secs, self.ram.served, self.ram.drive)
             + &self.cpu.as_ref().map(|c| format!("; CPU experts: up to {} per layer, {} computed", c.1, self.cpu_served))
                 .unwrap_or_default()
+            + &{
+                let v = &self.verify_stats;
+                if v[0] > 0.0 {
+                    let n = v[0];
+                    format!("; verify passes {:.0} ({:.1} tokens): {:.1} ms each, GPU waits {:.1} ms, file {:.1} ms, launches {:.0}                              ({:.1} ms of host)", n, v[1] / n, 1e3 * v[2] / n, 1e3 * v[3] / n, 1e3 * v[4] / n, v[6] / n, 1e3 * v[5] / n)
+                } else {
+                    String::new()
+                }
+            }
             + &(if self.tail_skip > 0 { format!("; tail skip (rank >= {}): {} routed experts skipped", self.tail_skip, self.tail_skipped) } else { String::new() })
             + &format!("; host waits per step: router {:.1} ms, copies {:.1} ms, file {:.1} ms",
                        1e3 * self.waits[0] / self.tokens.len().max(1) as f64, 1e3 * self.waits[1] / self.tokens.len().max(1) as f64,
