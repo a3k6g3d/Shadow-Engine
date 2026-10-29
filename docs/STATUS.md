@@ -624,3 +624,9 @@ Single-prompt runs, "Write a Rust function that parses a comma separated list...
   `hc_down_inject_fast_bf16` / `hc_down_inject_cols_fast_bf16` (one row a warp, dot8 / dotm); one token and a batch
   still agree bit for bit; 10/10 reference tests (the fixtures' tolerances). 2-run checks: exact +3.2%; the fastest
   mode (`--tail-skip 4 --mtp --spec 5 --verify-resident`) 30.1 -> **31.9 tok/s**, +53.9% paired over exact.
+- **Graphs for the batched step's DeltaNet segments** (one per layer x batch size x rollback flag, hc glue to router;
+  the router logits of the whole batch in one mapped read) and **grouped routed experts at one row a warp**
+  (`GROUPED_RW`: 640/2560-row experts with a few inputs need warps more than input reuse). Bit-identical (10/10).
+  2-run checks, fastest mode (`--tail-skip 4 --mtp --spec 5 --verify-resident`): 31.97 -> 32.95 (graphs) -> **34.0
+  tok/s** (one row a warp, +5.4% paired); a verify pass 78 -> 60 -> 56.6 ms for 3.4 tokens (launches 1,834 -> 1,017,
+  host time in launches 23 -> 5 ms). Prompt reading 0.024 s/token.

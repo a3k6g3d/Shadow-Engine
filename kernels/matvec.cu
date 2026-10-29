@@ -845,8 +845,9 @@ extern "C" __global__ void hc_down_inject_cols_bf16(const u8* w_down, float* dow
 // A batch's routed experts: group g = blockIdx.y is matrix wtab[g] on its own inputs.  gtab[17 g] = n (<= 8), then
 // 8 input rows and 8 output rows: input j at x + xi[j] * xs, output j at y + yi[j] * ys.  Same sums as
 // matvec_cols_m (dotm), so each one is matvec_fast_rows' on that input, bit for bit.  The inputs must be 16-byte
-// aligned with xs a multiple of 4.  Launch: block = 256 threads (32 rows), grid = (ceil(rows / 32), groups).
-template <typename Q, unsigned int M>
+// aligned with xs a multiple of 4.  Launch: block = 256 threads (8 * GROUPED_RW rows), grid = (ceil(rows / (8 *
+// GROUPED_RW)), groups).
+template <typename Q, unsigned int M, unsigned int RW>
 static __device__ __forceinline__ void grouped_m(const u8* w, const float* x, unsigned int xs, float* y,
                                                  unsigned int ys, const unsigned int* gi, unsigned int row0,
                                                  unsigned int nr, unsigned int lane, unsigned int cols) {
@@ -858,9 +859,9 @@ static __device__ __forceinline__ void grouped_m(const u8* w, const float* x, un
         xp[j] = x + (u64) gi[1 + j] * xs;
         yp[j] = y + (u64) gi[9 + j] * ys;
     }
-    float acc[COLS_ROWS][M];
+    float acc[RW][M];
 #pragma unroll
-    for (unsigned int k = 0; k < COLS_ROWS; k++)
+    for (unsigned int k = 0; k < RW; k++)
 #pragma unroll
         for (unsigned int j = 0; j < M; j++) acc[k][j] = 0.0f;
     for (unsigned int c = lane; c < cols / 8; c += 32) {
@@ -873,11 +874,11 @@ static __device__ __forceinline__ void grouped_m(const u8* w, const float* x, un
             xr[j * 8 + 4] = b.x; xr[j * 8 + 5] = b.y; xr[j * 8 + 6] = b.z; xr[j * 8 + 7] = b.w;
         }
 #pragma unroll
-        for (unsigned int k = 0; k < COLS_ROWS; k++)
+        for (unsigned int k = 0; k < RW; k++)
             if (k < nr) Fast<Q>::template dotm<M>(w + (row0 + k) * rb, c * 8, xr, 8, acc[k]);
     }
 #pragma unroll
-    for (unsigned int k = 0; k < COLS_ROWS; k++) {
+    for (unsigned int k = 0; k < RW; k++) {
         if (k >= nr) break;
 #pragma unroll
         for (unsigned int j = 0; j < M; j++) {
@@ -888,24 +889,27 @@ static __device__ __forceinline__ void grouped_m(const u8* w, const float* x, un
     }
 }
 
+#define GROUPED_RW 1
 template <typename Q>
 static __device__ __forceinline__ void grouped_rows(const u64* wtab, const unsigned int* gtab, const float* x,
                                                     unsigned int xs, float* y, unsigned int ys, unsigned int rows,
                                                     unsigned int cols) {
     const unsigned int* gi = gtab + (u64) blockIdx.y * 17;
     const u8* w = (const u8*) wtab[blockIdx.y];
-    unsigned int row0 = (blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32) * COLS_ROWS, lane = threadIdx.x % 32;
+    // one row a warp (GROUPED_RW): a routed expert has 640 or 2560 rows and a group few inputs, so the GPU needs the
+    // warps more than the input reuse of several rows a warp
+    unsigned int row0 = (blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32) * GROUPED_RW, lane = threadIdx.x % 32;
     if (row0 >= rows) return;
-    unsigned int nr = min(rows - row0, (unsigned int) COLS_ROWS);
+    unsigned int nr = min(rows - row0, (unsigned int) GROUPED_RW);
     switch (gi[0]) {
-        case 1: grouped_m<Q, 1>(w, x, xs, y, ys, gi, row0, nr, lane, cols); break;
-        case 2: grouped_m<Q, 2>(w, x, xs, y, ys, gi, row0, nr, lane, cols); break;
-        case 3: grouped_m<Q, 3>(w, x, xs, y, ys, gi, row0, nr, lane, cols); break;
-        case 4: grouped_m<Q, 4>(w, x, xs, y, ys, gi, row0, nr, lane, cols); break;
-        case 5: grouped_m<Q, 5>(w, x, xs, y, ys, gi, row0, nr, lane, cols); break;
-        case 6: grouped_m<Q, 6>(w, x, xs, y, ys, gi, row0, nr, lane, cols); break;
-        case 7: grouped_m<Q, 7>(w, x, xs, y, ys, gi, row0, nr, lane, cols); break;
-        default: grouped_m<Q, 8>(w, x, xs, y, ys, gi, row0, nr, lane, cols); break;
+        case 1: grouped_m<Q, 1, GROUPED_RW>(w, x, xs, y, ys, gi, row0, nr, lane, cols); break;
+        case 2: grouped_m<Q, 2, GROUPED_RW>(w, x, xs, y, ys, gi, row0, nr, lane, cols); break;
+        case 3: grouped_m<Q, 3, GROUPED_RW>(w, x, xs, y, ys, gi, row0, nr, lane, cols); break;
+        case 4: grouped_m<Q, 4, GROUPED_RW>(w, x, xs, y, ys, gi, row0, nr, lane, cols); break;
+        case 5: grouped_m<Q, 5, GROUPED_RW>(w, x, xs, y, ys, gi, row0, nr, lane, cols); break;
+        case 6: grouped_m<Q, 6, GROUPED_RW>(w, x, xs, y, ys, gi, row0, nr, lane, cols); break;
+        case 7: grouped_m<Q, 7, GROUPED_RW>(w, x, xs, y, ys, gi, row0, nr, lane, cols); break;
+        default: grouped_m<Q, 8, GROUPED_RW>(w, x, xs, y, ys, gi, row0, nr, lane, cols); break;
     }
 }
 

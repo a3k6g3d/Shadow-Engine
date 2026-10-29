@@ -269,6 +269,8 @@ pub struct GpuSession<'c, 'm> {
     /// hc glue, mixer and router), keyed by (layer, whether its first norm was fused into the previous write); captured
     /// on first use on `gstream`, which orders with the default stream.  `SHADOW_GRAPHS=0`: none.
     graphs: HashMap<(usize, bool), Graph<'c>>,
+    /// The same for the batched step: (layer, fused norm, tokens, keeping the rollback's inputs).
+    batch_graphs: HashMap<(usize, bool, usize, bool), Graph<'c>>,
     graphs_on: bool,
     /// BF16 / F32 matrices in the 8-at-a-time sum order the quantized ones use (vector loads; one token and a batch
     /// still agree bit for bit); `SHADOW_REF_ORDER=1`: the reference kernels' order.
@@ -1056,6 +1058,7 @@ impl<'c, 'm> GpuSession<'c, 'm> {
             mtp_probe: std::env::var("SHADOW_MTP_PROBE").is_ok_and(|v| v == "1").then_some((0, 0)),
             mtp,
             graphs: HashMap::new(),
+            batch_graphs: HashMap::new(),
             fast_order: !std::env::var("SHADOW_REF_ORDER").is_ok_and(|v| v == "1"),
             verify_stats: [0.0; 7],
             tail_skip: tiers.tail_skip,
@@ -1276,6 +1279,19 @@ impl<'c, 'm> GpuSession<'c, 'm> {
 
     /// Runs `f`'s launches as the graph `key`: captured from `f` the first time, replayed after.  `f` must launch the
     /// same kernels with the same arguments every time (no host decisions, uploads or reads inside).
+    /// `graph_segment` for the batched step's segments.
+    fn batch_graph_segment(&mut self, key: (usize, bool, usize, bool), f: impl FnOnce(&Self)) {
+        if !self.batch_graphs.contains_key(&key) {
+            self.gstream.begin_capture().unwrap();
+            self.capturing.set(true);
+            f(self);
+            self.capturing.set(false);
+            let g = self.gstream.end_capture().unwrap_or_else(|e| panic!("graph capture of layer {} x {}: {e}", key.0, key.2));
+            self.batch_graphs.insert(key, g);
+        }
+        self.batch_graphs[&key].launch(&self.gstream).unwrap();
+    }
+
     fn graph_segment(&mut self, key: (usize, bool), f: impl FnOnce(&Self)) {
         if !self.graphs.contains_key(&key) {
             self.gstream.begin_capture().unwrap();
@@ -2506,6 +2522,8 @@ impl<'c, 'm> GpuSession<'c, 'm> {
             }
         }
         let mut logs: Vec<Vec<u16>> = vec![vec![]; m];
+        let graphs = self.graphs_on && self.trace.is_none() && self.stop_after.is_none() && self.prof.is_none()
+            && self.prefetch.is_none() && self.pregate.is_none() && self.cache.slots > 0;
         let mut rn_ready = false;
         for l in 0..c.n_layer {
             if l == c.ple_layer {
@@ -2520,16 +2538,29 @@ impl<'c, 'm> GpuSession<'c, 'm> {
                 }
                 rn_ready = false;
             }
-            self.hc_read_batch(&format!("blk.{l}.hc_attn"), true, rn_ready, m);
-            if c.is_attention(l) {
-                self.attention_batch(l, p0, m);
+            if graphs && !c.is_attention(l) && l != c.ple_layer {
+                // a DeltaNet layer up to its router is the same launches for every batch of m: one graph
+                let on = self.replay.on.get();
+                self.batch_graph_segment((l, rn_ready, m, on), |s| {
+                    s.hc_read_batch(&format!("blk.{l}.hc_attn"), true, rn_ready, m);
+                    s.delta_batch(l, m);
+                    s.hc_write_batch(Some(&format!("blk.{l}.hc_ffn_norm.weight")), m);
+                    s.hc_read_batch(&format!("blk.{l}.hc_ffn"), true, true, m);
+                    s.moe_router_batch(l, m);
+                });
+                self.moe_batch(l, m, &mut logs, true);
             } else {
-                self.delta_batch(l, m);
+                self.hc_read_batch(&format!("blk.{l}.hc_attn"), true, rn_ready, m);
+                if c.is_attention(l) {
+                    self.attention_batch(l, p0, m);
+                } else {
+                    self.delta_batch(l, m);
+                }
+                self.hc_write_batch(Some(&format!("blk.{l}.hc_ffn_norm.weight")), m);
+                self.hc_read_batch(&format!("blk.{l}.hc_ffn"), true, true, m);
+                self.mark("batch: mixers, norms, hc glue");
+                self.moe_batch(l, m, &mut logs, false);
             }
-            self.hc_write_batch(Some(&format!("blk.{l}.hc_ffn_norm.weight")), m);
-            self.hc_read_batch(&format!("blk.{l}.hc_ffn"), true, true, m);
-            self.mark("batch: mixers, norms, hc glue");
-            self.moe_batch(l, m, &mut logs);
             self.mark("batch: routed experts + combine");
             let next = if l + 1 == c.ple_layer {
                 None
@@ -2772,16 +2803,27 @@ impl<'c, 'm> GpuSession<'c, 'm> {
     /// router logits, then the union of their routed experts into the VRAM cache (the misses beyond the layer's free
     /// slots into `batch_scratch`) - in groups of consecutive tokens whose misses fit together - and each token's
     /// routed experts and combine.
-    fn moe_batch(&mut self, l: usize, m: usize, logs: &mut [Vec<u16>]) {
+    /// The router (and the shared expert's gate logit) for the batch's m tokens.
+    fn moe_router_batch(&self, l: usize, m: usize) {
+        let c = &self.m.cfg;
+        let p = format!("blk.{l}");
+        let u = self.bb.u.ptr;
+        self.mv_cols(&format!("{p}.ffn_gate_inp.weight"), u, c.hidden, self.bb.rl.ptr, c.n_expert, m);
+        self.mv_cols(&format!("{p}.ffn_gate_inp_shexp.weight"), u, c.hidden, self.bb.sgl.ptr, 1, m);
+    }
+
+    /// `router_done`: `moe_router_batch` already ran (in a graph).
+    fn moe_batch(&mut self, l: usize, m: usize, logs: &mut [Vec<u16>], router_done: bool) {
         let c = &self.m.cfg;
         let p = format!("blk.{l}");
         let (h, sff, k, ne) = (c.hidden, c.shared_ff, c.n_expert_used, c.n_expert);
         let u = self.bb.u.ptr;
-        self.mv_cols(&format!("{p}.ffn_gate_inp.weight"), u, h, self.bb.rl.ptr, ne, m);
-        self.mv_cols(&format!("{p}.ffn_gate_inp_shexp.weight"), u, h, self.bb.sgl.ptr, 1, m);
-        let srcs: Vec<(u64, usize)> = (0..m).map(|j| (row(&self.bb.rl, ne, j), ne)).collect();
+        if !router_done {
+            self.moe_router_batch(l, m);
+        }
         let t_wait = std::time::Instant::now();
-        let logits = self.download_mapped(&srcs);
+        let all = self.download_mapped(&[(self.bb.rl.ptr, m * ne)]).remove(0);
+        let logits: Vec<Vec<f32>> = all.chunks(ne).map(|c| c.to_vec()).collect();
         self.waits[0] += t_wait.elapsed().as_secs_f64();
         self.mark("batch: router + logits down");
         {
@@ -2961,7 +3003,8 @@ impl<'c, 'm> GpuSession<'c, 'm> {
             // output rows), each a rows x cols matrix in the cache or the scratch slots; the rows they name are inside
             // the batch's buffers at the strides given.
             unsafe {
-                self.mvp.launch(&format!("matvec_grouped_{ty}"), (rows.div_ceil(32), count as u32, 1), (256, 1, 1), 0, self.ls(),
+                // 8 rows a block: matvec.cu's GROUPED_RW = 1
+                self.mvp.launch(&format!("matvec_grouped_{ty}"), (rows.div_ceil(8), count as u32, 1), (256, 1, 1), 0, self.ls(),
                                 &[Arg::Ptr(bb.gtab.ptr + wt), Arg::Ptr(bb.gtab.ptr + gt), Arg::Ptr(x), Arg::U32(xs as u32),
                                   Arg::Ptr(y), Arg::U32(ys as u32), Arg::U32(rows), Arg::U32(cols)])
             }
