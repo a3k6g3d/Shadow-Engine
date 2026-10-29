@@ -580,3 +580,12 @@ Single-prompt runs, "Write a Rust function that parses a comma separated list...
   **6.550**, R=7 6.600 (+0.8%), R=5 6.790 (+3.7%), R=4 7.113 (+8.6%), R=3 7.224 (+10.3%); argmax = next token 57.6-58.6%
   throughout. Speed (`bench/tail-2026-10-28`, 8 interleaved launches): exact 21.32, **R=7 24.45 (+15.9% paired), R=5
   27.78 (+29.8%), R=4 29.40 (+36.0%)**; every pair faster. Off by default.
+- **Upstream llama.cpp and ik_llama.cpp** (shallow clones `target-src-llama` cf24317 and `target-src-ik` 1c5ea12, both
+  with `qwen4exp`; built for sm_120 into `target-build-*`; `bench/engines-2026-10-29`, 2-run checks, same 6 turns):
+  upstream `-ngl 99 --n-cpu-moe 43` **15.1 tok/s**; ik with the same experts on the CPU (`-ot ...exps=CPU -dple`)
+  **16.4**, with `-ser 6,1` 16.0, with all experts on the CPU behind its GPU expert cache (`--moe-cache-mib 6000`) 16.0
+  (4000: 14.6). ik's `--n-cpu-moe` puts the CPU experts in 71 GB of pinned `CUDA_Host` buffers instead of the mmapped
+  file: available RAM fell to 1.0 GiB before `run_capped` (1 s polling) killed it; it ran afterwards under
+  `run_guard.ps1` (200 ms polling, 6 GiB floor) with `-ot ...=CPU`, which keeps the file mapped (min 8.4 GiB).
+- **Standing on this PC** (decode_warm): Strata 48.5, Strata without tail skip 36.6, **Shadow --tail-skip 4 / 5 / 7:
+  29.4 / 27.8 / 24.5, Shadow exact 21.3**, ik_llama.cpp 16.4, upstream llama.cpp 15.1, Strata's llama.cpp fork 12.8.
