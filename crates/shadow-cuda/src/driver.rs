@@ -63,6 +63,7 @@ table! {
     cuDeviceGetAttribute: fn(*mut c_int, c_int, CuDevice) = ["cuDeviceGetAttribute"];
     cuDeviceTotalMem: fn(*mut usize, CuDevice) = ["cuDeviceTotalMem_v2"];
     cuDevicePrimaryCtxRetain: fn(*mut H, CuDevice) = ["cuDevicePrimaryCtxRetain"];
+    cuDevicePrimaryCtxSetFlags: fn(CuDevice, c_uint) = ["cuDevicePrimaryCtxSetFlags_v2", "cuDevicePrimaryCtxSetFlags"];
     cuDevicePrimaryCtxRelease: fn(CuDevice) = ["cuDevicePrimaryCtxRelease_v2", "cuDevicePrimaryCtxRelease"];
     cuCtxSetCurrent: fn(H) = ["cuCtxSetCurrent"];
     cuCtxSynchronize: fn() = ["cuCtxSynchronize"];
@@ -157,6 +158,14 @@ impl Context {
         let mut dev = 0;
         call!(api, cuDeviceGet(&mut dev, ordinal))?;
         let mut ctx: H = std::ptr::null_mut();
+        // how the host waits for the GPU (every layer's router read): spin (the default here), yield, or the driver's
+        // choice - `SHADOW_SYNC=spin|yield|auto`.  A spinning wait wakes up sooner than a yielding or blocking one.
+        let flags = match std::env::var("SHADOW_SYNC").as_deref() {
+            Ok("auto") => 0,
+            Ok("yield") => 2,
+            _ => 1,
+        };
+        let _ = call!(api, cuDevicePrimaryCtxSetFlags(dev, flags)); // refused when the context is already active
         call!(api, cuDevicePrimaryCtxRetain(&mut ctx, dev))?;
         call!(api, cuCtxSetCurrent(ctx))?;
         let mut name = [0 as c_char; 256];

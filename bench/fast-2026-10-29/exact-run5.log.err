@@ -1,0 +1,3 @@
+placement: J:\Shadow\profiles\routing-6prompts.shrc, 675 tokens of routing
+shadow serve: listening on http://127.0.0.1:8091
+shadow serve: ready in 29.7 s; expert cache: 2739 slots x 1.96 MiB = 5.23 GiB; 0 hits, 0 misses (0.0% hits); 0 slice uploads; RAM tier: 15789 experts, 30.00 GiB pinned (filled in 26.3 s), misses served 0 from RAM, 0 from the file; host waits per step: router 0.0 ms, copies 0.0 ms, file 0.0 ms; kernel launches per step 0, 0.0 ms of host time in them

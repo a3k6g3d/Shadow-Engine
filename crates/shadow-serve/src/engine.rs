@@ -252,7 +252,12 @@ impl Emitter {
 /// Prompt lookup drafting: the (up to) k tokens that followed the latest earlier occurrence of the conversation's last
 /// 3 tokens, else its last 2; none without a match.
 fn lookup(hist: &[u32], k: usize) -> Vec<u32> {
-    for n in [3usize, 2] {
+    lookup_from(hist, k, &[3, 2])
+}
+
+/// `lookup` with the match lengths to try, longest first.
+fn lookup_from(hist: &[u32], k: usize, lens: &[usize]) -> Vec<u32> {
+    for &n in lens {
         if k == 0 || hist.len() <= n {
             break;
         }
@@ -346,7 +351,10 @@ fn answer<'c>(arch: &str, req: &Request, tok: &Tokenizer, sess: &mut GpuSession<
     let spec_min_p: f32 = std::env::var("SHADOW_SPEC_MIN_P").ok().and_then(|v| v.parse().ok()).unwrap_or(0.7);
     // speculation: the conversation so far (what prompt lookup drafts from), and (passes, drafted, accepted)
     let mut hist: Vec<u32> = if spec > 0 { ids.clone() } else { vec![] };
-    let mut spec_n = (0usize, 0usize, 0usize);
+    // (passes, drafted, accepted, passes drafted by lookup)
+    let mut spec_n = (0usize, 0usize, 0usize, 0usize);
+    // `SHADOW_LOOKUP_MIN=n`: the shortest repeat (in tokens) that drafts without the MTP layer; 0: never
+    let lookup_min: usize = std::env::var("SHADOW_LOOKUP_MIN").ok().and_then(|v| v.parse().ok()).unwrap_or(4);
     let mut spec_t = [0f64; 3]; // seconds drafting, checking, rolling back
     let mut snap: Option<shadow_cuda::session::Snapshot> = None;
     while n < req.max_tokens {
@@ -365,7 +373,16 @@ fn answer<'c>(arch: &str, req: &Request, tok: &Tokenizer, sess: &mut GpuSession<
             hist.push(next);
             let k = spec.min(req.max_tokens - n);
             let t_d = Instant::now();
-            let draft = if has_mtp { sess.mtp_draft(next, k, spec_min_p) } else { lookup(&hist, k) };
+            // a long repeat in the conversation drafts for free (and usually right); else the MTP layer
+            let repeat = if lookup_min > 0 { lookup_from(&hist, k, &[8, 6, lookup_min]) } else { vec![] };
+            let draft = if repeat.len() >= 2 {
+                spec_n.3 += 1;
+                repeat
+            } else if has_mtp {
+                sess.mtp_draft(next, k, spec_min_p)
+            } else {
+                lookup(&hist, k)
+            };
             spec_t[0] += t_d.elapsed().as_secs_f64();
             if draft.is_empty() {
                 *last_logits = sess.step(next);
@@ -413,8 +430,8 @@ fn answer<'c>(arch: &str, req: &Request, tok: &Tokenizer, sess: &mut GpuSession<
         *last_logits = sess.step(next);
     }
     if spec > 0 {
-        eprintln!("shadow serve: speculation: {} passes, {} of {} drafted tokens accepted, {} tokens in {:.1} s                    (drafting {:.2} s, checking {:.2} s, rolling back {:.2} s)",
-                  spec_n.0, spec_n.2, spec_n.1, n, t1.elapsed().as_secs_f64(), spec_t[0], spec_t[1], spec_t[2]);
+        eprintln!("shadow serve: speculation: {} passes ({} drafted by lookup), {} of {} drafted tokens accepted, {} tokens in {:.1} s                    (drafting {:.2} s, checking {:.2} s, rolling back {:.2} s)",
+                  spec_n.0, spec_n.3, spec_n.2, spec_n.1, n, t1.elapsed().as_secs_f64(), spec_t[0], spec_t[1], spec_t[2]);
     }
     Ok(Stats {
         prompt_tokens: ids.len(),

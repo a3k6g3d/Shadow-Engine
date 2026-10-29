@@ -272,6 +272,15 @@ pub struct GpuSession<'c, 'm> {
     /// The same for the batched step: (layer, fused norm, tokens, keeping the rollback's inputs).
     batch_graphs: HashMap<(usize, bool, usize, bool), Graph<'c>>,
     graphs_on: bool,
+    /// `SHADOW_LTIME=1`: CUDA events between a batched pass's layer segments, summed by kind in the report.
+    ltime: Option<std::cell::RefCell<Vec<(&'static str, crate::driver::Event<'c>)>>>,
+    timing_no_sync: bool,
+    /// Host seconds and calls in the n-gram rows' reads (`ple_at`).
+    ple_host: std::cell::Cell<f64>,
+    ple_calls: std::cell::Cell<u64>,
+    stale_logits: HashMap<(usize, usize), Vec<Vec<f32>>>,
+    /// `SHADOW_ZERO_COPY=1`: the single-token path's RAM-tier misses are read in place over PCIe, not copied.
+    zero_copy: bool,
     /// BF16 / F32 matrices in the 8-at-a-time sum order the quantized ones use (vector loads; one token and a batch
     /// still agree bit for bit); `SHADOW_REF_ORDER=1`: the reference kernels' order.
     fast_order: bool,
@@ -473,6 +482,8 @@ struct RamTier<'c> {
     /// Offsets in use since the copies were last waited for (a copy from them in flight, or a file read into them
     /// pending): the Clock hand must not hand them out again, even when it wraps.  Cleared by `moe` per layer.
     claimed: std::collections::HashSet<usize>,
+    /// Experts the kernels read in place (`SHADOW_ZERO_COPY=1`).
+    zc_reads: u64,
     /// Misses served from this tier, and from the file.
     served: u64,
     drive: u64,
@@ -485,7 +496,7 @@ impl<'c> RamTier<'c> {
         let mut t = RamTier {
             region: None, at: HashMap::new(), ring_by_off: HashMap::new(), ring_offs: Vec::new(),
             ring_sizes: Vec::new(), ring_owner: Vec::new(), ring_ref: Vec::new(), ring_hand: 0,
-            claimed: Default::default(), served: 0, drive: 0, fill_secs: 0.0,
+            claimed: Default::default(), zc_reads: 0, served: 0, drive: 0, fill_secs: 0.0,
         };
         if bytes == 0 {
             return Ok(t);
@@ -1058,6 +1069,12 @@ impl<'c, 'm> GpuSession<'c, 'm> {
             mtp_probe: std::env::var("SHADOW_MTP_PROBE").is_ok_and(|v| v == "1").then_some((0, 0)),
             mtp,
             graphs: HashMap::new(),
+            ltime: std::env::var("SHADOW_LTIME").is_ok_and(|v| v == "1").then(Default::default),
+            ple_host: std::cell::Cell::new(0.0),
+            ple_calls: std::cell::Cell::new(0),
+            timing_no_sync: std::env::var("SHADOW_TIMING_NO_SYNC").is_ok_and(|v| v == "1"),
+            stale_logits: HashMap::new(),
+            zero_copy: std::env::var("SHADOW_ZERO_COPY").is_ok_and(|v| v == "1"),
             batch_graphs: HashMap::new(),
             fast_order: !std::env::var("SHADOW_REF_ORDER").is_ok_and(|v| v == "1"),
             verify_stats: [0.0; 7],
@@ -1302,6 +1319,15 @@ impl<'c, 'm> GpuSession<'c, 'm> {
             self.graphs.insert(key, g);
         }
         self.graphs[&key].launch(&self.gstream).unwrap();
+    }
+
+    /// A point on the default stream for `SHADOW_LTIME`: the time since the previous point is charged to `name`.
+    fn lt_point(&self, name: &'static str) {
+        if let Some(l) = self.ltime.as_ref() {
+            let e = self.ctx.event().unwrap();
+            e.record(None).unwrap();
+            l.borrow_mut().push((name, e));
+        }
     }
 
     fn k(&self, name: &str, grid: u32, block: u32, args: &[Arg]) {
@@ -1705,8 +1731,8 @@ impl<'c, 'm> GpuSession<'c, 'm> {
             (0, 0)
         };
         unsafe {
-            self.mvp.launch(if self.fast_order { "hc_down_inject_fast_bf16" } else { "hc_down_inject_bf16" },
-                            ((r_down + r_inj).div_ceil(8), 1, 1), (256, 1, 1), 0, self.ls(), &[
+            let (entry, per_block) = if self.fast_order { ("hc_down_inject_fast_bf16", 2) } else { ("hc_down_inject_bf16", 8) };
+            self.mvp.launch(entry, ((r_down + r_inj).div_ceil(per_block), 1, 1), (256, 1, 1), 0, self.ls(), &[
                 Arg::Ptr(self.w[&format!("{p}_down.weight")].ptr), Arg::Ptr(b.down.ptr), Arg::U32(r_down),
                 Arg::Ptr(w_inj), Arg::Ptr(b.g.ptr), Arg::U32(r_inj),
                 Arg::Ptr(b.rn.ptr), Arg::U32(h * cs), Arg::F32(cs as f32),
@@ -2525,8 +2551,12 @@ impl<'c, 'm> GpuSession<'c, 'm> {
         let graphs = self.graphs_on && self.trace.is_none() && self.stop_after.is_none() && self.prof.is_none()
             && self.prefetch.is_none() && self.pregate.is_none() && self.cache.slots > 0;
         let mut rn_ready = false;
+        self.lt_point("(start)");
         for l in 0..c.n_layer {
             if l == c.ple_layer {
+                // every position's rows at once, in parallel
+                let all: Vec<i64> = (0..m).flat_map(|j| ple_rows(c, &self.tokens[..p0 + j + 1])).collect();
+                self.m.ple_prefetch(&all);
                 for j in 0..m {
                     let r = row(&self.bb.r, ch, j);
                     self.ple_at(l, p0 + j + 1, r);
@@ -2548,7 +2578,9 @@ impl<'c, 'm> GpuSession<'c, 'm> {
                     s.hc_read_batch(&format!("blk.{l}.hc_ffn"), true, true, m);
                     s.moe_router_batch(l, m);
                 });
+                self.lt_point(if graphs { "delta segment (graph)" } else { "delta segment" });
                 self.moe_batch(l, m, &mut logs, true);
+                self.lt_point("moe (router wait, fetch, experts)");
             } else {
                 self.hc_read_batch(&format!("blk.{l}.hc_attn"), true, rn_ready, m);
                 if c.is_attention(l) {
@@ -2559,7 +2591,9 @@ impl<'c, 'm> GpuSession<'c, 'm> {
                 self.hc_write_batch(Some(&format!("blk.{l}.hc_ffn_norm.weight")), m);
                 self.hc_read_batch(&format!("blk.{l}.hc_ffn"), true, true, m);
                 self.mark("batch: mixers, norms, hc glue");
+                self.lt_point(if c.is_attention(l) { "attention layer" } else { "delta segment" });
                 self.moe_batch(l, m, &mut logs, false);
+                self.lt_point("moe (router wait, fetch, experts)");
             }
             self.mark("batch: routed experts + combine");
             let next = if l + 1 == c.ple_layer {
@@ -2666,7 +2700,7 @@ impl<'c, 'm> GpuSession<'c, 'm> {
             // cs (g) floats, from row j0.
             unsafe {
                 let (entry, per_block) = if self.fast_order {
-                    ("hc_down_inject_cols_fast_bf16", 8)
+                    ("hc_down_inject_cols_fast_bf16", 2)
                 } else {
                     ("hc_down_inject_cols_bf16", cols_rows_per_block("hc_down_inject_cols_bf16", rank + r_inj as usize))
                 };
@@ -2706,30 +2740,29 @@ impl<'c, 'm> GpuSession<'c, 'm> {
         let (kd, vd) = (c.ssm_k_heads * d, vh * d);
         let ch = 2 * kd + vd;
         let bb = &self.bb;
-        self.mv_cols(&format!("{p}.attn_qkv.weight"), bb.u.ptr, h, bb.qkv.ptr, ch, m);
-        self.mv_cols(&format!("{p}.attn_gate.weight"), bb.u.ptr, h, bb.z.ptr, vd, m);
-        self.mv_cols(&format!("{p}.ssm_beta.weight"), bb.u.ptr, h, bb.beta.ptr, vh, m);
-        self.mv_cols(&format!("{p}.ssm_alpha.weight"), bb.u.ptr, h, bb.alpha.ptr, vh, m);
-        if self.replay.on.get() {
-            let qkv = self.replay.qkv.ptr + (l * MAX_VERIFY * ch * 4) as u64;
+        // a verify pass writes the recurrence's inputs straight into the rollback's slots for this layer
+        let (qkv_p, beta_p, alpha_p) = if self.replay.on.get() {
             let ba = self.replay.ba.ptr + (l * MAX_VERIFY * 2 * vh * 4) as u64;
-            for (dst, src, n) in [(qkv, bb.qkv.ptr, m * ch), (ba, bb.beta.ptr, m * vh),
-                                  (ba + (MAX_VERIFY * vh * 4) as u64, bb.alpha.ptr, m * vh)] {
-                self.k1("copy", n, &[Arg::Ptr(dst), Arg::Ptr(src), Arg::U32(n as u32)]);
-            }
-        }
+            (self.replay.qkv.ptr + (l * MAX_VERIFY * ch * 4) as u64, ba, ba + (MAX_VERIFY * vh * 4) as u64)
+        } else {
+            (bb.qkv.ptr, bb.beta.ptr, bb.alpha.ptr)
+        };
+        self.mv_cols(&format!("{p}.attn_qkv.weight"), bb.u.ptr, h, qkv_p, ch, m);
+        self.mv_cols(&format!("{p}.attn_gate.weight"), bb.u.ptr, h, bb.z.ptr, vd, m);
+        self.mv_cols(&format!("{p}.ssm_beta.weight"), bb.u.ptr, h, beta_p, vh, m);
+        self.mv_cols(&format!("{p}.ssm_alpha.weight"), bb.u.ptr, h, alpha_p, vh, m);
         if d == 128 {
             // conv and norms token by token (the conv window moves), then the recurrence for all of them at once
             let (s, conv) = self.delta[l].as_ref().unwrap();
             let kh = c.ssm_k_heads;
-            self.k1("conv_silu_steps", ch, &[Arg::Ptr(bb.qkv.ptr), Arg::Ptr(conv.ptr),
+            self.k1("conv_silu_steps", ch, &[Arg::Ptr(qkv_p), Arg::Ptr(conv.ptr),
                                             Arg::Ptr(self.sv(&format!("{p}.ssm_conv1d.weight"))), Arg::Ptr(bb.x.ptr),
                                             Arg::U32(ch as u32), Arg::U32(c.conv_k as u32), Arg::U32(m as u32)]);
             self.k2("l2norm_qk_rows", (2 * kh) as u32, m as u32, 128, &[Arg::Ptr(bb.x.ptr), Arg::U32(kh as u32), Arg::U32(d as u32),
                                                                        Arg::F32((d as f32).sqrt()), Arg::U32(ch as u32)]);
             self.k("delta_steps128", vh as u32, 128, &[
                 Arg::Ptr(bb.x.ptr), Arg::Ptr(bb.x.ptr + (kd * 4) as u64), Arg::Ptr(bb.x.ptr + (2 * kd * 4) as u64),
-                Arg::U32(ch as u32), Arg::Ptr(bb.beta.ptr), Arg::Ptr(bb.alpha.ptr), Arg::U32(vh as u32),
+                Arg::U32(ch as u32), Arg::Ptr(beta_p), Arg::Ptr(alpha_p), Arg::U32(vh as u32),
                 Arg::Ptr(self.sv(&format!("{p}.ssm_a"))), Arg::Ptr(self.sv(&format!("{p}.ssm_dt.bias"))), Arg::Ptr(s.ptr),
                 Arg::Ptr(bb.o.ptr), Arg::U32(vd as u32), Arg::U32(kh as u32), Arg::U32(m as u32)]);
             self.k2("gated_rmsnorm_rows", vh as u32, m as u32, 128, &[Arg::Ptr(bb.o.ptr), Arg::Ptr(self.sv(&format!("{p}.ssm_norm.weight"))),
@@ -2737,8 +2770,8 @@ impl<'c, 'm> GpuSession<'c, 'm> {
                                                                      Arg::U32(vd as u32)]);
         } else {
             for j in 0..m {
-                self.delta_mid(l, row(&bb.qkv, ch, j), row(&bb.z, vd, j), row(&bb.beta, vh, j), row(&bb.alpha, vh, j),
-                               row(&bb.o, vd, j));
+                self.delta_mid(l, qkv_p + (j * ch * 4) as u64, row(&bb.z, vd, j), beta_p + (j * vh * 4) as u64,
+                               alpha_p + (j * vh * 4) as u64, row(&bb.o, vd, j));
             }
         }
         self.mv_cols(&format!("{p}.ssm_out.weight"), bb.o.ptr, vd, bb.y.ptr, h, m);
@@ -2822,8 +2855,18 @@ impl<'c, 'm> GpuSession<'c, 'm> {
             self.moe_router_batch(l, m);
         }
         let t_wait = std::time::Instant::now();
-        let all = self.download_mapped(&[(self.bb.rl.ptr, m * ne)]).remove(0);
-        let logits: Vec<Vec<f32>> = all.chunks(ne).map(|c| c.to_vec()).collect();
+        // SHADOW_TIMING_NO_SYNC=1 (timing only, wrong output): last time's router logits, no wait for the GPU
+        let stale = self.timing_no_sync && self.stale_logits.get(&(l, m)).is_some();
+        let logits: Vec<Vec<f32>> = if stale {
+            self.stale_logits[&(l, m)].clone()
+        } else {
+            let all = self.download_mapped(&[(self.bb.rl.ptr, m * ne)]).remove(0);
+            let lg: Vec<Vec<f32>> = all.chunks(ne).map(|c| c.to_vec()).collect();
+            if self.timing_no_sync {
+                self.stale_logits.insert((l, m), lg.clone());
+            }
+            lg
+        };
         self.waits[0] += t_wait.elapsed().as_secs_f64();
         self.mark("batch: router + logits down");
         {
@@ -3087,6 +3130,16 @@ impl<'c, 'm> GpuSession<'c, 'm> {
                     self.cache.hits += 1;
                     hits.push((i, e, arena + self.cache.slot_offset[s]));
                 }
+                None if self.zero_copy && self.ram.at.contains_key(&(l, e)) => {
+                    // read in place over PCIe by the matvec kernels: no copy, no cache slot
+                    let off = self.ram.at[&(l, e)];
+                    self.ram.zc_reads += 1;
+                    if let Some(&r) = self.ram.ring_by_off.get(&off) {
+                        self.ram.ring_ref[r] = true;
+                    }
+                    self.ram.claimed.insert(off);
+                    hits.push((i, e, self.ram.region.as_ref().unwrap().dev_ptr + off as u64));
+                }
                 None => {
                     self.cache.misses += 1;
                     let s = self.cache.victim(l);
@@ -3164,7 +3217,12 @@ impl<'c, 'm> GpuSession<'c, 'm> {
         let p = format!("blk.{l}");
         let (h, cs) = (c.hidden, c.streams);
         let ch = h * cs;
-        let e: Vec<f32> = ple_rows(c, &self.tokens[..n]).into_iter().flat_map(|row| self.m.ple_row(row)).collect();
+        let t_ple = std::time::Instant::now();
+        let rows = ple_rows(c, &self.tokens[..n]);
+        self.m.ple_prefetch(&rows);
+        let e: Vec<f32> = rows.into_iter().flat_map(|row| self.m.ple_row(row)).collect();
+        self.ple_host.set(self.ple_host.get() + t_ple.elapsed().as_secs_f64());
+        self.ple_calls.set(self.ple_calls.get() + 1);
         let b = &self.b;
         self.upload_to(b.pe.ptr, &f32s(&e));
         self.mv_pair(&format!("{p}.ple_key.weight"), b.key.ptr, &format!("{p}.ple_value.weight"), b.val.ptr, b.pe.ptr);
@@ -3240,6 +3298,35 @@ impl Stepper for GpuSession<'_, '_> {
                     String::new()
                 }
             }
+            + &{
+                match self.ltime.as_ref() {
+                    Some(l) if l.borrow().len() > 1 => {
+                        let _ = self.ctx.synchronize();
+                        let v = l.borrow();
+                        let mut sum: Vec<(&str, f64, usize)> = vec![];
+                        for w in v.windows(2) {
+                            if w[1].0 == "(start)" {
+                                continue;
+                            }
+                            let ms = w[1].1.since(&w[0].1).unwrap_or(0.0) as f64;
+                            match sum.iter_mut().find(|x| x.0 == w[1].0) {
+                                Some(x) => { x.1 += ms; x.2 += 1; }
+                                None => sum.push((w[1].0, ms, 1)),
+                            }
+                        }
+                        let passes = v.iter().filter(|x| x.0 == "(start)").count().max(1) as f64;
+                        format!("; per batched pass: {}", sum.iter().map(|(n, ms, c)| format!("{n} {:.1} ms ({:.0}x)", ms / passes, *c as f64 / passes))
+                            .collect::<Vec<_>>().join(", "))
+                    }
+                    _ => String::new(),
+                }
+            }
+            + &(if self.ple_calls.get() > 0 {
+                format!("; n-gram rows: {:.2} ms a token on the host", 1e3 * self.ple_host.get() / self.ple_calls.get() as f64)
+            } else {
+                String::new()
+            })
+            + &(if self.zero_copy { format!("; {} experts read in place over PCIe", self.ram.zc_reads) } else { String::new() })
             + &(if self.tail_skip > 0 { format!("; tail skip (rank >= {}): {} routed experts skipped", self.tail_skip, self.tail_skipped) } else { String::new() })
             + &format!("; host waits per step: router {:.1} ms, copies {:.1} ms, file {:.1} ms",
                        1e3 * self.waits[0] / self.tokens.len().max(1) as f64, 1e3 * self.waits[1] / self.tokens.len().max(1) as f64,

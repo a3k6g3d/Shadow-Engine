@@ -455,6 +455,48 @@ impl Model {
     }
 
     /// One row of the n-gram table (ple_head_dim weights), cached in RAM.
+    /// Reads and caches the n-gram rows that are not cached yet, in parallel (a pass's rows are random places in a
+    /// 27 GB table, most of them not in the file cache: one read after another costs ~0.1 ms each).
+    pub fn ple_prefetch(&self, rows: &[i64]) {
+        let missing: Vec<i64> = match self.ple_cache.read() {
+            Ok(c) => {
+                let mut m: Vec<i64> = rows.iter().copied().filter(|r| !c.contains_key(r)).collect();
+                m.sort_unstable();
+                m.dedup();
+                m
+            }
+            Err(_) => return,
+        };
+        if missing.len() < 2 {
+            return;
+        }
+        let t = self.g.tensor("per_layer_token_embd.weight").unwrap();
+        let (be, bb) = t.ty.block().unwrap();
+        let rb = (t.dims[0] / be * bb) as usize;
+        let workers = missing.len().min(16);
+        let next = std::sync::atomic::AtomicUsize::new(0);
+        std::thread::scope(|s| {
+            for _ in 0..workers {
+                s.spawn(|| loop {
+                    let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let Some(&row) = missing.get(i) else { return };
+                    let mut b = vec![0u8; rb];
+                    if read_at(&self.files[t.shard], &mut b, t.offset + row as u64 * rb as u64).is_err() {
+                        continue;
+                    }
+                    let mut y = vec![0f32; t.dims[0] as usize];
+                    if dequantize(t.ty, &b, &mut y).is_ok() {
+                        if let Ok(mut c) = self.ple_cache.write() {
+                            if c.len() < 65536 {
+                                c.insert(row, y);
+                            }
+                        }
+                    }
+                });
+            }
+        });
+    }
+
     pub fn ple_row(&self, row: i64) -> Vec<f32> {
         if let Ok(c) = self.ple_cache.read() {
             if let Some(v) = c.get(&row) {

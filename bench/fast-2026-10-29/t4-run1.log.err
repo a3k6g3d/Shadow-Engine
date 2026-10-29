@@ -1,0 +1,10 @@
+placement: J:\Shadow\profiles\routing-6prompts.shrc, 675 tokens of routing
+shadow serve: listening on http://127.0.0.1:8091
+mtp: loaded tuned draft head from J:\Shadow\models\mtp-basalt-ft1 (~824 MB VRAM)
+shadow serve: ready in 30.1 s; expert cache: 2314 slots x 1.96 MiB = 4.43 GiB; 0 hits, 0 misses (0.0% hits); 0 slice uploads; RAM tier: 15789 experts, 30.00 GiB pinned (filled in 25.9 s), misses served 0 from RAM, 0 from the file; tail skip (rank >= 4): 0 routed experts skipped; host waits per step: router 0.0 ms, copies 0.0 ms, file 0.0 ms; kernel launches per step 0, 0.0 ms of host time in them; MTP: active (speculative decoding with tuned basalt head)
+shadow serve: speculation: 19 passes, 29 of 43 drafted tokens accepted, 48 tokens in 1.2 s                    (drafting 0.15 s, checking 1.03 s, rolling back 0.03 s)
+shadow serve: speculation: 17 passes, 36 of 57 drafted tokens accepted, 53 tokens in 1.3 s                    (drafting 0.18 s, checking 1.08 s, rolling back 0.03 s)
+shadow serve: speculation: 17 passes, 28 of 42 drafted tokens accepted, 45 tokens in 1.1 s                    (drafting 0.14 s, checking 0.96 s, rolling back 0.02 s)
+shadow serve: speculation: 34 passes, 37 of 64 drafted tokens accepted, 71 tokens in 2.0 s                    (drafting 0.22 s, checking 1.74 s, rolling back 0.03 s)
+shadow serve: speculation: 21 passes, 19 of 51 drafted tokens accepted, 40 tokens in 1.4 s                    (drafting 0.18 s, checking 1.19 s, rolling back 0.03 s)
+shadow serve: speculation: 7 passes, 5 of 15 drafted tokens accepted, 12 tokens in 0.5 s                    (drafting 0.05 s, checking 0.38 s, rolling back 0.01 s)

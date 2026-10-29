@@ -630,3 +630,24 @@ Single-prompt runs, "Write a Rust function that parses a comma separated list...
   2-run checks, fastest mode (`--tail-skip 4 --mtp --spec 5 --verify-resident`): 31.97 -> 32.95 (graphs) -> **34.0
   tok/s** (one row a warp, +5.4% paired); a verify pass 78 -> 60 -> 56.6 ms for 3.4 tokens (launches 1,834 -> 1,017,
   host time in launches 23 -> 5 ms). Prompt reading 0.024 s/token.
+
+## 2026-10-29 (late): fastest mode confirmed; zero-copy, spin-wait, hybrid drafting, the sync floor
+
+- **`bench/fast-2026-10-29`, 8 interleaved launches**: exact **20.40** tok/s; with MTP K=5 + `--verify-resident`:
+  `--tail-skip 7` 33.04 (+57.9% paired), 5: 31.79, **4: 36.22 (+66.4%, p10 +30.9%)**, 3: 31.58. Strata 48.5 (36.6
+  with its tail skip off). 23 of 40 answers differ from exact (inexact modes). Speed is not monotonic in the skip
+  rank: harder skipping lowers the drafter's acceptance (it was trained on the full model).
+- **Zero-copy PCIe reads, refuted on this PC** (`SHADOW_ZERO_COPY=1`: RAM-tier misses read in place by the matvec
+  kernels, exact): 0.115 s/token against 0.046 with copies - the kernels pull ~7 GB/s over PCIe where DMA does 22.
+  A zero-sync pass built on in-place reads would need kernels that stream experts in wide, aligned bursts first.
+- **Host waits, measured**: `SHADOW_SYNC=spin|yield|auto` (CUDA context scheduling; spin is the default now) changes
+  nothing (0.046-0.048 s/token). `SHADOW_TIMING_NO_SYNC=1` (timing only: stale routing, no router wait, no copies)
+  takes a verify pass from 55.6 to 45.2 ms - the sync and the copies are ~10 ms; **the rest is GPU kernel time and
+  launch latency**, about 4x the bandwidth roofline of the bytes the pass touches. The n-gram rows' host reads
+  (1.7 ms a token; now parallel, 0.01 ms) were hidden behind GPU work and moved nothing. A 4-warp hc down projection
+  cut that kernel 2.7x (2.05 -> 0.75 ms a token) without moving the pass either; rollback copies removed.
+- **Hybrid drafting** (a 4+ token repeat in the conversation drafts without the MTP layer): neutral on chat turns
+  (`SHADOW_LOOKUP_MIN`, default 4). `SHADOW_LTIME=1` times a batched pass by segment.
+- Next lever, for whoever continues: fewer, fatter kernels per layer (a cooperative hc block, the beta/alpha/gate
+  projections in one launch, attention without per-head double math) - the pass is GPU-bound at ~45 ms for ~4
+  positions against a ~12 ms roofline.
