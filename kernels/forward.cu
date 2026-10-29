@@ -722,3 +722,37 @@ extern "C" __global__ void argmax_subset(const float* logits, const unsigned int
         out[1] = (float) (1.0 / z);
     }
 }
+
+// argmax_subset over logits computed only for the subset: logits[i] belongs to token ids[i]; out[0] is the token id.
+extern "C" __global__ void argmax_compact(const float* logits, const unsigned int* ids, unsigned int n, float* out) {
+    __shared__ double bv[1024];
+    __shared__ unsigned int bi[1024];
+    double best = -1e300;
+    unsigned int bid = 0xffffffffu;
+    for (unsigned int i = threadIdx.x; i < n; i += blockDim.x) {
+        double v = logits[i];
+        unsigned int id = ids[i];
+        if (v > best || (v == best && id < bid)) { best = v; bid = id; }
+    }
+    bv[threadIdx.x] = best;
+    bi[threadIdx.x] = bid;
+    __syncthreads();
+    for (unsigned int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (threadIdx.x < s) {
+            double v = bv[threadIdx.x + s];
+            unsigned int id = bi[threadIdx.x + s];
+            if (v > bv[threadIdx.x] || (v == bv[threadIdx.x] && id < bi[threadIdx.x])) { bv[threadIdx.x] = v; bi[threadIdx.x] = id; }
+        }
+        __syncthreads();
+    }
+    const double top = bv[0];
+    const unsigned int tid = bi[0];
+    __syncthreads();
+    double z = 0.0;
+    for (unsigned int i = threadIdx.x; i < n; i += blockDim.x) z += exp((double) logits[i] - top);
+    z = block_sum(z);
+    if (threadIdx.x == 0) {
+        out[0] = (float) tid;
+        out[1] = (float) (1.0 / z);
+    }
+}

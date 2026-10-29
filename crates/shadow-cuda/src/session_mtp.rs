@@ -156,13 +156,31 @@ impl<'c, 'm> GpuSession<'c, 'm> {
         self.hc_write_at(b.r.ptr, b.inj2.ptr, b.y.ptr);
         // the final mixer and the main model's head, over the draft vocabulary
         self.mtp_hc_read("hyper_connection_mixer", None, false, b.sample.ptr);
-        self.mv("output.weight", b.sample.ptr, self.b.logits.ptr);
-        // the pick over the draft vocabulary on the GPU (smallest id on a tie), and its probability there
-        let (ids, n) = match &mt.draft_ids {
-            Some(d) => (d.ptr, mt.draft_vocab.as_ref().map_or(0, |v| v.len())),
-            None => (0, c.vocab),
-        };
-        self.k("argmax_subset", 1, 1024, &[Arg::Ptr(self.b.logits.ptr), Arg::Ptr(ids), Arg::U32(n as u32), Arg::Ptr(b.pick.ptr)]);
+        // the head over the draft vocabulary's rows only (when its type has the row-index kernel), the pick on the GPU
+        // (smallest id on a tie) and its probability there
+        let (t_out, _) = self.m.dense("output.weight");
+        let head_ty = t_out.ty.name().to_lowercase();
+        match (&mt.draft_ids, matches!(head_ty.as_str(), "q6_k" | "q4_k" | "iq4_xs") && self.m.scale("output.weight") == 1.0) {
+            (Some(d), true) => {
+                let n = mt.draft_vocab.as_ref().map_or(0, |v| v.len());
+                // SAFETY: n rows named by d (all < vocab) of the head as stored; sample holds t_out.dims[0] floats, logits n.
+                unsafe {
+                    self.mvp.launch(&format!("matvec_ids_{head_ty}"), ((n as u32).div_ceil(8), 1, 1), (256, 1, 1), 0, self.ls(),
+                                    &[Arg::Ptr(self.w["output.weight"].ptr), Arg::Ptr(d.ptr), Arg::Ptr(b.sample.ptr),
+                                      Arg::Ptr(self.b.logits.ptr), Arg::U32(n as u32), Arg::U32(t_out.dims[0] as u32)])
+                }
+                .unwrap_or_else(|err| panic!("mtp head: {err}"));
+                self.k("argmax_compact", 1, 1024, &[Arg::Ptr(self.b.logits.ptr), Arg::Ptr(d.ptr), Arg::U32(n as u32), Arg::Ptr(b.pick.ptr)]);
+            }
+            _ => {
+                self.mv("output.weight", b.sample.ptr, self.b.logits.ptr);
+                let (ids, n) = match &mt.draft_ids {
+                    Some(d) => (d.ptr, mt.draft_vocab.as_ref().map_or(0, |v| v.len())),
+                    None => (0, c.vocab),
+                };
+                self.k("argmax_subset", 1, 1024, &[Arg::Ptr(self.b.logits.ptr), Arg::Ptr(ids), Arg::U32(n as u32), Arg::Ptr(b.pick.ptr)]);
+            }
+        }
         let pick = self.download_mapped(&[(b.pick.ptr, 2)]).remove(0);
         Some((pick[0] as u32, pick[1]))
     }

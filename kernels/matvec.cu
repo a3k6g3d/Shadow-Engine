@@ -1024,3 +1024,19 @@ extern "C" __global__ void hc_down_inject_cols_fast_bf16(const u8* w_down, float
         }
     }
 }
+
+// matvec_fast_rows over the rows ids[i] of a matrix (the draft head: 106k of the 248k vocabulary rows): y[i] = W[ids[i]] x.
+template <typename Q>
+static __device__ __forceinline__ void matvec_ids_rows(const u8* w, const unsigned int* ids, const float* x, float* y,
+                                                       unsigned int n, unsigned int cols) {
+    unsigned int i = blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32, lane = threadIdx.x % 32;
+    if (i >= n) return;
+    const u8* r = w + (u64) ids[i] * (cols / Q::QK) * Q::BYTES;
+    float acc = 0.0f;
+    for (unsigned int c = lane; c < cols / 8; c += 32) acc += Fast<Q>::dot8(r, c * 8, x + c * 8);
+    for (int off = 16; off > 0; off >>= 1) acc += __shfl_down_sync(0xffffffffu, acc, off);
+    if (lane == 0) y[i] = acc;
+}
+extern "C" __global__ void matvec_ids_q6_k(const u8* w, const unsigned int* ids, const float* x, float* y, unsigned int n, unsigned int cols) { matvec_ids_rows<Q6K>(w, ids, x, y, n, cols); }
+extern "C" __global__ void matvec_ids_q4_k(const u8* w, const unsigned int* ids, const float* x, float* y, unsigned int n, unsigned int cols) { matvec_ids_rows<Q4K>(w, ids, x, y, n, cols); }
+extern "C" __global__ void matvec_ids_iq4_xs(const u8* w, const unsigned int* ids, const float* x, float* y, unsigned int n, unsigned int cols) { matvec_ids_rows<IQ4XS>(w, ids, x, y, n, cols); }
