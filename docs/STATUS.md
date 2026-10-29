@@ -589,3 +589,17 @@ Single-prompt runs, "Write a Rust function that parses a comma separated list...
   `run_guard.ps1` (200 ms polling, 6 GiB floor) with `-ot ...=CPU`, which keeps the file mapped (min 8.4 GiB).
 - **Standing on this PC** (decode_warm): Strata 48.5, Strata without tail skip 36.6, **Shadow --tail-skip 4 / 5 / 7:
   29.4 / 27.8 / 24.5, Shadow exact 21.3**, ik_llama.cpp 16.4, upstream llama.cpp 15.1, Strata's llama.cpp fork 12.8.
+- **AVX-512 CPU experts** (`shadow-model::cpu_expert_avx512`, the hybrid's kernels when the CPU has AVX-512 BW +
+  VBMI; `SHADOW_CPU_EXPERTS_F32=1` keeps the old AVX2 ones): int8 activations and integer dot products - Strata's
+  IQ2_S / IQ3_XXS / IQ3_S `iq_avx512.cpp` ported, plus IQ4_XS, IQ4_NL (lookup + |w| x signed y) and Q2_0 (vpermb
+  unpack, minus the activation sums); tested against `dequantize` with the quantized activations (1e-4). Real
+  experts (`cpu_expert_bench`, 14 threads): **0.088-0.136 ms an expert, 17-21 GB/s** (AVX2: 0.23-0.29 ms, 6-10 GB/s) -
+  as fast as one PCIe copy. The hybrid now runs inside the overlapped decode path (its input comes down with the
+  router logits; graphs and batched passes stay on). **Still a loss** (2-run checks): exact + 1 CPU expert a layer
+  -2.5% (4-6 threads) to -4.2% (14), 2 experts -6.7%; with `--tail-skip 4` (85% cache hits, ~1.2 misses a layer
+  left) -6.3% to -13.5%. One CPU expert saves one ~0.09 ms copy a layer, most of which already overlaps GPU work,
+  while the host waits for the CPU before the combine and the CPU's RAM reads compete with the DMA's. Opt-in.
+- **Where a tail4 step goes** (Rust prompt, 128 tokens): 33 ms a token; with every expert copy skipped
+  (`SHADOW_TIMING_NO_COPIES`, wrong output) 25 ms. Strata's 48.5 tok/s is 20.6 ms a token: single steps cannot get
+  there on copies alone; the verify pass (now ~77 ms for 3.1 positions with tail skip, against 34 ms a plain step)
+  has to get cheap. `--tail-skip 4 --mtp --spec 3`: +2.4% over tail4 alone (2-run check).

@@ -1490,7 +1490,7 @@ impl<'c, 'm> GpuSession<'c, 'm> {
         self.mark("embedding");
 
         let graphs = self.graphs_on && self.trace.is_none() && self.stop_after.is_none() && self.prof.is_none()
-            && self.cpu.is_none() && self.prefetch.is_none() && self.pregate.is_none() && self.cache.slots > 0;
+            && self.prefetch.is_none() && self.pregate.is_none() && self.cache.slots > 0;
         let mut rn_ready = false;
         for l in 0..c.n_layer {
             if self.stop_after == Some(l) {
@@ -2037,11 +2037,16 @@ impl<'c, 'm> GpuSession<'c, 'm> {
         if pf_next {
             srcs.push((self.prefetch.as_ref().unwrap().buf.ptr, c.n_expert));
         }
+        let cpu_on = !is_flint && self.cpu.is_some() && self.cache.slots > 0;
+        if cpu_on {
+            srcs.push((self.b.u.ptr, h)); // the CPU experts' input, in the same read
+        }
         let t_wait = std::time::Instant::now();
         let mut got = self.download_mapped(&srcs).into_iter();
         self.waits[0] += t_wait.elapsed().as_secs_f64();
         let logits = got.next().unwrap();
-        let next_logits = got.next();
+        let next_logits = if pf_next { got.next() } else { None };
+        let u_host = if cpu_on { got.next() } else { None };
         // Launch Qwen's shared expert on stream 0 immediately so the GPU SMs compute it while the CPU runs `route`
         // and `copy_stream` DMAs any missing routed experts.
         let sh_launched_early = !is_flint && self.prof.is_none();
@@ -2099,9 +2104,19 @@ impl<'c, 'm> GpuSession<'c, 'm> {
                 }
             }
         }
+        // --tail-skip: the low-ranked experts that are not in VRAM drop out (zero contribution, weights unchanged)
+        let mut top = top;
+        if self.tail_skip > 0 && !is_flint && self.cache.slots > 0 {
+            let before = top.len();
+            let mut i = 0;
+            top.retain(|&(e, _)| {
+                i += 1;
+                i <= self.tail_skip || self.cache.map.contains_key(&(l, e))
+            });
+            self.tail_skipped += (before - top.len()) as u64;
+        }
         // Hybrid MoE: up to `cpu_experts` of the lowest-weight misses that the RAM tier holds are computed on the CPU,
         // from the pinned bytes, while the GPU copies and runs the rest.  `top` becomes [GPU experts.., CPU experts..].
-        let mut top = top;
         let mut cpu_offs: Vec<usize> = vec![];
         if let Some(&(_, max)) = self.cpu.as_ref().filter(|_| !is_flint && self.cache.slots > 0) {
             let mut cpu_set: Vec<(usize, f64, usize)> = vec![];
@@ -2116,8 +2131,7 @@ impl<'c, 'm> GpuSession<'c, 'm> {
                 }
             }
             if !cpu_set.is_empty() {
-                let mut ub = vec![0u8; h * 4];
-                self.download(self.b.u.ptr, &mut ub);
+                let ub = u_host.clone().expect("the MoE input comes down with the router logits");
                 let base = self.ram.region.as_ref().unwrap().as_slice().as_ptr();
                 let refs: Vec<shadow_model::cpu_expert::ExpertRef> = cpu_set.iter().map(|&(_, _, off)| {
                     // SAFETY: the RAM tier holds this expert's [gate | up | down] at off, inside the region.
@@ -2129,6 +2143,7 @@ impl<'c, 'm> GpuSession<'c, 'm> {
                 for &(_, _, off) in &cpu_set {
                     if let Some(&r) = self.ram.ring_by_off.get(&off) {
                         self.ram.ring_ref[r] = true; // keep the Clock hand off it this layer
+                        self.ram.claimed.insert(off); // and this layer's file reads off its slot
                     }
                 }
                 let shape = shadow_model::cpu_expert::ExpertShape {
@@ -2137,17 +2152,17 @@ impl<'c, 'm> GpuSession<'c, 'm> {
                 let pool = &mut self.cpu.as_mut().unwrap().0;
                 // SAFETY: the region lives as long as the session, and nothing rewrites these experts' bytes before
                 // `wait` below: read_drive waits first if it is about to reuse one of their ring slots.
-                unsafe { pool.submit(&shape, refs, &floats(&ub)) };
+                unsafe { pool.submit(&shape, refs, &ub) };
                 self.cpu_served += cpu_set.len() as u64;
                 top.retain(|&(e, _)| !cpu_set.iter().any(|c| c.0 == e));
                 top.extend(cpu_set.iter().map(|&(e, w, _)| (e, w)));
                 cpu_offs = cpu_set.iter().map(|c| c.2).collect();
             }
         }
-        if !is_flint && sh_launched_early && self.cache.slots > 0 && cpu_offs.is_empty() && self.prefetch.is_none()
+        if !is_flint && sh_launched_early && self.cache.slots > 0 && self.prefetch.is_none()
             && infos[0].ty == infos[1].ty && infos[0].dims == infos[1].dims && self.overlap
         {
-            self.routed_overlapped(l, &top, &names, &infos, &sizes);
+            self.routed_overlapped(l, &top, cpu_offs.len(), &names, &infos, &sizes);
             return;
         }
         let ng = top.len() - cpu_offs.len();
@@ -2291,7 +2306,7 @@ impl<'c, 'm> GpuSession<'c, 'm> {
         }
         self.mark("routed expert matvecs");
         let b = &self.b;
-        let sh_out_ptr = b.eo.ptr + (n * h * 4) as u64;
+        let sh_out_ptr = b.eo.ptr + ((if sh_launched_early { c.n_expert_used } else { n }) * h * 4) as u64;
         if !sh_launched_early {
             let sh_act_ptr = if fuse_shexp {
                 b.act.ptr + (n * ff * 4) as u64
@@ -2332,7 +2347,7 @@ impl<'c, 'm> GpuSession<'c, 'm> {
     /// Whether `step_batch` takes this session's tokens through the layers together (else one at a time).
     fn batches(&self) -> bool {
         !(self.m.cfg.arch == "flint" || self.trace.is_some() || self.stop_after.is_some() || self.cache.slots == 0
-          || self.cpu.is_some() || self.prefetch.is_some() || self.pregate.is_some() || self.mtp_probe.is_some())
+          || self.prefetch.is_some() || self.pregate.is_some() || self.mtp_probe.is_some())
     }
 
     /// `step_batch` for a speculative verify pass (2..=MAX_VERIFY tokens): it also keeps what `rollback` needs to
@@ -2914,19 +2929,12 @@ impl<'c, 'm> GpuSession<'c, 'm> {
     /// out on copy_stream, and the default stream - not the host - waits for them before the misses run, so the host
     /// goes on queueing the layer meanwhile.  eo's rows come out resident first; the combine reads them in routing
     /// order (`perm`), so y is `moe`'s to the bit.
-    fn routed_overlapped(&mut self, l: usize, top: &[(usize, f64)], names: &[String; 3], infos: &[TensorInfo],
+    /// The last `ncpu` entries of `top` are the CPU's (submitted to the pool): their outputs come into eo after the
+    /// GPU's, before the combine.
+    fn routed_overlapped(&mut self, l: usize, top: &[(usize, f64)], ncpu: usize, names: &[String; 3], infos: &[TensorInfo],
                          sizes: &[usize]) {
-        // --tail-skip: the low-ranked experts that are not in VRAM drop out (zero contribution, weights unchanged)
-        let kept: Vec<(usize, f64)>;
-        let top = if self.tail_skip > 0 {
-            kept = top.iter().enumerate()
-                .filter(|&(i, &(e, _))| i < self.tail_skip || self.cache.map.contains_key(&(l, e)))
-                .map(|(_, &x)| x).collect();
-            self.tail_skipped += (top.len() - kept.len()) as u64;
-            &kept[..]
-        } else {
-            top
-        };
+        let all = top;
+        let top = &all[..all.len() - ncpu];
         let c = &self.m.cfg;
         let (h, ff, n) = (c.hidden, c.expert_ff, top.len());
         let arena = self.cache.arena.as_ref().unwrap().ptr;
@@ -2963,12 +2971,13 @@ impl<'c, 'm> GpuSession<'c, 'm> {
                 }
             }
         }
-        let mut perm = vec![0u32; n];
+        let mut perm: Vec<u32> = (0..all.len() as u32).collect(); // the CPU's rows follow the GPU's, in their order
         for (row, x) in hits.iter().chain(&misses).enumerate() {
             tab.extend_from_slice(&(x.2 + part[2]).to_le_bytes());
             perm[x.0] = row as u32;
         }
-        for &(_, w) in top {
+        let na = all.len();
+        for &(_, w) in all {
             tab.extend_from_slice(&(w as f32).to_le_bytes());
         }
         tab.extend(perm.iter().flat_map(|p| p.to_le_bytes()));
@@ -2996,11 +3005,15 @@ impl<'c, 'm> GpuSession<'c, 'm> {
             self.ctx.stream_wait_event(None, &self.copy_event).unwrap();
         }
         run(self, nh, misses.len());
+        if ncpu > 0 {
+            let out = self.cpu.as_mut().unwrap().0.wait();
+            self.upload_to(self.b.eo.ptr + ((na - ncpu) * h * 4) as u64, &f32s(&out));
+        }
         let b = &self.b;
         self.k1("moe_combine_qwen_perm", h, &[
-            Arg::Ptr(b.y.ptr), Arg::Ptr(b.eo.ptr), Arg::Ptr(b.tab.ptr + 24 * n as u64), Arg::Ptr(b.tab.ptr + 28 * n as u64),
+            Arg::Ptr(b.y.ptr), Arg::Ptr(b.eo.ptr), Arg::Ptr(b.tab.ptr + 24 * n as u64), Arg::Ptr(b.tab.ptr + (24 * n + 4 * na) as u64),
             // the shared expert's output is row n_expert_used of eo (`moe` launches it there), whatever n is
-            Arg::Ptr(b.eo.ptr + (c.n_expert_used * h * 4) as u64), Arg::Ptr(b.sgl.ptr), Arg::U32(h as u32), Arg::U32(n as u32)]);
+            Arg::Ptr(b.eo.ptr + (c.n_expert_used * h * 4) as u64), Arg::Ptr(b.sgl.ptr), Arg::U32(h as u32), Arg::U32(na as u32)]);
     }
 
     /// The n-gram memory at layer l, into gv (the caller adds it to r).

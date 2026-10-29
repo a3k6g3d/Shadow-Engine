@@ -244,6 +244,9 @@ struct Job {
     shape: ExpertShape,
     experts: Vec<ExpertRef>,
     x: Vec<f32>,
+    /// x as int8 blocks, when the AVX-512 kernels run (`cpu_expert_avx512`; then down quantizes each expert's act too)
+    #[cfg(target_arch = "x86_64")]
+    xq: Option<crate::cpu_expert_avx512::Q8>,
     act: Vec<std::cell::UnsafeCell<f32>>,
     out: Vec<std::cell::UnsafeCell<f32>>,
     items_a: usize,
@@ -280,6 +283,16 @@ impl Job {
                         (std::slice::from_raw_parts(ex.gate.add(r * grow), grow),
                          std::slice::from_raw_parts(ex.up.add(r * urow), urow))
                     };
+                    #[cfg(target_arch = "x86_64")]
+                    let v = match &self.xq {
+                        // SAFETY: xq exists only when the AVX-512 kernels are available; rows are whole blocks.
+                        Some(q) => unsafe {
+                            silu(crate::cpu_expert_avx512::row_dot(&self.shape.gate_ty, g, q))
+                                * crate::cpu_expert_avx512::row_dot(&self.shape.up_ty, u, q)
+                        },
+                        None => silu(row_dot(&self.shape.gate_ty, g, &self.x)) * row_dot(&self.shape.up_ty, u, &self.x),
+                    };
+                    #[cfg(not(target_arch = "x86_64"))]
                     let v = silu(row_dot(&self.shape.gate_ty, g, &self.x)) * row_dot(&self.shape.up_ty, u, &self.x);
                     // SAFETY: this item alone writes act[e * ff + r].
                     unsafe { *self.act[e * ff + r].get() = v };
@@ -294,11 +307,23 @@ impl Job {
                 let ex = self.experts[e];
                 // SAFETY: every act cell was written before done_a reached items_a (Acquire above); none is written again.
                 let a: Vec<f32> = (0..ff).map(|r| unsafe { *self.act[e * ff + r].get() }).collect();
+                #[cfg(target_arch = "x86_64")]
+                let aq = self.xq.as_ref().map(|_| {
+                    crate::cpu_expert_avx512::quantize(&a, crate::cpu_expert_avx512::act_block(&self.shape.down_ty).unwrap())
+                });
                 for r in blk * ROWS_B..((blk + 1) * ROWS_B).min(h) {
                     // SAFETY: row r of the h x ff down matrix as stored lies inside the expert's slice.
                     let d = unsafe { std::slice::from_raw_parts(ex.down.add(r * drow), drow) };
+                    #[cfg(target_arch = "x86_64")]
+                    let v = match &aq {
+                        // SAFETY: aq exists only when the AVX-512 kernels are available.
+                        Some(q) => unsafe { crate::cpu_expert_avx512::row_dot(&self.shape.down_ty, d, q) },
+                        None => row_dot(&self.shape.down_ty, d, &a),
+                    };
+                    #[cfg(not(target_arch = "x86_64"))]
+                    let v = row_dot(&self.shape.down_ty, d, &a);
                     // SAFETY: this item alone writes out[e * h + r].
-                    unsafe { *self.out[e * h + r].get() = row_dot(&self.shape.down_ty, d, &a) };
+                    unsafe { *self.out[e * h + r].get() = v };
                 }
                 self.done_b.fetch_add(1, Ordering::Release);
             } else {
@@ -306,6 +331,15 @@ impl Job {
             }
         }
     }
+}
+
+/// Whether the AVX-512 int8 kernels run this layer's experts (the CPU has them, they cover its types, gate and up
+/// take the same activation blocks, and `SHADOW_CPU_EXPERTS_F32` is not set).
+#[cfg(target_arch = "x86_64")]
+fn fast_kernels(s: &ExpertShape) -> bool {
+    use crate::cpu_expert_avx512::{act_block, available};
+    available() && std::env::var_os("SHADOW_CPU_EXPERTS_F32").is_none()
+        && act_block(&s.gate_ty).is_some() && act_block(&s.gate_ty) == act_block(&s.up_ty) && act_block(&s.down_ty).is_some()
 }
 
 struct Shared {
@@ -368,6 +402,10 @@ impl ExpertPool {
             items_b: n * shape.hidden.div_ceil(ROWS_B),
             act: (0..n * shape.ff).map(|_| std::cell::UnsafeCell::new(0.0)).collect(),
             out: (0..n * shape.hidden).map(|_| std::cell::UnsafeCell::new(0.0)).collect(),
+            #[cfg(target_arch = "x86_64")]
+            xq: fast_kernels(shape).then(|| {
+                crate::cpu_expert_avx512::quantize(x, crate::cpu_expert_avx512::act_block(&shape.gate_ty).unwrap())
+            }),
             shape: shape.clone(),
             experts,
             x: x.to_vec(),
