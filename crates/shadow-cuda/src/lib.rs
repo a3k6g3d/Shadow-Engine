@@ -3,6 +3,7 @@
 //! present.  No bindgen, no bindings crate, no nvcc, no CUDA toolkit at build time.
 
 pub mod backend;
+pub mod dflash;
 pub mod driver;
 pub mod dylib;
 pub mod kernels;

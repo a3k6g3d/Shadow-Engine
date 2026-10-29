@@ -296,7 +296,10 @@ fn answer<'c>(arch: &str, req: &Request, tok: &Tokenizer, sess: &mut GpuSession<
         let n = snap.tokens().len();
         if cached < n && n < ids.len() && ids[..n] == *snap.tokens() {
             match sess.restore(snap) {
-                Ok(()) => cached = n,
+                Ok(()) => {
+                    cached = n;
+                    sess.dflash_break();
+                }
                 Err(e) => {
                     eprintln!("shadow serve: prefix restore failed ({e}); reading the prompt");
                     sess.reset();
@@ -346,7 +349,8 @@ fn answer<'c>(arch: &str, req: &Request, tok: &Tokenizer, sess: &mut GpuSession<
     let mut finish = "length";
     // drafts from the MTP layer when it is loaded (`--mtp DIR`, 3 a pass unless --spec says), else prompt lookup
     let has_mtp = sess.mtp.is_some();
-    let spec = if has_mtp && spec == 0 { 3 } else { spec };
+    let has_df = sess.dflash.is_some();
+    let spec = if has_df && spec == 0 { 3 } else if has_mtp && spec == 0 { 3 } else { spec };
     // a chain stops after a draft the layer is less sure of than this (`SHADOW_SPEC_MIN_P`)
     let spec_min_p: f32 = std::env::var("SHADOW_SPEC_MIN_P").ok().and_then(|v| v.parse().ok()).unwrap_or(0.7);
     // speculation: the conversation so far (what prompt lookup drafts from), and (passes, drafted, accepted)
@@ -355,6 +359,10 @@ fn answer<'c>(arch: &str, req: &Request, tok: &Tokenizer, sess: &mut GpuSession<
     let mut spec_n = (0usize, 0usize, 0usize, 0usize);
     // `SHADOW_LOOKUP_MIN=n`: the shortest repeat (in tokens) that drafts without the MTP layer; 0: never
     let lookup_min: usize = std::env::var("SHADOW_LOOKUP_MIN").ok().and_then(|v| v.parse().ok()).unwrap_or(4);
+    // per draft position: (tried, right)
+    let mut spec_pos = [(0usize, 0usize); 8];
+    // `--dflash-min-p`: the DFlash chain stops after a draft the selector gives less than this
+    let df_min_p: f32 = sess.dflash.as_ref().map_or(0.0, |d| d.min_p);
     let mut spec_t = [0f64; 3]; // seconds drafting, checking, rolling back
     let mut snap: Option<shadow_cuda::session::Snapshot> = None;
     while n < req.max_tokens {
@@ -378,6 +386,9 @@ fn answer<'c>(arch: &str, req: &Request, tok: &Tokenizer, sess: &mut GpuSession<
             let draft = if repeat.len() >= 2 {
                 spec_n.3 += 1;
                 repeat
+            } else if has_df {
+                let d = sess.dflash_draft(next, k, df_min_p);
+                if d.is_empty() && has_mtp { sess.mtp_draft(next, k, spec_min_p) } else { d }
             } else if has_mtp {
                 sess.mtp_draft(next, k, spec_min_p)
             } else {
@@ -400,12 +411,14 @@ fn answer<'c>(arch: &str, req: &Request, tok: &Tokenizer, sess: &mut GpuSession<
             let mut keep = 1; // the tokens of `batch` the session keeps
             let mut cancelled = false;
             for (i, &d) in draft.iter().enumerate() {
+                spec_pos[i.min(7)].0 += 1;
                 // a stop token is left for the top of the loop to see, as without speculation
                 if argmax(&outs[i]) != d || tok.is_eog(d) || stops.contains(&d) {
                     break;
                 }
                 n += 1;
                 keep += 1;
+                spec_pos[i.min(7)].1 += 1;
                 hist.push(d);
                 if !em.push(tok, d, think_end, &req.tx) {
                     cancelled = true;
@@ -432,6 +445,9 @@ fn answer<'c>(arch: &str, req: &Request, tok: &Tokenizer, sess: &mut GpuSession<
     if spec > 0 {
         eprintln!("shadow serve: speculation: {} passes ({} drafted by lookup), {} of {} drafted tokens accepted, {} tokens in {:.1} s                    (drafting {:.2} s, checking {:.2} s, rolling back {:.2} s)",
                   spec_n.0, spec_n.3, spec_n.2, spec_n.1, n, t1.elapsed().as_secs_f64(), spec_t[0], spec_t[1], spec_t[2]);
+    }
+    if spec > 0 {
+        eprintln!("shadow serve: draft position right/tried: {}", spec_pos.iter().map(|p| format!("{}/{}", p.1, p.0)).collect::<Vec<_>>().join(" "));
     }
     Ok(Stats {
         prompt_tokens: ids.len(),

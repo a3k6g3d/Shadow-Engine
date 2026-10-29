@@ -23,6 +23,8 @@ use std::collections::{BTreeMap, HashMap};
 
 #[path = "session_mtp.rs"]
 mod mtp_layer;
+#[path = "session_dflash.rs"]
+mod dflash_layer;
 
 struct Attn<'c> {
     k: DeviceBuffer<'c>,
@@ -262,6 +264,8 @@ pub struct GpuSession<'c, 'm> {
     /// `SHADOW_MTP_PROBE=1` with `--mtp`: every step drafts first and counts (drafts, hits) against its own argmax.
     mtp_probe: Option<(u64, u64)>,
     pub mtp: Option<crate::mtp::MtpModel<'c>>,
+    /// The DFlash 2 drafter (`--dflash DIR`).
+    pub dflash: Option<crate::dflash::DflashModel<'c>>,
     /// The most tokens `step_batch` takes through the layers together: `MAX_BATCH`, or `SHADOW_BATCH=n` (1: one token
     /// at a time, for comparisons).
     pub batch_max: usize,
@@ -411,6 +415,10 @@ pub struct Tiers {
     pub order: Option<Vec<(usize, usize)>>,
     /// Path to tuned MTP head directory (e.g. models/mtp-basalt-ft1).
     pub mtp_dir: Option<std::path::PathBuf>,
+    /// `--dflash DIR`: the DFlash 2 drafter (models/dflash2).
+    pub dflash_dir: Option<std::path::PathBuf>,
+    /// `--dflash-min-p P`: a DFlash chain stops after a draft the selector gives less than P (default 0: all).
+    pub dflash_min_p: f32,
     /// Hybrid MoE: up to this many of a layer's misses that the RAM tier holds are computed on the CPU instead of
     /// copied to the GPU (0: off), on `cpu_threads` workers.
     pub cpu_experts: usize,
@@ -463,7 +471,9 @@ impl Tiers {
         let num = |f: &str, d: usize| -> Result<usize, String> {
             flag(f).map_or(Ok(d), |v| v.parse().map_err(|_| format!("{f}: not a number: {v}")))
         };
-        Ok(Tiers { vram_cache: gib("--expert-cache-gib")?, ram_bytes, ram_auto, order, mtp_dir,
+        let dflash_dir = flag("--dflash").filter(|p| p.as_str() != "off").map(std::path::PathBuf::from);
+        Ok(Tiers { vram_cache: gib("--expert-cache-gib")?, ram_bytes, ram_auto, order, mtp_dir, dflash_dir,
+                   dflash_min_p: flag("--dflash-min-p").and_then(|v| v.parse().ok()).unwrap_or(0.0),
                    cpu_experts: num("--cpu-experts", 0)?, cpu_threads: num("--cpu-threads", 8)?,
                    pregate: num("--pregate", 0)?,
                    tail_skip: num("--tail-skip", 0)?,
@@ -857,6 +867,21 @@ impl<'c, 'm> GpuSession<'c, 'm> {
             None => None,
         };
 
+        let dflash = match tiers.dflash_dir.as_ref() {
+            Some(p) => match crate::dflash::DflashModel::load(ctx, p, cap) {
+                Ok(mut m) => {
+                    m.min_p = tiers.dflash_min_p;
+                    eprintln!("dflash: loaded the drafter from {} (~1.2 GB VRAM)", p.display());
+                    Some(m)
+                }
+                Err(err) => {
+                    eprintln!("dflash: warning: failed to load {}: {err}", p.display());
+                    None
+                }
+            },
+            None => None,
+        };
+
         // the expert cache: partitioned per layer at each layer's exact expert size (0 internal fragmentation) when
         // the budget covers at least `n_expert_used` slots per MoE layer, otherwise uniform `slot_bytes` slots.
         let per = |name: String| m.g.tensor(&name).map(|t| (t.nbytes() / t.dims[2]) as usize).unwrap_or(0);
@@ -1075,6 +1100,7 @@ impl<'c, 'm> GpuSession<'c, 'm> {
             },
             mtp_probe: std::env::var("SHADOW_MTP_PROBE").is_ok_and(|v| v == "1").then_some((0, 0)),
             mtp,
+            dflash,
             graphs: HashMap::new(),
             multi: HashMap::new(),
             fuse: tiers.fuse.or_else(|| std::env::var("SHADOW_FUSE").ok().and_then(|v| v.parse().ok())).unwrap_or(0),
@@ -1631,9 +1657,15 @@ impl<'c, 'm> GpuSession<'c, 'm> {
                 rn_ready = true;
             }
             self.rec(format!("layer{l}.out"), self.b.r.ptr, h * cs);
+            if self.dflash.is_some() {
+                self.df_capture(l, self.b.r.ptr, 1);
+            }
         }
         if self.mtp.is_some() {
             self.mtp_observe(self.b.r.ptr, &[token], self.tokens.len() - 1);
+        }
+        if self.dflash.is_some() {
+            self.dflash_observe(1, self.tokens.len() - 1);
         }
         if !with_logits {
             return vec![];
@@ -2646,12 +2678,18 @@ impl<'c, 'm> GpuSession<'c, 'm> {
             };
             self.hc_write_batch(next.as_deref(), m);
             rn_ready = next.is_some();
+            if self.dflash.is_some() {
+                self.df_capture(l, self.bb.r.ptr, m);
+            }
         }
         if let Some((_, log)) = self.route_log.as_mut() {
             log.extend(logs.into_iter().flatten());
         }
         if self.mtp.is_some() {
             self.mtp_observe(self.bb.r.ptr, toks, p0);
+        }
+        if self.dflash.is_some() {
+            self.dflash_observe(m, p0);
         }
         if !with_logits {
             return vec![];

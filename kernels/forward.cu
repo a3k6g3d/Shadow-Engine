@@ -818,3 +818,230 @@ extern "C" __global__ void argmax_compact(const float* logits, const unsigned in
         out[1] = (float) (1.0 / z);
     }
 }
+
+// ------------------------------------------------------------------------------------------------ DFlash 2 drafter
+// A 5-layer block-diffusion drafter (docs/STATUS.md): BF16 weights (the top 16 bits of a float), float activations.
+static __device__ __forceinline__ float bf16f(const unsigned short* p, u64 i) { return __uint_as_float(((unsigned int) p[i]) << 16); }
+
+// feat[row][slot * h + i] = mean over the cs streams of the residual r[row][s * h + i]; grid = (ceil(h / 256), rows)
+extern "C" __global__ void df_capture(const float* r, float* feat, unsigned int slot, unsigned int h, unsigned int cs,
+                                      unsigned int nfeat) {
+    unsigned int i = blockIdx.x * blockDim.x + threadIdx.x, j = blockIdx.y;
+    if (i >= h) return;
+    const float* rj = r + (u64) j * h * cs;
+    float s = 0.0f;
+    for (unsigned int k = 0; k < cs; ++k) s += rj[(u64) k * h + i];
+    feat[(u64) j * nfeat + slot * h + i] = s / (float) cs;
+}
+
+// y[row] = rmsnorm(x[row]) * w (BF16, shared by the rows); grid = rows, block 256.  In place is fine.
+extern "C" __global__ void df_rmsnorm(const float* x, const unsigned short* w, float* y, unsigned int n, float eps) {
+    const float* xr = x + (u64) blockIdx.x * n;
+    float* yr = y + (u64) blockIdx.x * n;
+    double ss = 0.0;
+    for (unsigned int i = threadIdx.x; i < n; i += blockDim.x) ss += (double) xr[i] * (double) xr[i];
+    double r = 1.0 / sqrt(block_sum(ss) / (double) n + (double) eps);
+    for (unsigned int i = threadIdx.x; i < n; i += blockDim.x) yr[i] = (float) ((double) xr[i] * r) * bf16f(w, i);
+}
+
+// res[row] += d[row]; y[row] = rmsnorm(res[row]) * w; grid = rows, block 256
+extern "C" __global__ void df_add_rmsnorm(float* res, const float* d, const unsigned short* w, float* y, unsigned int n,
+                                          float eps) {
+    float* rr = res + (u64) blockIdx.x * n;
+    const float* dr = d + (u64) blockIdx.x * n;
+    float* yr = y + (u64) blockIdx.x * n;
+    double ss = 0.0;
+    for (unsigned int i = threadIdx.x; i < n; i += blockDim.x) {
+        float v = rr[i] + dr[i];
+        rr[i] = v;
+        ss += (double) v * (double) v;
+    }
+    double r = 1.0 / sqrt(block_sum(ss) / (double) n + (double) eps);
+    for (unsigned int i = threadIdx.x; i < n; i += blockDim.x) yr[i] = (float) ((double) rr[i] * r) * bf16f(w, i);
+}
+
+// The grouped dynamic 2-tap convolution along a block's rows (DFlashGroupedConv): with the kernel projection's output
+// delta (row t at delta + t * 4 * ngroups: [side][tap][group]) and base [side][tap][channel],
+// y[t][c] = (base0[c] + d0[g]) x[t][c] + (t >= 1) (base1[c] + d1[g]) x[t-1][c], g = c / group.  grid = (ceil(h / 256), rows)
+extern "C" __global__ void df_conv(const float* x, const float* delta, const unsigned short* base, float* y, unsigned int side,
+                                   unsigned int h, unsigned int group, unsigned int ngroups) {
+    unsigned int c = blockIdx.x * blockDim.x + threadIdx.x, t = blockIdx.y;
+    if (c >= h) return;
+    unsigned int g = c / group;
+    const float* d = delta + (u64) t * (4 * ngroups) + side * 2 * ngroups;
+    float c0 = bf16f(base, (u64) (side * 2 + 0) * h + c) + d[g];
+    float out = c0 * x[(u64) t * h + c];
+    if (t >= 1) {
+        float c1 = bf16f(base, (u64) (side * 2 + 1) * h + c) + d[ngroups + g];
+        out += c1 * x[(u64) (t - 1) * h + c];
+    }
+    y[(u64) t * h + c] = out;
+}
+
+// NeoX RoPE over full 128-wide heads, row j at position pos0 + j; grid = (heads, rows), block 64
+extern "C" __global__ void df_rope(float* x, unsigned int pos0, unsigned int stride, float theta) {
+    float* xr = x + (u64) blockIdx.y * stride + blockIdx.x * 128;
+    unsigned int i = threadIdx.x;
+    float f = (float) (pos0 + blockIdx.y) * powf(theta, -(float) i / 64.0f);
+    float cs, sn;
+    sincosf(f, &sn, &cs);
+    float a = xr[i], b = xr[i + 64];
+    xr[i] = a * cs - b * sn;
+    xr[i + 64] = b * cs + a * sn;
+}
+
+// ring[((pos0 + j) % cap) * width ..] = src[j * width ..]; grid = (ceil(width / 256), rows)
+extern "C" __global__ void df_ring_put(const float* src, float* ring, unsigned int pos0, unsigned int cap, unsigned int width) {
+    unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= width) return;
+    ring[(u64) ((pos0 + blockIdx.y) % cap) * width + i] = src[(u64) blockIdx.y * width + i];
+}
+
+// g[i] = silu(g[i]) * u[i]
+extern "C" __global__ void df_silu_mul(float* g, const float* u, unsigned int n) {
+    unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) g[i] = siluf_ref(g[i]) * u[i];
+}
+
+// Attention of the block's `rows` queries (32 heads of 128, 8 KV heads of 128) over the keys of positions
+// [max(0, qpos + 1 - window), n + rows) kept in the rings (position p in slot p % ring): the block sees all of itself.
+// grid = (32, rows), block 128, dynamic shared = (window + rows) floats
+extern "C" __global__ void df_attention(const float* q, const float* kc, const float* vc, float* out, unsigned int n,
+                                        unsigned int rows, unsigned int window, unsigned int ring, float scale) {
+    extern __shared__ float sc[];
+    __shared__ float qv[128];
+    __shared__ float red[128];
+    unsigned int h = blockIdx.x, t = blockIdx.y, kvh = h / 4, d = threadIdx.x;
+    unsigned int qpos = n + t, hi = n + rows - 1;
+    unsigned int lo = qpos + 1 > window ? qpos + 1 - window : 0;
+    qv[d] = q[(u64) t * 4096 + h * 128 + d];
+    __syncthreads();
+    unsigned int len = hi - lo + 1;
+    unsigned int warp = d / 32, lane = d % 32;
+    for (unsigned int j = warp; j < len; j += 4) {
+        const float* kr = kc + (u64) ((lo + j) % ring) * 1024 + kvh * 128;
+        float s = 0.0f;
+        for (unsigned int i = lane; i < 128; i += 32) s += qv[i] * kr[i];
+        for (int off = 16; off > 0; off >>= 1) s += __shfl_down_sync(0xffffffffu, s, off);
+        if (lane == 0) sc[j] = s * scale;
+    }
+    __syncthreads();
+    float mx = -3.0e38f;
+    for (unsigned int j = d; j < len; j += 128) mx = fmaxf(mx, sc[j]);
+    red[d] = mx;
+    __syncthreads();
+    for (unsigned int s = 64; s > 0; s >>= 1) {
+        if (d < s) red[d] = fmaxf(red[d], red[d + s]);
+        __syncthreads();
+    }
+    mx = red[0];
+    __syncthreads();
+    float sm = 0.0f;
+    for (unsigned int j = d; j < len; j += 128) {
+        float e = expf(sc[j] - mx);
+        sc[j] = e;
+        sm += e;
+    }
+    red[d] = sm;
+    __syncthreads();
+    for (unsigned int s = 64; s > 0; s >>= 1) {
+        if (d < s) red[d] += red[d + s];
+        __syncthreads();
+    }
+    sm = red[0];
+    float acc = 0.0f;
+    for (unsigned int j = 0; j < len; ++j) acc += sc[j] * vc[(u64) ((lo + j) % ring) * 1024 + kvh * 128 + d];
+    out[(u64) t * 4096 + h * 128 + d] = acc / sm;
+}
+
+// The 16 largest of each row of logits (vocab values, rows ls apart), largest first, ties to the lower id.
+// grid = rows, block 256.
+extern "C" __global__ void df_top16(const float* logits, unsigned int vocab, unsigned int ls, unsigned int* ids, float* vals) {
+    __shared__ float sv[256 * 16];
+    __shared__ unsigned int si[256 * 16];
+    __shared__ unsigned int pos[256];
+    __shared__ float bv[256];
+    __shared__ unsigned int bi[256], bt[256];
+    const float* row = logits + (u64) blockIdx.x * ls;
+    float lv[16];
+    unsigned int li[16];
+#pragma unroll
+    for (int k = 0; k < 16; ++k) { lv[k] = -3.0e38f; li[k] = 0xffffffffu; }
+    for (unsigned int i = threadIdx.x; i < vocab; i += 256) {
+        float v = row[i];
+        if (v > lv[15]) {
+            lv[15] = v;
+            li[15] = i;
+#pragma unroll
+            for (int k = 15; k > 0; --k) {
+                if (lv[k] > lv[k - 1]) {
+                    float tv = lv[k]; lv[k] = lv[k - 1]; lv[k - 1] = tv;
+                    unsigned int ti = li[k]; li[k] = li[k - 1]; li[k - 1] = ti;
+                }
+            }
+        }
+    }
+#pragma unroll
+    for (int k = 0; k < 16; ++k) { sv[threadIdx.x * 16 + k] = lv[k]; si[threadIdx.x * 16 + k] = li[k]; }
+    pos[threadIdx.x] = 0;
+    __syncthreads();
+    for (int r = 0; r < 16; ++r) {
+        unsigned int p = pos[threadIdx.x];
+        bv[threadIdx.x] = p < 16 ? sv[threadIdx.x * 16 + p] : -3.0e38f;
+        bi[threadIdx.x] = p < 16 ? si[threadIdx.x * 16 + p] : 0xffffffffu;
+        bt[threadIdx.x] = threadIdx.x;
+        __syncthreads();
+        for (unsigned int s = 128; s > 0; s >>= 1) {
+            if (threadIdx.x < s) {
+                float a = bv[threadIdx.x], b = bv[threadIdx.x + s];
+                unsigned int ia = bi[threadIdx.x], ib = bi[threadIdx.x + s];
+                if (b > a || (b == a && ib < ia)) {
+                    bv[threadIdx.x] = b; bi[threadIdx.x] = ib; bt[threadIdx.x] = bt[threadIdx.x + s];
+                }
+            }
+            __syncthreads();
+        }
+        if (threadIdx.x == 0) {
+            ids[blockIdx.x * 16 + r] = bi[0];
+            vals[blockIdx.x * 16 + r] = bv[0];
+            pos[bt[0]] += 1;
+        }
+        __syncthreads();
+    }
+}
+
+// The selector's greedy walk (DFlash2's CandidateSelector): slots e = 0 .. slots-1, 16 candidates cand[e][c] with
+// logits unary[e][c] and projected hidden hp[e][rank].  Slot e scores candidate c as
+//   unary[e][c] + < pred[p_e] * hp[e], succ[cand[e][c]] >,   p_0 = anchor, p_e = the token chosen for slot e - 1,
+// and takes the best.  One block of 512 threads (a warp a candidate); out[e] = the token chosen, out[slots + e] = the
+// float bits of its probability among the 16 (softmax of the scores).
+extern "C" __global__ void df_walk(const unsigned int* cand, const float* unary, const float* hp, const unsigned short* pred,
+                                   const unsigned short* succ, unsigned int anchor, unsigned int slots, unsigned int rank,
+                                   unsigned int* out) {
+    __shared__ float score[16];
+    __shared__ float pv[256];
+    __shared__ unsigned int ptok;
+    unsigned int warp = threadIdx.x / 32, lane = threadIdx.x % 32;
+    if (threadIdx.x == 0) ptok = anchor;
+    __syncthreads();
+    for (unsigned int e = 0; e < slots; ++e) {
+        for (unsigned int i = threadIdx.x; i < rank; i += 512) pv[i] = bf16f(pred, (u64) ptok * rank + i) * hp[e * rank + i];
+        __syncthreads();
+        unsigned int tok = cand[e * 16 + warp];
+        float s = 0.0f;
+        for (unsigned int i = lane; i < rank; i += 32) s += pv[i] * bf16f(succ, (u64) tok * rank + i);
+        for (int off = 16; off > 0; off >>= 1) s += __shfl_down_sync(0xffffffffu, s, off);
+        if (lane == 0) score[warp] = unary[e * 16 + warp] + s;
+        __syncthreads();
+        if (threadIdx.x == 0) {
+            unsigned int best = 0;
+            for (unsigned int c = 1; c < 16; ++c) if (score[c] > score[best]) best = c;
+            ptok = cand[e * 16 + best];
+            out[e] = ptok;
+            float z = 0.0f;
+            for (unsigned int c = 0; c < 16; ++c) z += expf(score[c] - score[best]);
+            out[slots + e] = __float_as_uint(1.0f / z);
+        }
+        __syncthreads();
+    }
+}

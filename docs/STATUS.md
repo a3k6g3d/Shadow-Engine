@@ -677,3 +677,21 @@ Single-prompt runs, "Write a Rust function that parses a comma separated list...
   output bit-identical to the unfused path). Paired vs no fusion, 20 pairs: fuse 0 **+0.3%** (tie, the noise floor is
   0.4-0.6%), fuse 7 **-1.1%**. The launch count is not what the pass waits for; **default is off**, kept opt-in.
 - The PLE (n-gram memory) rows are prefetched one layer ahead (`ple_prefetch`).
+
+## 2026-10-29 (night): DFlash 2 drafter ported (`--dflash models/dflash2`)
+
+- The 5-layer block-diffusion drafter (SGLang's DFlash2DraftModel; weights `models/dflash2/model.safetensors`, 1.2 GB BF16 in
+  VRAM; `crates/shadow-cuda/src/dflash.rs`, `session_dflash.rs`, `df_*` kernels in `kernels/forward.cu`). Features: the mean
+  over the 4 hyper-connection streams of layers 5/15/25/35/45's outputs, for every position the main model reads (also in
+  prefill); `fc` + `hidden_norm` -> per-layer K/V rings (window 2048); a draft round runs the anchor + 7 mask tokens through
+  the layers (grouped dynamic convs, non-causal attention over context + block), takes 16 candidates a slot from the main
+  model's own head (`df_top16`), and walks the selector's bilinear edge scores greedily (`df_walk`). ~8 ms a round.
+- Checked against a CPU torch rebuild (`tools/dflash2_ref.py`, with `SHADOW_DF_DUMP=dir`): block hidden max abs error 6e-5
+  (relative 1e-6), selector walk identical. Exactness of answers is the verify pass's, as with MTP.
+- Acceptance is deeper than MTP's chain (draft position right/tried on one run: 15/22 9/15 4/9 2/4 2/2 1/2 1/1), but a
+  7-draft pass costs ~73 ms, so speed needs a short block: fastest mode (`--tail-skip 4 --verify-resident`, 3 runs each,
+  6 chat turns): MTP `--spec 5` 38.9 tok/s; DFlash `--spec 2` 38.8, **`--spec 3` 39.8 (+2.2%, floor 0.6%)**, `--spec 4`
+  36.7, `--spec 5` 38.6, `--spec 7` 30-32. Stopping a 7-draft chain at a selector probability (`--dflash-min-p`): 0.3
+  31.7, 0.5 38.1, 0.7 38.5, 0.85 35.8 - no better than a fixed 3. **Default with `--dflash`: 3 drafts.**
+- After a prefix-snapshot restore the drafter has no features for the restored positions, so it drafts nothing until a
+  conversation starts from position 0 (the MTP head then drafts if loaded).
