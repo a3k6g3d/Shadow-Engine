@@ -666,3 +666,14 @@ Single-prompt runs, "Write a Rust function that parses a comma separated list...
   20.8 and Strata 48.5. The pass is GPU-bound (~45 ms for ~4 positions with sync and copies removed); remaining
   candidates: merging the projections of one input into a launch (4 in a DeltaNet layer, 5 in attention), a fused
   hc up-projection + mix, hc matrices in a narrower type.
+
+## 2026-10-29 (late night): fusions are a tie, float `expf`, PLE prefetch
+
+- Float `expf` for the DeltaNet decay and the decay's float runs: fastest mode 36.2 -> **38.9 tok/s** (4 runs, paired
+  vs the previous build; answers unchanged on the bench turns).
+- Kernel fusions (`--fuse N` / `SHADOW_FUSE`, bits: 1 `matvec_cols_multi` for a DeltaNet layer's qkv/gate/beta/alpha, the
+  router + shared-expert gate, and the shared expert's gate/up after the router read; 2 `hc_up_mix_cols`, the hc
+  up-projection + mix in one launch; 4 `delta_steps128_gn`, the gated RMSNorm folded into the DeltaNet kernel; every
+  output bit-identical to the unfused path). Paired vs no fusion, 20 pairs: fuse 0 **+0.3%** (tie, the noise floor is
+  0.4-0.6%), fuse 7 **-1.1%**. The launch count is not what the pass waits for; **default is off**, kept opt-in.
+- The PLE (n-gram memory) rows are prefetched one layer ahead (`ple_prefetch`).

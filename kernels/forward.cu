@@ -5,9 +5,10 @@
 // fixtures stream by stream.  Kernels take no doubles as arguments (the launcher has none); positions are u32 and the
 // RoPE base is passed as a float (1e7 is exact in float).
 
-static __device__ __forceinline__ float sigmoidf_ref(float x) { return (float) (1.0 / (1.0 + exp(-(double) x))); }
+// float transcendentals (expf, log1pf): FP64 is 1/64 rate on this GPU, and expf is good to ~1e-7 relative
+static __device__ __forceinline__ float sigmoidf_ref(float x) { return 1.0f / (1.0f + expf(-x)); }
 static __device__ __forceinline__ float siluf_ref(float x) { return x * sigmoidf_ref(x); }
-static __device__ __forceinline__ float softplusf_ref(float x) { return x > 20.0f ? x : (float) log1p(exp((double) x)); }
+static __device__ __forceinline__ float softplusf_ref(float x) { return x > 20.0f ? x : log1pf(expf(x)); }
 
 // block-wide sum of a double, blockDim.x <= 1024, a power of two
 static __device__ double block_sum(double v) {
@@ -263,7 +264,7 @@ extern "C" __global__ void delta_step(const float* q, const float* k, const floa
     __syncthreads();
     if (j >= d) return;
     float beta = sigmoidf_ref(b[h]);
-    float decay = (float) exp((double) A[h] * (double) softplusf_ref(a[h] + dtb[h]));
+    float decay = expf(A[h] * softplusf_ref(a[h] + dtb[h]));
     float* s = S + (u64) h * d * d;
     // the 128-term sums: float FMAs in runs of 16 (FP64 runs at 1/64 of FP32 on this GPU), the runs added in double
     double mem = 0.0;
@@ -308,7 +309,7 @@ extern "C" __global__ void delta_steps128(const float* q, const float* k, const 
         ks[j] = k[(u64) t * xs + kx * d + j];
         __syncthreads();
         float beta = sigmoidf_ref(b[(u64) t * bs + h]);
-        float decay = (float) exp((double) A[h] * (double) softplusf_ref(a[(u64) t * bs + h] + dtb[h]));
+        float decay = expf(A[h] * softplusf_ref(a[(u64) t * bs + h] + dtb[h]));
         double mem = 0.0;
 #pragma unroll
         for (unsigned int i0 = 0; i0 < d; i0 += 16) {
@@ -333,6 +334,58 @@ extern "C" __global__ void delta_steps128(const float* q, const float* k, const 
             acc += (double) part;
         }
         o[(u64) t * os + h * d + j] = (float) acc;
+    }
+#pragma unroll
+    for (unsigned int i = 0; i < d; ++i) s[i * d + j] = col[i];
+}
+
+// delta_steps128 with gated_rmsnorm_heads folded in: after each token's recurrence the head's 128 outputs are
+// normalized and gated in the block (the same operations in the same order as gated_rmsnorm_heads, whose block is
+// these 128 threads too).  z rows os apart; o is written normalized.
+extern "C" __global__ void delta_steps128_gn(const float* q, const float* k, const float* v, unsigned int xs, const float* b,
+                                             const float* a, unsigned int bs, const float* A, const float* dtb, float* S,
+                                             float* o, unsigned int os, unsigned int kh, unsigned int m, const float* z,
+                                             const float* nw, float eps) {
+    const unsigned int d = 128;
+    __shared__ float qs[128], ks[128];
+    unsigned int h = blockIdx.x, j = threadIdx.x, kx = h % kh;
+    float* s = S + (u64) h * d * d;
+    float col[128];
+#pragma unroll
+    for (unsigned int i = 0; i < d; ++i) col[i] = s[i * d + j];
+    for (unsigned int t = 0; t < m; ++t) {
+        __syncthreads();
+        qs[j] = q[(u64) t * xs + kx * d + j];
+        ks[j] = k[(u64) t * xs + kx * d + j];
+        __syncthreads();
+        float beta = sigmoidf_ref(b[(u64) t * bs + h]);
+        float decay = expf(A[h] * softplusf_ref(a[(u64) t * bs + h] + dtb[h]));
+        double mem = 0.0;
+#pragma unroll
+        for (unsigned int i0 = 0; i0 < d; i0 += 16) {
+            float part = 0.0f;
+#pragma unroll
+            for (unsigned int i = i0; i < i0 + 16; ++i) {
+                col[i] *= decay;
+                part = fmaf(col[i], ks[i], part);
+            }
+            mem += (double) part;
+        }
+        float delta = (float) (((double) v[(u64) t * xs + h * d + j] - mem) * (double) beta);
+        double acc = 0.0;
+#pragma unroll
+        for (unsigned int i0 = 0; i0 < d; i0 += 16) {
+            float part = 0.0f;
+#pragma unroll
+            for (unsigned int i = i0; i < i0 + 16; ++i) {
+                col[i] += ks[i] * delta;
+                part = fmaf(col[i], qs[i], part);
+            }
+            acc += (double) part;
+        }
+        const float ov = (float) acc;
+        double r = 1.0 / sqrt(block_sum((double) ov * (double) ov) / (double) d + (double) eps);
+        o[(u64) t * os + h * d + j] = (float) ((double) ov * r) * nw[j] * sigmoidf_ref(z[(u64) t * os + h * d + j]);
     }
 #pragma unroll
     for (unsigned int i = 0; i < d; ++i) s[i * d + j] = col[i];
@@ -465,7 +518,7 @@ static __device__ __forceinline__ void attention_head(const float* q, const floa
     mx = block_max(mx);
     double z = 0.0;
     for (unsigned int t = threadIdx.x; t < ntok; t += blockDim.x) {
-        double e = exp(sc[t] - mx);
+        double e = (double) expf((float) (sc[t] - mx));
         sc[t] = e;
         z += e;
     }

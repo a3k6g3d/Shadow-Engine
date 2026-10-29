@@ -630,7 +630,7 @@ extern "C" __global__ void hc_down_inject_bf16(const u8* w_down, float* down, un
     for (int off = 16; off > 0; off >>= 1) acc += __shfl_down_sync(0xffffffffu, acc, off);
     if (lane == 0) {
         float v = acc / div;
-        float sig = (float) (1.0 / (1.0 + exp(-(double) v)));
+        float sig = 1.0f / (1.0f + expf(-v));
         if (is_inj) g[row] = 2.0f * sig;
         else down[row] = v * sig;
     }
@@ -717,10 +717,10 @@ static __device__ __forceinline__ void matvec_cols_m(const u8* w, const float* x
 
 // Launch: block = 256 threads (8 warps x COLS_ROWS rows = 32 rows), grid = ceil(rows / 32).
 template <typename Q>
-static __device__ __forceinline__ void matvec_cols_rows(const u8* w, const float* x, unsigned int xs, float* y,
-                                                        unsigned int ys, unsigned int rows, unsigned int cols,
-                                                        unsigned int m) {
-    unsigned int row0 = (blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32) * COLS_ROWS, lane = threadIdx.x % 32;
+static __device__ __forceinline__ void matvec_cols_rows_b(const u8* w, const float* x, unsigned int xs, float* y,
+                                                          unsigned int ys, unsigned int rows, unsigned int cols,
+                                                          unsigned int m, unsigned int bx) {
+    unsigned int row0 = (bx * (blockDim.x / 32) + threadIdx.x / 32) * COLS_ROWS, lane = threadIdx.x % 32;
     if (row0 >= rows) return;
     unsigned int nr = min(rows - row0, (unsigned int) COLS_ROWS);
     switch (m) {
@@ -733,6 +733,13 @@ static __device__ __forceinline__ void matvec_cols_rows(const u8* w, const float
         case 7: matvec_cols_m<Q, 7>(w, x, xs, y, ys, row0, nr, lane, cols); break;
         default: matvec_cols_m<Q, 8>(w, x, xs, y, ys, row0, nr, lane, cols); break;
     }
+}
+
+template <typename Q>
+static __device__ __forceinline__ void matvec_cols_rows(const u8* w, const float* x, unsigned int xs, float* y,
+                                                        unsigned int ys, unsigned int rows, unsigned int cols,
+                                                        unsigned int m) {
+    matvec_cols_rows_b<Q>(w, x, xs, y, ys, rows, cols, m, blockIdx.x);
 }
 
 extern "C" __global__ void matvec_cols_q4_k(const u8* w, const float* x, unsigned int xs, float* y, unsigned int ys, unsigned int rows, unsigned int cols, unsigned int m) { matvec_cols_rows<Q4K>(w, x, xs, y, ys, rows, cols, m); }
@@ -794,7 +801,7 @@ static __device__ __forceinline__ void cols_ref_m(const u8* w0, float* y0, unsig
             if (lane != 0) continue;
             if (mode == 1) {
                 float v = a / div;
-                float sig = (float) (1.0 / (1.0 + exp(-(double) v)));
+                float sig = 1.0f / (1.0f + expf(-v));
                 a = row < r0 ? v * sig : 2.0f * sig;
             }
             if (row < r0) y0[(u64) j * ys0 + row] = a;
@@ -930,7 +937,7 @@ extern "C" __global__ void matvec_grouped_iq3_s(const u64* wtab, const unsigned 
 // order: vector loads, same math, only the float sum order differs.  One row a warp; grid = ceil((r_down + r_inj) / 8).
 static __device__ __forceinline__ float hc_epilogue(float a, float div, bool inj) {
     float v = a / div;
-    float sig = (float) (1.0 / (1.0 + exp(-(double) v)));
+    float sig = 1.0f / (1.0f + expf(-v));
     return inj ? 2.0f * sig : v * sig;
 }
 
@@ -1040,3 +1047,91 @@ static __device__ __forceinline__ void matvec_ids_rows(const u8* w, const unsign
 extern "C" __global__ void matvec_ids_q6_k(const u8* w, const unsigned int* ids, const float* x, float* y, unsigned int n, unsigned int cols) { matvec_ids_rows<Q6K>(w, ids, x, y, n, cols); }
 extern "C" __global__ void matvec_ids_q4_k(const u8* w, const unsigned int* ids, const float* x, float* y, unsigned int n, unsigned int cols) { matvec_ids_rows<Q4K>(w, ids, x, y, n, cols); }
 extern "C" __global__ void matvec_ids_iq4_xs(const u8* w, const unsigned int* ids, const float* x, float* y, unsigned int n, unsigned int cols) { matvec_ids_rows<IQ4XS>(w, ids, x, y, n, cols); }
+
+// ----------------------------------------------------------------------------- several matrices, one launch
+// The projections of one input (a DeltaNet layer's qkv / gate / beta / alpha; the router, its shared-expert gate and
+// the shared expert's gate and up) as jobs in one grid: job j owns blocks [first_j, first_{j+1}).  Each runs
+// matvec_cols_rows on its own matrix and output, so every output is the one-matrix kernel's bit for bit.
+struct ColsJob {
+    u64 w;
+    u64 y;
+    unsigned int ys, rows, type, first;
+};
+
+extern "C" __global__ void matvec_cols_multi(const ColsJob* jobs, unsigned int njobs, const float* x, unsigned int xs,
+                                             unsigned int cols, unsigned int m, unsigned int j0) {
+    unsigned int j = 0;
+    while (j + 1 < njobs && blockIdx.x >= jobs[j + 1].first) j++;
+    const ColsJob jb = jobs[j];
+    const unsigned int bx = blockIdx.x - jb.first;
+    const u8* w = (const u8*) jb.w;
+    float* y = (float*) jb.y + (u64) j0 * jb.ys;
+    switch (jb.type) {
+        case 0: matvec_cols_rows_b<Q4K>(w, x, xs, y, jb.ys, jb.rows, cols, m, bx); break;
+        case 1: matvec_cols_rows_b<Q5K>(w, x, xs, y, jb.ys, jb.rows, cols, m, bx); break;
+        case 2: matvec_cols_rows_b<Q6K>(w, x, xs, y, jb.ys, jb.rows, cols, m, bx); break;
+        case 3: matvec_cols_rows_b<IQ4XS>(w, x, xs, y, jb.ys, jb.rows, cols, m, bx); break;
+        case 4: matvec_cols_rows_b<BF16>(w, x, xs, y, jb.ys, jb.rows, cols, m, bx); break;
+        case 5: matvec_cols_rows_b<F32>(w, x, xs, y, jb.ys, jb.rows, cols, m, bx); break;
+        default: matvec_cols_rows_b<IQ4NL>(w, x, xs, y, jb.ys, jb.rows, cols, m, bx); break;
+    }
+}
+
+static __device__ __forceinline__ float sigmoidf_ref(float x) { return 1.0f / (1.0f + expf(-x)); }  // as forward.cu's
+
+// ------------------------------------------------------------------------------------ hc up-projection + mix
+// u[j][i] = (sum over streams s of sigmoid(W_up[s h + i] . down[j]) * rn[j][s h + i]) / streams, in one launch for
+// m <= 8 inputs: the up-projection never exists as a vector.  Each of the 4 dots is dotm over the 320 columns (the
+// sums of matvec_cols_bf16), the streams are added in order, as hc_mix does.  One output a warp; grid = ceil(h / 8).
+template <unsigned int M>
+static __device__ __forceinline__ void hc_up_mix_m(const u8* w_up, const float* down, unsigned int ds, const float* rn,
+                                                   unsigned int rs, float* u, unsigned int us, unsigned int h,
+                                                   unsigned int streams, unsigned int rank, unsigned int i,
+                                                   unsigned int lane) {
+    float mix[M];
+#pragma unroll
+    for (unsigned int j = 0; j < M; j++) mix[j] = 0.0f;
+    for (unsigned int s = 0; s < streams; ++s) {
+        const u8* r = w_up + ((u64) s * h + i) * rank * BF16::BYTES;
+        float acc[M];
+#pragma unroll
+        for (unsigned int j = 0; j < M; j++) acc[j] = 0.0f;
+        for (unsigned int c = lane; c < rank / 8; c += 32) {
+            float xr[M * 8];
+#pragma unroll
+            for (unsigned int j = 0; j < M; j++) {
+                const float4* p = (const float4*) (down + (u64) j * ds + c * 8);
+                float4 a = p[0], b = p[1];
+                xr[j * 8 + 0] = a.x; xr[j * 8 + 1] = a.y; xr[j * 8 + 2] = a.z; xr[j * 8 + 3] = a.w;
+                xr[j * 8 + 4] = b.x; xr[j * 8 + 5] = b.y; xr[j * 8 + 6] = b.z; xr[j * 8 + 7] = b.w;
+            }
+            Fast<BF16>::template dotm<M>(r, c * 8, xr, 8, acc);
+        }
+#pragma unroll
+        for (unsigned int j = 0; j < M; j++) {
+            float a = acc[j];
+            for (int off = 16; off > 0; off >>= 1) a += __shfl_down_sync(0xffffffffu, a, off);
+            if (lane == 0) mix[j] += sigmoidf_ref(a) * rn[(u64) j * rs + (u64) s * h + i];
+        }
+    }
+    if (lane == 0)
+#pragma unroll
+        for (unsigned int j = 0; j < M; j++) u[(u64) j * us + i] = mix[j] / (float) streams;
+}
+
+extern "C" __global__ void hc_up_mix_cols(const u8* w_up, const float* down, unsigned int ds, const float* rn,
+                                          unsigned int rs, float* u, unsigned int us, unsigned int h,
+                                          unsigned int streams, unsigned int rank, unsigned int m) {
+    const unsigned int i = blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32, lane = threadIdx.x % 32;
+    if (i >= h) return;
+    switch (m) {
+        case 1: hc_up_mix_m<1>(w_up, down, ds, rn, rs, u, us, h, streams, rank, i, lane); break;
+        case 2: hc_up_mix_m<2>(w_up, down, ds, rn, rs, u, us, h, streams, rank, i, lane); break;
+        case 3: hc_up_mix_m<3>(w_up, down, ds, rn, rs, u, us, h, streams, rank, i, lane); break;
+        case 4: hc_up_mix_m<4>(w_up, down, ds, rn, rs, u, us, h, streams, rank, i, lane); break;
+        case 5: hc_up_mix_m<5>(w_up, down, ds, rn, rs, u, us, h, streams, rank, i, lane); break;
+        case 6: hc_up_mix_m<6>(w_up, down, ds, rn, rs, u, us, h, streams, rank, i, lane); break;
+        case 7: hc_up_mix_m<7>(w_up, down, ds, rn, rs, u, us, h, streams, rank, i, lane); break;
+        default: hc_up_mix_m<8>(w_up, down, ds, rn, rs, u, us, h, streams, rank, i, lane); break;
+    }
+}

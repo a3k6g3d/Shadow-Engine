@@ -272,6 +272,10 @@ pub struct GpuSession<'c, 'm> {
     /// The same for the batched step: (layer, fused norm, tokens, keeping the rollback's inputs).
     batch_graphs: HashMap<(usize, bool, usize, bool), Graph<'c>>,
     graphs_on: bool,
+    /// `matvec_cols_multi`'s job tables, by (layer, group, rollback inputs): built before a graph is captured.
+    multi: HashMap<(usize, u8, bool), DeviceBuffer<'c>>,
+    /// `SHADOW_FUSE` bits: 1 the merged projections, 2 the hyper-connection up+mix, 4 the delta+norm kernel (0: none).
+    fuse: u8,
     /// `SHADOW_LTIME=1`: CUDA events between a batched pass's layer segments, summed by kind in the report.
     ltime: Option<std::cell::RefCell<Vec<(&'static str, crate::driver::Event<'c>)>>>,
     timing_no_sync: bool,
@@ -425,6 +429,8 @@ pub struct Tiers {
     /// `--verify-resident` (inexact; AcceptMoE, arXiv 2608.02989): in a speculative verify pass, the drafted positions
     /// (all but the first) use only the routed experts already in VRAM, so the pass copies about what one step does.
     pub verify_resident: bool,
+    /// `--fuse N`: the kernel fusions to use (`SHADOW_FUSE`'s bits; default none: measured 1.1% slower at 7, a tie at 0).
+    pub fuse: Option<u8>,
 }
 
 impl Tiers {
@@ -462,6 +468,7 @@ impl Tiers {
                    pregate: num("--pregate", 0)?,
                    tail_skip: num("--tail-skip", 0)?,
                    verify_resident: args.iter().any(|a| a == "--verify-resident"),
+                   fuse: flag("--fuse").and_then(|v| v.parse().ok()),
                    pin_margin: flag("--pin-margin").map(|v| v.parse().map_err(|_| format!("--pin-margin: not a number: {v}")))
                        .transpose()? })
     }
@@ -1069,6 +1076,8 @@ impl<'c, 'm> GpuSession<'c, 'm> {
             mtp_probe: std::env::var("SHADOW_MTP_PROBE").is_ok_and(|v| v == "1").then_some((0, 0)),
             mtp,
             graphs: HashMap::new(),
+            multi: HashMap::new(),
+            fuse: tiers.fuse.or_else(|| std::env::var("SHADOW_FUSE").ok().and_then(|v| v.parse().ok())).unwrap_or(0),
             ltime: std::env::var("SHADOW_LTIME").is_ok_and(|v| v == "1").then(Default::default),
             ple_host: std::cell::Cell::new(0.0),
             ple_calls: std::cell::Cell::new(0),
@@ -1738,8 +1747,32 @@ impl<'c, 'm> GpuSession<'c, 'm> {
                 Arg::Ptr(b.rn.ptr), Arg::U32(h * cs), Arg::F32(cs as f32),
             ]).unwrap_or_else(|err| panic!("hc_down_inject_bf16: {err}"));
         }
-        self.mv(&format!("{p}_up.weight"), b.down.ptr, b.up.ptr);
-        self.hc_mix(b.rn.ptr, b.up.ptr, b.u.ptr);
+        if self.fuse & 2 != 0 && self.fast_order {
+            self.hc_up_mix(p, b.down.ptr, c.hc_rank, b.rn.ptr, h as usize * cs as usize, b.u.ptr, h as usize, 1);
+        } else {
+            self.mv(&format!("{p}_up.weight"), b.down.ptr, b.up.ptr);
+            self.hc_mix(b.rn.ptr, b.up.ptr, b.u.ptr);
+        }
+    }
+
+    /// u = the hyper-connection mix of rn and sigmoid(W_up down) for m rows (`hc_up_mix_cols`): the up-projection
+    /// never leaves the kernel.  Rows are ds / rs / us floats apart.
+    #[allow(clippy::too_many_arguments)]
+    fn hc_up_mix(&self, p: &str, down: u64, ds: usize, rn: u64, rs: usize, u: u64, us: usize, m: usize) {
+        let c = &self.m.cfg;
+        let (h, cs, rank) = (c.hidden as u32, c.streams as u32, c.hc_rank as u32);
+        let w = self.w[&format!("{p}_up.weight")].ptr;
+        for j0 in (0..m).step_by(COLS_MAX) {
+            let n = (m - j0).min(COLS_MAX) as u32;
+            // SAFETY: h x streams BF16 rows of `rank` weights; n rows of down (rank floats), rn (h * streams) and u (h).
+            unsafe {
+                self.mvp.launch("hc_up_mix_cols", (h.div_ceil(8), 1, 1), (256, 1, 1), 0, self.ls(), &[
+                    Arg::Ptr(w), Arg::Ptr(down + (j0 * ds * 4) as u64), Arg::U32(ds as u32), Arg::Ptr(rn + (j0 * rs * 4) as u64),
+                    Arg::U32(rs as u32), Arg::Ptr(u + (j0 * us * 4) as u64), Arg::U32(us as u32), Arg::U32(h), Arg::U32(cs),
+                    Arg::U32(rank), Arg::U32(n)])
+            }
+            .unwrap_or_else(|err| panic!("hc_up_mix_cols: {err}"));
+        }
     }
 
     fn hc_norm(&self, p: &str, r: u64, rn: u64) {
@@ -2568,6 +2601,14 @@ impl<'c, 'm> GpuSession<'c, 'm> {
                 }
                 rn_ready = false;
             }
+            {
+                let on = self.replay.on.get();
+                if !c.is_attention(l) {
+                    self.ensure_multi(l, 0, on);
+                }
+                self.ensure_multi(l, 1, false);
+                self.ensure_multi(l, 2, false);
+            }
             if graphs && !c.is_attention(l) && l != c.ple_layer {
                 // a DeltaNet layer up to its router is the same launches for every batch of m: one graph
                 let on = self.replay.on.get();
@@ -2664,6 +2705,99 @@ impl<'c, 'm> GpuSession<'c, 'm> {
         }
     }
 
+    /// The job table of a group of projections of one input (see `matvec_cols_multi`), or None when a tensor is not
+    /// one the kernel covers (then the callers launch them one by one).
+    fn multi_jobs(&self, jobs: &[(String, u64, usize)], cols: usize) -> Option<(Vec<u8>, u32)> {
+        let mut bytes = Vec::with_capacity(jobs.len() * 32);
+        let mut first = 0u32;
+        for (name, y, ys) in jobs {
+            let (t, b) = self.m.dense(name);
+            let (qk, qb) = t.ty.block()?;
+            let rows = b.len() / (t.dims[0] / qk * qb) as usize;
+            let ty = match t.ty.name().as_str() {
+                "Q4_K" => 0u32, "Q5_K" => 1, "Q6_K" => 2, "IQ4_XS" => 3, "BF16" => 4, "F32" => 5, "IQ4_NL" => 6,
+                _ => return None,
+            };
+            if t.dims[0] as usize != cols || !cols.is_multiple_of(8) || self.m.scale(name) != 1.0 || !self.w.contains_key(name) {
+                return None;
+            }
+            bytes.extend_from_slice(&self.w[name].ptr.to_le_bytes());
+            bytes.extend_from_slice(&y.to_le_bytes());
+            for v in [*ys as u32, rows as u32, ty, first] {
+                bytes.extend_from_slice(&v.to_le_bytes());
+            }
+            first += (rows as u32).div_ceil(32);
+        }
+        Some((bytes, first))
+    }
+
+    /// Makes sure the table for (layer, group, rollback) exists (before a graph capture needs it).
+    fn ensure_multi(&mut self, l: usize, group: u8, on: bool) {
+        if self.multi.contains_key(&(l, group, on)) || self.fuse & 1 == 0 || !self.fast_order {
+            return;
+        }
+        let jobs = self.multi_group(l, group, on);
+        if let Some((bytes, _)) = self.multi_jobs(&jobs, self.m.cfg.hidden) {
+            let d = self.ctx.alloc(bytes.len()).unwrap();
+            d.upload(&bytes).unwrap();
+            self.multi.insert((l, group, on), d);
+        }
+    }
+
+    /// Group 0: a DeltaNet layer's qkv, gate, beta, alpha (outputs: the rollback's slots when `on`).  Group 1: the
+    /// router and the shared expert's gate logit (before the host reads the logits).  Group 2: the shared expert's
+    /// gate and up (after the read, while the host routes and the copies run).
+    fn multi_group(&self, l: usize, group: u8, on: bool) -> Vec<(String, u64, usize)> {
+        let c = &self.m.cfg;
+        let p = format!("blk.{l}");
+        let bb = &self.bb;
+        if group == 0 {
+            let (vh, d) = (c.ssm_v_heads, c.ssm_head_dim);
+            let (kd, vd) = (c.ssm_k_heads * d, vh * d);
+            let ch = 2 * kd + vd;
+            let (qkv_p, beta_p, alpha_p) = if on {
+                let ba = self.replay.ba.ptr + (l * MAX_VERIFY * 2 * vh * 4) as u64;
+                (self.replay.qkv.ptr + (l * MAX_VERIFY * ch * 4) as u64, ba, ba + (MAX_VERIFY * vh * 4) as u64)
+            } else {
+                (bb.qkv.ptr, bb.beta.ptr, bb.alpha.ptr)
+            };
+            vec![(format!("{p}.attn_qkv.weight"), qkv_p, ch), (format!("{p}.attn_gate.weight"), bb.z.ptr, vd),
+                 (format!("{p}.ssm_beta.weight"), beta_p, vh), (format!("{p}.ssm_alpha.weight"), alpha_p, vh)]
+        } else {
+            if group == 1 {
+                vec![(format!("{p}.ffn_gate_inp.weight"), bb.rl.ptr, c.n_expert),
+                     (format!("{p}.ffn_gate_inp_shexp.weight"), bb.sgl.ptr, 1)]
+            } else {
+                vec![(format!("{p}.ffn_gate_shexp.weight"), bb.sg.ptr, c.shared_ff),
+                     (format!("{p}.ffn_up_shexp.weight"), bb.su.ptr, c.shared_ff)]
+            }
+        }
+    }
+
+    /// The group's projections of bb.u for the batch's m tokens: one launch per chunk of 8, or one by one.
+    fn multi_cols(&self, l: usize, group: u8, on: bool, m: usize) {
+        let h = self.m.cfg.hidden;
+        let u = self.bb.u.ptr;
+        if let Some(tab) = self.multi.get(&(l, group, on)) {
+            let jobs = self.multi_group(l, group, on);
+            let (_, blocks) = self.multi_jobs(&jobs, h).unwrap();
+            for j0 in (0..m).step_by(COLS_MAX) {
+                let n = (m - j0).min(COLS_MAX) as u32;
+                // SAFETY: the table's jobs are resident matrices of h columns and outputs inside bb / replay.
+                unsafe {
+                    self.mvp.launch("matvec_cols_multi", (blocks, 1, 1), (256, 1, 1), 0, self.ls(), &[
+                        Arg::Ptr(tab.ptr), Arg::U32(jobs.len() as u32), Arg::Ptr(u + (j0 * h * 4) as u64), Arg::U32(h as u32),
+                        Arg::U32(h as u32), Arg::U32(n), Arg::U32(j0 as u32)])
+                }
+                .unwrap_or_else(|err| panic!("matvec_cols_multi: {err}"));
+            }
+            return;
+        }
+        for (name, y, ys) in self.multi_group(l, group, on) {
+            self.mv_cols(&name, u, h, y, ys, m);
+        }
+    }
+
     /// `count` matrices of t's shape from the device table at `tab`, one per blockIdx.y, on inputs x + n * xs
     /// (xs = 0: shared) into y + n * ys.
     #[allow(clippy::too_many_arguments)]
@@ -2712,6 +2846,10 @@ impl<'c, 'm> GpuSession<'c, 'm> {
                 ]).unwrap_or_else(|err| panic!("hc_down_inject_cols_bf16: {err}"));
             }
         }
+        if self.fuse & 2 != 0 && self.fast_order {
+            self.hc_up_mix(p, bb.down.ptr, rank, bb.rn.ptr, ch, bb.u.ptr, h, m);
+            return;
+        }
         self.mv_cols(&format!("{p}_up.weight"), bb.down.ptr, rank, bb.up.ptr, ch, m);
         self.k2("hc_mix_rows", (h as u32).div_ceil(256), m as u32, 256, &[Arg::Ptr(bb.rn.ptr), Arg::Ptr(bb.up.ptr), Arg::Ptr(bb.u.ptr),
                                                                          Arg::U32(h as u32), Arg::U32(cs as u32)]);
@@ -2741,16 +2879,15 @@ impl<'c, 'm> GpuSession<'c, 'm> {
         let ch = 2 * kd + vd;
         let bb = &self.bb;
         // a verify pass writes the recurrence's inputs straight into the rollback's slots for this layer
-        let (qkv_p, beta_p, alpha_p) = if self.replay.on.get() {
+        let on = self.replay.on.get();
+        let (qkv_p, beta_p, alpha_p) = if on {
             let ba = self.replay.ba.ptr + (l * MAX_VERIFY * 2 * vh * 4) as u64;
             (self.replay.qkv.ptr + (l * MAX_VERIFY * ch * 4) as u64, ba, ba + (MAX_VERIFY * vh * 4) as u64)
         } else {
             (bb.qkv.ptr, bb.beta.ptr, bb.alpha.ptr)
         };
-        self.mv_cols(&format!("{p}.attn_qkv.weight"), bb.u.ptr, h, qkv_p, ch, m);
-        self.mv_cols(&format!("{p}.attn_gate.weight"), bb.u.ptr, h, bb.z.ptr, vd, m);
-        self.mv_cols(&format!("{p}.ssm_beta.weight"), bb.u.ptr, h, beta_p, vh, m);
-        self.mv_cols(&format!("{p}.ssm_alpha.weight"), bb.u.ptr, h, alpha_p, vh, m);
+        let _ = h;
+        self.multi_cols(l, 0, on, m);
         if d == 128 {
             // conv and norms token by token (the conv window moves), then the recurrence for all of them at once
             let (s, conv) = self.delta[l].as_ref().unwrap();
@@ -2760,14 +2897,24 @@ impl<'c, 'm> GpuSession<'c, 'm> {
                                             Arg::U32(ch as u32), Arg::U32(c.conv_k as u32), Arg::U32(m as u32)]);
             self.k2("l2norm_qk_rows", (2 * kh) as u32, m as u32, 128, &[Arg::Ptr(bb.x.ptr), Arg::U32(kh as u32), Arg::U32(d as u32),
                                                                        Arg::F32((d as f32).sqrt()), Arg::U32(ch as u32)]);
-            self.k("delta_steps128", vh as u32, 128, &[
-                Arg::Ptr(bb.x.ptr), Arg::Ptr(bb.x.ptr + (kd * 4) as u64), Arg::Ptr(bb.x.ptr + (2 * kd * 4) as u64),
-                Arg::U32(ch as u32), Arg::Ptr(beta_p), Arg::Ptr(alpha_p), Arg::U32(vh as u32),
-                Arg::Ptr(self.sv(&format!("{p}.ssm_a"))), Arg::Ptr(self.sv(&format!("{p}.ssm_dt.bias"))), Arg::Ptr(s.ptr),
-                Arg::Ptr(bb.o.ptr), Arg::U32(vd as u32), Arg::U32(kh as u32), Arg::U32(m as u32)]);
-            self.k2("gated_rmsnorm_rows", vh as u32, m as u32, 128, &[Arg::Ptr(bb.o.ptr), Arg::Ptr(self.sv(&format!("{p}.ssm_norm.weight"))),
-                                                                     Arg::Ptr(bb.z.ptr), Arg::U32(d as u32), Arg::F32(c.eps),
-                                                                     Arg::U32(vd as u32)]);
+            if self.fuse & 4 != 0 {
+                // the recurrence and the head's gated RMSNorm in one kernel
+                self.k("delta_steps128_gn", vh as u32, 128, &[
+                    Arg::Ptr(bb.x.ptr), Arg::Ptr(bb.x.ptr + (kd * 4) as u64), Arg::Ptr(bb.x.ptr + (2 * kd * 4) as u64),
+                    Arg::U32(ch as u32), Arg::Ptr(beta_p), Arg::Ptr(alpha_p), Arg::U32(vh as u32),
+                    Arg::Ptr(self.sv(&format!("{p}.ssm_a"))), Arg::Ptr(self.sv(&format!("{p}.ssm_dt.bias"))), Arg::Ptr(s.ptr),
+                    Arg::Ptr(bb.o.ptr), Arg::U32(vd as u32), Arg::U32(kh as u32), Arg::U32(m as u32), Arg::Ptr(bb.z.ptr),
+                    Arg::Ptr(self.sv(&format!("{p}.ssm_norm.weight"))), Arg::F32(c.eps)]);
+            } else {
+                self.k("delta_steps128", vh as u32, 128, &[
+                    Arg::Ptr(bb.x.ptr), Arg::Ptr(bb.x.ptr + (kd * 4) as u64), Arg::Ptr(bb.x.ptr + (2 * kd * 4) as u64),
+                    Arg::U32(ch as u32), Arg::Ptr(beta_p), Arg::Ptr(alpha_p), Arg::U32(vh as u32),
+                    Arg::Ptr(self.sv(&format!("{p}.ssm_a"))), Arg::Ptr(self.sv(&format!("{p}.ssm_dt.bias"))), Arg::Ptr(s.ptr),
+                    Arg::Ptr(bb.o.ptr), Arg::U32(vd as u32), Arg::U32(kh as u32), Arg::U32(m as u32)]);
+                self.k2("gated_rmsnorm_rows", vh as u32, m as u32, 128, &[Arg::Ptr(bb.o.ptr), Arg::Ptr(self.sv(&format!("{p}.ssm_norm.weight"))),
+                                                                         Arg::Ptr(bb.z.ptr), Arg::U32(d as u32), Arg::F32(c.eps),
+                                                                         Arg::U32(vd as u32)]);
+            }
         } else {
             for j in 0..m {
                 self.delta_mid(l, qkv_p + (j * ch * 4) as u64, row(&bb.z, vd, j), beta_p + (j * vh * 4) as u64,
@@ -2838,11 +2985,8 @@ impl<'c, 'm> GpuSession<'c, 'm> {
     /// routed experts and combine.
     /// The router (and the shared expert's gate logit) for the batch's m tokens.
     fn moe_router_batch(&self, l: usize, m: usize) {
-        let c = &self.m.cfg;
-        let p = format!("blk.{l}");
-        let u = self.bb.u.ptr;
-        self.mv_cols(&format!("{p}.ffn_gate_inp.weight"), u, c.hidden, self.bb.rl.ptr, c.n_expert, m);
-        self.mv_cols(&format!("{p}.ffn_gate_inp_shexp.weight"), u, c.hidden, self.bb.sgl.ptr, 1, m);
+        // the router and the shared expert's gate logit: one launch
+        self.multi_cols(l, 1, false, m);
     }
 
     /// `router_done`: `moe_router_batch` already ran (in a graph).
@@ -2850,7 +2994,6 @@ impl<'c, 'm> GpuSession<'c, 'm> {
         let c = &self.m.cfg;
         let p = format!("blk.{l}");
         let (h, sff, k, ne) = (c.hidden, c.shared_ff, c.n_expert_used, c.n_expert);
-        let u = self.bb.u.ptr;
         if !router_done {
             self.moe_router_batch(l, m);
         }
@@ -2872,8 +3015,7 @@ impl<'c, 'm> GpuSession<'c, 'm> {
         {
             // the shared expert, on the GPU while the host routes and the copies run
             let bb = &self.bb;
-            self.mv_cols(&format!("{p}.ffn_gate_shexp.weight"), u, h, bb.sg.ptr, sff, m);
-            self.mv_cols(&format!("{p}.ffn_up_shexp.weight"), u, h, bb.su.ptr, sff, m);
+            self.multi_cols(l, 2, false, m);
             self.k1("swiglu", m * sff, &[Arg::Ptr(bb.sg.ptr), Arg::Ptr(bb.su.ptr), Arg::Ptr(bb.sa.ptr), Arg::U32((m * sff) as u32)]);
             self.mv_cols(&format!("{p}.ffn_down_shexp.weight"), bb.sa.ptr, sff, bb.so.ptr, h, m);
         }
