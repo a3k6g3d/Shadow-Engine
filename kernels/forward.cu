@@ -451,8 +451,13 @@ static __device__ __forceinline__ void attention_head(const float* q, const floa
     for (unsigned int t = threadIdx.x; t < ntok; t += blockDim.x) {
         unsigned int p = toks ? toks[t] : t;
         const float* kt = kc + ((u64) p * nkv + g) * hd;
+        // the 256-term dot in float runs of 16 added in double (FP64 is 1/64 rate on this GPU)
         double s = 0.0;
-        for (unsigned int i = 0; i < hd; ++i) s += (double) qh[i] * (double) kt[i];
+        for (unsigned int i0 = 0; i0 < hd; i0 += 16) {
+            float part = 0.0f;
+            for (unsigned int i = i0; i < i0 + 16 && i < hd; ++i) part = fmaf(qh[i], kt[i], part);
+            s += (double) part;
+        }
         s *= scale;
         sc[t] = s;
         mx = fmax(mx, s);
@@ -468,9 +473,13 @@ static __device__ __forceinline__ void attention_head(const float* q, const floa
     __syncthreads();
     for (unsigned int j = threadIdx.x; j < hd; j += blockDim.x) {
         double acc = 0.0;
-        for (unsigned int t = 0; t < ntok; ++t) {
-            unsigned int p = toks ? toks[t] : t;
-            acc += sc[t] * (double) vc[((u64) p * nkv + g) * hd + j];
+        for (unsigned int t0 = 0; t0 < ntok; t0 += 16) {
+            float part = 0.0f;
+            for (unsigned int t = t0; t < t0 + 16 && t < ntok; ++t) {
+                unsigned int p = toks ? toks[t] : t;
+                part = fmaf((float) sc[t], vc[((u64) p * nkv + g) * hd + j], part);
+            }
+            acc += (double) part;
         }
         o[h * hd + j] = (float) (acc / z) * sigmoidf_ref(gate[h * hd + j]);
     }

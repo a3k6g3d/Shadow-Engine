@@ -651,3 +651,18 @@ Single-prompt runs, "Write a Rust function that parses a comma separated list...
 - Next lever, for whoever continues: fewer, fatter kernels per layer (a cooperative hc block, the beta/alpha/gate
   projections in one launch, attention without per-head double math) - the pass is GPU-bound at ~45 ms for ~4
   positions against a ~12 ms roofline.
+
+## 2026-10-29 (night): FP64 was a hot spot - float runs added in double, the draft head's rows, attention
+
+- This GPU runs FP64 at 1/64 of FP32. Three kernels did their long sums in double; each now sums runs of 16 terms in
+  float (`fmaf`) and adds the runs in double (same code in the single-token and batched kernels, so one token and a
+  batch still agree bit for bit; the reference suite's tolerances, the 2,600-token DeltaNet/indexer fixture and the
+  48-layer compare all hold): `delta_step` / `delta_steps128` (117 us a launch for 4 tokens before): spec mode
+  36.20 -> **36.08..37.2** (+4.2% paired, 3 runs); attention (`attention_head`: scores and weighted sum): +1.3% on
+  the short bench prompts, more with context.
+- **The draft head over the draft vocabulary's rows only** (`matvec_ids_q6_k`, `argmax_compact`; 106k of 248k rows,
+  no extra VRAM): drafts still right 95.1% (98/103); spec mode +3.1%, **37.2 tok/s** (3 runs, paired).
+- Fastest mode now (2-3 run checks): `--tail-skip 4 --mtp --spec 5 --verify-resident` **37.2 tok/s** against exact
+  20.8 and Strata 48.5. The pass is GPU-bound (~45 ms for ~4 positions with sync and copies removed); remaining
+  candidates: merging the projections of one input into a launch (4 in a DeltaNet layer, 5 in attention), a fused
+  hc up-projection + mix, hc matrices in a narrower type.
