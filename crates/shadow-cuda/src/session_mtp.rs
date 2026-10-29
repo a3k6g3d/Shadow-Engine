@@ -2,7 +2,7 @@
 //! drafts.  Cell c comes from the main model's final residual at position c and the token at c + 1; a draft chain
 //! starts from the last position read and the token about to be stepped.  Follows Strata's `src/core/mtp.cpp`.
 
-use super::{f32s, floats, GpuSession};
+use super::{f32s, GpuSession};
 use crate::kernels::Arg;
 use crate::mtp::{BLOB_BYTES, EXPERT_FF, HEAD_DIM, N_EXPERTS, N_HEAD, N_HEAD_KV, TOP_K};
 use shadow_model::forward::route;
@@ -157,25 +157,14 @@ impl<'c, 'm> GpuSession<'c, 'm> {
         // the final mixer and the main model's head, over the draft vocabulary
         self.mtp_hc_read("hyper_connection_mixer", None, false, b.sample.ptr);
         self.mv("output.weight", b.sample.ptr, self.b.logits.ptr);
-        let mut out = vec![0u8; c.vocab * 4];
-        self.download(self.b.logits.ptr, &mut out);
-        let l = floats(&out);
-        let ids: Box<dyn Iterator<Item = u32>> = match &mt.draft_vocab {
-            Some(dv) => Box::new(dv.iter().copied().filter(|&t| (t as usize) < l.len())),
-            None => Box::new(0..l.len() as u32),
+        // the pick over the draft vocabulary on the GPU (smallest id on a tie), and its probability there
+        let (ids, n) = match &mt.draft_ids {
+            Some(d) => (d.ptr, mt.draft_vocab.as_ref().map_or(0, |v| v.len())),
+            None => (0, c.vocab),
         };
-        let (mut best, mut top, mut sum) = (0u32, f32::NEG_INFINITY, 0f64);
-        for t in ids {
-            // a running softmax denominator over the subset, rescaled when the maximum moves
-            let v = l[t as usize];
-            if v > top {
-                sum = sum * ((top - v) as f64).exp() + 1.0;
-                (best, top) = (t, v);
-            } else {
-                sum += ((v - top) as f64).exp();
-            }
-        }
-        Some((best, (1.0 / sum) as f32))
+        self.k("argmax_subset", 1, 1024, &[Arg::Ptr(self.b.logits.ptr), Arg::Ptr(ids), Arg::U32(n as u32), Arg::Ptr(b.pick.ptr)]);
+        let pick = self.download_mapped(&[(b.pick.ptr, 2)]).remove(0);
+        Some((pick[0] as u32, pick[1]))
     }
 
     /// The main model has read positions p0 .. p0 + toks.len() (`toks`), their final residuals in rows (row j at

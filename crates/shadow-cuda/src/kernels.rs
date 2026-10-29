@@ -266,6 +266,7 @@ pub const FILES: &[File] = &[
             e("moe_combine_qwen", &[W, C, C, C, C, U, U]),
             e("moe_combine_qwen_perm", &[W, C, C, C, C, C, U, U]),
             e("axpy_sigmoid", &[W, C, C, U]),
+            e("argmax_subset", &[C, C, U, W]),
             e("ple_gate", &[C, C, C, W, U]),
             e("ple_conv_step", &[C, W, C, W, U, U, U]),
         ],

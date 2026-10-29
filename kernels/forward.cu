@@ -667,3 +667,39 @@ extern "C" __global__ void ple_conv_step(const float* gvn, float* state, const f
     for (unsigned int t = 0; t + 1 < hist; ++t) state[t * ch + i] = state[(t + 1) * ch + i];
     state[(hist - 1) * ch + i] = gvn[i];
 }
+
+// ------------------------------------------------------------------------------------------------ draft argmax
+// The draft head's pick over a token subset (ids, or 0..n-1 when null): out[0] = the id with the largest logit (the
+// smallest id on a tie), out[1] = its softmax probability over the subset.  One block of 1024 threads.
+extern "C" __global__ void argmax_subset(const float* logits, const unsigned int* ids, unsigned int n, float* out) {
+    __shared__ double bv[1024];
+    __shared__ unsigned int bi[1024];
+    double best = -1e300;
+    unsigned int bid = 0xffffffffu;
+    for (unsigned int i = threadIdx.x; i < n; i += blockDim.x) {
+        unsigned int id = ids ? ids[i] : i;
+        double v = logits[id];
+        if (v > best || (v == best && id < bid)) { best = v; bid = id; }
+    }
+    bv[threadIdx.x] = best;
+    bi[threadIdx.x] = bid;
+    __syncthreads();
+    for (unsigned int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (threadIdx.x < s) {
+            double v = bv[threadIdx.x + s];
+            unsigned int id = bi[threadIdx.x + s];
+            if (v > bv[threadIdx.x] || (v == bv[threadIdx.x] && id < bi[threadIdx.x])) { bv[threadIdx.x] = v; bi[threadIdx.x] = id; }
+        }
+        __syncthreads();
+    }
+    const double top = bv[0];
+    const unsigned int tid = bi[0];
+    __syncthreads();
+    double z = 0.0;
+    for (unsigned int i = threadIdx.x; i < n; i += blockDim.x) z += exp((double) logits[ids ? ids[i] : i] - top);
+    z = block_sum(z);
+    if (threadIdx.x == 0) {
+        out[0] = (float) tid;
+        out[1] = (float) (1.0 / z);
+    }
+}

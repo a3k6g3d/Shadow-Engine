@@ -75,6 +75,8 @@ pub struct MtpBuffers<'c> {
     pub sample: DeviceBuffer<'c>,
     /// The main model's final residual streams at the last position it read (`MtpModel::pending`).
     pub last_r: DeviceBuffer<'c>,
+    /// argmax_subset's output: the draft token (as a float) and its probability
+    pub pick: DeviceBuffer<'c>,
 }
 
 pub struct MtpModel<'c> {
@@ -84,6 +86,8 @@ pub struct MtpModel<'c> {
     pub experts: DeviceBuffer<'c>,
     /// The token ids the draft head picks from (draft_vocab.bin), or the whole vocabulary.
     pub draft_vocab: Option<Vec<u32>>,
+    /// draft_vocab on the device (for argmax_subset)
+    pub draft_ids: Option<DeviceBuffer<'c>>,
     pub bufs: MtpBuffers<'c>,
     pub cap: usize,
     /// Whether `bufs.last_r` holds the residual of the session's last position, whose drafter K/V cell waits for the
@@ -205,10 +209,18 @@ impl<'c> MtpModel<'c> {
             scratch: ctx.alloc(N_HEAD * cap * 8).map_err(e)?, bo: a(h)?, sg: a(EXPERT_FF)?, su: a(EXPERT_FF)?,
             sa: a(EXPERT_FF)?, so: a(h)?, rl: a(N_EXPERTS)?, sgl: a(1)?, eg: a(2 * TOP_K * EXPERT_FF)?,
             act: a(TOP_K * EXPERT_FF)?, eo: a(TOP_K * h)?, tab: a(TOP_K * 7)?, y: a(h)?, sample: a(h)?,
-            last_r: a(h * cs)?,
+            last_r: a(h * cs)?, pick: a(2)?,
+        };
+        let draft_ids = match draft_vocab.as_ref() {
+            Some(v) => {
+                let d = ctx.alloc(v.len() * 4).map_err(e)?;
+                d.upload(&v.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>()).map_err(e)?;
+                Some(d)
+            }
+            None => None,
         };
         let _ = vocab_size;
-        Ok(Self { dense_weights, tensors, experts, draft_vocab, bufs, cap, pending: false, stats: (0, 0) })
+        Ok(Self { dense_weights, tensors, experts, draft_vocab, draft_ids, bufs, cap, pending: false, stats: (0, 0) })
     }
 
     pub fn tensor_ptr(&self, name: &str) -> Option<u64> {
