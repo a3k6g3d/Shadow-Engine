@@ -8,3 +8,4 @@ __pycache__/
 .venv-ref/
 models/mtp-basalt-ft1/*.bin
 /target-*/
+.venv-train/

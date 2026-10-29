@@ -88,6 +88,9 @@ impl<'c, 'm> GpuSession<'c, 'm> {
             let mut f = std::fs::OpenOptions::new().create(true).append(true).open(format!("{dir}/feats.bin")).unwrap();
             f.write_all(&(p0 as u32).to_le_bytes()).unwrap();
             f.write_all(&(m as u32).to_le_bytes()).unwrap();
+            for t in &self.tokens[p0..p0 + m] {
+                f.write_all(&t.to_le_bytes()).unwrap();
+            }
             f.write_all(&bytes).unwrap();
         }
         let df = self.dflash.as_mut().unwrap();
@@ -135,6 +138,16 @@ impl<'c, 'm> GpuSession<'c, 'm> {
             emb.extend_from_slice(df.mask_emb.as_ref().unwrap());
         }
         let b = &df.bufs;
+        let prof = df.prof.is_some();
+        let mut laps: Vec<(&'static str, f64)> = vec![];
+        let mut t0 = std::time::Instant::now();
+        let mut lap = |name: &'static str| {
+            if prof {
+                self.ctx.synchronize().unwrap();
+                laps.push((name, t0.elapsed().as_secs_f64()));
+                t0 = std::time::Instant::now();
+            }
+        };
         self.upload_to(b.emb.ptr, &super::f32s(&emb));
         let (h, nb) = (HIDDEN as u32, BLOCK as u32);
         let w = |name: &str| Arg::Ptr(df.ptr(name));
@@ -165,6 +178,7 @@ impl<'c, 'm> GpuSession<'c, 'm> {
             self.k2("df_rope", N_HEAD as u32, nb, 64, &[f(b.q.ptr), Arg::U32(n as u32), Arg::U32((N_HEAD * HEAD_DIM) as u32),
                                                         Arg::F32(ROPE_THETA)]);
             self.df_kv_finish(i, n, BLOCK);
+            lap("layer: qkv, norms, rope");
             // SAFETY: q is BLOCK x 4096 floats, the rings RING x 1024, ao BLOCK x 4096; the kernel reads slots
             // (lo + j) % RING for the window and the block, all written (context rows and this block's).
             unsafe {
@@ -173,10 +187,12 @@ impl<'c, 'm> GpuSession<'c, 'm> {
                     Arg::U32(WINDOW as u32), Arg::U32(RING as u32), Arg::F32((HEAD_DIM as f32).powf(-0.5))])
             }
             .unwrap_or_else(|err| panic!("df_attention: {err}"));
+            lap("layer: attention");
             self.df_mv(&format!("{p}.o_proj.weight"), b.ao.ptr, N_HEAD * HEAD_DIM, b.y.ptr, HIDDEN, BLOCK);
             conv(b.delta_a.ptr, &format!("{pre}.attention_conv.base_kernel"), 1, b.y.ptr, b.y2.ptr);
             self.k("df_add_rmsnorm", nb, 256, &[tp[0], tp[1], w(&format!("{pre}.post_attention_layernorm.weight")), f(b.xn.ptr), Arg::U32(h),
                                                 Arg::F32(EPS)]);
+            lap("layer: o_proj, conv, norm");
             // MLP with its own convolution
             self.df_mv(&format!("{pre}.mlp_conv.kernel_projection.weight"), b.xn.ptr, HIDDEN, b.delta_m.ptr, 4 * N_GROUPS, BLOCK);
             conv(b.delta_m.ptr, &format!("{pre}.mlp_conv.base_kernel"), 0, b.xn.ptr, b.xc.ptr);
@@ -185,20 +201,26 @@ impl<'c, 'm> GpuSession<'c, 'm> {
             self.k1("df_silu_mul", BLOCK * FF, &[f(b.g.ptr), f(b.u.ptr), Arg::U32((BLOCK * FF) as u32)]);
             self.df_mv(&format!("{pre}.mlp.down_proj.weight"), b.g.ptr, FF, b.y.ptr, HIDDEN, BLOCK);
             conv(b.delta_m.ptr, &format!("{pre}.mlp_conv.base_kernel"), 1, b.y.ptr, b.y2.ptr);
+            lap("layer: mlp + convs");
         }
         self.k("df_add_rmsnorm", nb, 256, &[tp[0], tp[1], w("norm.weight"), f(b.hid.ptr), Arg::U32(h), Arg::F32(EPS)]);
         // slots 1 .. BLOCK - 1 predict the tokens after the anchor: the main model's head, 16 candidates each, the walk
         let slots = BLOCK - 1;
         let vocab = self.m.cfg.vocab;
+        lap("final norm");
         let hid1 = row(&b.hid, HIDDEN, 1);
         self.mv_cols("output.weight", hid1, HIDDEN, self.bb.logits.ptr, vocab, slots);
+        lap("head (output.weight x 7)");
         self.k("df_top16", slots as u32, 256, &[f(self.bb.logits.ptr), Arg::U32(vocab as u32), Arg::U32(vocab as u32), f(b.cand.ptr), f(b.unary.ptr)]);
+        lap("top16");
         self.df_mv("candidate_selector.hidden_projection.weight", hid1, HIDDEN, b.hp.ptr, RANK, slots);
         self.k("df_walk", 1, 512, &[f(b.cand.ptr), f(b.unary.ptr), f(b.hp.ptr), w("candidate_selector.predecessor_codebook"),
                                     w("candidate_selector.successor_codebook"), Arg::U32(next), Arg::U32(slots as u32),
                                     Arg::U32(RANK as u32), f(b.out.ptr)]);
+        lap("hidden_projection + walk");
         let mut out = vec![0u8; 2 * slots * 4];
         self.download(b.out.ptr, &mut out);
+        lap("download");
         let words: Vec<u32> = out.chunks(4).map(|c| u32::from_le_bytes(c.try_into().unwrap())).collect();
         // the chain stops after a draft the selector is less sure of than min_p (that draft is kept)
         let mut toks = Vec::with_capacity(k);
@@ -208,7 +230,7 @@ impl<'c, 'm> GpuSession<'c, 'm> {
                 break;
             }
         }
-        if let Ok(dir) = std::env::var("SHADOW_DF_DUMP") {
+        if let (Ok(dir), true) = (std::env::var("SHADOW_DF_DUMP"), std::env::var("SHADOW_DF_DUMP_DRAFTS").is_ok_and(|v| v == "1")) {
             // one draft: n, next, then the block's input rows, its final hidden, the candidates (ids, logits), hp, picks
             let rd = |ptr: u64, nf: usize| {
                 let mut b = vec![0u8; nf * 4];
@@ -225,7 +247,20 @@ impl<'c, 'm> GpuSession<'c, 'm> {
                 f.write_all(&rd(ptr, nf)).unwrap();
             }
         }
-        self.dflash.as_mut().unwrap().stats.0 += 1;
+        let df = self.dflash.as_mut().unwrap();
+        df.stats.0 += 1;
+        if let Some(p) = df.prof.as_mut() {
+            for (name, s) in laps {
+                let e = p.entry(name).or_default();
+                e.0 += s;
+                e.1 += 1;
+            }
+            if df.stats.0 % 40 == 0 {
+                let rounds = df.stats.0 as f64;
+                let line: Vec<String> = p.iter().map(|(n, (s, _))| format!("{n}: {:.2} ms", 1e3 * s / rounds)).collect();
+                eprintln!("dflash: per draft round after {rounds} rounds: {}", line.join("; "));
+            }
+        }
         toks
     }
 }

@@ -23,6 +23,13 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+/// `--prompts-file F` (a JSON array of strings) replaces the turns.
+static CUSTOM_TURNS: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+
+fn turns_list() -> Vec<String> {
+    CUSTOM_TURNS.get().cloned().unwrap_or_else(|| TURNS.iter().map(|s| s.to_string()).collect())
+}
+
 const TURNS: &[&str] = &[
     "In three sentences, what is a hash table and why is lookup usually fast?",
     "Now give a short Python example of using a dictionary to count words in a sentence.",
@@ -82,7 +89,11 @@ fn run(a: &[String]) {
     let model = flag("--model").unwrap_or_else(|| usage());
     let out = PathBuf::from(flag("--out").unwrap_or_else(|| usage()));
     let runs: usize = flag("--runs").and_then(|v| v.parse().ok()).unwrap_or(8);
-    let turns: usize = flag("--turns").and_then(|v| v.parse().ok()).unwrap_or(6).min(TURNS.len());
+    if let Some(f) = flag("--prompts-file") {
+        let v: Vec<String> = serde_json::from_str(&std::fs::read_to_string(&f).expect("--prompts-file")).expect("a JSON array of strings");
+        let _ = CUSTOM_TURNS.set(v);
+    }
+    let turns: usize = flag("--turns").and_then(|v| v.parse().ok()).unwrap_or(6).min(turns_list().len());
     let tokens: usize = flag("--tokens").and_then(|v| v.parse().ok()).unwrap_or(96);
     let port: u16 = flag("--port").and_then(|v| v.parse().ok()).unwrap_or(8091);
     let arms: Vec<(String, String)> = a.iter().enumerate().filter(|(_, x)| *x == "--arm")
@@ -113,7 +124,7 @@ fn run(a: &[String]) {
         "model": model, "runs": runs, "turns": turns, "tokens": tokens, "port": port,
         "arms": arms.iter().map(|(n, f)| json!({"name": n, "flags": f, "exe": arm_exe.get(n).unwrap_or(&exe)}))
             .collect::<Vec<_>>(),
-        "prompts": &TURNS[..turns], "started": now(),
+        "prompts": &turns_list()[..turns], "started": now(),
     }).to_string()).unwrap();
     println!("{} arms x {runs} runs x {turns} turns, {tokens} tokens per turn; results in {}", arms.len(), results.display());
 
@@ -198,7 +209,7 @@ fn one_run(arm: &str, run: usize, port: u16, launch: &str, turns: usize, tokens:
     let mut error = None;
     if ready {
         let mut history: Vec<Value> = Vec::new();
-        for (t, prompt) in TURNS.iter().take(turns).enumerate() {
+        for (t, prompt) in turns_list().iter().take(turns).enumerate() {
             history.push(json!({"role": "user", "content": prompt}));
             let body = json!({"messages": history, "max_tokens": tokens, "chat_template_kwargs": {"enable_thinking": false}});
             sample(&mut min_ram, &mut max_gpu);

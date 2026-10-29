@@ -62,6 +62,7 @@ def main():
     while at < len(raw):
         p0, m = struct.unpack_from("<II", raw, at)
         at += 8
+        at += 4 * m  # the tokens
         arr = np.frombuffer(raw, dtype="<f4", count=m * nfeat, offset=at).reshape(m, nfeat)
         at += m * nfeat * 4
         for j in range(m):

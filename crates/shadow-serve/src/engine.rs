@@ -310,7 +310,8 @@ fn answer<'c>(arch: &str, req: &Request, tok: &Tokenizer, sess: &mut GpuSession<
     }
     // the start this prompt shares with the previous one: snapshot the session there while reading, for the next chat
     let shared = prefix.prev.iter().zip(&ids).take_while(|(a, b)| a == b).count();
-    let snap_at = (shared >= PREFIX_MIN && shared > cached && shared < ids.len()
+    // `SHADOW_NO_PREFIX=1`: no shared-prefix snapshots (every new conversation reads its whole prompt)
+    let snap_at = (shared >= PREFIX_MIN && !std::env::var("SHADOW_NO_PREFIX").is_ok_and(|v| v == "1") && shared > cached && shared < ids.len()
         && prefix.snap.as_ref().is_none_or(|s| s.tokens() != &ids[..shared])).then_some(shared);
     prefix.prev = ids.clone();
     let unread = &ids[cached..];

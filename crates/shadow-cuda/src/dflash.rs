@@ -85,6 +85,8 @@ pub struct DflashModel<'c> {
     pub broken: bool,
     /// a chain stops after a draft the selector gives less than this probability
     pub min_p: f32,
+    /// `SHADOW_DF_TIME=1`: seconds and rounds per phase of the draft round (synchronizes between phases)
+    pub prof: Option<std::collections::BTreeMap<&'static str, (f64, u64)>>,
     /// the mask token's embedding row (set when the session first drafts)
     pub mask_emb: Option<Vec<f32>>,
     /// rounds drafted, drafted tokens, tokens the main model agreed with (the speculation loop)
@@ -280,7 +282,7 @@ impl<'c> DflashModel<'c> {
         let ring = |_| ctx.alloc(RING * KV_WIDTH * 4).map_err(e);
         let kring = (0..LAYERS).map(ring).collect::<Result<Vec<_>, _>>()?;
         let vring = (0..LAYERS).map(ring).collect::<Result<Vec<_>, _>>()?;
-        Ok(Self { weights, tensors, bufs, kring, vring, valid: 0, broken: false, min_p: 0.0, mask_emb: None, stats: (0, 0, 0) })
+        Ok(Self { weights, tensors, bufs, kring, vring, valid: 0, broken: false, min_p: 0.0, prof: std::env::var("SHADOW_DF_TIME").is_ok_and(|v| v == "1").then(Default::default), mask_emb: None, stats: (0, 0, 0) })
     }
 
     pub fn ptr(&self, name: &str) -> u64 {

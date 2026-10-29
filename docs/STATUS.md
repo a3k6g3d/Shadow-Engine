@@ -695,3 +695,22 @@ Single-prompt runs, "Write a Rust function that parses a comma separated list...
   31.7, 0.5 38.1, 0.7 38.5, 0.85 35.8 - no better than a fixed 3. **Default with `--dflash`: 3 drafts.**
 - After a prefix-snapshot restore the drafter has no features for the restored positions, so it drafts nothing until a
   conversation starts from position 0 (the MTP head then drafts if loaded).
+
+## 2026-10-30: DFlash 2 fine-tuned on Shadow's own features; autotune loop
+
+- `tools/dflash2_train.py`: LoRA (r=32, all linears, fp32 over frozen BF16) on the drafter, trained on features Shadow
+  itself produced (`SHADOW_DF_DUMP=dir`: 5 taps, tokens; ~246k tokens of alpaca/code-alpaca answers, thinking on and
+  off, single- and multi-turn, greedy, fastest-mode flags) with the loss the drafter is used for (full-vocab CE through
+  the main model's head + CE over the selector's 16 candidates scored like `df_walk`); merged back to BF16
+  (`models/dflash2-ft2`, not in git: rerun the script). Metric: mean accepted prefix of the free-running greedy walk,
+  held-out conversations: thinking-mode set 2.72 -> 4.0 of 7; non-thinking multi-turn (the bench's kind) 2.57 -> 3.14.
+- A first tuning on thinking-mode data only did not carry to the bench (it sends `enable_thinking: false`): matching the
+  training data to the deployed mode was the fix.
+- Standard bench (6 turns, floor 0.2-0.6%, 3 runs): MTP `--spec 5` 38.95 tok/s; stock DFlash 2 `--spec 3` 39.84; tuned
+  (`--dflash models/dflash2-ft2`) `--spec 3` 38.38, `--spec 4` 37.99, **`--spec 5` 42.82 (+9.9% over MTP, +7.5% over
+  stock; runs 42.70 / 42.84 / 42.84)**. The non-monotonic 3/4 arms are not explained yet (their paired spread is wide).
+- Held-out prompts (`shadow-bench --prompts-file`, 12 turns of unseen alpaca prompts): speed there is dominated by
+  expert-tier misses (the placement was profiled on the 6 hash-table prompts): identical configs swung 9-47 tok/s, so
+  it cannot rank drafters; accepted tokens per pass there: tuned `--spec 5` 3.55, stock 2.86, MTP 2.84.
+- `tools/autotune.py`: coordinate ascent over serving flags with `shadow-bench` rounds (adopt a value only above
+  max(1%, 3 x floor) and a positive paired median), logged to `bench/autotune/log.md`.
