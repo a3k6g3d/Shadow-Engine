@@ -2,6 +2,28 @@
 
 All notable changes to Shadow will be documented in this file.
 
+## [0.1.27] — 2026-10-30
+### Changed (default on; `--exact` turns the speculation and inexact modes off)
+- `shadow serve MODEL` runs the fastest measured mode with no tier flags: `--tail-skip 4 --verify-resident --ram-tier-gib 30`,
+  the six-prompt placement, the DFlash 2 drafter (matrices Q8_0), `--spec 3`, `--dflash-min-p 0.5`. About 43 to 47 tok/s by
+  total throughput against about 20 for `--exact` (docs/STATUS.md, docs/BENCHMARKING.md). Not exact: `--tail-skip` changes the
+  model's own computation; speculation never does.
+- DeltaNet decay `expf` in float and the long sums in runs of 16 added in double (FP64 is 1/64 rate on the test GPU): +4% in spec mode.
+### Added
+- The DFlash 2 drafter (`--dflash DIR|off`, `--dflash-bf16`, `--dflash-min-p P`): features from layers 5/15/25/35/45, per-layer
+  K/V rings, a block-diffusion draft round, top-16 candidates through the main model's head and a bilinear selector walk
+  (docs/SPECULATION.md); `tools/dflash2_ref.py` checks it against torch, `tools/dflash2_train.py` is the fine-tuning pipeline.
+- Kernel fusions behind `--fuse N` (bit-identical, measured a tie or a loss, off); PLE row prefetch.
+- `shadow-bench`: records the machine once a second per run (CPU, RAM, disk, GPU util/memory/power/temperature/clocks, PCIe) and
+  each turn's start/end, `--prompts-file`, `--no-resources`; `tools/plot_bench.py` (charts, tables, joules per token),
+  `tools/bench_total.py` (total-throughput scoring), `tools/autotune.py` (coordinate ascent over flags),
+  `tools/bench_vs_strata.ps1`.
+- `SHADOW_RECORD_ROUTING=FILE` (a routing profile from a running server), `SHADOW_NO_PREFIX=1`, `SHADOW_DF_DUMP=DIR`, `SHADOW_DF_TIME=1`.
+### Learned (docs/STATUS.md)
+- The bench's per-turn median misranks arms that generate different text; score by total throughput.
+- A drafter fine-tune that looked like +25% accepted tokens counted prompt positions; on generated text it was a tie.
+- Candidates over a 106k draft vocabulary: -25%. Longer blocks than 3 drafts: slower.
+
 ## [0.1.26] — 2026-10-28
 ### Changed (default on, exact)
 - CUDA graphs for each DeltaNet layer's launches from its hc read to its router (`SHADOW_GRAPHS=0`: off):
