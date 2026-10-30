@@ -1048,6 +1048,53 @@ extern "C" __global__ void matvec_ids_q6_k(const u8* w, const unsigned int* ids,
 extern "C" __global__ void matvec_ids_q4_k(const u8* w, const unsigned int* ids, const float* x, float* y, unsigned int n, unsigned int cols) { matvec_ids_rows<Q4K>(w, ids, x, y, n, cols); }
 extern "C" __global__ void matvec_ids_iq4_xs(const u8* w, const unsigned int* ids, const float* x, float* y, unsigned int n, unsigned int cols) { matvec_ids_rows<IQ4XS>(w, ids, x, y, n, cols); }
 
+// matvec_ids_rows for M inputs at once (x_j = x + j * xs, y_j = y + j * ys): each selected weight row is decoded once.
+template <typename Q, unsigned int M>
+static __device__ __forceinline__ void matvec_ids_cols_m(const u8* w, const unsigned int* ids, const float* x, unsigned int xs,
+                                                         float* y, unsigned int ys, unsigned int n, unsigned int cols) {
+    unsigned int i = blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32, lane = threadIdx.x % 32;
+    if (i >= n) return;
+    const u8* r = w + (u64) ids[i] * (cols / Q::QK) * Q::BYTES;
+    float acc[M];
+#pragma unroll
+    for (unsigned int j = 0; j < M; j++) acc[j] = 0.0f;
+    for (unsigned int c = lane; c < cols / 8; c += 32) {
+        float xr[M * 8];
+#pragma unroll
+        for (unsigned int j = 0; j < M; j++) {
+            const float4* p = (const float4*) (x + (u64) j * xs + c * 8);
+            float4 a = p[0], b = p[1];
+            xr[j * 8 + 0] = a.x; xr[j * 8 + 1] = a.y; xr[j * 8 + 2] = a.z; xr[j * 8 + 3] = a.w;
+            xr[j * 8 + 4] = b.x; xr[j * 8 + 5] = b.y; xr[j * 8 + 6] = b.z; xr[j * 8 + 7] = b.w;
+        }
+        Fast<Q>::template dotm<M>(r, c * 8, xr, 8, acc);
+    }
+#pragma unroll
+    for (unsigned int j = 0; j < M; j++) {
+        float a = acc[j];
+        for (int off = 16; off > 0; off >>= 1) a += __shfl_down_sync(0xffffffffu, a, off);
+        if (lane == 0) y[(u64) j * ys + i] = a;
+    }
+}
+
+template <typename Q>
+static __device__ __forceinline__ void matvec_ids_cols(const u8* w, const unsigned int* ids, const float* x, unsigned int xs,
+                                                       float* y, unsigned int ys, unsigned int n, unsigned int cols, unsigned int m) {
+    switch (m) {
+        case 1: matvec_ids_cols_m<Q, 1>(w, ids, x, xs, y, ys, n, cols); break;
+        case 2: matvec_ids_cols_m<Q, 2>(w, ids, x, xs, y, ys, n, cols); break;
+        case 3: matvec_ids_cols_m<Q, 3>(w, ids, x, xs, y, ys, n, cols); break;
+        case 4: matvec_ids_cols_m<Q, 4>(w, ids, x, xs, y, ys, n, cols); break;
+        case 5: matvec_ids_cols_m<Q, 5>(w, ids, x, xs, y, ys, n, cols); break;
+        case 6: matvec_ids_cols_m<Q, 6>(w, ids, x, xs, y, ys, n, cols); break;
+        case 7: matvec_ids_cols_m<Q, 7>(w, ids, x, xs, y, ys, n, cols); break;
+        default: matvec_ids_cols_m<Q, 8>(w, ids, x, xs, y, ys, n, cols); break;
+    }
+}
+extern "C" __global__ void matvec_ids_cols_q6_k(const u8* w, const unsigned int* ids, const float* x, unsigned int xs, float* y, unsigned int ys, unsigned int n, unsigned int cols, unsigned int m) { matvec_ids_cols<Q6K>(w, ids, x, xs, y, ys, n, cols, m); }
+extern "C" __global__ void matvec_ids_cols_q4_k(const u8* w, const unsigned int* ids, const float* x, unsigned int xs, float* y, unsigned int ys, unsigned int n, unsigned int cols, unsigned int m) { matvec_ids_cols<Q4K>(w, ids, x, xs, y, ys, n, cols, m); }
+extern "C" __global__ void matvec_ids_cols_iq4_xs(const u8* w, const unsigned int* ids, const float* x, unsigned int xs, float* y, unsigned int ys, unsigned int n, unsigned int cols, unsigned int m) { matvec_ids_cols<IQ4XS>(w, ids, x, xs, y, ys, n, cols, m); }
+
 // ----------------------------------------------------------------------------- several matrices, one launch
 // The projections of one input (a DeltaNet layer's qkv / gate / beta / alpha; the router, its shared-expert gate and
 // the shared expert's gate and up) as jobs in one grid: job j owns blocks [first_j, first_{j+1}).  Each runs

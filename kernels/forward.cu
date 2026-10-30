@@ -954,9 +954,10 @@ extern "C" __global__ void df_attention(const float* q, const float* kc, const f
     out[(u64) t * 4096 + h * 128 + d] = acc / sm;
 }
 
-// The 16 largest of each row of logits (vocab values, rows ls apart), largest first, ties to the lower id.
-// grid = rows, block 256.
-extern "C" __global__ void df_top16(const float* logits, unsigned int vocab, unsigned int ls, unsigned int* ids, float* vals) {
+// The 16 largest of each row of logits (vocab values, rows ls apart), largest first, ties to the lower id; with `map`
+// the logits are over the vocabulary rows map[i] and the ids written are map[i].  grid = rows, block 256.
+extern "C" __global__ void df_top16(const float* logits, unsigned int vocab, unsigned int ls, const unsigned int* map,
+                                    unsigned int* ids, float* vals) {
     __shared__ float sv[256 * 16];
     __shared__ unsigned int si[256 * 16];
     __shared__ unsigned int pos[256];
@@ -1002,7 +1003,7 @@ extern "C" __global__ void df_top16(const float* logits, unsigned int vocab, uns
             __syncthreads();
         }
         if (threadIdx.x == 0) {
-            ids[blockIdx.x * 16 + r] = bi[0];
+            ids[blockIdx.x * 16 + r] = map ? map[bi[0]] : bi[0];
             vals[blockIdx.x * 16 + r] = bv[0];
             pos[bt[0]] += 1;
         }

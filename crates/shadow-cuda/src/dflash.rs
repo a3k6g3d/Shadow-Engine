@@ -83,6 +83,9 @@ pub struct DflashModel<'c> {
     /// the session was restored from a snapshot the drafter has no features for: no drafts until a conversation starts
     /// from position 0 again
     pub broken: bool,
+    /// the token ids the candidates are picked from (`draft_vocab.bin` beside the weights: the main model's likeliest
+    /// ~43% of the vocabulary), on the device; None: the whole vocabulary
+    pub draft_ids: Option<(DeviceBuffer<'c>, usize)>,
     /// a chain stops after a draft the selector gives less than this probability
     pub min_p: f32,
     /// `SHADOW_DF_TIME=1`: seconds and rounds per phase of the draft round (synchronizes between phases)
@@ -279,10 +282,19 @@ impl<'c> DflashModel<'c> {
             out: a(2 * BLOCK)?,
         };
         let _ = cap;
+        let draft_ids = match std::fs::read(dir.join("draft_vocab.bin")) {
+            Ok(vb) if std::env::var("SHADOW_DF_FULL_HEAD").is_err_and(|_| true) => {
+                let ids: Vec<u8> = vb.chunks_exact(4).flat_map(|c| c.to_vec()).collect();
+                let d = ctx.alloc(ids.len()).map_err(e)?;
+                d.upload(&ids).map_err(e)?;
+                Some((d, vb.len() / 4))
+            }
+            _ => None,
+        };
         let ring = |_| ctx.alloc(RING * KV_WIDTH * 4).map_err(e);
         let kring = (0..LAYERS).map(ring).collect::<Result<Vec<_>, _>>()?;
         let vring = (0..LAYERS).map(ring).collect::<Result<Vec<_>, _>>()?;
-        Ok(Self { weights, tensors, bufs, kring, vring, valid: 0, broken: false, min_p: 0.0, prof: std::env::var("SHADOW_DF_TIME").is_ok_and(|v| v == "1").then(Default::default), mask_emb: None, stats: (0, 0, 0) })
+        Ok(Self { weights, tensors, bufs, kring, vring, valid: 0, broken: false, draft_ids, min_p: 0.0, prof: std::env::var("SHADOW_DF_TIME").is_ok_and(|v| v == "1").then(Default::default), mask_emb: None, stats: (0, 0, 0) })
     }
 
     pub fn ptr(&self, name: &str) -> u64 {

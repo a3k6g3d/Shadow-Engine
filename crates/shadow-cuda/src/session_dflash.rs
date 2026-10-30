@@ -209,9 +209,31 @@ impl<'c, 'm> GpuSession<'c, 'm> {
         let vocab = self.m.cfg.vocab;
         lap("final norm");
         let hid1 = row(&b.hid, HIDDEN, 1);
-        self.mv_cols("output.weight", hid1, HIDDEN, self.bb.logits.ptr, vocab, slots);
-        lap("head (output.weight x 7)");
-        self.k("df_top16", slots as u32, 256, &[f(self.bb.logits.ptr), Arg::U32(vocab as u32), Arg::U32(vocab as u32), f(b.cand.ptr), f(b.unary.ptr)]);
+        match df.draft_ids.as_ref() {
+            // the draft vocabulary's rows only, every row decoded once for all the slots
+            Some((ids, n)) => {
+                let (t_out, _) = self.m.dense("output.weight");
+                let head_ty = t_out.ty.name().to_lowercase();
+                // SAFETY: n rows named by ids (all < vocab) of the head as stored; hid1 holds `slots` rows of HIDDEN floats,
+                // logits slots x n floats (n <= vocab).
+                unsafe {
+                    self.mvp.launch(&format!("matvec_ids_cols_{head_ty}"), ((*n as u32).div_ceil(8), 1, 1), (256, 1, 1), 0, self.ls(),
+                                    &[Arg::Ptr(self.w["output.weight"].ptr), Arg::Ptr(ids.ptr), Arg::Ptr(hid1), Arg::U32(HIDDEN as u32),
+                                      Arg::Ptr(self.bb.logits.ptr), Arg::U32(*n as u32), Arg::U32(*n as u32),
+                                      Arg::U32(t_out.dims[0] as u32), Arg::U32(slots as u32)])
+                }
+                .unwrap_or_else(|err| panic!("dflash head: {err}"));
+                lap("head (draft vocabulary)");
+                self.k("df_top16", slots as u32, 256, &[f(self.bb.logits.ptr), Arg::U32(*n as u32), Arg::U32(*n as u32), f(ids.ptr),
+                                                        f(b.cand.ptr), f(b.unary.ptr)]);
+            }
+            None => {
+                self.mv_cols("output.weight", hid1, HIDDEN, self.bb.logits.ptr, vocab, slots);
+                lap("head (output.weight x 7)");
+                self.k("df_top16", slots as u32, 256, &[f(self.bb.logits.ptr), Arg::U32(vocab as u32), Arg::U32(vocab as u32), Arg::Ptr(0),
+                                                        f(b.cand.ptr), f(b.unary.ptr)]);
+            }
+        }
         lap("top16");
         self.df_mv("candidate_selector.hidden_projection.weight", hid1, HIDDEN, b.hp.ptr, RANK, slots);
         self.k("df_walk", 1, 512, &[f(b.cand.ptr), f(b.unary.ptr), f(b.hp.ptr), w("candidate_selector.predecessor_codebook"),

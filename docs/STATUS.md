@@ -725,3 +725,11 @@ Single-prompt runs, "Write a Rust function that parses a comma separated list...
 - `shadow-bench` launched flag-less arms under a 16 GiB working-set cap (sized for no RAM tier), which squeezed the 30 GiB
   tier (first checks read 32.6 vs 42.7); it now assumes the default tier unless the arm says `--exact`.
 - Autotune (spec 3-7, min-p, tail-skip): nothing beat `--spec 5 --tail-skip 4`; the optimum is narrow (neighbours -5..-29%).
+
+## 2026-10-30 (later): DFlash candidates over the draft vocabulary - refuted
+
+- `matvec_ids_cols_{q6_k,q4_k,iq4_xs}` (the draft head's rows only, every row decoded once for all 7 slots) and `df_top16`'s id
+  map; used when a `draft_vocab.bin` sits beside the drafter's weights (opt-in; `SHADOW_DF_FULL_HEAD=1` ignores it). With the MTP
+  head's 106k-token list: the draft round 7.1 -> 6.1 ms, but candidates outside the list are lost: position-1 hits 300/432 ->
+  260/440, tokens per pass 2.89 -> 2.42, **-25% tok/s** (4 runs, floor 0.3%). The saving is at most ~1 ms of ~65 ms a pass;
+  a list built from this model's own outputs could cover more but cannot win more than ~1.5%.
