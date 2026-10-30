@@ -29,7 +29,7 @@ BASE = {
     "--tail-skip": 4,
     "--verify-resident": True,
     "--dflash": "J:\\Shadow\\models\\dflash2-ft2",
-    "--spec": 5,
+    "--spec": 3,
 }
 SPACE = {
     "--spec": [3, 4, 5, 6, 7],
@@ -57,24 +57,21 @@ def key(cfg):
 
 
 def parse_summary(path):
-    """arm -> (median tok/s, floor median %, paired median % or None)."""
-    rows, paired = {}, {}
-    sec = 0
-    for line in open(path, encoding="utf-8", errors="replace"):
-        if line.startswith("| arm"):
-            sec += 1
+    """arm -> (total tok/s, spread % across runs, None): total decode tokens / total decode time over the warm turns, from
+    the round's results.jsonl (the bench's per-turn median compares different turns when arms generate different text)."""
+    runs = {}
+    for line in open(os.path.join(os.path.dirname(path), "results.jsonl"), encoding="utf-8"):
+        r = json.loads(line)
+        if r.get("error"):
             continue
-        cells = [c.strip() for c in line.strip().strip("|").split("|")]
-        if not line.startswith("|") or len(cells) < 6 or cells[0].startswith("---"):
-            continue
-        try:
-            if sec == 1:
-                rows[cells[0]] = (float(cells[2]), float(cells[6].rstrip("%")))
-            elif sec == 2:
-                paired[cells[0]] = float(cells[2].rstrip("%").lstrip("+"))
-        except ValueError:
-            pass
-    return {a: (m, fl, paired.get(a)) for a, (m, fl) in rows.items() if not math.isnan(m)}
+        t = [x for x in r["turns"] if x["turn"] > 0]
+        runs.setdefault(r["arm"], []).append((sum(x["predicted_n"] for x in t), sum(x["predicted_ms"] for x in t)))
+    out = {}
+    for a, rs in runs.items():
+        per = [1000 * n / ms for n, ms in rs]
+        total = 1000 * sum(n for n, _ in rs) / sum(ms for _, ms in rs)
+        out[a] = (total, 100 * (max(per) - min(per)) / total, None)
+    return out
 
 
 def round_(args, name, base, variants, log):

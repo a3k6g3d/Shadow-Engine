@@ -756,3 +756,19 @@ Single-prompt runs, "Write a Rust function that parses a comma separated list...
   (which tokens come out) moves a run by several percent. Treat the `--spec 5` optimum and the autotune rounds (which used
   medians) as unproven; a bench with many more turns on varied text (and a placement profiled on it) is needed to rank
   drafters honestly. Strata's 48.5 is a median of the same kind - not re-scored.
+
+## 2026-10-30 (night): varied-text bench; the fine-tune was a prompt-text artifact; default back to the stock drafter
+
+- New bench: 36 turns of unseen alpaca/code-alpaca prompts (`bench/dfdata/varied36.json`, `shadow-bench --prompts-file F --turns 36`)
+  with a placement profiled on 300 *other* prompts (`profiles/routing-varied300.shrc`, recorded by `SHADOW_RECORD_ROUTING=FILE` on
+  `shadow serve`), scored by total decode tokens / time (`tools/bench_total.py`; the bench's per-turn median swung 18..44 here).
+  Total tok/s, 3 runs each (agree to 0.1-0.3): **stock DFlash 2 `--spec 3` 46.7**, MTP `--spec 5` 45.7, tuned `--spec 5` 44.6,
+  tuned `--spec 3` 42.8. Draft position-1 hits: stock 75%, tuned 71%. All DFlash arms ran the Q8_0 drafter.
+- Why the tuning "worked" on my held-out eval and not here: the eval (and the training) drew anchors from every position of a
+  conversation, including the user's prompt text, which the drafter never drafts in use. With anchors only inside generated
+  spans (`generated_mask` in `tools/dflash2_train.py`): stock 3.24, first tuning 3.35 accepted prefix; a retraining on
+  generated-span anchors (2500 steps, ~150k generated tokens) peaked at 3.39 after 250 steps and ended at 3.24: no gain. The
+  stock drafter is at its ceiling for this amount of data. `models/dflash2-ft2` / `-ft3` are not used.
+- `shadow serve` defaults: the stock `models/dflash2` (Q8_0), `--spec 3` (was the tuned weights, `--spec 5`). `tools/autotune.py` now
+  scores rounds by total throughput. Strata's 48.5 (a per-turn median on the six hash-table prompts) is not comparable
+  with these totals; Shadow's total on that bench is ~43 (stock3 42.9, Q8 default 45.4).

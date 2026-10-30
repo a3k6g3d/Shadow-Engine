@@ -244,9 +244,9 @@ fn compare(path: &std::path::Path, fixture: &std::path::Path, mode: Mode, rest: 
     ExitCode::SUCCESS
 }
 
-/// The fastest measured serving mode (docs/STATUS.md: 42.8 tok/s on the standard bench, exact mode 20.4) is what
-/// `shadow serve` runs unless the flags say otherwise: tail-skip 4, verify-resident, the fine-tuned DFlash 2 drafter with
-/// 5 drafts a pass, a 30 GiB RAM expert tier and the routing profile.  Each is only a default (give the flag to change
+/// The fastest measured serving mode (docs/STATUS.md: ~43-47 tok/s by total throughput, exact mode ~20) is what
+/// `shadow serve` runs unless the flags say otherwise: tail-skip 4, verify-resident, the DFlash 2 drafter (Q8_0) with
+/// 3 drafts a pass, a 30 GiB RAM expert tier and the routing profile.  Each is only a default (give the flag to change
 /// it; `--dflash off`, `--tail-skip 0`); `--exact` turns all of them off - the exact, unspeculated path, bit for bit
 /// the reference.
 fn fastest_defaults(rest: &[String]) -> Vec<String> {
@@ -278,13 +278,13 @@ fn fastest_defaults(rest: &[String]) -> Vec<String> {
         }
     }
     if !has("--dflash") && !has("--mtp") {
-        let dir = found("models/dflash2-ft2").or_else(|| found("models/dflash2"));
+        let dir = found("models/dflash2");
         if let Some(d) = dir.filter(|d| d.join("model.safetensors").exists()) {
             set.extend(["--dflash".into(), d.display().to_string()]);
         }
     }
     if !has("--spec") && (set.iter().any(|a| a == "--dflash") || has("--dflash")) {
-        set.extend(["--spec".into(), "5".into()]);
+        set.extend(["--spec".into(), "3".into()]);
     }
     if !set.is_empty() {
         eprintln!("shadow serve: fastest-mode defaults: {} (--exact for the exact path)", set.join(" "));

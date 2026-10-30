@@ -82,8 +82,47 @@ def load_sequences(d):
     out = []
     for s in seqs:
         if len(s["tok"]) >= 48:
-            out.append((np.array(s["tok"], dtype=np.int64), np.stack(s["feat"])))
+            tok = np.array(s["tok"], dtype=np.int64)
+            out.append((tok, np.stack(s["feat"]), generated_mask(tok)))
     return out
+
+
+IM_START, IM_END, THINK, END_THINK = 248045, 248046, 248068, 248069
+
+
+def generated_mask(tok):
+    """True where the main model generated the token (an assistant turn after its template header; a non-thinking turn's
+    empty think block is part of the header).  Drafts only ever start inside these spans."""
+    n = len(tok)
+    m = np.zeros(n, dtype=bool)
+    i = 0
+    while i < n:
+        if tok[i] == IM_START and i + 2 < n and tok[i + 1] != 846:  # 846: "user"
+            j = i + 3  # <|im_start|> assistant NEWLINE
+            if j < n and tok[j] == THINK:
+                k = j + 1
+                while k < min(n, j + 4) and tok[k] != END_THINK:
+                    k += 1
+                if k < min(n, j + 4):
+                    j = k + 2  # an empty think block closed in the header: the answer follows it
+                else:
+                    j = j + 2  # an open think block: the reasoning follows
+            e = j
+            while e < n and tok[e] != IM_END:
+                e += 1
+            m[j:min(e + 1, n)] = True
+            i = e
+        i += 1
+    return m
+
+
+def anchors_of(gen, L, k, rng=None):
+    """k anchor positions (8 <= a < L - 8) inside generated spans."""
+    ok = np.where(gen[:L])[0]
+    ok = ok[(ok >= 8) & (ok < L - BLOCK)]
+    if len(ok) == 0:
+        return None
+    return torch.from_numpy(ok[np.random.randint(len(ok), size=k)])
 
 
 # ---------------------------------------------------------------------------------------------------- model
@@ -250,13 +289,16 @@ def evaluate(model, emb_table, head, data, n_per_seq=24, seqs=None):
     """Mean accepted prefix length of the free-running greedy walk, and teacher-forced slot accuracy."""
     model_acc, slot_hit, slot_n, total = 0.0, np.zeros(7), np.zeros(7), 0
     g = torch.Generator().manual_seed(1)
-    for tok_np, feat_np in data[:seqs] if seqs else data:
+    for tok_np, feat_np, gen_np in data[:seqs] if seqs else data:
         L = min(len(tok_np), args.maxlen)
         tok = torch.from_numpy(tok_np[:L]).to(dev)
         feats = torch.from_numpy(feat_np[:L].astype(np.float32)).to(dev).to(wdt)
         if L < 40:
             continue
-        anchors = torch.randint(8, L - BLOCK, (n_per_seq,), generator=g).to(dev)
+        anchors = anchors_of(gen_np, L, n_per_seq)
+        if anchors is None:
+            continue
+        anchors = anchors.to(dev)
         with torch.autocast(dev, dtype=torch.bfloat16, enabled=dev == "cuda"):
             kv = model.ctx_kv(feats)
             emb = sample_block(model, emb_table, tok, feats, anchors)
@@ -301,7 +343,7 @@ def main():
     data = load_sequences(args.data)
     if args.max_seqs:
         data = data[:args.max_seqs]
-    tot = sum(len(t) for t, _ in data)
+    tot = sum(len(t) for t, _, _ in data)
     print(f"{len(data)} conversations, {tot} tokens ({time.time() - t0:.0f} s)", flush=True)
     nval = max(4, len(data) // 10)
     train, val = data[:-nval], data[-nval:]
@@ -325,11 +367,14 @@ def main():
             g_["lr"] = args.lr * sched(step)
         lc = ls = 0.0
         for _ in range(args.accum):
-            tok_np, feat_np = train[np.random.randint(len(train))]
+            tok_np, feat_np, gen_np = train[np.random.randint(len(train))]
             L = min(len(tok_np), args.maxlen)
             tok = torch.from_numpy(tok_np[:L]).to(dev)
             feats = torch.from_numpy(feat_np[:L].astype(np.float32)).to(dev).to(wdt)
-            anchors = torch.randint(8, L - BLOCK, (args.anchors,)).to(dev)
+            anchors = anchors_of(gen_np, L, args.anchors)
+            if anchors is None:
+                continue
+            anchors = anchors.to(dev)
             with torch.autocast(dev, dtype=torch.bfloat16, enabled=dev == "cuda"):
                 ce, sel, _, _ = forward_loss(model, emb_table, head, tok, feats, anchors)
             (0.5 * ce + sel).div(args.accum).backward()

@@ -165,6 +165,11 @@ fn run(cfg: Config, rx: std::sync::mpsc::Receiver<Request>, status: &Mutex<Statu
         {
             use shadow_model::forward::Stepper;
             s.report = sess.report();
+            // `SHADOW_RECORD_ROUTING=FILE`: the routing counts of everything this server has read, rewritten after each answer
+            // (a placement profile for `--placement`)
+            if let (Ok(path), Some(rc)) = (std::env::var("SHADOW_RECORD_ROUTING"), sess.routing()) {
+                let _ = std::fs::write(path, rc.to_bytes());
+            }
             if std::env::var("SHADOW_REPORT").is_ok_and(|v| v == "1") {
                 eprintln!("shadow serve: after this answer: {}", s.report);
             }
