@@ -837,3 +837,20 @@ Single-prompt runs, "Write a Rust function that parses a comma separated list...
   N=1 28.67 (-17%), N=2 34.28 (-1.2%); tokens a run 2,041 / 2,028 / 2,025.
 - So a CPU pool, as wired here (a join per layer, a spinning pool on the host's own cores), does not by itself explain Strata's 35% lower
   expert traffic per token (215 against 334 MB). Opt-in, off by default.
+
+## 2026-10-31: how is Strata still faster? (its own counters, and a larger CPU pool)
+
+- Strata logs, per request, where each routed expert use went. Its last 35 requests of the varied bench (1,206 generated tokens, 47.4 tok/s):
+  **GPU cache hit 48.4%, skipped 25.7%, computed elsewhere (its CPU pool) 13.4%, copied over PCIe 12.5%** of 576,035 routed uses (478 a
+  generated token). Per generated token: 231 cache hits, 123 skipped, 64 on the CPU, 60 PCIe reads.
+- Shadow, default mode, 14 turns / 997 generated tokens (`/v1/status` tiers line): 236,554 hits, 129,520 misses (every miss is a PCIe
+  copy: **130 a generated token**), 165,876 routed experts skipped (166 a token, but those include the rejected draft positions; about 19% of
+  all routed uses by a rough count). Units differ (Shadow counts union experts per pass), so read it as approximate: Strata copies half as
+  many experts as Shadow and computes the other half of the misses on the CPU, which is the 119 MB a token (61 experts) between 334 and 215.
+- A bigger CPU pool in Shadow's verify pass (exact speculation, 14 turns, same text, 1,091 tokens each): none 20.2 tok/s; 3 experts a layer
+  on 14 threads 19.7; **6 a layer on 14 threads 19.5** (misses down 29%, GPU waits 58 -> 34 ms, 94,626 CPU computations); 3 on 6 threads
+  20.0. The verify pass stays at 104 to 107 ms: the CPU join (about +20 ms of host time) replaces the GPU's wait. Taking misses off the bus
+  does not shorten the pass as wired (a per-layer join after the router, so the CPU's time adds to the layer's critical path).
+- Not verified: whether Strata's CPU share overlaps with GPU work across layers or batches tokens per expert; whether its higher skip share
+  (about 26%) costs quality (its replies on the same prompts are shorter: 1,417 against 2,041 tokens a run, which a more approximate model
+  could also produce).
