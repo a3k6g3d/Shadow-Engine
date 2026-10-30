@@ -33,6 +33,12 @@ CUDA index, `safetensors`, `numpy`, `matplotlib`).
 | `tools/dflash2_ref.py DIR` | recomputes the GPU drafter's block from the features it was given, in CPU torch, and compares hidden states and the selector walk (`SHADOW_DF_DUMP_DRAFTS=1`) |
 | `tools/dflash2_train.py` | LoRA fine-tuning of the drafter on Shadow's own features; reports the free-running accepted prefix on held-out conversations ([SPECULATION.md](SPECULATION.md); the gain it showed once was an artifact, kept as a pipeline) |
 
+## Research prototypes
+
+| tool | what |
+|---|---|
+| `tools/moe_speculative_gater.py` | PyTorch module `MoESpeculativeGater`: expert capacity gating for speculative verification of an offloaded MoE (commitment-weighted demand from a draft route predictor and the target router prior, effective-rank set size under a hard `k_max_experts` cap, residency-aware pruning, substitution routing `route_with_mask`); self-test with `python tools/moe_speculative_gater.py`. The same selection as `accept_route` in `session.rs`, for experiments outside the engine. |
+
 ## Reference and fixtures (correctness)
 
 | tool | what |
