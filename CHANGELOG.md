@@ -22,6 +22,9 @@ All notable changes to Shadow will be documented in this file.
 - `SHADOW_RECORD_ROUTING=FILE` (a routing profile from a running server), `SHADOW_NO_PREFIX=1`, `SHADOW_DF_DUMP=DIR`, `SHADOW_DF_TIME=1`.
 - AcceptMoE verifier expert sets (`--accept-moe`, `--accept-beta/--accept-scale/--accept-budget`), the graded `--verify-rank R`,
   `finish` recorded per bench turn, tokens-a-run and early stops in `bench_total.py`, `tools/quality_test.py`, `tools/trunc_test.py`.
+- The n-gram (PLE) row prefetch reads through the model's read pool (own file handles: one shared synchronous handle serializes reads on Windows): prefetch
+  3.5-9 ms -> 1.2 ms a verify pass, +7% in the default mode, output unchanged (34.7 -> 37.1 tok/s on the varied bench).
+- Opt-in experiments, all exact and none a gain: `--pipeline` (two token groups per verify pass), `--cpu-experts N` in the verify pass, `--verify-rank R`.
 ### Learned (docs/STATUS.md)
 - The bench's per-turn median misranks arms that generate different text; score by total throughput.
 - A drafter fine-tune that looked like +25% accepted tokens counted prompt positions; on generated text it was a tie.
