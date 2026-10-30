@@ -811,3 +811,14 @@ Single-prompt runs, "Write a Rust function that parses a comma separated list...
 - Autotune on the varied bench (total throughput): `--spec` 3 best (4/5/6/7: -6.5 to -21%), `--tail-skip` 4 best (3/5: -2.8/-5.1%),
   `--dflash-min-p 0.5` +2.0%, `--pin-margin` 2/4/8 -6.4 to -6.7%, `--cpu-experts` 2/4 no gain, `--fuse` no gain (these ran with
   `--verify-resident` on; the ranking needs a re-check on the AcceptMoE default).
+
+## 2026-10-31: how predictable is routing? (the draft-side route predictor question)
+
+- `tools/route_predictability.py` on three exact-mode routing logs (~200 generated tokens each, 48 MoE layers, k=10), recall of the actual
+  top-10 experts of the token d positions after the last committed one, within a predicted set:
+  last committed token's experts (|set| 10): **0.39** (d=1) / 0.30 / 0.27 / 0.25 (d=4); union of the last 2 (16 experts): 0.47 / 0.39 / 0.36 / 0.33;
+  union of the last 4 (26): 0.56 / 0.48 / 0.45 / 0.42; a static frequency profile of 16 or 32 experts: 0.07 / 0.16; last token + frequent
+  experts (16 / 31): 0.40 / 0.45. Training-free signals are weak (Specter's quantized self-draft gets 91 to 96% expert-ID agreement; a
+  learned predictor would be needed), so routing-driven prefetch from cheap signals cannot hide the copies, consistent with `--pregate`
+  finding nothing. The gater (`accept_route`) does not need a predictor to pick its set (it uses the target's own router logits at verify
+  time); a predictor only matters for starting copies earlier.

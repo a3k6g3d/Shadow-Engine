@@ -37,6 +37,7 @@ CUDA index, `safetensors`, `numpy`, `matplotlib`).
 
 | tool | what |
 |---|---|
+| `tools/route_predictability.py` | recall of a token's actual top-k experts per layer within cheap predicted sets (the last committed token's experts, unions of the last 2 and 4, a static frequency profile), by distance ahead: how predictable routing is without a learned predictor (`SHADOW_ROUTE_LOG` logs) |
 | `tools/moe_speculative_gater.py` | PyTorch module `MoESpeculativeGater`: expert capacity gating for speculative verification of an offloaded MoE (commitment-weighted demand from a draft route predictor and the target router prior, effective-rank set size under a hard `k_max_experts` cap, residency-aware pruning, substitution routing `route_with_mask`); self-test with `python tools/moe_speculative_gater.py`. The same selection as `accept_route` in `session.rs`, for experiments outside the engine. |
 
 ## Reference and fixtures (correctness)
