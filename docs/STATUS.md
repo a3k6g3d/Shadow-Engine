@@ -940,3 +940,7 @@ Single-prompt runs, "Write a Rust function that parses a comma separated list...
   `--admit-after 1` **48.4%** (-1.5 points, yet faster in the bench). The 0.6 GiB of extra slots buys 2.7 points of hit rate, about 5% fewer misses, which does not pay for
   taking the reserve down to nothing (the 5.0 GiB bench arm: -10%). The cache is at the edge of what the card can hold; the next VRAM would have to come from the drafter
   (1.2 GB) or the dense weights (4.4 GB), not from idle buffers.
+- The drafter's cost, by the same map with `--dflash off`: 5,826 MiB free before the cache against 4,996 with it, so **the DFlash 2 drafter holds 830 MiB** (about 610 MiB of Q8_0
+  matrices, the rest its K/V rings and buffers). A 4-bit drafter would free about 290 MiB: +150 cache slots (+6.5%), about +1.3 points of hit rate by the 5.0 GiB
+  arm's rate (13.5% more slots gave 2.7 points), i.e. about 2.5% fewer misses, under 1% of speed, against a drafter whose acceptance (the thing the speed rests on) can only
+  get worse. Not built: the expected gain is below the bench's run-to-run floor.
