@@ -920,3 +920,9 @@ Single-prompt runs, "Write a Rust function that parses a comma separated list...
   on top of `--admit-after`, and VRAM lending (which would give the bigger cache without starving the pass), are the next candidates.
 - Bench hygiene: three runs of the follow-up bench died ("connection forcibly closed"), one with available RAM at 3.6 GiB: the 4 GiB watchdog in `tools/run_capped.ps1`
   killed them while the browser pane was open. Nothing else was running for the scored runs; the default arm of the follow-up has one complete run.
+- Avalon-style LFU contest tried on top (a full layer admits a miss only if its demand count beats the LRU entry's, counts capped at 15 and halved every W x slots
+  demands, an evicted expert keeping its count; three benches of 3 runs, varied text, total throughput; default 36.50, `--admit-after 1` 37.49): `--admit-lfu 5` 37.07,
+  `--admit-lfu 5 --admit-after 1` 35.80, `--admit-lfu 2 --admit-after 1` 37.41. It adds nothing over the plain second-miss filter and one setting loses, so it was **removed**.
+  `--admit-after 1` now reads +1.2% to +2.7% over the default in three benches (36.89 / 37.01 / 37.49 against 36.45 / 36.53 / 36.50); still opt-in, since the output
+  text changes with the cache contents (AcceptMoE's sets follow residency) and no quality check has been run on it.
+- With the browser pane closed the bench keeps 8-9 GiB of RAM free (4.1-4.9 GiB with it open), and no run died: the earlier deaths were the 4 GiB watchdog.
