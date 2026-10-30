@@ -246,6 +246,9 @@ pub struct GpuSession<'c, 'm> {
     /// The hybrid MoE's CPU side (`Tiers::cpu_experts`), and how many experts it has computed.
     cpu: Option<(shadow_model::cpu_expert::ExpertPool, usize)>,
     pub cpu_served: u64,
+    /// the verify pass's CPU experts: how many joins, the host's seconds waiting in them, and the seconds from each
+    /// job's submit to its result (the job is out of the host's way until the join)
+    cpu_join: (u64, f64, f64),
     prefetch: Option<Prefetch<'c>>,
     /// Mapped pinned memory the router logits are copied into by a kernel, and the event the host waits on for them:
     /// a device-to-host memcpy would queue in the copy engine behind `copy_stream`'s uploads.
@@ -1111,6 +1114,7 @@ impl<'c, 'm> GpuSession<'c, 'm> {
             cpu: (tiers.cpu_experts > 0 && tiers.cpu_threads > 0)
                 .then(|| (shadow_model::cpu_expert::ExpertPool::new(tiers.cpu_threads), tiers.cpu_experts)),
             cpu_served: 0,
+            cpu_join: (0, 0.0, 0.0),
             mapped: PinnedRegion::new(ctx, MAX_BATCH.max(2) * c.n_expert * 4)?,
             mapped_event: ctx.event().map_err(e)?,
             waits: [0.0; 3],
@@ -3234,6 +3238,7 @@ impl<'c, 'm> GpuSession<'c, 'm> {
         let mut cpu_pairs: Vec<(usize, usize)> = vec![];
         let mut cpu_offs: Vec<usize> = vec![];
         let mut cpu_pending = false;
+        let mut cpu_submit = std::time::Instant::now();
         if let (Some(ub), Some(max)) = (u_host.as_ref(), self.cpu.as_ref().map(|c| c.1)) {
             if infos[0].ty == infos[1].ty && infos[0].dims == infos[1].dims && self.ram.region.is_some() {
                 let mut users: HashMap<usize, Vec<(usize, usize, f64)>> = HashMap::new();
@@ -3281,6 +3286,7 @@ impl<'c, 'm> GpuSession<'c, 'm> {
                     unsafe { self.cpu.as_mut().unwrap().0.submit_multi(&shape, refs, xidx, &xs) };
                     self.cpu_served += cpu_pairs.len() as u64;
                     cpu_pending = true;
+                    cpu_submit = std::time::Instant::now();
                 }
             }
         }
@@ -3381,7 +3387,11 @@ impl<'c, 'm> GpuSession<'c, 'm> {
             }
             self.read_drive(&names, &sizes);
             if cpu_pending {
+                let t_join = std::time::Instant::now();
                 let out = self.cpu.as_mut().unwrap().0.wait();
+                self.cpu_join.0 += 1;
+                self.cpu_join.1 += t_join.elapsed().as_secs_f64();
+                self.cpu_join.2 += cpu_submit.elapsed().as_secs_f64();
                 for (n, &(j, i)) in cpu_pairs.iter().enumerate() {
                     self.upload_to(row(&self.bb.eo, k * h, j) + (i * h * 4) as u64, &f32s(&out[n * h..(n + 1) * h]));
                 }
@@ -3675,6 +3685,11 @@ impl Stepper for GpuSession<'_, '_> {
                        self.ram.fill_secs, self.ram.served, self.ram.drive)
             + &self.cpu.as_ref().map(|c| format!("; CPU experts: up to {} per layer, {} computed", c.1, self.cpu_served))
                 .unwrap_or_default()
+            + &self.cpu.as_ref().filter(|_| self.cpu_join.0 > 0).map(|_| {
+                let (n, join, job) = self.cpu_join;
+                format!("; verify-pass CPU joins: {n}, host waited {:.0} us each, submit-to-result {:.0} us each",
+                        1e6 * join / n as f64, 1e6 * job / n as f64)
+            }).unwrap_or_default()
             + &{
                 let v = &self.verify_stats;
                 if v[0] > 0.0 {

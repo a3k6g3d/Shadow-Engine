@@ -854,3 +854,20 @@ Single-prompt runs, "Write a Rust function that parses a comma separated list...
 - Not verified: whether Strata's CPU share overlaps with GPU work across layers or batches tokens per expert; whether its higher skip share
   (about 26%) costs quality (its replies on the same prompts are shorter: 1,417 against 2,041 tokens a run, which a more approximate model
   could also produce).
+
+## 2026-10-31: the CPU join, measured; Strata's pipeline, read; Strata's fidelity
+
+- The verify-pass CPU join is timed (`verify-pass CPU joins` in the report). Exact speculation, 14 threads, none / 2 / 4 / 6 experts a layer:
+  pass 104.3 / 107.2 / 109.0 / 108.1 ms; **host wait at the join 66 / 155 / 253 us a layer** (about 3 / 7 / 12 ms a pass: the CPU job, 0.85 to
+  1.06 ms from submit to result, is almost always done before the host gets to the join); GPU waits 57.9 / 44.5 / 38.9 / 33.5 ms; file waits
+  23.4 / 28.4 / 31.3 / 30.5; host launch time 4.8 / 8.1 / 8.6 / 9.4 ms. At 6 a layer: -24 ms of GPU waiting is paid back by +12 ms of join,
+  +7 ms of file waiting (the CPU experts claim ring slots) and +5 ms of host launches and uploads. **The earlier statement that the CPU join
+  added about 20 ms was an inference and wrong**; the measured join is 3 to 12 ms and the rest is extra host work. The pass is limited by a serial
+  host chain (router sync, issuing copies, file reads, the combine), not by PCIe bytes, so a smaller byte count does not shorten it.
+- Strata's source (`src/core/verify.cpp`, "Plan v0.3 P6 split window"): the window's tokens are cut into two groups A and B and the stream is
+  ordered `pre(0,A) pre(0,B) | post(0,A) pre(1,A) | post(0,B) pre(1,B) | ...` so the CPU computes A's experts of layer l while the GPU runs
+  B's mixer and router of layer l, and B's experts while the GPU combines A and runs A's layer l + 1; the whole window is a captured CUDA graph
+  with device-side planning and flags instead of host round trips. That software pipeline is the overlap Shadow's per-layer chain lacks.
+- Fidelity of Strata's replies against the exact run (same history, 24 turns): mean prefix match **0.431**, 6 of 24 identical (Shadow default
+  0.572 / 9 of 24; plain tail skip 4 0.481); free-run 14 turns: 920 tokens, 5 early stops, 31.8 tok/s end to end (Shadow default 997 tokens, 3 early,
+  27.8; exact 1,091, 3, 18.2). Strata is the least faithful of these, so part of its lead is approximation.
