@@ -16,6 +16,11 @@
 //!                  [--tokens 96] [--port 8091] [--arm-exe NAME=EXE ...]
 //! shadow-bench summary DIR
 //! ```
+//!
+//! Every run also records the machine once a second (`DIR/ARM-runN.sys.csv`: CPU %, available RAM, disk and paging;
+//! `.gpu.csv`: GPU and memory utilisation, memory used, power, temperature, SM and memory clocks; `.pcie.csv`:
+//! PCIe rx / tx MB/s), and `results.jsonl` carries each turn's start and end (unix seconds), so `tools/plot_bench.py`
+//! can chart the arms' resource use against the decode windows.  `--no-resources` turns it off.
 
 use serde_json::{json, Value};
 use std::collections::HashMap;
@@ -73,6 +78,66 @@ fn http(port: u16, method: &str, path: &str, body: Option<&Value>, timeout: Dura
 }
 
 /// GPU memory in use (MiB), from nvidia-smi; None if it cannot be asked.
+/// Resource samplers for one run: PowerShell counters (CPU, RAM, disk, paging) and two `nvidia-smi` loops, each writing
+/// a CSV beside the results.  Killed with `stop`; any that fail to start are simply absent.
+struct Monitors {
+    kids: Vec<std::process::Child>,
+}
+
+const SYSMON_PS1: &str = r#"param([string]$Out)
+"time,cpu_pct,avail_mb,disk_read_bps,disk_write_bps,pages_per_s" | Out-File -Encoding ascii $Out
+$names = @('\Processor(_Total)\% Processor Time', '\Memory\Available MBytes', '\PhysicalDisk(_Total)\Disk Read Bytes/sec',
+           '\PhysicalDisk(_Total)\Disk Write Bytes/sec', '\Memory\Pages/sec')
+while ($true) {
+  $c = Get-Counter -Counter $names -SampleInterval 1
+  $v = $c.CounterSamples | ForEach-Object { $_.CookedValue }
+  ('{0},{1:F1},{2:F0},{3:F0},{4:F0},{5:F1}' -f (Get-Date).ToString('yyyy-MM-dd HH:mm:ss.fff'), $v[0], $v[1], $v[2], $v[3], $v[4]) |
+    Out-File -Encoding ascii -Append $Out
+}
+"#;
+
+impl Monitors {
+    fn start(prefix: &Path) -> Monitors {
+        use std::process::{Command, Stdio};
+        let mut kids = Vec::new();
+        let ps1 = prefix.with_file_name("sysmon.ps1");
+        if std::fs::write(&ps1, SYSMON_PS1).is_ok() {
+            if let Ok(k) = Command::new("powershell")
+                .args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", &ps1.display().to_string(), "-Out",
+                       &format!("{}.sys.csv", prefix.display())])
+                .stdout(Stdio::null()).stderr(Stdio::null()).spawn() {
+                kids.push(k);
+            }
+        }
+        let q = "timestamp,utilization.gpu,utilization.memory,memory.used,power.draw,temperature.gpu,clocks.sm,clocks.mem,\
+                 pcie.link.gen.current,pcie.link.width.current,clocks_throttle_reasons.active";
+        if let Ok(k) = Command::new("nvidia-smi")
+            .args([&format!("--query-gpu={q}"), "--format=csv,nounits", "-lms", "1000", "-f", &format!("{}.gpu.csv", prefix.display())])
+            .stdout(Stdio::null()).stderr(Stdio::null()).spawn() {
+            kids.push(k);
+        }
+        if let Ok(k) = Command::new("nvidia-smi")
+            .args(["dmon", "-s", "t", "-d", "1", "-o", "DT", "-f", &format!("{}.pcie.csv", prefix.display())])
+            .stdout(Stdio::null()).stderr(Stdio::null()).spawn() {
+            kids.push(k);
+        }
+        Monitors { kids }
+    }
+
+    fn stop(&mut self) {
+        for k in &mut self.kids {
+            let _ = std::process::Command::new("taskkill").args(["/T", "/F", "/PID", &k.id().to_string()]).output();
+            let _ = k.kill();
+            let _ = k.wait();
+        }
+        self.kids.clear();
+    }
+}
+
+fn unix_secs() -> f64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs_f64()
+}
+
 fn gpu_used_mib() -> Option<u64> {
     let o = std::process::Command::new("nvidia-smi").args(["--query-gpu=memory.used", "--format=csv,noheader,nounits"])
         .output().ok()?;
@@ -145,7 +210,8 @@ fn run(a: &[String]) {
                 None => format!("& '{}' -CapGiB {cap} -Out '{}' -Exe '{}' -Arguments '{}'", capped.display(),
                                 log.display(), arm_exe.get(name).unwrap_or(&exe).display(), args),
             };
-            let rec = one_run(name, i, port, &launch, turns, tokens);
+            let res = (!a.iter().any(|x| x == "--no-resources")).then(|| out.join(format!("{name}-run{i}")));
+            let rec = one_run(name, i, port, &launch, turns, tokens, res.as_deref());
             println!("run {i} {name}: {}", rec.get("line").and_then(Value::as_str).unwrap_or(""));
             let mut f = std::fs::OpenOptions::new().create(true).append(true).open(&results).unwrap();
             writeln!(f, "{rec}").unwrap();
@@ -173,9 +239,11 @@ fn settle_ram() -> f64 {
     }
 }
 
-fn one_run(arm: &str, run: usize, port: u16, launch: &str, turns: usize, tokens: usize) -> Value {
+fn one_run(arm: &str, run: usize, port: u16, launch: &str, turns: usize, tokens: usize, res: Option<&Path>) -> Value {
     let ram_at_launch = settle_ram();
     let t0 = Instant::now();
+    let t_launch = unix_secs();
+    let mut monitors = res.map(Monitors::start);
     let mut child = std::process::Command::new("powershell")
         .args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", launch])
         .stdout(std::process::Stdio::piped())
@@ -207,6 +275,7 @@ fn one_run(arm: &str, run: usize, port: u16, launch: &str, turns: usize, tokens:
         std::thread::sleep(Duration::from_secs(2));
     };
     let load_s = t0.elapsed().as_secs_f64();
+    let t_ready = unix_secs();
     let mut turns_out = Vec::new();
     let mut error = None;
     if ready {
@@ -215,7 +284,10 @@ fn one_run(arm: &str, run: usize, port: u16, launch: &str, turns: usize, tokens:
             history.push(json!({"role": "user", "content": prompt}));
             let body = json!({"messages": history, "max_tokens": tokens, "chat_template_kwargs": {"enable_thinking": false}});
             sample(&mut min_ram, &mut max_gpu);
-            match http(port, "POST", "/v1/chat/completions", Some(&body), Duration::from_secs(1800)) {
+            let t_start = unix_secs();
+            let reply = http(port, "POST", "/v1/chat/completions", Some(&body), Duration::from_secs(1800));
+            let t_end = unix_secs();
+            match reply {
                 Ok((200, b)) => {
                     let v: Value = serde_json::from_str(&b).unwrap_or(Value::Null);
                     let content = v["choices"][0]["message"]["content"].as_str().unwrap_or("").to_string();
@@ -223,7 +295,7 @@ fn one_run(arm: &str, run: usize, port: u16, launch: &str, turns: usize, tokens:
                     turns_out.push(json!({
                         "turn": t, "decode_tps": tm["predicted_per_second"], "predicted_n": tm["predicted_n"],
                         "predicted_ms": tm["predicted_ms"], "prompt_n": tm["prompt_n"], "prompt_ms": tm["prompt_ms"],
-                        "cache_n": tm["cache_n"], "content": content,
+                        "cache_n": tm["cache_n"], "content": content, "t_start": t_start, "t_end": t_end,
                     }));
                     history.push(json!({"role": "assistant", "content": content}));
                 }
@@ -252,6 +324,10 @@ fn one_run(arm: &str, run: usize, port: u16, launch: &str, turns: usize, tokens:
         let _ = std::process::Command::new("taskkill").args(["/T", "/F", "/PID", &child.id().to_string()]).output();
         let _ = child.kill();
     }
+    let t_done = unix_secs();
+    if let Some(m) = monitors.as_mut() {
+        m.stop();
+    }
     let mut capped_out = String::new();
     if let Some(mut so) = child.stdout.take() {
         let _ = so.read_to_string(&mut capped_out);
@@ -263,6 +339,7 @@ fn one_run(arm: &str, run: usize, port: u16, launch: &str, turns: usize, tokens:
                        error.as_ref().map(|e| format!(" - ERROR {e}")).unwrap_or_default());
     json!({
         "arm": arm, "run": run, "launch": launch, "load_s": load_s, "turns": turns_out, "error": error,
+        "t_launch": t_launch, "t_ready": t_ready, "t_done": t_done, "resources": res.map(|p| p.display().to_string()),
         "available_ram_at_launch_gib": ram_at_launch,
         "min_available_ram_gib": gib(min_ram), "peak_gpu_mib": max_gpu,
         "run_capped": capped_out.trim().lines().last().unwrap_or(""), "line": line, "ended": now(),
