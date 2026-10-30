@@ -535,9 +535,16 @@ mod tests {
             let act: Vec<f32> = (0..shape.ff).map(|r| silu(row_dot("IQ3_S", &g[r * grow..(r + 1) * grow], &x))
                 * row_dot("IQ3_S", &u[r * grow..(r + 1) * grow], &x)).collect();
             let drow = down_bytes / shape.hidden;
-            for r in 0..shape.hidden {
-                let want = row_dot("IQ4_NL", &d[r * drow..(r + 1) * drow], &act);
-                assert_eq!(got[e * shape.hidden + r].to_bits(), want.to_bits(), "expert {e} row {r}");
+            let want: Vec<f32> = (0..shape.hidden).map(|r| row_dot("IQ4_NL", &d[r * drow..(r + 1) * drow], &act)).collect();
+            if fast_kernels(&shape) {
+                // the AVX-512 kernels quantize the activations to int8: close to the f32 serial path, not bit for bit
+                let num: f64 = (0..shape.hidden).map(|r| (got[e * shape.hidden + r] - want[r]).powi(2) as f64).sum();
+                let den: f64 = want.iter().map(|w| (*w as f64).powi(2)).sum();
+                assert!(num <= 0.05 * 0.05 * den.max(1e-12), "expert {e}: relative L2 error {}", (num / den).sqrt());
+            } else {
+                for r in 0..shape.hidden {
+                    assert_eq!(got[e * shape.hidden + r].to_bits(), want[r].to_bits(), "expert {e} row {r}");
+                }
             }
         }
     }
