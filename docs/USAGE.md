@@ -68,6 +68,7 @@ RAM, expert-cache hit rates, memory tiers).
 | `--ram-tier-gib G` or `auto` | 30 | pinned host memory for the expert tier; `auto` sizes it from the RAM available now less 10 GiB |
 | `--placement FILE` | the six-prompt profile | a routing profile (`SHRC`) ranking which experts the tier holds |
 | `--expert-cache-gib G` | all free VRAM less 384 MiB | the VRAM expert cache (LRU per layer) |
+| `--admit-after N` | 0 | a VRAM-cache miss gets a slot only from its (N+1)th miss (N=1: about +1%; STATUS.md) |
 | `--pin-margin N` | off | pin each layer's hottest experts in VRAM, keeping N evictable slots a layer |
 | `--tail-skip R` | 4 | routed experts of rank >= R are skipped when not in VRAM (0: exact) |
 | `--accept-moe`, `--accept-beta B`, `--accept-scale S`, `--accept-budget F` | on, 1.0, 1, 1 | AcceptMoE verifier expert sets (docs/SPECULATION.md); B sharpens the commitment weights, S scales the set, F the pruning budget |

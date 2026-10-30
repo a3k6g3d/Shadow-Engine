@@ -903,3 +903,20 @@ Single-prompt runs, "Write a Rust function that parses a comma separated list...
   repo's own readpool note says so), so the "parallel" reads ran one after another plus the spawns. Fix: the rows are read through the model's `ReadPool`
   (8 workers, each with its own handles). Prefetch: mean **1.22 ms** (median 1.12, p90 1.46 over 371 passes).
 - Default mode, varied bench, 2 runs, total throughput, same 2,041 tokens a run (bit-identical output): 34.66 / 34.71 before (two earlier benches) -> **37.08 now (+7%)**.
+
+## 2026-10-31: the VRAM cache - bigger loses, a second-miss admission filter gains ~1%
+
+- Strata's cache holds 5.01 GiB against Shadow's 4.42 GiB (the free VRAM less `VRAM_RESERVE`, after the drafter and buffers). Shadow's slots are already per-layer and
+  exactly sized, so Strata's "size slots in bytes" finding (+13%) is already in. Paired bench, varied text, 3 runs, total throughput, one exe:
+  default 4.42 GiB **36.45**, `--expert-cache-gib 4.8` **34.64 (-5%)**, 5.0 **32.96 (-10%)**. A bigger cache is slower here: peak GPU use reaches 11.7-11.8 of 12.2 GiB and
+  the extra slots come out of what the verify pass needs. Strata's larger cache does not transfer.
+- New `--admit-after N` (off by default): a miss gets a VRAM slot only from its (N+1)th miss; the first N are read through the scratch slots and kept out of the cache,
+  so a one-off expert does not evict a useful one. Total throughput, same bench: N=1 **36.89** and **37.01** in two benches (default 36.45 / 36.53), N=2 36.78, N=4 35.87.
+  About +1.2% at N=1, steady to 0.1 tok/s across runs; the text differs (1,986 tokens a run against 2,041, as AcceptMoE's residency-aware sets follow the cache), so
+  read the gain as small. Opt-in.
+- Avalon (freriadoc/Avalon, a llama.cpp fork, MIT) was read: its cache counts each expert's demands, admits at 3, and when full admits only an expert whose aged count
+  beats the LRU entry's (counts capped at 15, halved every 5 x entries demands, window shortened with context depth); an evicted expert keeps its count; admission copies are
+  deferred so they do not slow the CPU's rows; compute buffers and the unused KV tail are lent to the cache between phases. Not built here: an LFU contest with aging
+  on top of `--admit-after`, and VRAM lending (which would give the bigger cache without starving the pass), are the next candidates.
+- Bench hygiene: three runs of the follow-up bench died ("connection forcibly closed"), one with available RAM at 3.6 GiB: the 4 GiB watchdog in `tools/run_capped.ps1`
+  killed them while the browser pane was open. Nothing else was running for the scored runs; the default arm of the follow-up has one complete run.

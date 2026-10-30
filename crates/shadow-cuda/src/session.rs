@@ -53,6 +53,10 @@ struct ExpertCache<'c> {
     clock: u64,
     hits: u64,
     misses: u64,
+    /// `--admit-after N`: an expert missed fewer than N times before is read through scratch, not given a cache slot
+    admit_after: usize,
+    seen: HashMap<(usize, usize), u32>,
+    scratch_reads: u64,
 }
 
 impl ExpertCache<'_> {
@@ -459,6 +463,9 @@ pub struct Tiers {
     /// slots a layer; `None` (the default): every slot is LRU.  On real routing, LRU over a layer's slots hits more:
     /// 70.7% vs 56.6% with N = 12 (docs/STATUS.md, tools/cache_sim.py).
     pub pin_margin: Option<usize>,
+    /// `--admit-after N`: a miss gets a VRAM slot only from its (N+1)th miss on; the first N are read through scratch
+    /// slots (kept out of the cache, so a one-off expert does not push a useful one out).  0: every miss is admitted.
+    pub admit_after: usize,
     /// `--tail-skip R` (inexact, off by default; Strata's STRATA_ROUTE_TAIL_SKIP): a routed expert that is not in VRAM
     /// and that every token of a step or verify pass routes only at rank >= R (0-based, of the top 10) is neither
     /// copied nor computed - its contribution is zero and the others keep their weights.  Changes answers.
@@ -531,6 +538,7 @@ impl Tiers {
                    pipeline: args.iter().any(|a| a == "--pipeline") || std::env::var("SHADOW_PIPELINE").is_ok_and(|v| v == "1"),
                    verify_rank: flag("--verify-rank").and_then(|v| v.parse().ok()).unwrap_or(0),
                    fuse: flag("--fuse").and_then(|v| v.parse().ok()),
+                   admit_after: num("--admit-after", 0)?,
                    pin_margin: flag("--pin-margin").map(|v| v.parse().map_err(|_| format!("--pin-margin: not a number: {v}")))
                        .transpose()? })
     }
@@ -1061,6 +1069,7 @@ impl<'c, 'm> GpuSession<'c, 'm> {
         let mut cache = ExpertCache {
             arena, slot_offset, layer_range, evict_range, slot_bytes, arena_bytes, slots, map: HashMap::new(),
             owner: vec![None; slots], stamp: vec![0; slots], clock: 0, hits: 0, misses: 0,
+            admit_after: tiers.admit_after, seen: HashMap::new(), scratch_reads: 0,
         };
         for (l, ep, s) in vram_pinned_slots {
             cache.owner[s] = Some((l, ep));
@@ -3399,7 +3408,18 @@ impl<'c, 'm> GpuSession<'c, 'm> {
                     continue;
                 }
                 self.cache.misses += 1;
-                let base = if self.cache.has_victim(l) {
+                let times = if self.cache.admit_after > 0 {
+                    let n = self.cache.seen.entry((l, e)).or_insert(0);
+                    *n += 1;
+                    *n as usize
+                } else {
+                    usize::MAX
+                };
+                let cold = times <= self.cache.admit_after && extra.len() < scratch.1;
+                if cold {
+                    self.cache.scratch_reads += 1;
+                }
+                let base = if !cold && self.cache.has_victim(l) {
                     let s = self.cache.victim(l);
                     self.cache.owner[s] = Some((l, e));
                     self.cache.map.insert((l, e), s);
@@ -3750,6 +3770,7 @@ impl Stepper for GpuSession<'_, '_> {
         let avg_mib = if slots > 0 { (self.cache.arena_bytes as f64 / slots as f64) / (1u64 << 20) as f64 } else { bytes as f64 / (1u64 << 20) as f64 };
         format!("expert cache: {slots} slots x {avg_mib:.2} MiB = {arena_gib:.2} GiB; {hits} hits, {misses} misses ({:.1}% hits); {} slice uploads",
                 100.0 * hits as f64 / (hits + misses).max(1) as f64, self.expert_uploads)
+            + &(if self.cache.admit_after > 0 { format!("; admit-after {}: {} misses kept out of the cache", self.cache.admit_after, self.cache.scratch_reads) } else { String::new() })
             + &format!("; RAM tier: {} experts, {:.2} GiB pinned (filled in {:.1} s), misses served {} from RAM, {} from the file",
                        self.ram.at.len(), self.ram.region.as_ref().map_or(0, |r| r.len()) as f64 / (1u64 << 30) as f64,
                        self.ram.fill_secs, self.ram.served, self.ram.drive)
