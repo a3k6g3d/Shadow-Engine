@@ -28,7 +28,7 @@ BASE = {
     "--placement": "J:\\Shadow\\profiles\\routing-6prompts.shrc",
     "--tail-skip": 4,
     "--verify-resident": True,
-    "--dflash": "J:\\Shadow\\models\\dflash2-ft2",
+    "--dflash": "J:\\Shadow\\models\\dflash2",
     "--spec": 3,
 }
 SPACE = {
@@ -80,7 +80,7 @@ def round_(args, name, base, variants, log):
     for i, v in enumerate(variants):
         arms[f"v{i}"] = v
     if not os.path.exists(os.path.join(d, "summary.md")):
-        cmd = [args.bench, "run", "--model", MODEL, "--out", d, "--runs", str(args.runs)]
+        cmd = [args.bench, "run", "--model", MODEL, "--out", d, "--runs", str(args.runs)] + args.bench_args.split()
         for a, c in arms.items():
             cmd += ["--arm", f"{a}={flags(c)}", "--arm-exe", f"{a}={args.exe}"]
         log(f"- running `{name}`: {len(arms)} arms x {args.runs} runs")
@@ -103,12 +103,16 @@ def main():
     ap.add_argument("--knobs", default=None)
     ap.add_argument("--space", default=None)
     ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("--bench-args", default="", help="extra shadow-bench flags, e.g. '--turns 36 --prompts-file F'")
+    ap.add_argument("--placement", default=None, help="replaces the base config's --placement")
     args = ap.parse_args()
     os.makedirs(args.out, exist_ok=True)
     space = json.load(open(args.space)) if args.space else SPACE
     knobs = args.knobs.split(",") if args.knobs else list(space)
     best_path = os.path.join(args.out, "best.json")
     best = json.load(open(best_path)) if os.path.exists(best_path) else dict(BASE)
+    if args.placement:
+        best["--placement"] = args.placement
     logf = open(os.path.join(args.out, "log.md"), "a", encoding="utf-8")
 
     def log(s):
