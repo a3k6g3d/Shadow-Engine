@@ -283,8 +283,13 @@ fn fastest_defaults(rest: &[String]) -> Vec<String> {
             set.extend(["--dflash".into(), d.display().to_string()]);
         }
     }
-    if !has("--spec") && (set.iter().any(|a| a == "--dflash") || has("--dflash")) {
+    let df = set.iter().any(|a| a == "--dflash") || has("--dflash");
+    if !has("--spec") && df {
         set.extend(["--spec".into(), "3".into()]);
+    }
+    // a draft chain stops after a draft the selector gives under 0.5 (autotune: +2.0% on varied text, +5% on the six prompts)
+    if !has("--dflash-min-p") && df {
+        set.extend(["--dflash-min-p".into(), "0.5".into()]);
     }
     if !set.is_empty() {
         eprintln!("shadow serve: fastest-mode defaults: {} (--exact for the exact path)", set.join(" "));

@@ -772,3 +772,11 @@ Single-prompt runs, "Write a Rust function that parses a comma separated list...
 - `shadow serve` defaults: the stock `models/dflash2` (Q8_0), `--spec 3` (was the tuned weights, `--spec 5`). `tools/autotune.py` now
   scores rounds by total throughput. Strata's 48.5 (a per-turn median on the six hash-table prompts) is not comparable
   with these totals; Shadow's total on that bench is ~43 (stock3 42.9, Q8 default 45.4).
+
+## 2026-10-30 (night): autotune on the varied bench; `--dflash-min-p 0.5` is a default
+
+- `tools/autotune.py` on the varied-text bench (36 turns, placement from other prompts, total-throughput scoring, 2 runs, floor 0.1-0.5%):
+  `--spec` 3 (base 46.56) vs 4/5/6/7: -9.3 / -9.9 / -11.1 / -21.0%; `--tail-skip` 4 (base 46.73) vs 3/5: -2.8 / -5.1%;
+  `--dflash-min-p` (base 46.70): unset +0.1% (control), **0.5 +2.0% (47.62)**, 0.7 -2.9%. Re-tuning `--spec` with min-p 0.5 in place (base
+  47.51): 4/5/6/7 -6.5 / -3.4 / -6.3 / -4.8%. Confirmed on the six hash-table prompts (3 runs, total throughput): 43.4 vs 41.1-41.2.
+- `shadow serve` defaults now add `--dflash-min-p 0.5` (with the drafter). Fastest mode on varied text: ~47.5 tok/s total.
