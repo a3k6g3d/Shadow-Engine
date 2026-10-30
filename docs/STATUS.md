@@ -929,3 +929,14 @@ Single-prompt runs, "Write a Rust function that parses a comma separated list...
 - Same-history fidelity of `--admit-after 1` (`tools/quality_test.py`, 24 turns, same prompts as the earlier AcceptMoE figure): **0.556** (8 of 24 replies identical, 1,495
   tokens) against the default's **0.572** (9 of 24, 1,597 tokens, reproducing the earlier number). One reply of 24 flipping moves it that much, so the filter
   costs little or no fidelity; it stays opt-in until the speed gain (+1.2% to +2.7%) is shown on a second prompt set.
+
+## 2026-10-31: where the VRAM goes (`SHADOW_VRAM_MAP=1`); lending has nothing to lend
+
+- `SHADOW_VRAM_MAP=1` prints the free VRAM at each stage of a serve start and once more in the ready line. 12.2 GiB card, desktop already using about 1.2 GiB: start 11,036 MiB
+  free -> dense weights 4,446 MiB -> buffers and the DFlash drafter 1,594 MiB -> expert cache 4,612 MiB (4.42 GiB) -> **384 MiB free**, the reserve, the same after the ready line.
+- Avalon lends its 9,536-token prefill compute buffers and the unused KV tail to its expert cache between phases. Shadow prefills in 64-token batches, so it has no large idle
+  prefill buffers; every resident byte is decode working memory and the 384 MiB reserve is the only slack. VRAM lending as Avalon does it has nothing to lend here.
+- Hit rates (`/v1/status`, 16 turns of the varied prompts, cumulative union-expert counts): default 4.42 GiB **49.9%**, `--expert-cache-gib 5.0` **52.6%** (+2.7 points),
+  `--admit-after 1` **48.4%** (-1.5 points, yet faster in the bench). The 0.6 GiB of extra slots buys 2.7 points of hit rate, about 5% fewer misses, which does not pay for
+  taking the reserve down to nothing (the 5.0 GiB bench arm: -10%). The cache is at the edge of what the card can hold; the next VRAM would have to come from the drafter
+  (1.2 GB) or the dense weights (4.4 GB), not from idle buffers.

@@ -824,6 +824,13 @@ impl<'c, 'm> GpuSession<'c, 'm> {
         let cache_bytes = tiers.vram_cache;
         let c = &m.cfg;
         let e = |x: crate::driver::CudaError| x.to_string();
+        let vmap = std::env::var("SHADOW_VRAM_MAP").is_ok();
+        let vm = |s: &str| {
+            if vmap {
+                eprintln!("vram map: {s}: {} MiB free", ctx.mem_info().map_or(0, |x| x.0 >> 20));
+            }
+        };
+        vm("start");
         let mvp = Program::load(ctx, file("matvec.cu").ok_or("matvec.cu")?)?;
         let fw = Program::load(ctx, file("forward.cu").ok_or("forward.cu")?)?;
         let mut w = HashMap::new();
@@ -847,6 +854,7 @@ impl<'c, 'm> GpuSession<'c, 'm> {
                 v.insert(name.to_string(), sb);
             }
         }
+        vm("dense weights on the GPU");
         let (h, cs) = (c.hidden, c.streams);
         let ch = cs * h;
         let kd = c.ssm_k_heads * c.ssm_head_dim;
@@ -942,6 +950,7 @@ impl<'c, 'm> GpuSession<'c, 'm> {
             None => None,
         };
 
+        vm("buffers and the drafter, before the expert cache");
         // the expert cache: partitioned per layer at each layer's exact expert size (0 internal fragmentation) when
         // the budget covers at least `n_expert_used` slots per MoE layer, otherwise uniform `slot_bytes` slots.
         let per = |name: String| m.g.tensor(&name).map(|t| (t.nbytes() / t.dims[2]) as usize).unwrap_or(0);
@@ -1015,6 +1024,7 @@ impl<'c, 'm> GpuSession<'c, 'm> {
                 Err(_) => budget = budget * 7 / 8,
             }
         }
+        vm("expert cache arena");
         if arena.is_none() {
             slot_offset.clear();
             layer_range = vec![0..0; c.n_layer];
@@ -3770,6 +3780,7 @@ impl Stepper for GpuSession<'_, '_> {
         let avg_mib = if slots > 0 { (self.cache.arena_bytes as f64 / slots as f64) / (1u64 << 20) as f64 } else { bytes as f64 / (1u64 << 20) as f64 };
         format!("expert cache: {slots} slots x {avg_mib:.2} MiB = {arena_gib:.2} GiB; {hits} hits, {misses} misses ({:.1}% hits); {} slice uploads",
                 100.0 * hits as f64 / (hits + misses).max(1) as f64, self.expert_uploads)
+            + &(if std::env::var("SHADOW_VRAM_MAP").is_ok() { format!("; vram free now {} MiB", self.ctx.mem_info().map_or(0, |x| x.0 >> 20)) } else { String::new() })
             + &(if self.cache.admit_after > 0 { format!("; admit-after {}: {} misses kept out of the cache", self.cache.admit_after, self.cache.scratch_reads) } else { String::new() })
             + &format!("; RAM tier: {} experts, {:.2} GiB pinned (filled in {:.1} s), misses served {} from RAM, {} from the file",
                        self.ram.at.len(), self.ram.region.as_ref().map_or(0, |r| r.len()) as f64 / (1u64 << 30) as f64,
