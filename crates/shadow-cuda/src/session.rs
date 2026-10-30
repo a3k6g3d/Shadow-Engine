@@ -3152,10 +3152,22 @@ impl<'c, 'm> GpuSession<'c, 'm> {
         let t_wait = std::time::Instant::now();
         // SHADOW_TIMING_NO_SYNC=1 (timing only, wrong output): last time's router logits, no wait for the GPU
         let stale = self.timing_no_sync && self.stale_logits.get(&(l, m)).is_some();
+        // the hybrid's CPU experts in a verify pass need the MoE input on the host
+        let want_u = self.cpu.is_some() && self.replay.on.get() && (2..=MAX_VERIFY).contains(&m) && self.overlap
+            && self.prof.is_none() && !stale;
+        let mut u_host: Option<Vec<f32>> = None;
         let logits: Vec<Vec<f32>> = if stale {
             self.stale_logits[&(l, m)].clone()
         } else {
-            let all = self.download_mapped(&[(self.bb.rl.ptr, m * ne)]).remove(0);
+            let mut srcs = vec![(self.bb.rl.ptr, m * ne)];
+            if want_u {
+                srcs.push((self.bb.u.ptr, m * h));
+            }
+            let mut got = self.download_mapped(&srcs);
+            if want_u {
+                u_host = Some(got.remove(1));
+            }
+            let all = got.remove(0);
             let lg: Vec<Vec<f32>> = all.chunks(ne).map(|c| c.to_vec()).collect();
             if self.timing_no_sync {
                 self.stale_logits.insert((l, m), lg.clone());
@@ -3214,6 +3226,64 @@ impl<'c, 'm> GpuSession<'c, 'm> {
         let names = [format!("{p}.ffn_gate_exps.weight"), format!("{p}.ffn_up_exps.weight"), format!("{p}.ffn_down_exps.weight")];
         let infos: Vec<TensorInfo> = names.iter().map(|n| self.expert_info(n)).collect();
         let sizes: Vec<usize> = names.iter().map(|n| self.m.expert_bytes(n)).collect();
+        // Hybrid MoE in a verify pass: up to `cpu_experts` of the layer's cache misses that the RAM tier holds and that
+        // ONE token routes to (the CPU computes an expert per token; a copy serves every token that uses it) are computed
+        // on the CPU from the pinned bytes while the GPU runs the resident experts and the copies run.  Their rank rows of
+        // eo are filled from the host before the combine; tops keeps them, so the combine weights them as usual.
+        let mut cpu_skip: Vec<usize> = vec![];
+        let mut cpu_pairs: Vec<(usize, usize)> = vec![];
+        let mut cpu_offs: Vec<usize> = vec![];
+        let mut cpu_pending = false;
+        if let (Some(ub), Some(max)) = (u_host.as_ref(), self.cpu.as_ref().map(|c| c.1)) {
+            if infos[0].ty == infos[1].ty && infos[0].dims == infos[1].dims && self.ram.region.is_some() {
+                let mut users: HashMap<usize, Vec<(usize, usize, f64)>> = HashMap::new();
+                for (j, top) in tops.iter().enumerate() {
+                    for (i, &(e, w)) in top.iter().enumerate() {
+                        users.entry(e).or_default().push((j, i, w));
+                    }
+                }
+                // (weight, expert, token, rank, offset in the RAM tier), lowest weight first
+                let mut cand: Vec<(f64, usize, usize, usize, usize)> = vec![];
+                for (&e, us) in &users {
+                    if us.len() == 1 && !self.cache.map.contains_key(&(l, e)) {
+                        if let Some(&off) = self.ram.at.get(&(l, e)) {
+                            cand.push((us[0].2, e, us[0].0, us[0].1, off));
+                        }
+                    }
+                }
+                cand.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap().then(a.1.cmp(&b.1)));
+                cand.truncate(max);
+                if !cand.is_empty() {
+                    let mut toks: Vec<usize> = cand.iter().map(|c| c.2).collect();
+                    toks.sort_unstable();
+                    toks.dedup();
+                    let xs: Vec<f32> = toks.iter().flat_map(|&j| ub[j * h..(j + 1) * h].iter().copied()).collect();
+                    let xidx: Vec<usize> = cand.iter().map(|c| toks.iter().position(|&j| j == c.2).unwrap()).collect();
+                    let base = self.ram.region.as_ref().unwrap().as_slice().as_ptr();
+                    let refs: Vec<shadow_model::cpu_expert::ExpertRef> = cand.iter().map(|c| {
+                        // SAFETY: the RAM tier holds this expert's [gate | up | down] at its offset, inside the region.
+                        unsafe {
+                            shadow_model::cpu_expert::ExpertRef { gate: base.add(c.4), up: base.add(c.4 + sizes[0]),
+                                                                  down: base.add(c.4 + sizes[0] + sizes[1]) }
+                        }
+                    }).collect();
+                    for c in &cand {
+                        cpu_skip.push(c.1);
+                        cpu_pairs.push((c.2, c.3));
+                        cpu_offs.push(c.4);
+                    }
+                    let shape = shadow_model::cpu_expert::ExpertShape {
+                        hidden: h, ff: self.m.cfg.expert_ff, gate_ty: infos[0].ty.name(), up_ty: infos[1].ty.name(),
+                        down_ty: infos[2].ty.name(),
+                    };
+                    // SAFETY: the region lives as long as the session, and nothing rewrites these experts' bytes before
+                    // the `wait` below: the group loop re-claims their ring slots after every `claimed.clear()`.
+                    unsafe { self.cpu.as_mut().unwrap().0.submit_multi(&shape, refs, xidx, &xs) };
+                    self.cpu_served += cpu_pairs.len() as u64;
+                    cpu_pending = true;
+                }
+            }
+        }
         // misses read from the file may wait in the staging buffer, a slot each
         let max_file = self.staging.as_ref().map_or(usize::MAX, |s| s.len() / self.cache.slot_bytes.max(1));
         let scratch = self.batch_scratch.as_ref().map_or((0, 0), |(b, n)| (b.ptr, *n));
@@ -3225,7 +3295,7 @@ impl<'c, 'm> GpuSession<'c, 'm> {
             while end < m {
                 let mut cand = set.clone();
                 for &(e, _) in &tops[end] {
-                    if !cand.contains(&e) {
+                    if !cand.contains(&e) && !cpu_skip.contains(&e) {
                         cand.push(e);
                     }
                 }
@@ -3245,6 +3315,14 @@ impl<'c, 'm> GpuSession<'c, 'm> {
                 self.ctx.synchronize().unwrap();
             }
             self.ram.claimed.clear(); // the previous group's copies were waited for
+            if cpu_pending {
+                for &off in &cpu_offs {
+                    if let Some(&r) = self.ram.ring_by_off.get(&off) {
+                        self.ram.ring_ref[r] = true; // keep the Clock hand off the CPU's experts
+                    }
+                    self.ram.claimed.insert(off);
+                }
+            }
             self.cache.clock += 1;
             for &e in &set {
                 self.cache.touch((l, e));
@@ -3302,6 +3380,13 @@ impl<'c, 'm> GpuSession<'c, 'm> {
                 n_file += from_file as usize;
             }
             self.read_drive(&names, &sizes);
+            if cpu_pending {
+                let out = self.cpu.as_mut().unwrap().0.wait();
+                for (n, &(j, i)) in cpu_pairs.iter().enumerate() {
+                    self.upload_to(row(&self.bb.eo, k * h, j) + (i * h * 4) as u64, &f32s(&out[n * h..(n + 1) * h]));
+                }
+                cpu_pending = false;
+            }
             if let Some(p) = plan.as_ref() {
                 if !copying.is_empty() {
                     self.copy_event.record(Some(&self.copy_stream)).unwrap();

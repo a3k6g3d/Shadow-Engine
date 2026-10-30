@@ -243,10 +243,13 @@ const ROWS_B: usize = 64; // down rows per work item
 struct Job {
     shape: ExpertShape,
     experts: Vec<ExpertRef>,
+    /// the inputs, `hidden` floats each, and which one each expert reads
     x: Vec<f32>,
-    /// x as int8 blocks, when the AVX-512 kernels run (`cpu_expert_avx512`; then down quantizes each expert's act too)
+    xi: Vec<usize>,
+    /// each input as int8 blocks, when the AVX-512 kernels run (`cpu_expert_avx512`; then down quantizes each expert's
+    /// act too)
     #[cfg(target_arch = "x86_64")]
-    xq: Option<crate::cpu_expert_avx512::Q8>,
+    xq: Option<Vec<crate::cpu_expert_avx512::Q8>>,
     act: Vec<std::cell::UnsafeCell<f32>>,
     out: Vec<std::cell::UnsafeCell<f32>>,
     items_a: usize,
@@ -277,6 +280,8 @@ impl Job {
             if i < self.items_a {
                 let (e, blk) = (i / per_a, i % per_a);
                 let ex = self.experts[e];
+                let xi = self.xi[e];
+                let xs = &self.x[xi * h..(xi + 1) * h];
                 for r in blk * ROWS_A..((blk + 1) * ROWS_A).min(ff) {
                     // SAFETY: row r of a ff x h matrix as stored lies inside the expert's slice (ExpertRef's contract).
                     let (g, u) = unsafe {
@@ -286,14 +291,14 @@ impl Job {
                     #[cfg(target_arch = "x86_64")]
                     let v = match &self.xq {
                         // SAFETY: xq exists only when the AVX-512 kernels are available; rows are whole blocks.
-                        Some(q) => unsafe {
-                            silu(crate::cpu_expert_avx512::row_dot(&self.shape.gate_ty, g, q))
-                                * crate::cpu_expert_avx512::row_dot(&self.shape.up_ty, u, q)
+                        Some(qs) => unsafe {
+                            silu(crate::cpu_expert_avx512::row_dot(&self.shape.gate_ty, g, &qs[xi]))
+                                * crate::cpu_expert_avx512::row_dot(&self.shape.up_ty, u, &qs[xi])
                         },
-                        None => silu(row_dot(&self.shape.gate_ty, g, &self.x)) * row_dot(&self.shape.up_ty, u, &self.x),
+                        None => silu(row_dot(&self.shape.gate_ty, g, xs)) * row_dot(&self.shape.up_ty, u, xs),
                     };
                     #[cfg(not(target_arch = "x86_64"))]
-                    let v = silu(row_dot(&self.shape.gate_ty, g, &self.x)) * row_dot(&self.shape.up_ty, u, &self.x);
+                    let v = silu(row_dot(&self.shape.gate_ty, g, xs)) * row_dot(&self.shape.up_ty, u, xs);
                     // SAFETY: this item alone writes act[e * ff + r].
                     unsafe { *self.act[e * ff + r].get() = v };
                 }
@@ -394,8 +399,20 @@ impl ExpertPool {
     /// # Safety
     /// Every pointer in `experts` must stay valid and unchanged, for its whole matrix of `shape`, until `wait` returns.
     pub unsafe fn submit(&mut self, shape: &ExpertShape, experts: Vec<ExpertRef>, x: &[f32]) {
+        let xi = vec![0; experts.len()];
+        self.submit_multi(shape, experts, xi, x);
+    }
+
+    /// `submit` with several inputs: `x` holds them back to back (`hidden` floats each) and expert i reads input
+    /// `xi[i]` (a verify pass: each expert for the token that routes to it).
+    ///
+    /// # Safety
+    /// As `submit`.
+    pub unsafe fn submit_multi(&mut self, shape: &ExpertShape, experts: Vec<ExpertRef>, xi: Vec<usize>, x: &[f32]) {
         assert!(self.current.is_none(), "one job at a time");
-        assert_eq!(x.len(), shape.hidden);
+        assert_eq!(x.len() % shape.hidden, 0);
+        assert_eq!(xi.len(), experts.len());
+        assert!(xi.iter().all(|&i| (i + 1) * shape.hidden <= x.len()));
         let n = experts.len();
         let job = Arc::new(Job {
             items_a: n * shape.ff.div_ceil(ROWS_A),
@@ -404,10 +421,12 @@ impl ExpertPool {
             out: (0..n * shape.hidden).map(|_| std::cell::UnsafeCell::new(0.0)).collect(),
             #[cfg(target_arch = "x86_64")]
             xq: fast_kernels(shape).then(|| {
-                crate::cpu_expert_avx512::quantize(x, crate::cpu_expert_avx512::act_block(&shape.gate_ty).unwrap())
+                let blk = crate::cpu_expert_avx512::act_block(&shape.gate_ty).unwrap();
+                x.chunks(shape.hidden).map(|row| crate::cpu_expert_avx512::quantize(row, blk)).collect()
             }),
             shape: shape.clone(),
             experts,
+            xi,
             x: x.to_vec(),
             next: AtomicUsize::new(0),
             done_a: AtomicUsize::new(0),

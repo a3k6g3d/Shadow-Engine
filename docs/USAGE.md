@@ -78,7 +78,7 @@ RAM, expert-cache hit rates, memory tiers).
 | `--dflash-min-p P` | 0.5 | stop a draft chain after a draft the selector gives under P |
 | `--mtp DIR` or `off` | off | the MTP draft head instead of DFlash (`models/mtp-basalt-ft1`) |
 | `--spec K` | 3 with a drafter | drafted tokens checked per pass; without a drafter, prompt-lookup drafting |
-| `--cpu-experts N`, `--cpu-threads T` | 0, 8 | compute up to N RAM-tier misses a layer on the CPU instead of copying them (opt-in; see STATUS.md) |
+| `--cpu-experts N`, `--cpu-threads T` | 0, 8 | compute up to N RAM-tier misses a layer on the CPU instead of copying them, in decode and in verify passes (opt-in: measured a tie at N=2 and a loss at 1 and 4; STATUS.md) |
 | `--pregate N` | 0 | experimental router lookahead |
 | `--fuse N` | 0 | kernel fusions, bits 1/2/4 (measured a tie or a loss; opt-in) |
 

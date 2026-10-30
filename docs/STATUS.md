@@ -822,3 +822,18 @@ Single-prompt runs, "Write a Rust function that parses a comma separated list...
   learned predictor would be needed), so routing-driven prefetch from cheap signals cannot hide the copies, consistent with `--pregate`
   finding nothing. The gater (`accept_route`) does not need a predictor to pick its set (it uses the target's own router logits at verify
   time); a predictor only matters for starting copies earlier.
+
+## 2026-10-31: CPU experts in the verify pass - no gain
+
+- `--cpu-experts N` now also works in the batched verify pass (it was a silent no-op there: the hybrid only ran in single-token
+  decode, so the autotune's -0.5% / -0.2% for N=2 / 4 were noise). `moe_batch` takes the MoE input down with the router logits (8 rows at
+  most), picks up to N cache misses per layer that the RAM tier holds and that exactly ONE token routes to (a CPU computes an expert per
+  token; one copy serves every token that uses the expert), computes them on the AVX-512 pool from the pinned bytes (`ExpertPool::
+  submit_multi`: one job, a different input per expert) while the GPU runs the resident experts and the copies run, and writes their
+  outputs into the combine's rows of `eo` (`tops` keeps them, so the combine weights them as usual).
+- Exact speculation (`--tail-skip 0`, 14 turns, same prompts): none 1,091 tokens, 20.2 tok/s end to end; N=2 identical text (1,091),
+  19.9; N=4 1,056 tokens, 13.9 (-31%). The GPU's wait per verify pass fell as predicted (58 -> 46 -> 39 ms) but the pass stayed at 104 ms:
+  the CPU time moved the wait into the host's join. Default fast mode on the varied bench (2 runs, total throughput): none 34.71,
+  N=1 28.67 (-17%), N=2 34.28 (-1.2%); tokens a run 2,041 / 2,028 / 2,025.
+- So a CPU pool, as wired here (a join per layer, a spinning pool on the host's own cores), does not by itself explain Strata's 35% lower
+  expert traffic per token (215 against 334 MB). Opt-in, off by default.
