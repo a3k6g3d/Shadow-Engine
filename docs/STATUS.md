@@ -926,3 +926,6 @@ Single-prompt runs, "Write a Rust function that parses a comma separated list...
   `--admit-after 1` now reads +1.2% to +2.7% over the default in three benches (36.89 / 37.01 / 37.49 against 36.45 / 36.53 / 36.50); still opt-in, since the output
   text changes with the cache contents (AcceptMoE's sets follow residency) and no quality check has been run on it.
 - With the browser pane closed the bench keeps 8-9 GiB of RAM free (4.1-4.9 GiB with it open), and no run died: the earlier deaths were the 4 GiB watchdog.
+- Same-history fidelity of `--admit-after 1` (`tools/quality_test.py`, 24 turns, same prompts as the earlier AcceptMoE figure): **0.556** (8 of 24 replies identical, 1,495
+  tokens) against the default's **0.572** (9 of 24, 1,597 tokens, reproducing the earlier number). One reply of 24 flipping moves it that much, so the filter
+  costs little or no fidelity; it stays opt-in until the speed gain (+1.2% to +2.7%) is shown on a second prompt set.
