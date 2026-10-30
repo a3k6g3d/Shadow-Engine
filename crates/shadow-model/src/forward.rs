@@ -473,28 +473,24 @@ impl Model {
         let t = self.g.tensor("per_layer_token_embd.weight").unwrap();
         let (be, bb) = t.ty.block().unwrap();
         let rb = (t.dims[0] / be * bb) as usize;
-        let workers = missing.len().min(16);
-        let next = std::sync::atomic::AtomicUsize::new(0);
-        std::thread::scope(|s| {
-            for _ in 0..workers {
-                s.spawn(|| loop {
-                    let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    let Some(&row) = missing.get(i) else { return };
-                    let mut b = vec![0u8; rb];
-                    if read_at(&self.files[t.shard], &mut b, t.offset + row as u64 * rb as u64).is_err() {
-                        continue;
-                    }
-                    let mut y = vec![0f32; t.dims[0] as usize];
-                    if dequantize(t.ty, &b, &mut y).is_ok() {
-                        if let Ok(mut c) = self.ple_cache.write() {
-                            if c.len() < 65536 {
-                                c.insert(row, y);
-                            }
-                        }
-                    }
-                });
+        // the model's read pool: its workers each hold their own handles on the shards (one synchronous handle serializes
+        // its reads on Windows, so threads sharing `self.files` only added spawn cost)
+        let mut bufs: Vec<Vec<u8>> = missing.iter().map(|_| vec![0u8; rb]).collect();
+        {
+            let mut jobs: Vec<(usize, u64, &mut [u8])> = missing.iter().zip(bufs.iter_mut())
+                .map(|(&row, b)| (t.shard, t.offset + row as u64 * rb as u64, b.as_mut_slice())).collect();
+            if self.pool.read_many(&mut jobs).is_err() {
+                return;
             }
-        });
+        }
+        if let Ok(mut c) = self.ple_cache.write() {
+            for (&row, b) in missing.iter().zip(&bufs) {
+                let mut y = vec![0f32; t.dims[0] as usize];
+                if dequantize(t.ty, b, &mut y).is_ok() && c.len() < 65536 {
+                    c.insert(row, y);
+                }
+            }
+        }
     }
 
     pub fn ple_row(&self, row: i64) -> Vec<f32> {

@@ -891,3 +891,15 @@ Single-prompt runs, "Write a Rust function that parses a comma separated list...
   doubles those costs while the GPU work they were meant to hide under is small (the whole batch's mixer is about 0.6 ms a layer). Strata avoids the
   chain rather than hiding it: its window is one captured CUDA graph with device-side planning and flag doorbells, so there are almost no host round
   trips. The structure that matters is fewer host synchronisations per pass (48 router syncs today), not overlapping them. Kept as an opt-in, off by default.
+
+## 2026-10-31: host round trips measured; the PLE prefetch was serialized - +7%
+
+- The batched MoE's host latency, from "router logits received" to "first expert kernel queued", is **about 100 us a layer** (~5 ms of a 62 ms verify pass), so
+  cutting the 48 round trips (device-side planning) can give at most ~8%. The GPU kernel time is ~37 ms of the pass (dense projections ~15, grouped
+  experts ~12); the rest is the GPU waiting on the bus and on latencies. `SHADOW_LTIME` charged ~8.4 ms a pass to the one non-graph segment, the PLE layer
+  (a normal DeltaNet layer: ~0.4 ms); `SHADOW_PLE_TIME=1` showed why: `ple_prefetch` (the n-gram rows, random reads in a 27 GB table) took **3.5 to 9.3 ms** on most
+  passes (0.01 ms when cached) while the GPU idled after layer 0.
+- Cause: `ple_prefetch` read through `Model`'s one shared file handle from 16 freshly spawned threads, and Windows serializes I/O on one synchronous handle (the
+  repo's own readpool note says so), so the "parallel" reads ran one after another plus the spawns. Fix: the rows are read through the model's `ReadPool`
+  (8 workers, each with its own handles). Prefetch: mean **1.22 ms** (median 1.12, p90 1.46 over 371 passes).
+- Default mode, varied bench, 2 runs, total throughput, same 2,041 tokens a run (bit-identical output): 34.66 / 34.71 before (two earlier benches) -> **37.08 now (+7%)**.

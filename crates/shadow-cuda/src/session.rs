@@ -259,6 +259,8 @@ pub struct GpuSession<'c, 'm> {
     pipeline: bool,
     pipe_active: bool,
     pipelined_passes: u64,
+    /// the batched MoE's host latency from "router logits received" to the first expert kernel queued: layers, seconds
+    plan_lat: (u64, f64),
     row_shift: usize,
     mapped_event2: Event<'c>,
     group_event: Event<'c>,
@@ -1137,6 +1139,7 @@ impl<'c, 'm> GpuSession<'c, 'm> {
             pipeline: tiers.pipeline,
             pipe_active: false,
             pipelined_passes: 0,
+            plan_lat: (0, 0.0),
             row_shift: 0,
             mapped_event2: ctx.event().map_err(e)?,
             group_event: ctx.event().map_err(e)?,
@@ -2768,8 +2771,14 @@ impl<'c, 'm> GpuSession<'c, 'm> {
         for l in 0..(if piped { 0 } else { c.n_layer }) {
             if l == c.ple_layer {
                 // every position's rows at once, in parallel
+                let ple_probe = std::env::var("SHADOW_PLE_TIME").is_ok_and(|v| v == "1");
+                if ple_probe {
+                    self.ctx.synchronize().unwrap();
+                }
+                let t_ple_block = std::time::Instant::now();
                 let all: Vec<i64> = (0..m).flat_map(|j| ple_rows(c, &self.tokens[..p0 + j + 1])).collect();
                 self.m.ple_prefetch(&all);
+                let t_pref = t_ple_block.elapsed().as_secs_f64();
                 for j in 0..m {
                     let r = row(&self.bb.r, ch, j);
                     self.ple_at(l, p0 + j + 1, r);
@@ -2780,6 +2789,12 @@ impl<'c, 'm> GpuSession<'c, 'm> {
                     self.k1("add", ch, &[Arg::Ptr(r), Arg::Ptr(self.b.gv.ptr), Arg::U32(ch as u32)]);
                 }
                 rn_ready = false;
+                if ple_probe {
+                    let t_host = t_ple_block.elapsed().as_secs_f64();
+                    self.ctx.synchronize().unwrap();
+                    eprintln!("SHADOW_PLE_TIME m={m}: prefetch {:.2} ms, host to queued {:.2} ms, with the GPU done {:.2} ms",
+                              1e3 * t_pref, 1e3 * t_host, 1e3 * t_ple_block.elapsed().as_secs_f64());
+                }
             }
             {
                 let on = self.replay.on.get();
@@ -3216,6 +3231,7 @@ impl<'c, 'm> GpuSession<'c, 'm> {
             lg
         };
         self.waits[0] += t_wait.elapsed().as_secs_f64();
+        let t_woke = std::time::Instant::now();
         self.mark("batch: router + logits down");
         {
             // the shared expert, on the GPU while the host routes and the copies run
@@ -3410,6 +3426,10 @@ impl<'c, 'm> GpuSession<'c, 'm> {
                 let p = grouped_plan(&tops, start, end, &set, k, MAX_BATCH * k, addr, copied, part);
                 assert!(p.bytes.len() <= self.bb.gtab.bytes, "grouped experts: {} bytes of tables", p.bytes.len());
                 self.upload_to(self.bb.gtab.ptr, &p.bytes);
+                if start == 0 {
+                    self.plan_lat.0 += 1;
+                    self.plan_lat.1 += t_woke.elapsed().as_secs_f64();
+                }
                 self.routed_grouped(&p, 0, start, end, &infos);
                 plan = Some(p);
             }
@@ -3736,6 +3756,10 @@ impl Stepper for GpuSession<'_, '_> {
             + &self.cpu.as_ref().map(|c| format!("; CPU experts: up to {} per layer, {} computed", c.1, self.cpu_served))
                 .unwrap_or_default()
             + &(if self.pipeline { format!("; pipelined verify passes: {}", self.pipelined_passes) } else { String::new() })
+            + &(if self.plan_lat.0 > 0 {
+                format!("; MoE host latency, router logits received to first expert kernel queued: {:.0} us a layer",
+                        1e6 * self.plan_lat.1 / self.plan_lat.0 as f64)
+            } else { String::new() })
             + &self.cpu.as_ref().filter(|_| self.cpu_join.0 > 0).map(|_| {
                 let (n, join, job) = self.cpu_join;
                 format!("; verify-pass CPU joins: {n}, host waited {:.0} us each, submit-to-result {:.0} us each, choosing and submitting {:.0} us, uploading the outputs {:.0} us",
