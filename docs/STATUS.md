@@ -780,3 +780,34 @@ Single-prompt runs, "Write a Rust function that parses a comma separated list...
   `--dflash-min-p` (base 46.70): unset +0.1% (control), **0.5 +2.0% (47.62)**, 0.7 -2.9%. Re-tuning `--spec` with min-p 0.5 in place (base
   47.51): 4/5/6/7 -6.5 / -3.4 / -6.3 / -4.8%. Confirmed on the six hash-table prompts (3 runs, total throughput): 43.4 vs 41.1-41.2.
 - `shadow serve` defaults now add `--dflash-min-p 0.5` (with the drafter). Fastest mode on varied text: ~47.5 tok/s total.
+
+## 2026-10-30/31: the truncation, AcceptMoE, and the corrected comparison with Strata
+
+- **`--verify-resident` truncated answers.** A varied-text Shadow-vs-Strata run showed Shadow producing 519 tokens against Strata's
+  1,388: its replies ended mid-sentence. Same 14-turn conversation: exact 1,091 tokens (3 turns ended early); exact speculation
+  (`--tail-skip 0`, no `--verify-resident`) 1,091 (identical lengths, 20.2 tok/s end to end against 18.2); `--tail-skip 4` alone 1,038
+  (3 early, 28.0); default with `--verify-resident` 458 (11 early); `--tail-skip 0 --verify-resident` 706 (8). The cause is that
+  `--verify-resident` drops the extra positions' top-ranked experts when they are not in VRAM, and the logits that pick the next
+  token come from those positions; the short replies then enter the history and later replies copy them. All "fastest mode"
+  numbers of 43 to 47 tok/s earlier in this file were measured with it on and are retracted.
+- **Same-history fidelity** (`tools/quality_test.py`, 24 turns, mean fraction of each reply that follows the exact reply): tail skip 4
+  0.481, `--verify-rank 1` 0.511, `--verify-rank 2` 0.475, `--tail-skip 3` 0.412, `--tail-skip 5` 0.490, `--verify-resident` 0.444,
+  **AcceptMoE 0.549 (beta 0.5), 0.572 (beta 1.0)**; tighter AcceptMoE sets 0.47 to 0.53. All inexact modes follow the exact text
+  for only about half of a reply (5 to 9 of 24 identical).
+- **AcceptMoE** (`--accept-moe`, after arXiv 2608.02989; docs/SPECULATION.md) is the default verify: same speed as plain tail skip
+  (34.68 against 34.36 tok/s on the varied bench, 2,041 against 2,016 tokens a run) and the most faithful. `--verify-rank 1` is
+  +18% faster (40.73) but generates 17% fewer tokens (1,682, 20 of 35 turns early): an option, not a default.
+- **Shadow against Strata, quality-matched, varied bench** (`bench/vs-strata-final`, 3 runs each, interleaved, resource recording on):
+  Shadow **34.68 tok/s** (2,041 tokens a run), Strata **47.18** (1,417). Shadow is at 73.5% of Strata. Resources over the warm decode
+  turns, Shadow / Strata: GPU util 86.4 / 78.7%, GPU power 105 / 93 W, **GPU J per token 7.2 / 4.9** (turn windows, prefill included),
+  PCIe host-to-GPU 11.6 / 10.1 GB/s (so **334 / 215 MB of expert weights per generated token**), CPU 12.6 / 49.3%, disk read
+  159 / 491 MB/s, RAM available min 9.5 / 7.1 GiB. The gap is expert traffic per token (Shadow moves 55% more), not an idle GPU.
+  An earlier near-parity reading (47.2 / 47.8) was Shadow with `--verify-resident` truncating its answers.
+- Read in full (docs/SPECULATION.md summarises): AcceptMoE, S2-MoE (2608.15018), SpecMoEOff (2508.21706), Specter (2511.14102),
+  EcoSpec (2607.12696), MoE-Spec (2602.16052). Their headline speedups are against different baselines and mostly different regimes
+  (large-batch, fully resident, small MoEs, A100/H200); what carries over is substitution routing (done), reuse-aware soft gating
+  (S2-MoE: bias logits toward experts the block already uses; not yet tried with residency as the preference), cost-aware chain
+  length (approximated by `--dflash-min-p`), and routing-driven prefetch (needs a draft with the target's routing: not built).
+- Autotune on the varied bench (total throughput): `--spec` 3 best (4/5/6/7: -6.5 to -21%), `--tail-skip` 4 best (3/5: -2.8/-5.1%),
+  `--dflash-min-p 0.5` +2.0%, `--pin-margin` 2/4/8 -6.4 to -6.7%, `--cpu-experts` 2/4 no gain, `--fuse` no gain (these ran with
+  `--verify-resident` on; the ranking needs a re-check on the AcceptMoE default).

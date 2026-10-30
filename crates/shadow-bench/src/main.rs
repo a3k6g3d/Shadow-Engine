@@ -296,6 +296,7 @@ fn one_run(arm: &str, run: usize, port: u16, launch: &str, turns: usize, tokens:
                         "turn": t, "decode_tps": tm["predicted_per_second"], "predicted_n": tm["predicted_n"],
                         "predicted_ms": tm["predicted_ms"], "prompt_n": tm["prompt_n"], "prompt_ms": tm["prompt_ms"],
                         "cache_n": tm["cache_n"], "content": content, "t_start": t_start, "t_end": t_end,
+                        "finish": v["choices"][0]["finish_reason"],
                     }));
                     history.push(json!({"role": "assistant", "content": content}));
                 }

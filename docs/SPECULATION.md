@@ -34,9 +34,26 @@ from `--exact`:
 
 * `--tail-skip R`: a routed expert of rank >= R (by router weight) is skipped unless it is already in VRAM. Strata's
   `STRATA_ROUTE_TAIL_SKIP` does the same; it is about a quarter of Strata's speed.
-* `--verify-resident`: positions after the first in a verify pass use only experts already in VRAM.
+* `--accept-moe` (default): AcceptMoE's verifier expert selection, below.
 
-Neither is part of the exact path; `--exact` removes both.
+Neither is part of the exact path; `--exact` removes both. `--verify-resident` (positions after the first use only experts
+already in VRAM) is **not** a default any more: it dropped each extra position's top-ranked experts too, and on varied text 11
+of 14 replies ended early (EOS) against 3 without it; the short replies then entered the history and later replies copied them.
+
+### AcceptMoE (`--accept-moe`)
+
+After [arXiv 2608.02989](https://arxiv.org/abs/2608.02989). For each MoE layer of a verify pass the anchor (position 0) routes
+naturally. Positions 1.. share one eligible set: the anchor's top-k plus the experts the block demands most, where demand is
+the router probability weighted by how likely each position is to be committed (`commit_prob`: observed marginal rates, 0.75 /
+0.56 / 0.47 ... as a prior, raised to `--accept-beta`), the number added is the exponential of the entropy of that demand
+(`--accept-scale`), and non-resident members are pruned lowest-demand first within the number of natural assignments the set
+already displaced (`--accept-budget`). Each drafted token then re-picks its k experts among the eligible ones (*substitution*,
+which both MoE-Spec and AcceptMoE found at least as good as dropping), so it never runs on fewer than k. Measured on the
+same-history check (`tools/quality_test.py`: each config sees the exact run's own replies as history; mean fraction of each
+reply that follows the exact reply): plain tail skip 0.48, `--verify-resident` 0.44, `--verify-rank 1` 0.51, AcceptMoE 0.55
+(beta 0.5) and **0.57 (beta 1.0, the default)**; speed equal to plain tail skip within noise (34.7 against 34.4 tok/s). Tightening
+the set (`--accept-scale 0.25..0.5`) or widening the pruning budget returned the fidelity to the plain level without a clear
+speed gain, or truncated again.
 
 ## Where drafts come from
 

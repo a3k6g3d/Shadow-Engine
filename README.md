@@ -23,40 +23,71 @@ The plan is in [docs/SHADOW_PLAN.md](docs/SHADOW_PLAN.md), rewritten 2026-10-26.
 - **Correctness before speed.** The stages each end in tokens: a scalar CPU reference first, the GPU dense path
   checked against it, then the memory tiers, the server, and only then speed, one lever at a time.
 
-## The floor
+## Speed
 
-Shadow measures its own noise with `shadow-bench` (`bench/floor-2026-10-27`): **0.8% median, 2.0% p90, 3.6% worst**
-on `decode_warm`. A change must clear that on ≥8 interleaved launches, paired turn by turn, or it is reported as a
-tie. Strata's floor (10.1% / 27.0% / 51.9%, [docs/BENCH_NOISE.md](docs/BENCH_NOISE.md)) is history. Current speed and
-every lever tried, kept or not, are in [docs/STATUS.md](docs/STATUS.md).
+Measured on one PC (RTX 5070 12 GB, i7-11700K, 64 GB RAM, NVMe, Windows 11) with the Swift IQ3_S GGUF of Qwen3.8-Flash-Next,
+greedy, 96 tokens a turn, a 36-turn conversation of unseen prompts, scored by **total decode throughput** (tokens / decode
+time; the bench's per-turn median misranks arms that generate different text, see
+[docs/BENCHMARKING.md](docs/BENCHMARKING.md)):
+
+| | tok/s | note |
+|---|---|---|
+| Shadow `--exact` | ~20 | no speculation, no inexact modes; bit for bit the reference |
+| Shadow default (`shadow serve MODEL`) | **34.7** | DFlash 2 drafter, `--tail-skip 4`, AcceptMoE verify, 30 GiB RAM expert tier |
+| Strata (its tuned config, same model, prompts, context) | **47.2** | interleaved with Shadow in the same session |
+
+**Shadow is about 27% slower than Strata on this bench** (Strata 36% faster). The resource record
+(`bench/vs-strata-final/charts/`) shows where: GPU utilisation is *higher* for Shadow (86% against 79%) and PCIe throughput
+similar (11.6 against 10.1 GB/s), so Shadow moves about 334 MB of expert weights per generated token against Strata's 215 MB:
+the gap is expert traffic per token, not an idle GPU. Strata also uses the CPU (49% against 13%) and reads the disk harder (490
+against 159 MB/s). Earlier figures in this repository's history that put Shadow at 43 to 47 tok/s came from a mode that cut
+answers short (`--verify-resident`) and from per-turn medians; both are documented in
+[docs/STATUS.md](docs/STATUS.md). Shadow's noise floor is 0.8% median on the exact engine
+(`bench/floor-2026-10-27`), about 0.1 to 0.5% for total throughput in the fastest mode.
+
+## Quick start
+
+```bash
+cargo build --release
+shadow serve path/to/model.gguf            # the fastest mode by default; add --exact for the exact path
+# http://127.0.0.1:8081/ chat UI, /monitor telemetry, /v1/chat/completions OpenAI API
+```
+
+What the defaults are, every flag and every environment variable: [docs/USAGE.md](docs/USAGE.md). Shadow never pins memory
+that would leave less than 4 GiB of RAM available, and the default 30 GiB expert tier peaks around 35 GiB resident, so on a
+smaller machine pass `--ram-tier-gib` explicitly.
+
+## Documentation
+
+| | |
+|---|---|
+| [docs/USAGE.md](docs/USAGE.md) | requirements, build, run, flags, environment variables, the API |
+| [docs/SPECULATION.md](docs/SPECULATION.md) | the verify pass, the drafters (prompt lookup, MTP, DFlash 2), AcceptMoE, what did not work |
+| [docs/BENCHMARKING.md](docs/BENCHMARKING.md) | the protocol, total-throughput scoring, resource charts, comparing with another engine, autotune, pitfalls |
+| [docs/TOOLS.md](docs/TOOLS.md) | every tool and binary |
+| [docs/STATUS.md](docs/STATUS.md) | what is measured, in order, including the wrong turns |
+| [docs/ARCH.md](docs/ARCH.md) | the model as math, from the file and the reference |
+| [docs/SHADOW_PLAN.md](docs/SHADOW_PLAN.md), [docs/HANDOFF.md](docs/HANDOFF.md) | the plan and the state handed over |
+| [CHANGELOG.md](CHANGELOG.md) | release notes |
+
+Shadow runs two architectures: Qwen3.8-Flash-Next (everything above) and Flint (`RecursiveSI/flint`, NVFP4). Flint uses the
+memory tiers and the server but not the batched verify pass, so none of the speculation applies to it. It is not a general
+LLM runner: a dense Llama or Qwen3 GGUF has no forward pass here.
 
 ## Server & Web UI
 
-Shadow runs a built-in OpenAI-compatible HTTP server and embedded web chat UI:
-
-```text
-shadow serve <path-to-gguf> [--port 8081] [--host 127.0.0.1] [--ram-tier-gib 30] [--mtp models/mtp-basalt-ft1]
-```
-
-* **Desktop UI (`shadow-ui.exe`)**: Native Windows desktop launcher built with Rust and Tauri 2 (WebView2). Connects to `http://127.0.0.1:8081`, provides system tray controls, and manages single-instance window focusing.
-* **MTP draft head (experimental, `--mtp <DIR>`, off by default)**: loads the borrowed `models/mtp-basalt-ft1` draft head (824 MB VRAM). It does **not** speed decoding up yet: the server checks a draft with ordinary one-token steps (Shadow has no batched verify pass), so every draft is extra work, and the head's KV cache is never filled for prompt positions. `tools/spec_probe.py` measures what speculation could buy here (docs/STATUS.md).
-* **Web Chat & Process Monitor UI**: Visit `http://127.0.0.1:8081/` in any browser:
-  * **Chat View**: Full SSE streaming, collapsible `<think>` blocks with direct inline "Stop Thinking" buttons, live reasoning elapsed timer, chat-bar stop button, global `Escape` cancellation shortcut, Claude & Antigravity style reasoning effort selector (`Off`, `Low`, `Medium`, `High`, `X-High`), native Windows tool orchestration (`read_file`, `glob`, `grep`, `edit_file`, `write_file`, `cmd`), and customizable system persona allowing sovereign local file inspection, test execution, and code modifications.
-  * **Process Monitor View (`/monitor` or Tab Switcher)**: Strictly separate full-screen dashboard tracking accurate CPU % (process & system), real NVML GPU compute load %, GPU temperature, RAM working set & commit, MoE expert cache hit rates, and 3-tier memory distribution (VRAM -> Pinned RAM -> NVMe).
-* **API Endpoints**:
-  * `POST /v1/chat/completions`: OpenAI-compatible streaming and non-streaming chat completions (supporting `reasoning_effort` and `chat_template_kwargs.enable_thinking`).
-  * `GET /v1/tools`: List of available native Windows agent tools.
-  * `POST /v1/tools/execute`: Execute a local tool natively on Windows.
-  * `GET /v1/telemetry`: Real-time hardware telemetry JSON (CPU, RAM, GPU utilization %, VRAM, and MoE cache stats).
-  * `GET /monitor`: Direct access to the standalone system telemetry dashboard.
-  * `GET /v1/status`: Live throughput, queue status, and memory tier breakdown.
-  * `GET /v1/models`, `/health`, `/metrics` (Prometheus).
+* **Desktop UI (`shadow-ui.exe`)**: Windows launcher built with Rust and Tauri 2 (WebView2); connects to `http://127.0.0.1:8081`.
+* **Web chat and process monitor**: streaming chat with collapsible `<think>` blocks, a reasoning-effort selector, native tool
+  orchestration (`read_file`, `glob`, `grep`, `edit_file`, `write_file`, `cmd`); `/monitor` charts CPU, GPU load, temperature, RAM,
+  expert-cache hit rates and the three memory tiers (VRAM, pinned RAM, NVMe).
+* **API**: `POST /v1/chat/completions` (streaming or not), `GET /v1/models`, `/health`, `/metrics` (Prometheus), `/v1/status`,
+  `/v1/telemetry`, `/v1/tools`, `/v1/tools/execute`.
 
 ## Layout
 
     crates/          the engine (shadow-model, shadow-cuda, shadow-serve, shadow), shadow-bench, shadow-eval
     kernels/         the CUDA C++ the engine compiles with NVRTC at run time
-    docs/            the plan, STATUS (what is measured), HANDOFF; docs/history/ holds the retired Strata-era designs
+    docs/            USAGE, SPECULATION, BENCHMARKING, TOOLS, STATUS (what is measured), the plan, HANDOFF; docs/history/ holds the retired designs
     bench/           shadow-bench runs, one directory per comparison
     profiles/        routing profiles for the RAM tier's placement
     tools/           the harness and shadow_memory.py, both Python for now

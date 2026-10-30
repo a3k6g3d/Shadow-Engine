@@ -16,9 +16,13 @@ for d in sys.argv[1:]:
             continue
         t = [x for x in r["turns"] if x["turn"] > 0]
         n, ms = sum(x["predicted_n"] for x in t), sum(x["predicted_ms"] for x in t)
-        runs[r["arm"]].append((n, ms))
+        # turns that stopped on their own before the token budget: a mode that truncates answers looks fast
+        early = sum(1 for x in t if x.get("finish") == "stop" and x["predicted_n"] < 0.5 * max(y["predicted_n"] for y in t))
+        runs[r["arm"]].append((n, ms, early, len(t)))
     print(d)
     for arm, rs in runs.items():
-        tot = 1000 * sum(n for n, _ in rs) / sum(ms for _, ms in rs)
-        per = ", ".join(f"{1000 * n / ms:.1f}" for n, ms in rs)
-        print(f"  {arm:12s} {tot:6.2f} tok/s over {len(rs)} runs ({per})")
+        tot = 1000 * sum(r[0] for r in rs) / sum(r[1] for r in rs)
+        per = ", ".join(f"{1000 * r[0] / r[1]:.1f}" for r in rs)
+        toks = sum(r[0] for r in rs) / len(rs)
+        early = sum(r[2] for r in rs) / len(rs)
+        print(f"  {arm:12s} {tot:6.2f} tok/s over {len(rs)} runs ({per}); {toks:.0f} tokens a run, {early:.1f} of {rs[0][3]} turns ended early")

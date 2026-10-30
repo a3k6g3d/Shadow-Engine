@@ -123,5 +123,10 @@ environment variables).
 5. **Another GPU job.** Never run anything else on the GPU while a bench runs; a data-generation server next to a bench
    skews both (VRAM and PCIe are shared).
 6. **A cold first run.** The first arm after a long idle has read slow and noisy (33 against 41 tok/s); interleaving and 3+ runs average it out.
-7. **Thinking mode.** Training and testing a drafter on thinking-mode text while the bench sends `enable_thinking: false`
+7. **Speed bought by shorter answers.** A mode that cuts replies short (premature end-of-sequence) decodes "fast" and, worse,
+   pollutes the conversation history so later replies shrink too. `tools/bench_total.py` prints tokens a run and early
+   stops, and `shadow-bench` records each turn's `finish`; compare arms only when their token counts are close. For a
+   same-text fidelity check use `tools/quality_test.py` (every config sees the exact run's replies as history; mean reply
+   prefix match) and `tools/trunc_test.py` (free-running; early stops and tokens).
+8. **Thinking mode.** Training and testing a drafter on thinking-mode text while the bench sends `enable_thinking: false`
    (or the reverse) measures the wrong distribution.

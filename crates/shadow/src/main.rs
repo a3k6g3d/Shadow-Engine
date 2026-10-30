@@ -266,9 +266,14 @@ fn fastest_defaults(rest: &[String]) -> Vec<String> {
     if !has("--tail-skip") {
         set.extend(["--tail-skip".into(), "4".into()]);
     }
-    if !has("--verify-resident") {
-        set.push("--verify-resident".into());
+    // AcceptMoE's verifier expert sets: the most faithful inexact verify measured (same-history prefix match 0.57 against
+    // 0.48 for plain tail skip) at the same speed (docs/SPECULATION.md)
+    if !has("--accept-moe") && !has("--verify-resident") && !has("--verify-rank") {
+        set.push("--accept-moe".into());
     }
+    // NOT `--verify-resident`: it computes a verify pass's extra positions with the resident experts only, and the logits
+    // that pick the next token come from those positions - 11 of 14 varied-text answers ended early (EOS), against 3 of 14
+    // without it (docs/STATUS.md).  It stays an explicit opt-in.
     if !has("--ram-tier-gib") {
         set.extend(["--ram-tier-gib".into(), "30".into()]);
     }

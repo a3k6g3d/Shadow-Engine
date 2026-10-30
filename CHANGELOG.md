@@ -4,10 +4,11 @@ All notable changes to Shadow will be documented in this file.
 
 ## [0.1.27] — 2026-10-30
 ### Changed (default on; `--exact` turns the speculation and inexact modes off)
-- `shadow serve MODEL` runs the fastest measured mode with no tier flags: `--tail-skip 4 --verify-resident --ram-tier-gib 30`,
-  the six-prompt placement, the DFlash 2 drafter (matrices Q8_0), `--spec 3`, `--dflash-min-p 0.5`. About 43 to 47 tok/s by
-  total throughput against about 20 for `--exact` (docs/STATUS.md, docs/BENCHMARKING.md). Not exact: `--tail-skip` changes the
-  model's own computation; speculation never does.
+- `shadow serve MODEL` runs the fastest mode that keeps answers intact with no tier flags: `--tail-skip 4 --accept-moe
+  --accept-beta 1.0 --ram-tier-gib 30`, the six-prompt placement, the DFlash 2 drafter (matrices Q8_0), `--spec 3`,
+  `--dflash-min-p 0.5`. About 35 tok/s by total throughput on varied text against about 20 for `--exact`, and 47 for Strata
+  (docs/STATUS.md, docs/BENCHMARKING.md). Not exact: `--tail-skip` and `--accept-moe` change the model's own computation;
+  speculation never does. `--verify-resident` is no longer a default: it truncated answers (11 of 14 replies ended early).
 - DeltaNet decay `expf` in float and the long sums in runs of 16 added in double (FP64 is 1/64 rate on the test GPU): +4% in spec mode.
 ### Added
 - The DFlash 2 drafter (`--dflash DIR|off`, `--dflash-bf16`, `--dflash-min-p P`): features from layers 5/15/25/35/45, per-layer
@@ -19,6 +20,8 @@ All notable changes to Shadow will be documented in this file.
   `tools/bench_total.py` (total-throughput scoring), `tools/autotune.py` (coordinate ascent over flags),
   `tools/bench_vs_strata.ps1`.
 - `SHADOW_RECORD_ROUTING=FILE` (a routing profile from a running server), `SHADOW_NO_PREFIX=1`, `SHADOW_DF_DUMP=DIR`, `SHADOW_DF_TIME=1`.
+- AcceptMoE verifier expert sets (`--accept-moe`, `--accept-beta/--accept-scale/--accept-budget`), the graded `--verify-rank R`,
+  `finish` recorded per bench turn, tokens-a-run and early stops in `bench_total.py`, `tools/quality_test.py`, `tools/trunc_test.py`.
 ### Learned (docs/STATUS.md)
 - The bench's per-turn median misranks arms that generate different text; score by total throughput.
 - A drafter fine-tune that looked like +25% accepted tokens counted prompt positions; on generated text it was a tie.

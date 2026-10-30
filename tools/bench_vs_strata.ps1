@@ -25,5 +25,6 @@ $a += '--arm'; $a += 'strata=-'
 $a += '--arm-exe'; $a += "shadow=$ShadowExe"
 $a += '--arm-launch'; $a += "strata=$L"
 & $Bench @a
-python tools/bench_total.py $Out
-python tools/plot_bench.py $Out
+$py = if ($env:PYTHON) { $env:PYTHON } else { 'python' }
+& $py tools/bench_total.py $Out
+& $py tools/plot_bench.py $Out

@@ -298,7 +298,15 @@ pub struct GpuSession<'c, 'm> {
     /// `Tiers::tail_skip` (0: off), and how many routed experts it has skipped.
     tail_skip: usize,
     pub tail_skipped: u64,
+    /// `--accept-moe`: AcceptMoE's verifier expert sets; `accept_beta` its commitment exponent; `commit` per draft position
+    /// (committed, tried) from the verify passes so far (`note_verify`).
+    accept_moe: bool,
+    accept_beta: f64,
+    accept_scale: f64,
+    accept_budget: f64,
+    commit: Vec<(u32, u32)>,
     verify_resident: bool,
+    verify_rank: usize,
     /// `routed_overlapped` instead of waiting on the host for a layer's copies (`SHADOW_OVERLAP=0`: off).
     overlap: bool,
     gstream: Stream<'c>,
@@ -439,6 +447,19 @@ pub struct Tiers {
     /// `--verify-resident` (inexact; AcceptMoE, arXiv 2608.02989): in a speculative verify pass, the drafted positions
     /// (all but the first) use only the routed experts already in VRAM, so the pass copies about what one step does.
     pub verify_resident: bool,
+    /// `--verify-rank R` (inexact, implies `--verify-resident`): the drafted positions keep their top R routed experts even
+    /// when they are not in VRAM (copied as usual) and drop only the non-resident ones below that; 0 = `--verify-resident`.
+    pub verify_rank: usize,
+    /// `--accept-moe` (inexact; AcceptMoE, arXiv 2608.02989, docs/SPECULATION.md): a verify pass routes its drafted positions
+    /// through one block-wide eligible expert set (the anchor's top-k plus the experts the committed positions demand, sized
+    /// by the demand's effective rank, non-resident members pruned lowest demand first); each token still takes k experts,
+    /// re-picked among the eligible ones.  `--accept-beta B` (default 1.0; the paper uses 0.5) sharpens the commitment weights.
+    pub accept_moe: bool,
+    pub accept_beta: f64,
+    /// `--accept-scale S` (default 1): the set holds S x the effective rank of the demand beyond the anchor; `--accept-budget F`
+    /// (default 1): the pruning may displace F x the assignments forming the set already displaced.
+    pub accept_scale: f64,
+    pub accept_budget: f64,
     /// `--fuse N`: the kernel fusions to use (`SHADOW_FUSE`'s bits; default none: measured 1.1% slower at 7, a tie at 0).
     pub fuse: Option<u8>,
 }
@@ -480,7 +501,12 @@ impl Tiers {
                    cpu_experts: num("--cpu-experts", 0)?, cpu_threads: num("--cpu-threads", 8)?,
                    pregate: num("--pregate", 0)?,
                    tail_skip: num("--tail-skip", 0)?,
-                   verify_resident: args.iter().any(|a| a == "--verify-resident"),
+                   verify_resident: args.iter().any(|a| a == "--verify-resident" || a == "--verify-rank"),
+                   accept_moe: args.iter().any(|a| a == "--accept-moe"),
+                   accept_beta: flag("--accept-beta").and_then(|v| v.parse().ok()).unwrap_or(1.0),
+                   accept_scale: flag("--accept-scale").and_then(|v| v.parse().ok()).unwrap_or(1.0),
+                   accept_budget: flag("--accept-budget").and_then(|v| v.parse().ok()).unwrap_or(1.0),
+                   verify_rank: flag("--verify-rank").and_then(|v| v.parse().ok()).unwrap_or(0),
                    fuse: flag("--fuse").and_then(|v| v.parse().ok()),
                    pin_margin: flag("--pin-margin").map(|v| v.parse().map_err(|_| format!("--pin-margin: not a number: {v}")))
                        .transpose()? })
@@ -1118,7 +1144,13 @@ impl<'c, 'm> GpuSession<'c, 'm> {
             verify_stats: [0.0; 7],
             tail_skip: tiers.tail_skip,
             verify_resident: tiers.verify_resident,
+            verify_rank: tiers.verify_rank,
             tail_skipped: 0,
+            accept_moe: tiers.accept_moe,
+            accept_beta: tiers.accept_beta,
+            accept_scale: tiers.accept_scale,
+            accept_budget: tiers.accept_budget,
+            commit: vec![],
             graphs_on: std::env::var("SHADOW_GRAPHS").map_or(true, |v| v != "0")
                 && !std::env::var("SHADOW_KTIME").is_ok_and(|v| v == "1"),
             overlap: std::env::var("SHADOW_OVERLAP").map_or(true, |v| v != "0"),
@@ -2533,6 +2565,85 @@ impl<'c, 'm> GpuSession<'c, 'm> {
     /// the recurrent states restored and only their updates for those tokens redone, from what the pass kept (the KV
     /// of those positions, the drafter cells and the final residuals are still the ones the pass wrote).  Without
     /// such a pass, restore and read the tokens again.
+    /// The engine's word on a verify pass of `m` positions (the anchor and m - 1 drafts) of which `keep` were kept: the
+    /// marginal commitment probability of each draft position (`--accept-moe`).
+    pub fn note_verify(&mut self, keep: usize, m: usize) {
+        if self.commit.len() < m {
+            self.commit.resize(m, (0, 0));
+        }
+        for j in 1..m {
+            self.commit[j].1 += 1;
+            if keep > j {
+                self.commit[j].0 += 1;
+            }
+        }
+    }
+
+    /// AcceptMoE's marginal probability that draft position j (1-based) reaches the output: the observed rate, with a
+    /// prior (0.75, 0.56, 0.47, ... what the first runs measured) worth 8 passes.
+    fn commit_prob(&self, j: usize) -> f64 {
+        const PRIOR: [f64; 7] = [0.75, 0.56, 0.47, 0.39, 0.32, 0.27, 0.22];
+        let p = PRIOR[(j - 1).min(PRIOR.len() - 1)];
+        let (c, n) = self.commit.get(j).copied().unwrap_or((0, 0));
+        (c as f64 + 8.0 * p) / (n as f64 + 8.0)
+    }
+
+    /// `--accept-moe` for one MoE layer of a verify pass: tops[0] (the anchor) stays natural; positions 1.. are re-routed
+    /// through the block's eligible expert set.
+    fn accept_route(&mut self, l: usize, logits: &[Vec<f32>], tops: &mut [Vec<(usize, f64)>]) {
+        let k = self.m.cfg.n_expert_used;
+        let m = tops.len();
+        let nat: Vec<Vec<(usize, f64)>> = tops.to_vec();
+        // commitment-weighted demand (a chain: one node a position, so the width discount is 1)
+        let mut u: HashMap<usize, f64> = HashMap::new();
+        for (j, top) in nat.iter().enumerate() {
+            let alpha = if j == 0 { 1.0 } else { self.commit_prob(j).powf(self.accept_beta) };
+            for &(e, w) in top {
+                *u.entry(e).or_insert(0.0) += alpha * w;
+            }
+        }
+        let anchor: Vec<usize> = nat[0].iter().map(|&(e, _)| e).collect();
+        let mut rest: Vec<(usize, f64)> = u.iter().filter(|(e, _)| !anchor.contains(e)).map(|(&e, &v)| (e, v)).collect();
+        rest.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap().then(a.0.cmp(&b.0)));
+        let z: f64 = rest.iter().map(|r| r.1).sum();
+        let n_er = if z > 0.0 {
+            let h: f64 = -rest.iter().map(|r| r.1 / z).filter(|&q| q > 0.0).map(|q| q * q.ln()).sum::<f64>();
+            (self.accept_scale * h.exp()).ceil() as usize
+        } else {
+            0
+        };
+        let mut set: Vec<usize> = anchor.clone();
+        set.extend(rest.iter().take(n_er.max(k.saturating_sub(set.len()))).map(|r| r.0));
+        // residency-aware pruning: non-resident members, lowest demand first, within the rerouting budget
+        let votes = |e: usize| nat.iter().filter(|t| t.iter().any(|&(x, _)| x == e)).count();
+        let displaced: usize = (self.accept_budget * u.keys().filter(|e| !set.contains(e)).map(|&e| votes(e)).sum::<usize>() as f64).ceil() as usize;
+        let mut cand: Vec<usize> = set.iter().copied().filter(|e| !self.cache.map.contains_key(&(l, *e))).collect();
+        cand.sort_by(|a, b| u.get(a).unwrap_or(&0.0).partial_cmp(u.get(b).unwrap_or(&0.0)).unwrap().then(a.cmp(b)));
+        let (mut spent, mut removed) = (0usize, vec![]);
+        for e in cand {
+            let v = votes(e);
+            if spent + v > displaced || set.len() - removed.len() <= k {
+                break;
+            }
+            spent += v;
+            removed.push(e);
+        }
+        set.retain(|e| !removed.contains(e));
+        let mut masked = vec![f32::NEG_INFINITY; logits[0].len()];
+        for j in 1..m {
+            for v in masked.iter_mut() {
+                *v = f32::NEG_INFINITY;
+            }
+            for &e in &set {
+                masked[e] = logits[j][e];
+            }
+            let before = tops[j].len();
+            tops[j] = route(&masked, k);
+            let _ = before;
+        }
+        self.tail_skipped += removed.len() as u64;
+    }
+
     pub fn rollback(&mut self, snap: &Snapshot<'c>, kept: &[u32]) -> Result<(), String> {
         let pass = self.replay.pass.take();
         let fits = pass.as_ref().is_some_and(|(p0, toks)| {
@@ -3070,11 +3181,18 @@ impl<'c, 'm> GpuSession<'c, 'm> {
                 logs[j].extend(top.iter().map(|&(e, _)| e as u16));
             }
         }
-        if self.verify_resident && self.replay.on.get() {
+        if self.accept_moe && self.replay.on.get() && m >= 2 {
+            self.accept_route(l, &logits, &mut tops);
+        }
+        if self.verify_resident && !self.accept_moe && self.replay.on.get() {
             // a verify pass: the drafted positions keep only their resident experts
             for top in tops.iter_mut().skip(1) {
                 let before = top.len();
-                top.retain(|&(e, _)| self.cache.map.contains_key(&(l, e)));
+                let mut rank = 0;
+                top.retain(|&(e, _)| {
+                    rank += 1;
+                    rank <= self.verify_rank || self.cache.map.contains_key(&(l, e))
+                });
                 self.tail_skipped += (before - top.len()) as u64;
             }
         }

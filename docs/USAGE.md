@@ -40,7 +40,7 @@ With no tier flags this is the **fastest measured mode**, an OpenAI-compatible s
 | default | flag it stands for | what it is |
 |---|---|---|
 | inexact tail skip | `--tail-skip 4` | a routed expert past the 4th by router weight is skipped unless it is already in VRAM |
-| resident verify | `--verify-resident` | a verify pass uses only the experts already in VRAM for its extra positions |
+| AcceptMoE verify | `--accept-moe --accept-beta 1.0` | a verify pass routes its drafted positions through one block-wide expert set (the anchor's top-k plus the experts the likely-to-be-accepted positions demand); each token still takes k experts, re-picked inside the set |
 | RAM expert tier | `--ram-tier-gib 30` | 30 GiB of pinned host memory holds the likeliest experts, copied to the GPU by DMA |
 | placement | `--placement profiles/routing-6prompts.shrc` | which experts the RAM tier holds (a routing profile) |
 | drafter | `--dflash models/dflash2` | the DFlash 2 drafter, matrices as Q8_0 |
@@ -48,8 +48,8 @@ With no tier flags this is the **fastest measured mode**, an OpenAI-compatible s
 | draft cutoff | `--dflash-min-p 0.5` | a draft chain stops after a draft the selector gives under 0.5 |
 
 Each default applies only when you did not pass that flag and the file exists. **`--exact`** turns all of them off: the
-exact, unspeculated path, bit for bit the reference (about 20 tok/s on the test machine against about 43 to 47 in the
-default mode). The default mode is **not exact**: `--tail-skip` changes which experts run, so answers can differ from the
+exact, unspeculated path, bit for bit the reference (about 20 tok/s on the test machine against about 35 in the
+default mode on varied text). The default mode is **not exact**: `--tail-skip` changes which experts run, so answers can differ from the
 exact path. The verify pass still checks every drafted token against the model it is running, so speculation itself never
 changes an answer; only the tail skip does.
 
@@ -70,7 +70,9 @@ RAM, expert-cache hit rates, memory tiers).
 | `--expert-cache-gib G` | all free VRAM less 384 MiB | the VRAM expert cache (LRU per layer) |
 | `--pin-margin N` | off | pin each layer's hottest experts in VRAM, keeping N evictable slots a layer |
 | `--tail-skip R` | 4 | routed experts of rank >= R are skipped when not in VRAM (0: exact) |
-| `--verify-resident` | on | a verify pass uses resident experts only for its extra positions |
+| `--accept-moe`, `--accept-beta B`, `--accept-scale S`, `--accept-budget F` | on, 1.0, 1, 1 | AcceptMoE verifier expert sets (docs/SPECULATION.md); B sharpens the commitment weights, S scales the set, F the pruning budget |
+| `--verify-resident` | off | **can truncate answers**: a verify pass's extra positions use only the experts already in VRAM; on varied text 11 of 14 replies ended early against 3 |
+| `--verify-rank R` | off | like `--verify-resident` but each extra position keeps its top R experts even when they must be copied; R=1: about +18% tok/s and about 17% fewer generated tokens |
 | `--dflash DIR` or `off` | `models/dflash2` | the DFlash 2 drafter |
 | `--dflash-bf16` | off | keep the drafter's matrices BF16 instead of Q8_0 (about 0.4 GB more VRAM) |
 | `--dflash-min-p P` | 0.5 | stop a draft chain after a draft the selector gives under P |

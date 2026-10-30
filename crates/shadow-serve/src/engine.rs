@@ -431,6 +431,7 @@ fn answer<'c>(arch: &str, req: &Request, tok: &Tokenizer, sess: &mut GpuSession<
                     break;
                 }
             }
+            sess.note_verify(keep, batch.len());
             spec_n.0 += 1;
             spec_n.1 += draft.len();
             spec_n.2 += keep - 1;
