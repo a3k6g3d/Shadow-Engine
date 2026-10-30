@@ -244,9 +244,59 @@ fn compare(path: &std::path::Path, fixture: &std::path::Path, mode: Mode, rest: 
     ExitCode::SUCCESS
 }
 
+/// The fastest measured serving mode (docs/STATUS.md: 42.8 tok/s on the standard bench, exact mode 20.4) is what
+/// `shadow serve` runs unless the flags say otherwise: tail-skip 4, verify-resident, the fine-tuned DFlash 2 drafter with
+/// 5 drafts a pass, a 30 GiB RAM expert tier and the routing profile.  Each is only a default (give the flag to change
+/// it; `--dflash off`, `--tail-skip 0`); `--exact` turns all of them off - the exact, unspeculated path, bit for bit
+/// the reference.
+fn fastest_defaults(rest: &[String]) -> Vec<String> {
+    let mut out = rest.to_vec();
+    if rest.iter().any(|a| a == "--exact") {
+        out.retain(|a| a != "--exact");
+        eprintln!("shadow serve: --exact: no speculation, no inexact modes");
+        return out;
+    }
+    let root = std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../.."));
+    let has = |f: &str| rest.iter().any(|a| a == f);
+    let found = |rel: &str| {
+        let p = std::path::Path::new(rel);
+        [p.to_path_buf(), root.join(rel)].into_iter().find(|c| c.exists())
+    };
+    let mut set: Vec<String> = vec![];
+    if !has("--tail-skip") {
+        set.extend(["--tail-skip".into(), "4".into()]);
+    }
+    if !has("--verify-resident") {
+        set.push("--verify-resident".into());
+    }
+    if !has("--ram-tier-gib") {
+        set.extend(["--ram-tier-gib".into(), "30".into()]);
+    }
+    if !has("--placement") {
+        if let Some(p) = found("profiles/routing-6prompts.shrc") {
+            set.extend(["--placement".into(), p.display().to_string()]);
+        }
+    }
+    if !has("--dflash") && !has("--mtp") {
+        let dir = found("models/dflash2-ft2").or_else(|| found("models/dflash2"));
+        if let Some(d) = dir.filter(|d| d.join("model.safetensors").exists()) {
+            set.extend(["--dflash".into(), d.display().to_string()]);
+        }
+    }
+    if !has("--spec") && (set.iter().any(|a| a == "--dflash") || has("--dflash")) {
+        set.extend(["--spec".into(), "5".into()]);
+    }
+    if !set.is_empty() {
+        eprintln!("shadow serve: fastest-mode defaults: {} (--exact for the exact path)", set.join(" "));
+    }
+    out.extend(set);
+    out
+}
+
 /// `shadow serve MODEL [--host H] [--port P] [--ctx N] [tier flags]`: the HTTP server (shadow-serve) on the GPU
 /// session.  Port 8081 by default - 8080 is where the user's other server lives.
 fn serve(path: &std::path::Path, rest: &[String]) -> ExitCode {
+    let rest = &fastest_defaults(rest);
     let flag = |f: &str| rest.iter().position(|a| a == f).and_then(|i| rest.get(i + 1));
     let host = flag("--host").map(String::as_str).unwrap_or("127.0.0.1");
     let port: u16 = flag("--port").and_then(|v| v.parse().ok()).unwrap_or(8081);

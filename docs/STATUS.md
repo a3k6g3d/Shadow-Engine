@@ -714,3 +714,14 @@ Single-prompt runs, "Write a Rust function that parses a comma separated list...
   it cannot rank drafters; accepted tokens per pass there: tuned `--spec 5` 3.55, stock 2.86, MTP 2.84.
 - `tools/autotune.py`: coordinate ascent over serving flags with `shadow-bench` rounds (adopt a value only above
   max(1%, 3 x floor) and a positive paired median), logged to `bench/autotune/log.md`.
+
+## 2026-10-30 (later): the fastest mode is `shadow serve`'s default
+
+- `shadow serve MODEL` with no tier flags now runs the fastest measured mode: `--tail-skip 4 --verify-resident --ram-tier-gib 30
+  --placement profiles/routing-6prompts.shrc --dflash models/dflash2-ft2 --spec 5` (each only when its flag is absent and
+  the file exists; `models/dflash2` if the tuned weights are missing). `--exact` turns all of it off (the exact, unspeculated
+  path); `--tail-skip 0`, `--dflash off`, `--spec N` change one piece. Flag-less vs the explicit flags, 3 runs: **42.09 vs
+  42.22 tok/s (tie, floor 1.8%)**; exact mode is ~20.4.
+- `shadow-bench` launched flag-less arms under a 16 GiB working-set cap (sized for no RAM tier), which squeezed the 30 GiB
+  tier (first checks read 32.6 vs 42.7); it now assumes the default tier unless the arm says `--exact`.
+- Autotune (spec 3-7, min-p, tail-skip): nothing beat `--spec 5 --tail-skip 4`; the optimum is narrow (neighbours -5..-29%).

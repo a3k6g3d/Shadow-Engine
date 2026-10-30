@@ -134,7 +134,9 @@ fn run(a: &[String]) {
             // the cap covers a RAM tier: its size plus the process (dense weights, buffers) plus headroom
             let cap = if flags.contains("--ram-tier-gib auto") { 44 } else {
                 flags.split_whitespace().skip_while(|w| *w != "--ram-tier-gib").nth(1)
-                    .and_then(|g| g.parse::<f64>().ok()).map_or(16, |g| g.ceil() as u64 + 12)
+                    .and_then(|g| g.parse::<f64>().ok())
+                    // no flag: `shadow serve`'s own default tier (30 GiB) unless the arm says --exact
+                    .map_or(if flags.contains("--exact") { 16 } else { 42 }, |g| g.ceil() as u64 + 12)
             };
             let log = out.join(format!("{name}-run{i}.log"));
             let args = format!("serve {model} --port {port} {flags}");
