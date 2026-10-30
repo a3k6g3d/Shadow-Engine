@@ -36,6 +36,8 @@ pub const EPS: f32 = 1e-6;
 pub struct DfTensor {
     /// byte offset in the weights buffer
     pub offset: usize,
+    /// stored as Q8_0 blocks (34 bytes a 32 weights) instead of BF16
+    pub q8: bool,
     pub rows: usize,
     pub cols: usize,
 }
@@ -94,6 +96,20 @@ pub struct DflashModel<'c> {
     pub mask_emb: Option<Vec<f32>>,
     /// rounds drafted, drafted tokens, tokens the main model agreed with (the speculation loop)
     pub stats: (u64, u64, u64),
+}
+
+/// BF16 weights (little-endian u16, rows of 32-multiples) as GGML Q8_0 blocks: an f16 scale then 32 int8, x = d * q.
+fn quantize_q8_0(bf16: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(bf16.len() / 64 * 34);
+    for blk in bf16.chunks_exact(64) {
+        let x: Vec<f32> = blk.chunks_exact(2).map(|c| f32::from_bits((u16::from_le_bytes([c[0], c[1]]) as u32) << 16)).collect();
+        let amax = x.iter().fold(0f32, |m, v| m.max(v.abs()));
+        let d = amax / 127.0;
+        let id = if d == 0.0 { 0.0 } else { 1.0 / d };
+        out.extend_from_slice(&shadow_model::half::f32_to_f16(d).to_le_bytes());
+        out.extend(x.iter().map(|v| (v * id).round().clamp(-127.0, 127.0) as i8 as u8));
+    }
+    out
 }
 
 /// A tiny reader for the safetensors header: {"name": {"dtype": "BF16", "shape": [r, c], "data_offsets": [s, e]}, ...}.
@@ -219,7 +235,8 @@ fn parse_header(h: &[u8]) -> Result<Vec<(String, Vec<usize>, (usize, usize))>, S
 }
 
 impl<'c> DflashModel<'c> {
-    pub fn load(ctx: &'c Context, dir: &Path, cap: usize) -> Result<Self, String> {
+    /// `q8`: the matrices (not the norms, convolution bases or selector codebooks) as Q8_0, half the VRAM.
+    pub fn load(ctx: &'c Context, dir: &Path, cap: usize, q8: bool) -> Result<Self, String> {
         let e = |x: crate::driver::CudaError| x.to_string();
         let path = dir.join("model.safetensors");
         let mut f = std::fs::File::open(&path).map_err(|err| format!("{}: {err}", path.display()))?;
@@ -230,7 +247,10 @@ impl<'c> DflashModel<'c> {
         f.read_exact(&mut head).map_err(|err| err.to_string())?;
         let entries = parse_header(&head)?;
         let data0 = 8 + hlen as u64;
-        let total: usize = entries.iter().map(|(_, _, r)| (r.1 - r.0).next_multiple_of(256)).sum();
+        let quantize = |name: &str, shape: &[usize]| q8 && shape.len() == 2 && shape[1] % 32 == 0 && name.ends_with(".weight")
+            && !name.ends_with("norm.weight");
+        let stored = |name: &str, shape: &[usize], bytes: usize| if quantize(name, shape) { bytes / 64 * 34 } else { bytes };
+        let total: usize = entries.iter().map(|(n, s, r)| stored(n, s, r.1 - r.0).next_multiple_of(256)).sum();
         let weights = ctx.alloc(total).map_err(e)?;
         let mut tensors = HashMap::new();
         let mut at = 0usize;
@@ -239,6 +259,10 @@ impl<'c> DflashModel<'c> {
             buf.resize(en - s, 0u8);
             f.seek(SeekFrom::Start(data0 + s as u64)).map_err(|err| err.to_string())?;
             f.read_exact(&mut buf).map_err(|err| err.to_string())?;
+            let is_q8 = quantize(&name, &shape);
+            if is_q8 {
+                buf = quantize_q8_0(&buf);
+            }
             // SAFETY: [at, at + buf.len()) is inside the buffer allocated for the sum of the padded tensor sizes.
             let r = unsafe {
                 (ctx.api.cuMemcpyHtoD)(weights.ptr + at as u64, buf.as_ptr() as *const std::ffi::c_void, buf.len())
@@ -247,7 +271,7 @@ impl<'c> DflashModel<'c> {
                 return Err(format!("dflash: upload of {name} failed ({r})"));
             }
             let (rows, cols) = if shape.len() == 2 { (shape[0], shape[1]) } else { (1, shape.iter().product()) };
-            tensors.insert(name, DfTensor { offset: at, rows, cols });
+            tensors.insert(name, DfTensor { offset: at, rows, cols, q8: is_q8 });
             at += buf.len().next_multiple_of(256);
         }
         for need in ["fc.weight", "hidden_norm.weight", "norm.weight", "candidate_selector.predecessor_codebook"] {

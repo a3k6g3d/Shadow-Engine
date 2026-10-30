@@ -419,6 +419,8 @@ pub struct Tiers {
     pub dflash_dir: Option<std::path::PathBuf>,
     /// `--dflash-min-p P`: a DFlash chain stops after a draft the selector gives less than P (default 0: all).
     pub dflash_min_p: f32,
+    /// The drafter's matrices as Q8_0 (half the VRAM, ~220 more expert slots); `--dflash-bf16` keeps them BF16.
+    pub dflash_q8: bool,
     /// Hybrid MoE: up to this many of a layer's misses that the RAM tier holds are computed on the CPU instead of
     /// copied to the GPU (0: off), on `cpu_threads` workers.
     pub cpu_experts: usize,
@@ -473,6 +475,7 @@ impl Tiers {
         };
         let dflash_dir = flag("--dflash").filter(|p| p.as_str() != "off").map(std::path::PathBuf::from);
         Ok(Tiers { vram_cache: gib("--expert-cache-gib")?, ram_bytes, ram_auto, order, mtp_dir, dflash_dir,
+                   dflash_q8: !args.iter().any(|a| a == "--dflash-bf16"),
                    dflash_min_p: flag("--dflash-min-p").and_then(|v| v.parse().ok()).unwrap_or(0.0),
                    cpu_experts: num("--cpu-experts", 0)?, cpu_threads: num("--cpu-threads", 8)?,
                    pregate: num("--pregate", 0)?,
@@ -868,7 +871,7 @@ impl<'c, 'm> GpuSession<'c, 'm> {
         };
 
         let dflash = match tiers.dflash_dir.as_ref() {
-            Some(p) => match crate::dflash::DflashModel::load(ctx, p, cap) {
+            Some(p) => match crate::dflash::DflashModel::load(ctx, p, cap, tiers.dflash_q8) {
                 Ok(mut m) => {
                     m.min_p = tiers.dflash_min_p;
                     eprintln!("dflash: loaded the drafter from {} (~1.2 GB VRAM)", p.display());

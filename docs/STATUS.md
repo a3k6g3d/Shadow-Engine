@@ -733,3 +733,12 @@ Single-prompt runs, "Write a Rust function that parses a comma separated list...
   head's 106k-token list: the draft round 7.1 -> 6.1 ms, but candidates outside the list are lost: position-1 hits 300/432 ->
   260/440, tokens per pass 2.89 -> 2.42, **-25% tok/s** (4 runs, floor 0.3%). The saving is at most ~1 ms of ~65 ms a pass;
   a list built from this model's own outputs could cover more but cannot win more than ~1.5%.
+
+## 2026-10-30 (later): the drafter's matrices as Q8_0 (default; `--dflash-bf16` opts out)
+
+- Quantizing the drafter's matrices to Q8_0 at load (norms, convolution bases and selector codebooks stay BF16) frees ~0.4 GB of VRAM:
+  the expert cache grows 2094 -> 2311 slots, and the draft round drops 7.1 -> 6.3 ms (`matvec_cols_q8_0`). Tokens accepted per
+  pass did not fall (3.05 vs 2.89). Pass time (draft + check) 66.7 -> 65.6 ms: ~1.6%.
+- The bench's per-turn median is a poor judge here: with tail-skip the arms generate different text, and one run read 36.5 vs 43.0
+  tok/s by median but 45.3 vs 42.0 by total tokens/time (4 runs each, turn 0 dropped). The mechanism is the measurement;
+  the +7.8% in total throughput is mostly which tokens were generated.

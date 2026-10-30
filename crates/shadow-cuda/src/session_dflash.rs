@@ -8,8 +8,8 @@ use shadow_model::quant::dequantize;
 
 impl<'c, 'm> GpuSession<'c, 'm> {
     /// y_j = W x_j (a BF16 matrix of `rows` x `cols` at `w`) for j < m, x_j at x + j * xs floats, y_j at y + j * ys.
-    fn df_mv_ptr(&self, w: u64, rows: usize, cols: usize, x: u64, xs: usize, y: u64, ys: usize, m: usize) {
-        let entry = "matvec_cols_bf16";
+    fn df_mv_ptr(&self, w: u64, q8: bool, rows: usize, cols: usize, x: u64, xs: usize, y: u64, ys: usize, m: usize) {
+        let entry = if q8 { "matvec_cols_q8_0" } else { "matvec_cols_bf16" };
         for j0 in (0..m).step_by(COLS_MAX) {
             let n = (m - j0).min(COLS_MAX);
             // SAFETY: `rows` rows of `cols` BF16 weights at w; n inputs of `cols` floats at x + j * xs and n outputs of
@@ -27,7 +27,7 @@ impl<'c, 'm> GpuSession<'c, 'm> {
     fn df_mv(&self, name: &str, x: u64, xs: usize, y: u64, ys: usize, m: usize) {
         let df = self.dflash.as_ref().unwrap();
         let (rows, cols) = df.dims(name);
-        self.df_mv_ptr(df.ptr(name), rows, cols, x, xs, y, ys, m);
+        self.df_mv_ptr(df.ptr(name), df.tensors[name].q8, rows, cols, x, xs, y, ys, m);
     }
 
     /// The layer-`l` output residual of the m rows at `r` (streams h apart in each row), if `l` is one of the taps: its
