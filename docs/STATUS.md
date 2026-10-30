@@ -742,3 +742,17 @@ Single-prompt runs, "Write a Rust function that parses a comma separated list...
 - The bench's per-turn median is a poor judge here: with tail-skip the arms generate different text, and one run read 36.5 vs 43.0
   tok/s by median but 45.3 vs 42.0 by total tokens/time (4 runs each, turn 0 dropped). The mechanism is the measurement;
   the +7.8% in total throughput is mostly which tokens were generated.
+
+## 2026-10-30 (correction): per-turn medians overstated the tuned drafter
+
+- `shadow-bench`'s headline is the median over a run's 5 warm turns. With inexact modes (tail-skip) the arms generate different
+  text, so the medians compare different turns. Re-scored by total tokens / total decode time (turn 0 dropped, from the
+  servers' own speculation lines; runs are deterministic, 3 runs agree to 0.1):
+  MTP `--spec 5` **40.3** tok/s; stock DFlash 2 `--spec 3` **42.9**; tuned (`dflash2-ft2`) `--spec 3` 41.7, `--spec 4` 42.1,
+  `--spec 5` 42.0 (earlier medians: 38.95 / 39.84 / 38.38 / 37.99 / 42.82). Min-p arms: 0.3 38.6, 0.5 41.5, 0.7 43.9, 0.85 40.0.
+- So: DFlash 2 is ~+6% over MTP on this bench by total throughput (not +10%), and the fine-tune does not show a gain here
+  (0.2 .. -2.8% vs stock), although held-out acceptance rose 2.57 -> 3.14 (non-thinking chat) and 2.72 -> 4.0 (thinking).
+  The 6 hash-table prompts are too few tokens (~500 a run) and too narrow for the draft quality to dominate; the trajectory
+  (which tokens come out) moves a run by several percent. Treat the `--spec 5` optimum and the autotune rounds (which used
+  medians) as unproven; a bench with many more turns on varied text (and a placement profiled on it) is needed to rank
+  drafters honestly. Strata's 48.5 is a median of the same kind - not re-scored.
