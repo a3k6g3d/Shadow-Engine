@@ -871,3 +871,23 @@ Single-prompt runs, "Write a Rust function that parses a comma separated list...
 - Fidelity of Strata's replies against the exact run (same history, 24 turns): mean prefix match **0.431**, 6 of 24 identical (Shadow default
   0.572 / 9 of 24; plain tail skip 4 0.481); free-run 14 turns: 920 tokens, 5 early stops, 31.8 tok/s end to end (Shadow default 997 tokens, 3 early,
   27.8; exact 1,091, 3, 18.2). Strata is the least faithful of these, so part of its lead is approximation.
+
+## 2026-10-31: the two-group pipeline (`--pipeline`) - exact, no gain
+
+- Built our own version of the overlap Strata's source shows (`crates/shadow-cuda/src/session_pipeline.rs`): a verify window of m tokens is cut into
+  groups A (the first half) and B; the GPU stream runs `pre(l,A) pre(l,B) | post(l,A) pre(l+1,A) | post(l,B) pre(l+1,B)`, `pre` = mixer + router,
+  `post` = experts + combine + hyper-connection write, so the host's expert work for one group (router read, plan, copies, file reads, CPU
+  experts, launches) runs while the GPU executes the other group's mixer. Mechanics: every per-token batch buffer's base pointer is shifted to the
+  group's first row for the duration of a stage (`with_rows`; the plan-table buffer split in halves; CUDA-graph keys include the row offset); each
+  group's router logits (and MoE input) are copied to the pinned mapped region right after its `pre` and fenced by an event the host waits on later
+  (`issue_router_read` / `wait_router_read`); buffer reuse between groups is fenced on the GPU (the copy stream waits for an event recorded after the
+  previous `post`) and the host syncs the copy stream only before a file read that may reuse a pinned slot.
+- **Correct:** exact speculation (`--tail-skip 0`, 14 turns) gives the same 1,091 tokens and the same early-stop pattern with and without it, and the report
+  counts every verify pass as pipelined (103 of 103). The groups' arithmetic per token is unchanged (the inexact modes' per-group expert sets differ).
+- **Speed: none, or negative.** Exact mode (about 750 expert copies = 1.5 GB a pass, about 67 of the 104 ms on the bus): 19.9 against 20.1 tok/s; the
+  verify pass 105.6 against 104.8 ms, GPU waits 40 against 58 ms, launches 1,893 against 1,011, host launch time 8.9 against 4.9 ms. Default fast mode,
+  varied bench, 2 runs, total throughput: base 34.66, `--pipeline` **31.28 (-9.8%)**, `--pipeline --cpu-experts 2` 29.51 (-14.9%).
+- Why: Shadow's layer is a host-driven chain with fixed costs per group (a router sync, planning, launches, a join), so cutting the window in two
+  doubles those costs while the GPU work they were meant to hide under is small (the whole batch's mixer is about 0.6 ms a layer). Strata avoids the
+  chain rather than hiding it: its window is one captured CUDA graph with device-side planning and flag doorbells, so there are almost no host round
+  trips. The structure that matters is fewer host synchronisations per pass (48 router syncs today), not overlapping them. Kept as an opt-in, off by default.

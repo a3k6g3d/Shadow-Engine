@@ -35,7 +35,8 @@ impl<'c, 'm> GpuSession<'c, 'm> {
     pub(super) fn df_capture(&self, l: usize, r: u64, m: usize) {
         let Some(slot) = TAPS.iter().position(|&t| t == l) else { return };
         let c = &self.m.cfg;
-        let feat = self.dflash.as_ref().unwrap().bufs.feat.ptr;
+        // a pipelined group writes its rows of the feature buffer, not the first ones
+        let feat = self.dflash.as_ref().unwrap().bufs.feat.ptr + (self.row_shift * NFEAT * 4) as u64;
         self.k2("df_capture", (c.hidden as u32).div_ceil(256), m as u32, 256,
                 &[Arg::Ptr(r), Arg::Ptr(feat), Arg::U32(slot as u32), Arg::U32(c.hidden as u32), Arg::U32(c.streams as u32),
                   Arg::U32(NFEAT as u32)]);

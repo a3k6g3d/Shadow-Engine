@@ -80,6 +80,7 @@ RAM, expert-cache hit rates, memory tiers).
 | `--spec K` | 3 with a drafter | drafted tokens checked per pass; without a drafter, prompt-lookup drafting |
 | `--cpu-experts N`, `--cpu-threads T` | 0, 8 | compute up to N RAM-tier misses a layer on the CPU instead of copying them, in decode and in verify passes (opt-in: measured a tie at N=2 and a loss at 1 and 4; STATUS.md) |
 | `--pregate N` | 0 | experimental router lookahead |
+| `--pipeline` | off | a verify pass as two token groups with one group's expert work under the other's mixer (exact; measured -10% in the default mode, a tie in exact mode; STATUS.md) |
 | `--fuse N` | 0 | kernel fusions, bits 1/2/4 (measured a tie or a loss; opt-in) |
 
 `shadow generate MODEL "prompt" | @FILE [-n N] [--gpu] [--chat] [tier flags]` decodes greedily from the command line,

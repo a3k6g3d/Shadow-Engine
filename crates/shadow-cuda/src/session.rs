@@ -25,6 +25,8 @@ use std::collections::{BTreeMap, HashMap};
 mod mtp_layer;
 #[path = "session_dflash.rs"]
 mod dflash_layer;
+#[path = "session_pipeline.rs"]
+mod pipeline_layer;
 
 struct Attn<'c> {
     k: DeviceBuffer<'c>,
@@ -249,6 +251,18 @@ pub struct GpuSession<'c, 'm> {
     /// the verify pass's CPU experts: how many joins, the host's seconds waiting in them, and the seconds from each
     /// job's submit to its result (the job is out of the host's way until the join)
     cpu_join: (u64, f64, f64),
+    /// seconds of host time choosing and submitting the CPU experts / uploading their outputs
+    cpu_host: (f64, f64),
+    /// `--pipeline`: a verify pass as two token groups (session_pipeline.rs); `pipe_active` while one runs, `row_shift` the
+    /// first row of the group whose view of the batch buffers is current, `ticket_stage` the staging mark of each group's
+    /// queued router read
+    pipeline: bool,
+    pipe_active: bool,
+    pipelined_passes: u64,
+    row_shift: usize,
+    mapped_event2: Event<'c>,
+    group_event: Event<'c>,
+    ticket_stage: [usize; 2],
     prefetch: Option<Prefetch<'c>>,
     /// Mapped pinned memory the router logits are copied into by a kernel, and the event the host waits on for them:
     /// a device-to-host memcpy would queue in the copy engine behind `copy_stream`'s uploads.
@@ -277,7 +291,7 @@ pub struct GpuSession<'c, 'm> {
     /// on first use on `gstream`, which orders with the default stream.  `SHADOW_GRAPHS=0`: none.
     graphs: HashMap<(usize, bool), Graph<'c>>,
     /// The same for the batched step: (layer, fused norm, tokens, keeping the rollback's inputs).
-    batch_graphs: HashMap<(usize, bool, usize, bool), Graph<'c>>,
+    batch_graphs: HashMap<(usize, bool, usize, bool, usize), Graph<'c>>,
     graphs_on: bool,
     /// `matvec_cols_multi`'s job tables, by (layer, group, rollback inputs): built before a graph is captured.
     multi: HashMap<(usize, u8, bool), DeviceBuffer<'c>>,
@@ -453,6 +467,9 @@ pub struct Tiers {
     /// `--verify-rank R` (inexact, implies `--verify-resident`): the drafted positions keep their top R routed experts even
     /// when they are not in VRAM (copied as usual) and drop only the non-resident ones below that; 0 = `--verify-resident`.
     pub verify_rank: usize,
+    /// `--pipeline` (or `SHADOW_PIPELINE=1`): a verify pass as two token groups, one group's expert phase running under the
+    /// other group's mixer (session_pipeline.rs).  Same arithmetic per token.
+    pub pipeline: bool,
     /// `--accept-moe` (inexact; AcceptMoE, arXiv 2608.02989, docs/SPECULATION.md): a verify pass routes its drafted positions
     /// through one block-wide eligible expert set (the anchor's top-k plus the experts the committed positions demand, sized
     /// by the demand's effective rank, non-resident members pruned lowest demand first); each token still takes k experts,
@@ -509,6 +526,7 @@ impl Tiers {
                    accept_beta: flag("--accept-beta").and_then(|v| v.parse().ok()).unwrap_or(1.0),
                    accept_scale: flag("--accept-scale").and_then(|v| v.parse().ok()).unwrap_or(1.0),
                    accept_budget: flag("--accept-budget").and_then(|v| v.parse().ok()).unwrap_or(1.0),
+                   pipeline: args.iter().any(|a| a == "--pipeline") || std::env::var("SHADOW_PIPELINE").is_ok_and(|v| v == "1"),
                    verify_rank: flag("--verify-rank").and_then(|v| v.parse().ok()).unwrap_or(0),
                    fuse: flag("--fuse").and_then(|v| v.parse().ok()),
                    pin_margin: flag("--pin-margin").map(|v| v.parse().map_err(|_| format!("--pin-margin: not a number: {v}")))
@@ -1115,6 +1133,14 @@ impl<'c, 'm> GpuSession<'c, 'm> {
                 .then(|| (shadow_model::cpu_expert::ExpertPool::new(tiers.cpu_threads), tiers.cpu_experts)),
             cpu_served: 0,
             cpu_join: (0, 0.0, 0.0),
+            cpu_host: (0.0, 0.0),
+            pipeline: tiers.pipeline,
+            pipe_active: false,
+            pipelined_passes: 0,
+            row_shift: 0,
+            mapped_event2: ctx.event().map_err(e)?,
+            group_event: ctx.event().map_err(e)?,
+            ticket_stage: [usize::MAX; 2],
             mapped: PinnedRegion::new(ctx, MAX_BATCH.max(2) * c.n_expert * 4)?,
             mapped_event: ctx.event().map_err(e)?,
             waits: [0.0; 3],
@@ -1371,7 +1397,7 @@ impl<'c, 'm> GpuSession<'c, 'm> {
     /// Runs `f`'s launches as the graph `key`: captured from `f` the first time, replayed after.  `f` must launch the
     /// same kernels with the same arguments every time (no host decisions, uploads or reads inside).
     /// `graph_segment` for the batched step's segments.
-    fn batch_graph_segment(&mut self, key: (usize, bool, usize, bool), f: impl FnOnce(&Self)) {
+    fn batch_graph_segment(&mut self, key: (usize, bool, usize, bool, usize), f: impl FnOnce(&Self)) {
         if !self.batch_graphs.contains_key(&key) {
             self.gstream.begin_capture().unwrap();
             self.capturing.set(true);
@@ -2601,7 +2627,7 @@ impl<'c, 'm> GpuSession<'c, 'm> {
         // commitment-weighted demand (a chain: one node a position, so the width discount is 1)
         let mut u: HashMap<usize, f64> = HashMap::new();
         for (j, top) in nat.iter().enumerate() {
-            let alpha = if j == 0 { 1.0 } else { self.commit_prob(j).powf(self.accept_beta) };
+            let alpha = if j == 0 { 1.0 } else { self.commit_prob(j + self.row_shift).powf(self.accept_beta) };
             for &(e, w) in top {
                 *u.entry(e).or_insert(0.0) += alpha * w;
             }
@@ -2735,7 +2761,11 @@ impl<'c, 'm> GpuSession<'c, 'm> {
             && self.prefetch.is_none() && self.pregate.is_none() && self.cache.slots > 0;
         let mut rn_ready = false;
         self.lt_point("(start)");
-        for l in 0..c.n_layer {
+        let piped = self.pipeline_ok(m);
+        if piped {
+            rn_ready = self.layers_pipelined(m, p0, &mut logs, graphs);
+        }
+        for l in 0..(if piped { 0 } else { c.n_layer }) {
             if l == c.ple_layer {
                 // every position's rows at once, in parallel
                 let all: Vec<i64> = (0..m).flat_map(|j| ple_rows(c, &self.tokens[..p0 + j + 1])).collect();
@@ -2762,7 +2792,7 @@ impl<'c, 'm> GpuSession<'c, 'm> {
             if graphs && !c.is_attention(l) && l != c.ple_layer {
                 // a DeltaNet layer up to its router is the same launches for every batch of m: one graph
                 let on = self.replay.on.get();
-                self.batch_graph_segment((l, rn_ready, m, on), |s| {
+                self.batch_graph_segment((l, rn_ready, m, on, 0), |s| {
                     s.hc_read_batch(&format!("blk.{l}.hc_attn"), true, rn_ready, m);
                     s.delta_batch(l, m);
                     s.hc_write_batch(Some(&format!("blk.{l}.hc_ffn_norm.weight")), m);
@@ -2770,7 +2800,7 @@ impl<'c, 'm> GpuSession<'c, 'm> {
                     s.moe_router_batch(l, m);
                 });
                 self.lt_point(if graphs { "delta segment (graph)" } else { "delta segment" });
-                self.moe_batch(l, m, &mut logs, true);
+                self.moe_batch(l, m, &mut logs, true, None);
                 self.lt_point("moe (router wait, fetch, experts)");
             } else {
                 self.hc_read_batch(&format!("blk.{l}.hc_attn"), true, rn_ready, m);
@@ -2783,7 +2813,7 @@ impl<'c, 'm> GpuSession<'c, 'm> {
                 self.hc_read_batch(&format!("blk.{l}.hc_ffn"), true, true, m);
                 self.mark("batch: mixers, norms, hc glue");
                 self.lt_point(if c.is_attention(l) { "attention layer" } else { "delta segment" });
-                self.moe_batch(l, m, &mut logs, false);
+                self.moe_batch(l, m, &mut logs, false, None);
                 self.lt_point("moe (router wait, fetch, experts)");
             }
             self.mark("batch: routed experts + combine");
@@ -3146,7 +3176,7 @@ impl<'c, 'm> GpuSession<'c, 'm> {
     }
 
     /// `router_done`: `moe_router_batch` already ran (in a graph).
-    fn moe_batch(&mut self, l: usize, m: usize, logs: &mut [Vec<u16>], router_done: bool) {
+    fn moe_batch(&mut self, l: usize, m: usize, logs: &mut [Vec<u16>], router_done: bool, ticket: Option<usize>) {
         let c = &self.m.cfg;
         let p = format!("blk.{l}");
         let (h, sff, k, ne) = (c.hidden, c.shared_ff, c.n_expert_used, c.n_expert);
@@ -3157,10 +3187,17 @@ impl<'c, 'm> GpuSession<'c, 'm> {
         // SHADOW_TIMING_NO_SYNC=1 (timing only, wrong output): last time's router logits, no wait for the GPU
         let stale = self.timing_no_sync && self.stale_logits.get(&(l, m)).is_some();
         // the hybrid's CPU experts in a verify pass need the MoE input on the host
-        let want_u = self.cpu.is_some() && self.replay.on.get() && (2..=MAX_VERIFY).contains(&m) && self.overlap
-            && self.prof.is_none() && !stale;
+        let want_u = self.want_u_rows(m) && !stale;
         let mut u_host: Option<Vec<f32>> = None;
-        let logits: Vec<Vec<f32>> = if stale {
+        if self.pipe_active {
+            // the copies below reuse slots the previous group's experts may still be reading: the copy stream waits for them
+            self.ctx.stream_wait_event(Some(&self.copy_stream), &self.group_event).unwrap();
+        }
+        let logits: Vec<Vec<f32>> = if let Some(slot) = ticket {
+            let (lg, u) = self.wait_router_read(slot, m, want_u);
+            u_host = u;
+            lg
+        } else if stale {
             self.stale_logits[&(l, m)].clone()
         } else {
             let mut srcs = vec![(self.bb.rl.ptr, m * ne)];
@@ -3238,6 +3275,7 @@ impl<'c, 'm> GpuSession<'c, 'm> {
         let mut cpu_pairs: Vec<(usize, usize)> = vec![];
         let mut cpu_offs: Vec<usize> = vec![];
         let mut cpu_pending = false;
+        let t_plan = std::time::Instant::now();
         let mut cpu_submit = std::time::Instant::now();
         if let (Some(ub), Some(max)) = (u_host.as_ref(), self.cpu.as_ref().map(|c| c.1)) {
             if infos[0].ty == infos[1].ty && infos[0].dims == infos[1].dims && self.ram.region.is_some() {
@@ -3289,6 +3327,9 @@ impl<'c, 'm> GpuSession<'c, 'm> {
                     cpu_submit = std::time::Instant::now();
                 }
             }
+        }
+        if cpu_pending {
+            self.cpu_host.0 += t_plan.elapsed().as_secs_f64();
         }
         // misses read from the file may wait in the staging buffer, a slot each
         let max_file = self.staging.as_ref().map_or(usize::MAX, |s| s.len() / self.cache.slot_bytes.max(1));
@@ -3380,6 +3421,10 @@ impl<'c, 'm> GpuSession<'c, 'm> {
                 }
             }
             let mut n_file = 0;
+            if self.pipe_active && copying.iter().any(|&(e, _)| !self.ram.at.contains_key(&(l, e))) {
+                // a file read may reuse a pinned slot an earlier group's copy is still reading
+                self.copy_stream.synchronize().unwrap();
+            }
             for &(e, base) in &copying {
                 let from_file = !self.ram.at.contains_key(&(l, e));
                 self.fetch_expert(l, e, n_file, &names, &sizes, [base, base + part[1], base + part[2]]);
@@ -3392,9 +3437,11 @@ impl<'c, 'm> GpuSession<'c, 'm> {
                 self.cpu_join.0 += 1;
                 self.cpu_join.1 += t_join.elapsed().as_secs_f64();
                 self.cpu_join.2 += cpu_submit.elapsed().as_secs_f64();
+                let t_up = std::time::Instant::now();
                 for (n, &(j, i)) in cpu_pairs.iter().enumerate() {
                     self.upload_to(row(&self.bb.eo, k * h, j) + (i * h * 4) as u64, &f32s(&out[n * h..(n + 1) * h]));
                 }
+                self.cpu_host.1 += t_up.elapsed().as_secs_f64();
                 cpu_pending = false;
             }
             if let Some(p) = plan.as_ref() {
@@ -3421,6 +3468,9 @@ impl<'c, 'm> GpuSession<'c, 'm> {
                 }
             }
             start = end;
+        }
+        if self.pipe_active {
+            self.group_event.record(None).unwrap();
         }
     }
 
@@ -3685,10 +3735,12 @@ impl Stepper for GpuSession<'_, '_> {
                        self.ram.fill_secs, self.ram.served, self.ram.drive)
             + &self.cpu.as_ref().map(|c| format!("; CPU experts: up to {} per layer, {} computed", c.1, self.cpu_served))
                 .unwrap_or_default()
+            + &(if self.pipeline { format!("; pipelined verify passes: {}", self.pipelined_passes) } else { String::new() })
             + &self.cpu.as_ref().filter(|_| self.cpu_join.0 > 0).map(|_| {
                 let (n, join, job) = self.cpu_join;
-                format!("; verify-pass CPU joins: {n}, host waited {:.0} us each, submit-to-result {:.0} us each",
-                        1e6 * join / n as f64, 1e6 * job / n as f64)
+                format!("; verify-pass CPU joins: {n}, host waited {:.0} us each, submit-to-result {:.0} us each, choosing and submitting {:.0} us, uploading the outputs {:.0} us",
+                        1e6 * join / n as f64, 1e6 * job / n as f64, 1e6 * self.cpu_host.0 / n as f64,
+                        1e6 * self.cpu_host.1 / n as f64)
             }).unwrap_or_default()
             + &{
                 let v = &self.verify_stats;
