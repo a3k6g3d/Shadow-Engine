@@ -72,3 +72,31 @@ fn the_gpu_copies_from_pinned_memory_exactly() {
     d.download(&mut back).unwrap();
     assert!(back == r.as_slice(), "the device copy differs from the pinned source");
 }
+
+/// Host-to-device bandwidth of the RAM tier's kind of memory, by copy size (`cargo test --release -p shadow-cuda --test pinned -- --ignored --nocapture`).
+#[test]
+#[ignore]
+fn host_to_device_bandwidth() {
+    let Some(ctx) = context() else { return };
+    let total = 1usize << 30;
+    let region = PinnedRegion::new(&ctx, total).expect("1 GiB pinned");
+    let dev = ctx.alloc(total).unwrap();
+    let stream = ctx.stream().unwrap();
+    let api = ctx.api;
+    for &chunk in &[256usize << 10, 2 << 20, 16 << 20, 128 << 20] {
+        for rep in 0..2 {
+            let t0 = std::time::Instant::now();
+            let mut off = 0;
+            while off + chunk <= total {
+                let r = unsafe { (api.cuMemcpyHtoDAsync)(dev.ptr + off as u64, region.as_slice()[off..].as_ptr() as *const _, chunk, stream.raw()) };
+                assert_eq!(r, 0);
+                off += chunk;
+            }
+            stream.synchronize().unwrap();
+            let s = t0.elapsed().as_secs_f64();
+            if rep == 1 {
+                println!("{:4} KiB copies: {:.1} GB/s", chunk >> 10, off as f64 / s / 1e9);
+            }
+        }
+    }
+}
