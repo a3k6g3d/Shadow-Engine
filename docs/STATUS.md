@@ -1120,3 +1120,13 @@ Single-prompt runs, "Write a Rust function that parses a comma separated list...
   The link itself does 23-28 GB/s from the RAM tier's kind of memory (`host_to_device_bandwidth` in `tests/pinned.rs`, ignored by default), and a second copy stream changed nothing (128 / 145 / 133 / 139 tok/s with and without), so the 13 GB/s is not the link: host DRAM is the likely limit
   (each file-only expert crosses it ~4 times: SSD -> page cache, page cache -> pinned buffer read and write, pinned -> GPU; the RAM-tier ones once), about 2 GB of traffic a layer in ~65 ms. Not measured further. Ideas left, in order: unbuffered reads into the pinned buffers (a third of the traffic), copying only the experts a chunk needs
   (prediction from the previous chunk; ~30% of the bytes), tensor-core MoE kernels for the 22 + 17 ms.
+
+## 2026-10-31: anatomy of a decode pass (Nsight Systems, `--cuda-graph-trace=node`)
+
+- 14 varied prompts, 1,077 tokens, default mode: per verify pass (385 passes, 2.80 tokens each) drafting 5.5 ms, checking **45.4 ms**, rollback 1.0 ms, other 1.8 ms. Over the 24 s generation window: GPU kernels busy 8.6 s, host-to-device copies 4.0 s (6 GB/s mean; 0.6 s of it
+  overlapped with kernels), neither 12.0 s. Most of the "neither" is between passes and requests (gaps over 4 ms: 4.7 s: the draft, sampling, rollback and per-request prefill), not inside a verify pass.
+- Inside a verify pass the GPU is already dense: a layer takes ~0.73 ms with no gap over ~25 us (nodes of the mixer graph 0.2 us apart; the MoE segment's `copy` -> shared expert -> plan upload -> grouped kernels -> combine in ~0.45 ms). So the host round trip per layer is not what costs (the earlier
+  reading of `--cuda-graph-trace=graph`, which hides graph nodes, showed fake 350 us gaps). A device-side-planning rewrite would save the few small gaps, not a pass's 45 ms.
+- What the 45 ms is: ~35 ms of dense GPU chain (dense-weight matvecs ~14 ms: `matvec_cols_q6_k` 18% of kernel time, `iq4_xs`, `q8_0`, `q5_k` 86 us for one projection against 19 us for a bf16 one; expert grouped matvecs ~35%: `iq4_nl` 15%, `iq2_s` 10%, `iq3_xxs` 9%, `iq3_s` 5%) and ~10 ms around the layers (embedding,
+  four positions' logits over 248k vocabulary, capture). The floor at 672 GB/s is ~10 ms a pass (4.4 GiB of dense weights + ~25 experts a layer), so the kernels run at about 30-45% of VRAM bandwidth: the real slack, and the real work: faster dense and grouped matvec kernels (vectorised loads, fewer launches
+  per layer), needing ncu counters to see what limits each. Not done. Decode at 48.7 tok/s is a tie with Strata; a 3x gain is not on the table from scheduling alone.
