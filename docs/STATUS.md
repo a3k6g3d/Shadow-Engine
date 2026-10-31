@@ -1094,3 +1094,9 @@ Single-prompt runs, "Write a Rust function that parses a comma separated list...
 - Same-history fidelity of `--verify-rank 2` as the default (24 turns, 3 runs, identical each time): **0.423**, 6 of 24 replies identical (AcceptMoE 0.415, Strata 0.431). `shadow serve` now runs `--verify-rank 2` unless `--accept-moe`, `--verify-resident` or `--verify-rank` is given.
 - **Bug fixed (introduced with prompt lending, 65c5f27):** `restore_cache` put each evicted expert back into its old slot without checking that the prompt had not loaded it again into another slot, leaving two slots owning one expert; a later eviction then dropped the live mapping and
   `moe_batch` panicked with "a routed expert neither cached nor fetched" (HTTP 500). It showed on the 24-turn same-history test at turn 14 (250-token continuations; it needs a prompt of 128+ unread tokens), every run, and not with `SHADOW_NO_LEND=1`. Fixed by skipping entries already cached; all 24 turns pass.
+
+## 2026-10-31: Shadow against Strata with the current defaults: a tie
+
+- `bench/vs-strata-final3` (3 interleaved runs, 36 varied prompts, total throughput): Shadow default **48.74** tok/s (48.7, 48.8, 48.7; 1,801 tokens a run, 17 of 35 turns ended early), Strata **48.63** (47.5, 49.3, 49.1; 1,385 tokens a run, 23.7 ended early).
+  Shadow +0.2%, inside Strata's run-to-run spread. Fidelity 0.423 against 0.431. PCIe 10.95 against 11.06 GB/s, so **225 against 227 MB of expert traffic per token** (259 against 209 this morning); GPU 86% against 78% busy, 4.2 against 5.2 J a token, CPU 12% against 48%, disk 189 against 480 MB/s.
+- Still behind: prompt reading (~80 against Strata's 1,376 tok/s) and the fidelity is 0.008 under. Ahead: bit-exact `--exact` path, CPU and disk use.

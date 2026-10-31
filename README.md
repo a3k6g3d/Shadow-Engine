@@ -33,14 +33,14 @@ time; the bench's per-turn median misranks arms that generate different text, se
 | | tok/s | note |
 |---|---|---|
 | Shadow `--exact` | ~20 | no speculation, no inexact modes; bit for bit the reference |
-| Shadow default (`shadow serve MODEL`) | **39.4** | DFlash 2 drafter, `--tail-skip 3`, AcceptMoE verify, 36 GiB RAM expert tier (30 when under 49 GiB of RAM is free); same-history fidelity 0.415 (Strata 0.431) |
-| Strata (its tuned config, same model, prompts, context) | **47.2** | interleaved with Shadow in the same session |
+| Shadow default (`shadow serve MODEL`) | **48.7** | DFlash 2 drafter, `--tail-skip 3`, `--verify-rank 2`, 36 GiB RAM expert tier (30 when under 49 GiB of RAM is free); same-history fidelity 0.423 (Strata 0.431) |
+| Strata (its tuned config, same model, prompts, context) | **48.6** | interleaved with Shadow in the same session |
 
-**Shadow is about 17% slower than Strata on this bench** (Strata 21% faster; at matched fidelity Shadow runs 39.4 to 42.8 tok/s against Strata's 47.2, see docs/STATUS.md). The resource record
-(`bench/vs-strata-final2/charts/`, 3 interleaved runs of the 36-prompt set with the current defaults: Shadow 39.9 tok/s, Strata 48.3) shows where: GPU utilisation is *higher* for Shadow (87% against 78%) and PCIe throughput
-similar (10.3 against 10.1 GB/s), so Shadow moves about 259 MB of expert weights per generated token against Strata's 209 MB:
-the gap is expert traffic per token, not an idle GPU. Strata also uses the CPU (52% against 13%) and reads the disk harder (474
-against 154 MB/s). Earlier figures in this repository's history that put Shadow at 43 to 47 tok/s came from a mode that cut
+**Shadow and Strata tie on this bench** (48.7 against 48.6 tok/s by total throughput; Strata's three runs spread 47.5 to 49.3, Shadow's 48.7 to 48.8). Shadow's replies are longer (1,801 tokens a run against Strata's 1,385) and its fidelity to the exact model
+is about the same (0.423 against 0.431). With AcceptMoE verification (`--accept-moe`) Shadow runs 45.1 tok/s at fidelity 0.415. Prompt reading is slower: about 80 tok/s against Strata's 1,376 on long prompts. The resource record
+(`bench/vs-strata-final3/charts/`, 3 interleaved runs of the 36-prompt set with the current defaults) shows the two now do the same work per token: PCIe throughput is the same (10.95 against 11.06 GB/s), so each moves about 225 MB of expert weights
+per generated token (Shadow was at 259 against Strata's 209 before the attention and verify-rank work). Shadow's GPU is busier (86% against 78%) and uses less power per token (4.2 against 5.2 J); Strata uses the CPU (48% against 12%) and reads the disk harder
+(480 against 189 MB/s). Earlier figures in this repository's history that put Shadow at 43 to 47 tok/s came from a mode that cut
 answers short (`--verify-resident`) and from per-turn medians; both are documented in
 [docs/STATUS.md](docs/STATUS.md). Shadow's noise floor is 0.8% median on the exact engine
 (`bench/floor-2026-10-27`), about 0.1 to 0.5% for total throughput in the fastest mode.
