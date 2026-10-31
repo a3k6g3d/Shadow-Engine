@@ -944,3 +944,14 @@ Single-prompt runs, "Write a Rust function that parses a comma separated list...
   matrices, the rest its K/V rings and buffers). A 4-bit drafter would free about 290 MiB: +150 cache slots (+6.5%), about +1.3 points of hit rate by the 5.0 GiB
   arm's rate (13.5% more slots gave 2.7 points), i.e. about 2.5% fewer misses, under 1% of speed, against a drafter whose acceptance (the thing the speed rests on) can only
   get worse. Not built: the expected gain is below the bench's run-to-run floor.
+
+## 2026-10-31: the ceiling of device-side planning is 3.9 ms a pass (6.5%); the copies are 19 ms
+
+- Default mode, 8 turns, ms of checking per verify pass (the speculation line; timing-only switches, wrong output): normal **59.7** (95 passes); `SHADOW_TIMING_NO_COPIES=1`
+  **40.4** (114 passes); `SHADOW_TIMING_NO_COPIES=1 SHADOW_TIMING_NO_SYNC=1` **36.5** (124 passes).
+- So the router wait and host planning, the thing device-side planning would remove (Strata plans on the device inside a captured window), cost **at most 3.9 ms of 59.7
+  (6.5%)**, and a device planner would still need the host for the copies. The demand copies cost **19.3 ms (32%)**: about 290 misses a pass at 1.96 MiB is ~570 MiB, 26 ms
+  of PCIe at 22 GB/s, partly hidden under the GPU's hit work. The pass is bus-bound; planning on the device does not touch that.
+- Earlier attempts on the bus all moved the wait instead of removing it: pre-gated prefetch (the DMA slows the layer's own work), zero-copy reads (7 GB/s), CPU experts
+  (the join). What removes bytes from the bus: more hits (the cache is at the VRAM edge, see above), skipping (a fidelity trade), computing on the CPU without a per-layer join.
+- Decision: device-side planning is not built; a 6.5% ceiling for a large change is the worst ratio of the remaining ideas.
