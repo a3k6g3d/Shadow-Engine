@@ -324,9 +324,13 @@ fn answer<'c>(arch: &str, req: &Request, tok: &Tokenizer, sess: &mut GpuSession<
     PREFILL.0.store(0, Relaxed);
     PREFILL.1.store(unread.len(), Relaxed);
     // MAX_BATCH tokens at a time through the layers (`step_batch`), a chunk ending where the snapshot goes
+    // a long prompt borrows the tail of the VRAM expert cache as staging and reads in big chunks; a short one, 64 at a time
+    let lent = unread.len() >= 128 && !std::env::var("SHADOW_NO_LEND").is_ok_and(|v| v == "1") && sess.lend_cache();
+    let chunk = std::env::var("SHADOW_PREFILL_CHUNK").ok().and_then(|v| v.parse().ok())
+        .unwrap_or(if lent { MAX_BATCH } else { 64usize }).clamp(1, MAX_BATCH);
     let mut i = 0;
     while i < unread.len() {
-        let mut end = (i + MAX_BATCH).min(unread.len());
+        let mut end = (i + chunk).min(unread.len());
         if let Some(at) = snap_at.map(|s| s - cached).filter(|&at| i < at && at < end) {
             end = at;
         }
@@ -343,6 +347,9 @@ fn answer<'c>(arch: &str, req: &Request, tok: &Tokenizer, sess: &mut GpuSession<
                 Err(e) => eprintln!("shadow serve: prefix snapshot failed ({e})"),
             }
         }
+    }
+    if lent {
+        sess.restore_cache();
     }
     PREFILL.0.store(unread.len(), Relaxed);
     let prompt_ms = t0.elapsed().as_secs_f64() * 1e3;

@@ -978,3 +978,21 @@ Single-prompt runs, "Write a Rust function that parses a comma separated list...
 - Hit rate stays at 49-50% in all of these (50.0% for rank 2): the skips remove copies, not misses.
 - **Default changed to `--tail-skip 3`** (was 4): +6.4% (39.39 against 37.01 tok/s), same reply length, fidelity 0.415 against 0.572 (Strata 0.431). `--tail-skip 4`
   restores the earlier mode. README speed table and USAGE updated; `shadow serve` prints `--tail-skip 3` in its fastest-mode defaults line.
+
+## 2026-10-31: prompt reading - the cache is lent to long prompts (51 -> 80-86 tok/s)
+
+- Prompt reading was never in the decode benches. Measured now: **about 51 tok/s** (a 740-token prompt took 14 s; Strata reads at 1,376, Avalon at 1,613). Chunk size made no
+  difference (64/128/256 tokens: 50-52 tok/s). `SHADOW_LTIME=1`: the MoE segment is 972 of ~1,130 ms of a 64-token pass (86%). Cause: `moe_batch` runs a layer's tokens in
+  groups limited by free cache slots plus 32 scratch slots (~80 experts), so a chunk's experts were copied again for every group; bigger chunks changed nothing.
+- Fix (`lend_cache` / `restore_cache`, `session.rs`): a prompt of 128+ unread tokens evicts the tail of the VRAM expert cache (room for all 512 experts of a layer, at
+  most half the cache), uses it as the scratch for that prompt's layers, reads in `MAX_BATCH` = 256 token chunks (a 256-slot pinned staging buffer for the file reads),
+  and afterwards reloads the evicted entries from the RAM tier. Decode never sees it. `SHADOW_NO_LEND=1` turns it off; `SHADOW_PREFILL_LEND_MIB`,
+  `SHADOW_PREFILL_STAGING` (slots) and `SHADOW_PREFILL_CHUNK` tune it.
+- Measured (default mode; prompt tokens/s): 740-token chat prompt 51 -> **78**; four 1.8k-4.6k-token source/doc prompts **66-74** with 256-token chunks; the same prompts
+  at 512 -> 76-85. A 1,771-token source prompt: 40.6 without lending, **86.4** with (2.1x); `--exact` 18.4 -> 41.8 (2.3x). Output is identical with and without
+  lending in `--exact` mode (a 1,771-token prompt, 40 tokens, word for word); decode right after a lent prompt runs at the same speed (38.1 against 38.4 tok/s).
+- `MAX_BATCH` 64 -> 256 costs decode nothing (varied bench, 3 runs, total throughput: 39.46 old, 40.04 and 40.01 new), though the per-token buffers take 122 MiB from the
+  cache (4.42 -> 4.30 GiB). **512 costs decode 5.4%** (37.83 against 40.01 tok/s) and was dropped.
+- What is left: a 256-token pass copies ~250 experts a layer (~0.5 GiB, 22 ms of PCIe) and reads the ones the RAM tier lacks (36%) from the SSD; the pass sits near the bus
+  and disk limit, so a bigger chunk is the lever but VRAM for its per-token buffers is not available. Strata's 1,376 tok/s is 16x this; this PC's gap on prompts is
+  larger than on decode.

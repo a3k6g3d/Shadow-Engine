@@ -3,6 +3,9 @@
 All notable changes to Shadow will be documented in this file.
 
 ## [Unreleased]
+### Added
+- Long prompts (128+ unread tokens) borrow the tail of the VRAM expert cache as staging and are read in 256-token chunks; the cache is restored from the RAM tier afterwards.
+  Prompt reading 51 -> 78-86 tok/s in the default mode (2.3x in `--exact`), output unchanged, decode unaffected. `SHADOW_NO_LEND=1` turns it off (docs/STATUS.md).
 ### Changed
 - The default tail skip is **3** (was 4): 39.4 tok/s by total throughput on varied text against 37.0, same reply length, same-history fidelity 0.415 against
   0.572 (Strata measured 0.431 the same way). `--tail-skip 4` restores the earlier mode. Added `--admit-after N` (VRAM-cache admission filter, opt-in, about +1%) and the

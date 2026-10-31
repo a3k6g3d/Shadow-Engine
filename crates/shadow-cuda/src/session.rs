@@ -36,6 +36,15 @@ struct Attn<'c> {
     nblocks: usize,
 }
 
+/// The part of the expert cache a long prompt borrows: `n` staging slots from `ptr`, the cache slots from `s0` on (their
+/// entries `saved`, for the restoration) and every layer's evictable range as it was.
+struct Lent {
+    ptr: u64,
+    n: usize,
+    saved: Vec<(usize, usize, usize)>,
+    evict_saved: Vec<std::ops::Range<usize>>,
+}
+
 /// Routed experts resident in VRAM: either partitioned per layer at each layer's exact expert size (0 wasted padding
 /// across mixed-quant layers) or shared `slots` of `slot_bytes` when the budget is too small to give every layer its
 /// minimum slots.
@@ -151,7 +160,7 @@ struct Bufs<'c> {
 /// The most tokens `step_batch` takes through the layers together.  The projections take them COLS_MAX at a time
 /// (matvec_cols' limit); the MoE fetches the union of all of them, which grows slowly: on an 1,271-token prompt a
 /// token needs 5.95 experts of its 10 a layer in groups of 8, 3.60 in groups of 32, 2.51 in groups of 64.
-pub const MAX_BATCH: usize = 64;
+pub const MAX_BATCH: usize = 256;
 const COLS_MAX: usize = 8;
 /// Tokens a batched attention launch takes (its score scratch is per token).
 const ATT_ROWS: usize = 8;
@@ -257,6 +266,8 @@ pub struct GpuSession<'c, 'm> {
     cpu_join: (u64, f64, f64),
     /// seconds of host time choosing and submitting the CPU experts / uploading their outputs
     cpu_host: (f64, f64),
+    /// the tail of the VRAM expert cache, lent to a long prompt as staging (`lend_cache` / `restore_cache`)
+    lent: Option<Lent>,
     /// `--pipeline`: a verify pass as two token groups (session_pipeline.rs); `pipe_active` while one runs, `row_shift` the
     /// first row of the group whose view of the batch buffers is current, `ticket_stage` the staging mark of each group's
     /// queued router read
@@ -1155,6 +1166,7 @@ impl<'c, 'm> GpuSession<'c, 'm> {
             cpu_served: 0,
             cpu_join: (0, 0.0, 0.0),
             cpu_host: (0.0, 0.0),
+            lent: None,
             pipeline: tiers.pipeline,
             pipe_active: false,
             pipelined_passes: 0,
@@ -2235,6 +2247,81 @@ impl<'c, 'm> GpuSession<'c, 'm> {
             self.ram.served += n;
             self.expert_uploads += 3 * n as usize;
         }
+    }
+
+    /// Lends the tail of the VRAM expert cache (`SHADOW_PREFILL_LEND_MIB`, else room for all of a layer's experts, at most half
+    /// of it) to a long prompt as staging: a prompt chunk's whole expert union for a layer is then copied once and run in one
+    /// group, instead of in groups of the few free slots.  The evicted entries come back with `restore_cache`.  False when
+    /// there is nothing to lend (no cache, a pinned placement).
+    pub fn lend_cache(&mut self) -> bool {
+        if self.lent.is_some() || self.cache.slots == 0 || self.cache.arena.is_none() || self.cache.layer_range != self.cache.evict_range {
+            return false;
+        }
+        let want = std::env::var("SHADOW_PREFILL_LEND_MIB").ok().and_then(|v| v.parse::<usize>().ok()).map(|m| m << 20)
+            .unwrap_or(self.m.cfg.n_expert * self.cache.slot_bytes)
+            .min(self.cache.arena_bytes / 2);
+        let target = self.cache.arena_bytes - want;
+        let s0 = self.cache.slot_offset.partition_point(|&o| (o as usize) < target);
+        if s0 >= self.cache.slots {
+            return false;
+        }
+        let start = self.cache.slot_offset[s0] as usize;
+        let n = (self.cache.arena_bytes - start) / self.cache.slot_bytes.max(1);
+        if n < 2 {
+            return false;
+        }
+        self.ctx.synchronize().unwrap(); // nothing is still reading the entries about to go
+        let mut saved = vec![];
+        for s in s0..self.cache.slots {
+            if let Some((l, e)) = self.cache.owner[s].take() {
+                self.cache.map.remove(&(l, e));
+                saved.push((s, l, e));
+            }
+        }
+        let evict_saved = self.cache.evict_range.clone();
+        for r in &mut self.cache.evict_range {
+            if r.start >= s0 {
+                *r = r.start..r.start;
+            } else if r.end > s0 {
+                r.end = s0;
+            }
+        }
+        // the file reads of a layer's misses wait in the staging buffer, a slot each: room for a prompt chunk's share of them
+        // (`SHADOW_PREFILL_STAGING` slots), kept after the prompt
+        let slots = std::env::var("SHADOW_PREFILL_STAGING").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(256);
+        let need = slots * self.cache.slot_bytes;
+        if self.staging.as_ref().is_some_and(|s| s.len() < need) {
+            if let Ok(r) = PinnedRegion::new(self.ctx, need) {
+                self.staging = Some(r);
+            }
+        }
+        let ptr = self.cache.arena.as_ref().unwrap().ptr + start as u64;
+        self.lent = Some(Lent { ptr, n, saved, evict_saved });
+        true
+    }
+
+    /// Gives the lent cache back: the layers' ranges as they were, and the evicted entries read again from the RAM tier
+    /// (the ones it holds; the rest warm up by demand).
+    pub fn restore_cache(&mut self) {
+        let Some(lent) = self.lent.take() else { return };
+        self.ctx.synchronize().unwrap();
+        self.cache.evict_range = lent.evict_saved;
+        let arena = self.cache.arena.as_ref().unwrap().ptr;
+        let stream = self.copy_stream.raw();
+        for (s, l, e) in lent.saved {
+            let Some(&off) = self.ram.at.get(&(l, e)) else { continue };
+            let Some(region) = self.ram.region.as_ref() else { continue };
+            let total: usize = ["gate", "up", "down"].iter().map(|p| self.m.expert_bytes(&format!("blk.{l}.ffn_{p}_exps.weight"))).sum();
+            if let Some(&r) = self.ram.ring_by_off.get(&off) {
+                self.ram.ring_ref[r] = true;
+            }
+            let src = &region.as_slice()[off..off + total];
+            self.upload_pinned_on(arena + self.cache.slot_offset[s], src, stream);
+            self.cache.owner[s] = Some((l, e));
+            self.cache.map.insert((l, e), s);
+            self.cache.stamp[s] = 0;
+        }
+        self.copy_stream.synchronize().unwrap();
     }
 
     /// The router's logits (and the shared expert's gate logit) for layer l into rl (and sgl).
@@ -3368,7 +3455,10 @@ impl<'c, 'm> GpuSession<'c, 'm> {
         }
         // misses read from the file may wait in the staging buffer, a slot each
         let max_file = self.staging.as_ref().map_or(usize::MAX, |s| s.len() / self.cache.slot_bytes.max(1));
-        let scratch = self.batch_scratch.as_ref().map_or((0, 0), |(b, n)| (b.ptr, *n));
+        let scratch = match self.lent.as_ref() {
+            Some(l) => (l.ptr, l.n),
+            None => self.batch_scratch.as_ref().map_or((0, 0), |(b, n)| (b.ptr, *n)),
+        };
         let arena = self.cache.arena.as_ref().unwrap().ptr;
         let mut start = 0;
         while start < m {
