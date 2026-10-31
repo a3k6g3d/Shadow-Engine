@@ -425,6 +425,19 @@ extern "C" __global__ void head_norm_rope(const float* in, unsigned int in_strid
     rope_one(y, pos, rope_dims, theta);
 }
 
+// `head_norm_rope` for tokens r = blockIdx.y at positions pos0 + r: input rows `in_rs` and output rows `out_rs` floats apart.
+// grid = (heads, rows).
+extern "C" __global__ void head_norm_rope_rows(const float* in, unsigned int in_stride, unsigned int in_rs, float* out,
+                                               unsigned int out_stride, unsigned int out_rs, const float* w, unsigned int d,
+                                               float eps, unsigned int pos0, unsigned int rope_dims, float theta) {
+    const u64 r = blockIdx.y;
+    const float* x = in + r * in_rs + (u64) blockIdx.x * in_stride;
+    float* y = out + r * out_rs + (u64) blockIdx.x * out_stride;
+    rmsnorm_one(x, w, y, d, eps);
+    __syncthreads();
+    rope_one(y, pos0 + (unsigned int) r, rope_dims, theta);
+}
+
 // Blocks 0..nh-1 normalize+RoPE query heads (qg -> q, with wq); blocks nh..nh+nkv-1 normalize+RoPE key heads (kk -> kc, with wk).
 extern "C" __global__ void head_norm_rope_qk(const float* qg, float* q, const float* wq,
                                              const float* kk, float* kc, const float* wk,
@@ -501,15 +514,42 @@ static __device__ __forceinline__ void attention_head(const float* q, const floa
     double* sc = scratch + (u64) h * stride;
     double scale = 1.0 / sqrt((double) hd);
     double mx = -1e300;
+    // The same sums in the same order, with far fewer memory instructions (the kernel was bound by the L1/L2 queue: a load of
+    // q[i] and one of kt[i] for every multiply-add, and sc[t] and toks[t] for every one of the weighted sum): q staged in shared
+    // memory, K read 16 bytes at a time, the tile's scores and positions staged in shared memory.
+    __shared__ float qs[512];
+    __shared__ float scs[256];
+    __shared__ unsigned int ps[256];
+    const bool fast = hd <= 512 && (hd & 15) == 0 && hd <= blockDim.x && blockDim.x <= 256;
+    if (fast) {
+        for (unsigned int i = threadIdx.x; i < hd; i += blockDim.x) qs[i] = qh[i];
+        __syncthreads();
+    }
     for (unsigned int t = threadIdx.x; t < ntok; t += blockDim.x) {
         unsigned int p = toks ? toks[t] : t;
         const float* kt = kc + ((u64) p * nkv + g) * hd;
         // the 256-term dot in float runs of 16 added in double (FP64 is 1/64 rate on this GPU)
         double s = 0.0;
-        for (unsigned int i0 = 0; i0 < hd; i0 += 16) {
-            float part = 0.0f;
-            for (unsigned int i = i0; i < i0 + 16 && i < hd; ++i) part = fmaf(qh[i], kt[i], part);
-            s += (double) part;
+        if (fast) {
+            const float4* k4 = (const float4*) kt;
+            for (unsigned int i0 = 0; i0 < hd; i0 += 16) {
+                float part = 0.0f;
+                #pragma unroll
+                for (unsigned int c = 0; c < 4; ++c) {
+                    float4 kv = k4[i0 / 4 + c];
+                    part = fmaf(qs[i0 + 4 * c], kv.x, part);
+                    part = fmaf(qs[i0 + 4 * c + 1], kv.y, part);
+                    part = fmaf(qs[i0 + 4 * c + 2], kv.z, part);
+                    part = fmaf(qs[i0 + 4 * c + 3], kv.w, part);
+                }
+                s += (double) part;
+            }
+        } else {
+            for (unsigned int i0 = 0; i0 < hd; i0 += 16) {
+                float part = 0.0f;
+                for (unsigned int i = i0; i < i0 + 16 && i < hd; ++i) part = fmaf(qh[i], kt[i], part);
+                s += (double) part;
+            }
         }
         s *= scale;
         sc[t] = s;
@@ -524,6 +564,31 @@ static __device__ __forceinline__ void attention_head(const float* q, const floa
     }
     z = block_sum(z);
     __syncthreads();
+    if (fast) {
+        // one output element a thread; tiles of 256 positions (a multiple of the runs of 16) through shared memory
+        const unsigned int j = threadIdx.x;
+        double acc = 0.0;
+        for (unsigned int tile = 0; tile < ntok; tile += 256) {
+            unsigned int t = tile + threadIdx.x;
+            __syncthreads();
+            if (t < ntok) {
+                scs[threadIdx.x] = (float) sc[t];
+                ps[threadIdx.x] = toks ? toks[t] : t;
+            }
+            __syncthreads();
+            if (j < hd) {
+                const unsigned int n = min(256u, ntok - tile);
+                for (unsigned int r0 = 0; r0 < n; r0 += 16) {
+                    float part = 0.0f;
+                    for (unsigned int r = r0; r < r0 + 16 && r < n; ++r)
+                        part = fmaf(scs[r], vc[((u64) ps[r] * nkv + g) * hd + j], part);
+                    acc += (double) part;
+                }
+            }
+        }
+        if (j < hd) o[h * hd + j] = (float) (acc / z) * sigmoidf_ref(gate[h * hd + j]);
+        return;
+    }
     for (unsigned int j = threadIdx.x; j < hd; j += blockDim.x) {
         double acc = 0.0;
         for (unsigned int t0 = 0; t0 < ntok; t0 += 16) {
@@ -625,6 +690,26 @@ extern "C" __global__ void pool_block(const float* raw, float* blocks, const flo
 
 // score[b] = (sum over heads of max(0, q_h . key_b)) / sqrt(id); the dots in double, rounded to float, as the reference.
 // One thread per block.
+// `index_scores` for tokens r = blockIdx.y (row r has (n0 + r) / ratio complete blocks): iq rows `iq_rs` floats apart, score rows
+// `sc_rs` floats apart.  grid = (ceil(max blocks / 256), rows), block = 256.
+extern "C" __global__ void index_scores_rows(const float* iq, const float* blocks, float* scores, unsigned int n0,
+                                             unsigned int ratio, unsigned int heads, unsigned int id,
+                                             unsigned int iq_rs, unsigned int sc_rs) {
+    const u64 r = blockIdx.y;
+    unsigned int nb = (n0 + (unsigned int) r) / ratio;
+    unsigned int b = blockIdx.x * blockDim.x + threadIdx.x;
+    if (b >= nb) return;
+    const float* q = iq + r * iq_rs;
+    const float* kb = blocks + (u64) b * id;
+    float s = 0.0f;
+    for (unsigned int h = 0; h < heads; ++h) {
+        double d = 0.0;
+        for (unsigned int i = 0; i < id; ++i) d += (double) q[h * id + i] * (double) kb[i];
+        s += fmaxf((float) d, 0.0f);
+    }
+    scores[r * sc_rs + b] = s / sqrtf((float) id);
+}
+
 extern "C" __global__ void index_scores(const float* iq, const float* blocks, float* scores, unsigned int nb,
                                         unsigned int heads, unsigned int id) {
     unsigned int b = blockIdx.x * blockDim.x + threadIdx.x;

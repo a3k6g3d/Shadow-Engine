@@ -1060,3 +1060,18 @@ Single-prompt runs, "Write a Rust function that parses a comma separated list...
   3,003-token prompt gave the same 48-token text as the double kernels. So the double sums are not the cost, there was nothing to trade against fidelity, and the kernels were removed.
 - The remaining ~56 ms a layer per 256-token pass is elsewhere (per-token launches of the indexer's query and score kernels, the host selection and the uploads, or the gather of the selected K/V rows);
   not profiled further.
+
+## 2026-10-31: prompt attention profiled with Nsight Compute; the attention kernel is 2.7x faster
+
+- Profiling needed GPU performance counters, which the driver keeps admin-only (`ERR_NVGPUCTRPERM`); `bench/ncu_attn.ps1` runs Nsight Compute from an elevated PowerShell and saves a report
+  (`ncu --import bench/ncu_attn.ncu-repz --page details` reads it without admin). Timers around one sparse call (a layer's 256-token chunk, contexts 2k-4.5k) first: indexer scores 20 ms, host selection 7.7 ms,
+  **attention kernel 39-43 ms**.
+- `attention_heads_sel_rows` (24 heads x 32 rows, 256 threads): 5.66 ms a launch, **L2 80% / L1 71% busy, DRAM 0.6%**, L2 hit rate 99.7%, 40 registers, occupancy 77%; each warp spent 66 of 93 cycles
+  stalled on a full global-memory instruction queue. Not FP64 (the float experiment above agrees) and not the SSD: three global loads for every multiply-add (`q[i]`, `kt[i]`; `sc[t]`, `toks[t]`, `vc` in the weighted sum).
+- Fix, bit-identical (`attention_head` in `kernels/forward.cu`, used by the decode, prompt-dense and sparse kernels): `q` staged in shared memory, K read as `float4`, each 256-position tile's scores and positions
+  staged in shared memory; the sums are the same fmaf runs of 16 added in double in the same order. 39 -> **14.3 ms** a call. The `--exact` 3,003-token prompt gives the same text; the full `cargo test --release` passes.
+- Also: the indexer's query and block scores run as `head_norm_rope_rows` / `index_scores_rows` over a group's rows (the scores kernel was FP64-bound in a 5-block launch per token): 20 -> 1.8 ms a call;
+  sparse attention rows go 32 to a launch with scratch sized to the selection, not the context.
+- Prompt reading (4,574-token prompt, 30 GiB tier, 256-token chunks): 62.0 tok/s before the attention work -> 71.2 (batched selection) -> 74.7 (scores rows) -> **80.1** (kernel). Default mode, four prompts of
+  1.8k-4.6k tokens at the 30 GiB tier: **77.1 / 82.5 / 87.5 / 83.6** against 74.0 / 70.6 / 68.7 / 65.4 (+4% to +28%); decode right after them 42.3 tok/s.
+- Left in a sparse call: host selection 7.7 ms (a sort per token on one thread), the dense rows before it. Not done.

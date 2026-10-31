@@ -3304,17 +3304,16 @@ impl<'c, 'm> GpuSession<'c, 'm> {
             let mut j = jt;
             while j < m {
                 let e = (j + SEL_ROWS).min(m);
-                for jj in j..e {
-                    let r = jj - j;
-                    let nb = (p0 + jj + 1) / ratio;
-                    self.k("head_norm_rope", idx_heads as u32, 128, &[
-                        Arg::Ptr(row(&bb.iq, iqd, jj)), Arg::U32(id as u32), Arg::Ptr(row(&bb.sel_iqn, iqd, r)), Arg::U32(id as u32),
-                        Arg::Ptr(self.sv(&format!("{p}.indexer.q_norm.weight"))), Arg::U32(id as u32), Arg::F32(eps),
-                        Arg::U32((p0 + jj) as u32), Arg::U32(rd), Arg::F32(th)]);
-                    self.k1("index_scores", nb, &[Arg::Ptr(row(&bb.sel_iqn, iqd, r)), Arg::Ptr(at.blocks.ptr),
-                                                  Arg::Ptr(row(&bb.sel_scores, sstride, r)), Arg::U32(nb as u32),
-                                                  Arg::U32(idx_heads as u32), Arg::U32(id as u32)]);
-                }
+                // the group's rows in two launches: the indexer queries, then every row's block scores
+                self.k2("head_norm_rope_rows", idx_heads as u32, (e - j) as u32, 128, &[
+                    Arg::Ptr(row(&bb.iq, iqd, j)), Arg::U32(id as u32), Arg::U32(iqd as u32), Arg::Ptr(bb.sel_iqn.ptr), Arg::U32(id as u32),
+                    Arg::U32(iqd as u32), Arg::Ptr(self.sv(&format!("{p}.indexer.q_norm.weight"))), Arg::U32(id as u32), Arg::F32(eps),
+                    Arg::U32((p0 + j) as u32), Arg::U32(rd), Arg::F32(th)]);
+                let max_nb = (p0 + e) / ratio;
+                self.k2("index_scores_rows", (max_nb as u32).div_ceil(256), (e - j) as u32, 256, &[
+                    Arg::Ptr(bb.sel_iqn.ptr), Arg::Ptr(at.blocks.ptr), Arg::Ptr(bb.sel_scores.ptr), Arg::U32((p0 + j + 1) as u32),
+                    Arg::U32(ratio as u32), Arg::U32(idx_heads as u32), Arg::U32(id as u32), Arg::U32(iqd as u32),
+                    Arg::U32(sstride as u32)]);
                 let mut sb = vec![0u8; (e - j) * sstride * 4];
                 self.download(bb.sel_scores.ptr, &mut sb);
                 let all = floats(&sb);
@@ -3341,12 +3340,14 @@ impl<'c, 'm> GpuSession<'c, 'm> {
                 }
                 self.upload_to(bb.sel_toks.ptr, &toks_host.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>());
                 let lens = bb.sel_toks.ptr + (SEL_ROWS * tstride * 4) as u64;
-                for r0 in (0..e - j).step_by(ATT_ROWS) {
-                    let n = (e - j - r0).min(ATT_ROWS);
+                // a row needs only its selection's length of scratch (tstride), not the context's (cap): more rows a launch
+                let per_launch = (ATT_ROWS * self.cap / tstride).clamp(1, SEL_ROWS);
+                for r0 in (0..e - j).step_by(per_launch) {
+                    let n = (e - j - r0).min(per_launch);
                     self.k2("attention_heads_sel_rows", nh as u32, n as u32, 256, &[
                         Arg::Ptr(row(&bb.q, qd, j + r0)), Arg::Ptr(at.k.ptr), Arg::Ptr(at.v.ptr), Arg::Ptr(row(&bb.sel_toks, tstride, r0)),
                         Arg::U32(tstride as u32), Arg::Ptr(lens + (r0 * 4) as u64), Arg::Ptr(row(&bb.gate, qd, j + r0)),
-                        Arg::Ptr(row(&bb.ao, qd, j + r0)), Arg::Ptr(bb.att.ptr), Arg::U32(self.cap as u32), Arg::U32(nkv as u32),
+                        Arg::Ptr(row(&bb.ao, qd, j + r0)), Arg::Ptr(bb.att.ptr), Arg::U32(tstride as u32), Arg::U32(nkv as u32),
                         Arg::U32(hd as u32), Arg::U32((nh / nkv) as u32), Arg::U32(nh as u32)]);
                 }
                 j = e;
