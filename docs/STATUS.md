@@ -1004,3 +1004,22 @@ Single-prompt runs, "Write a Rust function that parses a comma separated list...
   mid-prompt. A read-ahead (the next layer's non-resident experts read from the SSD under this layer's compute) would hide up to ~36% but the next layer's experts are not
   known until this layer ends; with 1024-token chunks it would be "all the non-resident ones" (~180 experts a layer, 0.35 GiB), which needs those chunks' buffers
   (0.6 MiB a token, ~0.6 GiB at 1024) allocated only while a prompt is read. Not built.
+
+## 2026-10-31: prompt read-ahead built and measured (not kept); the long-prompt attention path; resource record refreshed
+
+- **Read-ahead** (`ReadPool::submit` / `wait_async`, two pinned buffers by layer parity: while layer l runs, the file-only experts of layer l+1 - those in neither the VRAM
+  cache nor the RAM tier - are read on the read pool; layer l+1 copies them from the buffer like RAM-tier experts). Works and is bit-safe (the bytes are the model's), but the
+  win is small and needs big chunks: 256-token chunks **44, 44, 43, 42 tok/s** (worse than the 66-86 without: it reads every file-only expert, ~180 a layer, when a chunk needs ~90
+  of them); 1024-token chunks (a temporary `MAX_BATCH` 1024 build) **101.5, 92.7, 82.0, 83.5 tok/s** against 88.6, 84.3, 77.8, 75.0 without (+5% to +15%). Chunks of 1024 need
+  ~0.6 GiB of per-token buffers that the VRAM budget cannot hold all the time (512 already costs decode 5.4%), so it would also need those buffers allocated only while a prompt
+  is read. **Dropped**: that rewrite for +5-15% on prompts is not worth it. The patch is not in the tree.
+- **What a long prompt spends** (`SHADOW_LTIME=1`, 4,574-token prompt, 1024 chunks, read-ahead on, 72.8 tok/s under the timers): per batched pass the MoE segment 5.3 s, the 12
+  attention layers **3.5 s (295 ms each)**, the 35 delta layers 1.1 s. Host waits per token: router 4.4 ms, file 1.7 ms. The attention layers cost 26 ms each for a 740-token
+  prompt, so about 8x more per token beyond ~2,051 positions: past the indexer's budget `attention_batch` falls back to `attention_mid` one token at a time (`session.rs`, the `else`
+  branch after `idx_budget`), ~29% of a 4.5k-token prompt's time. A batched sparse-selection kernel is the next lever for long prompts; the MoE path is at the file/bus limit.
+- **A 36 GiB RAM tier is killed by the RAM-floor watchdog** (confirmed: `KILLED at 3.97 GiB available`, peak working set 41.1 GiB for a 36 GiB tier); 30 stays the default.
+- **Resource record refreshed** (`bench/vs-strata-final2/`, current defaults, 3 interleaved runs of the 36-prompt set, total throughput): Shadow **39.9** tok/s (39.9, 39.9, 40.0),
+  Strata **48.3** (47.8, 48.7, 48.4; its replies are shorter, 1,344 against 2,015 tokens a run). GPU utilisation 87% against 78%, PCIe 10.3 against 10.1 GB/s, so **259 MB of expert
+  traffic per token against Strata's 209**; CPU 13% against 52%, disk 154 against 474 MB/s. README updated.
+- **The CPU rows without a per-layer join** were not built: the join was measured at 3-12 ms of a 105 ms verify pass (2026-10-31, "the CPU join, measured") and the host-planning
+  ceiling at 3.9 ms (6.5%), so removing the join needs Strata's whole-window graph with device-side flags for at most that much.
