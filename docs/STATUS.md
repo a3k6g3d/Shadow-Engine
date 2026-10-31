@@ -1075,3 +1075,14 @@ Single-prompt runs, "Write a Rust function that parses a comma separated list...
 - Prompt reading (4,574-token prompt, 30 GiB tier, 256-token chunks): 62.0 tok/s before the attention work -> 71.2 (batched selection) -> 74.7 (scores rows) -> **80.1** (kernel). Default mode, four prompts of
   1.8k-4.6k tokens at the 30 GiB tier: **77.1 / 82.5 / 87.5 / 83.6** against 74.0 / 70.6 / 68.7 / 65.4 (+4% to +28%); decode right after them 42.3 tok/s.
 - Left in a sparse call: host selection 7.7 ms (a sort per token on one thread), the dense rows before it. Not done.
+
+## 2026-10-31: the heads of a GQA group share K/V reads in the sparse attention kernel
+
+- Re-profiled the new kernel (`bench/ncu_attn.ncu-repz`; the first profile is `ncu_attn_before.ncu-repz`): `attention_heads_sel_rows` 5.66 -> **2.06 ms** a launch, DRAM throughput 0.57% -> 0.97% (3.76 -> 6.45 GB/s: GPU
+  memory use up 1.7x from nearly nothing), but **L2 84% busy** (was 80%), L1 hit rate 43% -> 15% (the K reads are 16-byte loads), 39 cycles between warp issues (was 93). Still L2-bound: every head of a GQA
+  group (24 heads over 2 kv heads here, 12 a group) re-read the same K rows and V elements of each token's selected positions.
+- `attention_group_sel_rows` (`kernels/forward.cu`): a block takes `hb` heads (default 4, `SHADOW_ATT_HB`, at most 8) of one kv head for one token, loads each selected position's K row and V element once for all
+  of them, and keeps each head's sums exactly as before (fmaf runs of 16 added in double, the same block reductions): the `--exact` 3,003-token prompt gives the same text, and `cargo test --release` passes.
+  Used when `hd` is a multiple of 16 and at most 256 (else the per-head kernel).
+- Attention layers on a 4.5k-token prompt (`SHADOW_LTIME=1`, 30 GiB tier): 675 ms (after the staged-load kernel; 1,251 before any of it) -> **267 ms** a pass (hb 4; hb 8: 277). Prompt reading 80.1 -> **81.2 tok/s**: attention
+  is now ~9% of a pass, so the rest of the gain is small; the MoE segment (2.2 s of ~3 s) and the file reads are what is left.

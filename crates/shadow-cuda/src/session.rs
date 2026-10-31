@@ -3344,11 +3344,21 @@ impl<'c, 'm> GpuSession<'c, 'm> {
                 let per_launch = (ATT_ROWS * self.cap / tstride).clamp(1, SEL_ROWS);
                 for r0 in (0..e - j).step_by(per_launch) {
                     let n = (e - j - r0).min(per_launch);
-                    self.k2("attention_heads_sel_rows", nh as u32, n as u32, 256, &[
+                    let group = nh / nkv;
+                    let args = [
                         Arg::Ptr(row(&bb.q, qd, j + r0)), Arg::Ptr(at.k.ptr), Arg::Ptr(at.v.ptr), Arg::Ptr(row(&bb.sel_toks, tstride, r0)),
                         Arg::U32(tstride as u32), Arg::Ptr(lens + (r0 * 4) as u64), Arg::Ptr(row(&bb.gate, qd, j + r0)),
                         Arg::Ptr(row(&bb.ao, qd, j + r0)), Arg::Ptr(bb.att.ptr), Arg::U32(tstride as u32), Arg::U32(nkv as u32),
-                        Arg::U32(hd as u32), Arg::U32((nh / nkv) as u32), Arg::U32(nh as u32)]);
+                        Arg::U32(hd as u32), Arg::U32(group as u32), Arg::U32(nh as u32)];
+                    if hd % 16 == 0 && hd <= 256 {
+                        // the heads of a GQA group share each position's K and V reads, `hb` of them a block
+                        let hb = std::env::var("SHADOW_ATT_HB").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(4).clamp(1, 8).min(group);
+                        let mut a = args.to_vec();
+                        a.push(Arg::U32(hb as u32));
+                        self.k2("attention_group_sel_rows", (nkv * group.div_ceil(hb)) as u32, n as u32, 256, &a);
+                    } else {
+                        self.k2("attention_heads_sel_rows", nh as u32, n as u32, 256, &args);
+                    }
                 }
                 j = e;
             }

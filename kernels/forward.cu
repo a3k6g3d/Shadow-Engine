@@ -630,6 +630,119 @@ extern "C" __global__ void attention_heads_sel_rows(const float* q, const float*
                    scratch + j * nh * stride, stride, nkv, hd, group, blockIdx.x);
 }
 
+// `attention_heads_sel_rows` with the heads of a GQA group sharing their K and V reads: block (x, row) takes the heads
+// [part * hb, min(group, (part + 1) * hb)) of kv head g, x = g * ceil(group / hb) + part, so each selected position's K row (and V
+// element) is loaded once for up to hb heads instead of once a head.  Every head's sums are the same fmaf runs of 16 added in double in
+// the same order, its softmax the same block reductions: the same numbers as `attention_head`.  hd a multiple of 16, at most 256;
+// blockDim 256; hb <= 8.  grid = (nkv * ceil(group / hb), rows).
+#define HBMAX 8
+extern "C" __global__ void attention_group_sel_rows(const float* q, const float* kc, const float* vc, const u32* toks,
+                                                    unsigned int tstride, const u32* ntoks, const float* gate, float* o,
+                                                    double* scratch, unsigned int stride, unsigned int nkv, unsigned int hd,
+                                                    unsigned int group, unsigned int nh, unsigned int hb) {
+    const u64 row = blockIdx.y;
+    const unsigned int nsplit = (group + hb - 1) / hb;
+    const unsigned int g = blockIdx.x / nsplit, part = blockIdx.x % nsplit;
+    const unsigned int h0 = g * group + part * hb;                   // the first head of this block
+    const unsigned int nhh = min(hb, group - part * hb);              // how many
+    const float* qrow = q + row * nh * hd;
+    const float* gaterow = gate + row * nh * hd;
+    float* orow = o + row * nh * hd;
+    const u32* tk = toks + row * tstride;
+    const unsigned int ntok = ntoks[row];
+    double* scr = scratch + row * nh * stride;
+    __shared__ float qs[HBMAX][256];
+    __shared__ float scs[HBMAX][256];
+    __shared__ unsigned int ps[256];
+    for (unsigned int idx = threadIdx.x; idx < nhh * hd; idx += blockDim.x) qs[idx / hd][idx % hd] = qrow[(u64) h0 * hd + idx];
+    __syncthreads();
+    const double scale = 1.0 / sqrt((double) hd);
+    double mx[HBMAX];
+    #pragma unroll
+    for (unsigned int a = 0; a < HBMAX; ++a) mx[a] = -1e300;
+    for (unsigned int t = threadIdx.x; t < ntok; t += blockDim.x) {
+        const float4* k4 = (const float4*) (kc + ((u64) tk[t] * nkv + g) * hd);
+        double s[HBMAX];
+        #pragma unroll
+        for (unsigned int a = 0; a < HBMAX; ++a) s[a] = 0.0;
+        for (unsigned int i0 = 0; i0 < hd; i0 += 16) {
+            float kv[16];
+            #pragma unroll
+            for (unsigned int c = 0; c < 4; ++c) {
+                float4 v = k4[i0 / 4 + c];
+                kv[4 * c] = v.x; kv[4 * c + 1] = v.y; kv[4 * c + 2] = v.z; kv[4 * c + 3] = v.w;
+            }
+            #pragma unroll
+            for (unsigned int a = 0; a < HBMAX; ++a) {
+                if (a < nhh) {
+                    float p = 0.0f;
+                    #pragma unroll
+                    for (unsigned int i = 0; i < 16; ++i) p = fmaf(qs[a][i0 + i], kv[i], p);
+                    s[a] += (double) p;
+                }
+            }
+        }
+        #pragma unroll
+        for (unsigned int a = 0; a < HBMAX; ++a) {
+            if (a < nhh) {
+                s[a] *= scale;
+                scr[(u64) (h0 + a) * stride + t] = s[a];
+                mx[a] = fmax(mx[a], s[a]);
+            }
+        }
+    }
+    double z[HBMAX];
+    #pragma unroll
+    for (unsigned int a = 0; a < HBMAX; ++a) {
+        z[a] = 1.0;
+        if (a < nhh) {
+            double m = block_max(mx[a]);
+            double zt = 0.0;
+            double* sc = scr + (u64) (h0 + a) * stride;
+            for (unsigned int t = threadIdx.x; t < ntok; t += blockDim.x) {
+                double e = (double) expf((float) (sc[t] - m));
+                sc[t] = e;
+                zt += e;
+            }
+            z[a] = block_sum(zt);
+        }
+    }
+    __syncthreads();
+    const unsigned int j = threadIdx.x;
+    double acc[HBMAX];
+    #pragma unroll
+    for (unsigned int a = 0; a < HBMAX; ++a) acc[a] = 0.0;
+    for (unsigned int tile = 0; tile < ntok; tile += 256) {
+        __syncthreads();
+        const unsigned int n = min(256u, ntok - tile);
+        for (unsigned int idx = threadIdx.x; idx < nhh * 256; idx += blockDim.x) {
+            const unsigned int a = idx / 256, r = idx % 256;
+            if (r < n) scs[a][r] = (float) scr[(u64) (h0 + a) * stride + tile + r];
+        }
+        if (threadIdx.x < n) ps[threadIdx.x] = tk[tile + threadIdx.x];
+        __syncthreads();
+        if (j < hd) {
+            for (unsigned int r0 = 0; r0 < n; r0 += 16) {
+                float p[HBMAX];
+                #pragma unroll
+                for (unsigned int a = 0; a < HBMAX; ++a) p[a] = 0.0f;
+                for (unsigned int r = r0; r < r0 + 16 && r < n; ++r) {
+                    const float v = vc[((u64) ps[r] * nkv + g) * hd + j];
+                    #pragma unroll
+                    for (unsigned int a = 0; a < HBMAX; ++a) if (a < nhh) p[a] = fmaf(scs[a][r], v, p[a]);
+                }
+                #pragma unroll
+                for (unsigned int a = 0; a < HBMAX; ++a) acc[a] += (double) p[a];
+            }
+        }
+    }
+    if (j < hd) {
+        #pragma unroll
+        for (unsigned int a = 0; a < HBMAX; ++a)
+            if (a < nhh) orow[(u64) (h0 + a) * hd + j] = (float) (acc[a] / z[a]) * sigmoidf_ref(gaterow[(u64) (h0 + a) * hd + j]);
+    }
+}
+
 // Softmax attention of each query head over positions start_pos .. start_pos + ntok, GQA, with a learned per-head
 // sink logit included in the softmax max and denominator (zero value contribution) and no output gate (Flint).
 extern "C" __global__ void attention_sinks_heads(const float* q, const float* kc, const float* vc,
