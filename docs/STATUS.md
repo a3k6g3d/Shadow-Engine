@@ -1051,3 +1051,12 @@ Single-prompt runs, "Write a Rust function that parses a comma separated list...
 - With the default 36 GiB tier: prompts of 1.8k-4.6k tokens **86.0 / 84.4 / 87.0 / 82.9 tok/s** against 79.0 / 73.4 / 72.8 / 69.6 before (+9% to +19%); decode right after them 43.8 tok/s.
 - The 36 GiB tier started from 49.05 GiB available bottoms out at **4.1 GiB**, a hair above the 4 GiB floor, so the default 36 GiB tier now comes with `--ram-floor-gib 3` (an explicit tier keeps 4); the watchdog
   needs `-FloorGiB 3` for it. Under 49 GiB available the default stays 30.
+
+## 2026-10-31: float-precision attention for prompt reading: no gain, dropped
+
+- Tried: `attention_head_f` (scores, softmax and weighted sum accumulated in float, the denominator in float per thread and double across the block) as `attention_heads_rows_f` and
+  `attention_heads_sel_rows_f`, used only when a pass has more than `MAX_VERIFY` tokens, behind a switch. The idea was that the double-precision sums (FP64 is 1/64 rate here) set the attention time.
+- Result (4,574-token prompt, 30 GiB tier, `SHADOW_LTIME=1`): the 12 attention layers **681.8 ms** a pass against **675.3 ms** with the double kernels; prompt 70.8 against 72.2 tok/s (noise). The `--exact`
+  3,003-token prompt gave the same 48-token text as the double kernels. So the double sums are not the cost, there was nothing to trade against fidelity, and the kernels were removed.
+- The remaining ~56 ms a layer per 256-token pass is elsewhere (per-token launches of the indexer's query and score kernels, the host selection and the uploads, or the gather of the selected K/V rows);
+  not profiled further.
