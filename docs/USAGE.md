@@ -39,7 +39,7 @@ With no tier flags this is the **fastest measured mode**, an OpenAI-compatible s
 
 | default | flag it stands for | what it is |
 |---|---|---|
-| inexact tail skip | `--tail-skip 4` | a routed expert past the 4th by router weight is skipped unless it is already in VRAM |
+| inexact tail skip | `--tail-skip 3` | a routed expert past the 3rd by router weight is skipped unless it is already in VRAM |
 | AcceptMoE verify | `--accept-moe --accept-beta 1.0` | a verify pass routes its drafted positions through one block-wide expert set (the anchor's top-k plus the experts the likely-to-be-accepted positions demand); each token still takes k experts, re-picked inside the set |
 | RAM expert tier | `--ram-tier-gib 30` | 30 GiB of pinned host memory holds the likeliest experts, copied to the GPU by DMA |
 | placement | `--placement profiles/routing-6prompts.shrc` | which experts the RAM tier holds (a routing profile) |
@@ -70,7 +70,7 @@ RAM, expert-cache hit rates, memory tiers).
 | `--expert-cache-gib G` | all free VRAM less 384 MiB | the VRAM expert cache (LRU per layer) |
 | `--admit-after N` | 0 | a VRAM-cache miss gets a slot only from its (N+1)th miss (N=1: about +1%; STATUS.md) |
 | `--pin-margin N` | off | pin each layer's hottest experts in VRAM, keeping N evictable slots a layer |
-| `--tail-skip R` | 4 | routed experts of rank >= R are skipped when not in VRAM (0: exact) |
+| `--tail-skip R` | 3 | routed experts of rank >= R are skipped when not in VRAM (0: exact; 4: the earlier default, fidelity 0.572 and 6% slower) |
 | `--accept-moe`, `--accept-beta B`, `--accept-scale S`, `--accept-budget F` | on, 1.0, 1, 1 | AcceptMoE verifier expert sets (docs/SPECULATION.md); B sharpens the commitment weights, S scales the set, F the pruning budget |
 | `--verify-resident` | off | **can truncate answers**: a verify pass's extra positions use only the experts already in VRAM; on varied text 11 of 14 replies ended early against 3 |
 | `--verify-rank R` | off | like `--verify-resident` but each extra position keeps its top R experts even when they must be copied; R=1: about +18% tok/s and about 17% fewer generated tokens |

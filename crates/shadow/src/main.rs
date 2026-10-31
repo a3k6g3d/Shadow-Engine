@@ -244,8 +244,8 @@ fn compare(path: &std::path::Path, fixture: &std::path::Path, mode: Mode, rest: 
     ExitCode::SUCCESS
 }
 
-/// The fastest measured serving mode (docs/STATUS.md: ~43-47 tok/s by total throughput, exact mode ~20) is what
-/// `shadow serve` runs unless the flags say otherwise: tail-skip 4, verify-resident, the DFlash 2 drafter (Q8_0) with
+/// The fastest measured serving mode that keeps replies at Strata's fidelity (docs/STATUS.md: ~39 tok/s by total throughput,
+/// exact mode ~20) is what `shadow serve` runs unless the flags say otherwise: tail-skip 3, AcceptMoE, the DFlash 2 drafter (Q8_0) with
 /// 3 drafts a pass, a 30 GiB RAM expert tier and the routing profile.  Each is only a default (give the flag to change
 /// it; `--dflash off`, `--tail-skip 0`); `--exact` turns all of them off - the exact, unspeculated path, bit for bit
 /// the reference.
@@ -264,7 +264,7 @@ fn fastest_defaults(rest: &[String]) -> Vec<String> {
     };
     let mut set: Vec<String> = vec![];
     if !has("--tail-skip") {
-        set.extend(["--tail-skip".into(), "4".into()]);
+        set.extend(["--tail-skip".into(), "3".into()]);
     }
     // AcceptMoE's verifier expert sets: the most faithful inexact verify measured (same-history prefix match 0.57 against
     // 0.48 for plain tail skip) at the same speed (docs/SPECULATION.md)

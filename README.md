@@ -33,10 +33,10 @@ time; the bench's per-turn median misranks arms that generate different text, se
 | | tok/s | note |
 |---|---|---|
 | Shadow `--exact` | ~20 | no speculation, no inexact modes; bit for bit the reference |
-| Shadow default (`shadow serve MODEL`) | **37.1** | DFlash 2 drafter, `--tail-skip 4`, AcceptMoE verify, 30 GiB RAM expert tier |
+| Shadow default (`shadow serve MODEL`) | **39.4** | DFlash 2 drafter, `--tail-skip 3`, AcceptMoE verify, 30 GiB RAM expert tier; same-history fidelity 0.415 (Strata 0.431) |
 | Strata (its tuned config, same model, prompts, context) | **47.2** | interleaved with Shadow in the same session |
 
-**Shadow is about 21% slower than Strata on this bench** (Strata 27% faster; the resource record below was taken at 34.7 tok/s, before the n-gram prefetch fix in docs/STATUS.md). The resource record
+**Shadow is about 17% slower than Strata on this bench** (Strata 20% faster; at matched fidelity Shadow runs 39.4 to 42.8 tok/s against Strata's 47.2, see docs/STATUS.md; the resource record below was taken at 34.7 tok/s, before the n-gram prefetch fix and the tail-skip 3 default). The resource record
 (`bench/vs-strata-final/charts/`) shows where: GPU utilisation is *higher* for Shadow (86% against 79%) and PCIe throughput
 similar (11.6 against 10.1 GB/s), so Shadow moves about 334 MB of expert weights per generated token against Strata's 215 MB:
 the gap is expert traffic per token, not an idle GPU. Strata also uses the CPU (49% against 13%) and reads the disk harder (490

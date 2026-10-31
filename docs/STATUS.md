@@ -976,3 +976,5 @@ Single-prompt runs, "Write a Rust function that parses a comma separated list...
   same way, though no turn ended early here), so `--tail-skip 3` is the like-for-like step: +6.4% at the same length. Defaults unchanged; both stay options. `--tail-skip 3` is
   slightly below Strata's fidelity, `--verify-rank 2` slightly above.
 - Hit rate stays at 49-50% in all of these (50.0% for rank 2): the skips remove copies, not misses.
+- **Default changed to `--tail-skip 3`** (was 4): +6.4% (39.39 against 37.01 tok/s), same reply length, fidelity 0.415 against 0.572 (Strata 0.431). `--tail-skip 4`
+  restores the earlier mode. README speed table and USAGE updated; `shadow serve` prints `--tail-skip 3` in its fastest-mode defaults line.

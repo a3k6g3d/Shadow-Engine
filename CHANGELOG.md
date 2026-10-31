@@ -2,6 +2,12 @@
 
 All notable changes to Shadow will be documented in this file.
 
+## [Unreleased]
+### Changed
+- The default tail skip is **3** (was 4): 39.4 tok/s by total throughput on varied text against 37.0, same reply length, same-history fidelity 0.415 against
+  0.572 (Strata measured 0.431 the same way). `--tail-skip 4` restores the earlier mode. Added `--admit-after N` (VRAM-cache admission filter, opt-in, about +1%) and the
+  `SHADOW_VRAM_MAP=1` startup probe (docs/STATUS.md has the cache, VRAM and bus measurements behind both).
+
 ## [0.1.27] — 2026-10-30
 ### Changed (default on; `--exact` turns the speculation and inexact modes off)
 - `shadow serve MODEL` runs the fastest mode that keeps answers intact with no tier flags: `--tail-skip 4 --accept-moe
