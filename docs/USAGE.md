@@ -10,7 +10,7 @@ how they were measured and what did not work are in [STATUS.md](STATUS.md) and [
 | OS | Windows 11 | the engine uses Win32 APIs (pinned memory, overlapped file reads, CUDA driver DLL) |
 | GPU | NVIDIA GeForce RTX 5070, 12 GB (compute 12.0) | any CUDA GPU the NVRTC in use can target; 12 GB is what the defaults are sized for |
 | CPU | Intel i7-11700K (AVX-512) | the hybrid CPU-expert path uses AVX-512 when present |
-| RAM | 64 GB | the default 30 GiB pinned expert tier needs ~44 GiB free to load; see "The RAM rule" |
+| RAM | 64 GB | the default 36 GiB pinned expert tier needs ~49 GiB free (else the default is 30 GiB, ~44 GiB free); see "The RAM rule" |
 | Disk | NVMe | expert reads that miss both VRAM and the RAM tier come from the GGUF |
 | Rust | stable (edition 2021+) | `cargo build` is the whole build: no nvcc, no CMake, no CUDA toolkit to compile |
 | CUDA runtime | the driver (`nvcuda.dll`) and an `nvrtc64_*.dll` | NVRTC is found via `SHADOW_NVRTC` (full path), else `%CUDA_PATH%\bin\x64` / `\bin` |
@@ -41,7 +41,7 @@ With no tier flags this is the **fastest measured mode**, an OpenAI-compatible s
 |---|---|---|
 | inexact tail skip | `--tail-skip 3` | a routed expert past the 3rd by router weight is skipped unless it is already in VRAM |
 | AcceptMoE verify | `--accept-moe --accept-beta 1.0` | a verify pass routes its drafted positions through one block-wide expert set (the anchor's top-k plus the experts the likely-to-be-accepted positions demand); each token still takes k experts, re-picked inside the set |
-| RAM expert tier | `--ram-tier-gib 30` | 30 GiB of pinned host memory holds the likeliest experts, copied to the GPU by DMA |
+| RAM expert tier | `--ram-tier-gib 36` | 36 GiB (30 when under 49 GiB of RAM is available at start) of pinned host memory holds the likeliest experts, copied to the GPU by DMA |
 | placement | `--placement profiles/routing-6prompts.shrc` | which experts the RAM tier holds (a routing profile) |
 | drafter | `--dflash models/dflash2` | the DFlash 2 drafter, matrices as Q8_0 |
 | draft length | `--spec 3` | up to 3 drafted tokens checked per pass |
@@ -65,7 +65,7 @@ RAM, expert-cache hit rates, memory tiers).
 | `--host H`, `--port P` | `127.0.0.1`, `8081` | where to listen |
 | `--ctx N` | 16384 | positions the session is built for (KV and drafter rings scale with it) |
 | `--exact` | off | no speculation, no inexact modes, none of the defaults above |
-| `--ram-tier-gib G` or `auto` | 30 | pinned host memory for the expert tier; `auto` sizes it from the RAM available now less 10 GiB |
+| `--ram-tier-gib G` or `auto` | 36 (30 when under 49 GiB of RAM is available) | pinned host memory for the expert tier; `auto` sizes it from the RAM available now less 10 GiB |
 | `--ram-floor-gib N` | 4 | RAM that must stay available after pinning (0: no check); see "The RAM rule" |
 | `--placement FILE` | the six-prompt profile | a routing profile (`SHRC`) ranking which experts the tier holds |
 | `--expert-cache-gib G` | all free VRAM less 384 MiB | the VRAM expert cache (LRU per layer) |
@@ -112,7 +112,7 @@ Defaults are right for normal use; these are for measurement and diagnosis.
 Shadow never pins memory that would leave less than **4 GiB** of RAM available, checks again after the pages are locked and
 again as the tier fills: a pinned tier cannot be paged out, and the test machine has frozen hard at 0.4 GiB free.
 `--ram-floor-gib N` changes the floor (0 turns the check off); `tools/run_capped.ps1 -FloorGiB N` and `tools/run_strata.ps1` do the same for the
-watchdog that kills a run below it. Lower it only to try a bigger `--ram-tier-gib`, and measure that it pays. The default 30 GiB tier peaks around 35 GiB resident for the process. On a smaller
+watchdog that kills a run below it. Lower it only to try a bigger `--ram-tier-gib`, and measure that it pays. The default 36 GiB tier peaks around 41 GiB resident (the 30 GiB one around 35) for the process. On a smaller
 machine pass `--ram-tier-gib` explicitly (or `auto`), or `--exact` with a small tier.
 
 ## The API

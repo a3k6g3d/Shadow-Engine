@@ -1034,3 +1034,5 @@ Single-prompt runs, "Write a Rust function that parses a comma separated list...
   against 10.4-10.7 GiB for 30.
 - So a bigger tier pays a little (+2.5% decode, ~+10% prompts) for ~5.5 GiB less free RAM. The default stays 30 with the 4 GiB floor; 36 needs `--ram-floor-gib 3` or less
   on this PC and leaves about 5 GiB free in steady state.
+- **Default tier is now 36 GiB** when 49 GiB or more of RAM is available at start (30 otherwise; `shadow serve` says which). Checked with the defaults: 740-token prompt 93 tok/s, peak working
+  set 41.3 GiB, available RAM bottomed at 5.1 GiB, floor still 4. `shadow-ui` no longer passes `--ram-tier-gib 30`.

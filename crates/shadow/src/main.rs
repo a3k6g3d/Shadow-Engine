@@ -246,7 +246,7 @@ fn compare(path: &std::path::Path, fixture: &std::path::Path, mode: Mode, rest: 
 
 /// The fastest measured serving mode that keeps replies at Strata's fidelity (docs/STATUS.md: ~39 tok/s by total throughput,
 /// exact mode ~20) is what `shadow serve` runs unless the flags say otherwise: tail-skip 3, AcceptMoE, the DFlash 2 drafter (Q8_0) with
-/// 3 drafts a pass, a 30 GiB RAM expert tier and the routing profile.  Each is only a default (give the flag to change
+/// 3 drafts a pass, a 36 GiB RAM expert tier (30 when under 49 GiB of RAM is available now) and the routing profile.  Each is only a default (give the flag to change
 /// it; `--dflash off`, `--tail-skip 0`); `--exact` turns all of them off - the exact, unspeculated path, bit for bit
 /// the reference.
 fn fastest_defaults(rest: &[String]) -> Vec<String> {
@@ -275,7 +275,13 @@ fn fastest_defaults(rest: &[String]) -> Vec<String> {
     // that pick the next token come from those positions - 11 of 14 varied-text answers ended early (EOS), against 3 of 14
     // without it (docs/STATUS.md).  It stays an explicit opt-in.
     if !has("--ram-tier-gib") {
-        set.extend(["--ram-tier-gib".into(), "30".into()]);
+        // 36 GiB measured +2.5% decode and ~+10% prompts over 30 (docs/STATUS.md), but it bottoms out near 4.5 GiB of RAM available
+        // when it starts from ~49: with less free RAM than that, the 4 GiB floor would refuse it or the watchdog would kill the run
+        let avail = shadow_cuda::pinned::available_ram() as f64 / (1u64 << 30) as f64;
+        set.extend(["--ram-tier-gib".into(), if avail >= 49.0 { "36" } else { "30" }.into()]);
+        if avail < 49.0 {
+            eprintln!("shadow serve: {avail:.1} GiB of RAM available (49 needed for the 36 GiB tier): using the 30 GiB tier");
+        }
     }
     if !has("--placement") {
         if let Some(p) = found("profiles/routing-6prompts.shrc") {

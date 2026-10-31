@@ -45,7 +45,7 @@ impl Default for Config {
             start_server: true,
             model_path: DEFAULT_MODEL.into(),
             shadow_exe: String::new(),
-            extra_flags: "--port 8081 --ram-tier-gib 30".into(),
+            extra_flags: "--port 8081".into(),
             launcher: String::new(),
             console_log: log_path.to_string_lossy().to_string(),
             stop_on_quit: true,

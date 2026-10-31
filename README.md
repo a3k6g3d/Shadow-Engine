@@ -33,7 +33,7 @@ time; the bench's per-turn median misranks arms that generate different text, se
 | | tok/s | note |
 |---|---|---|
 | Shadow `--exact` | ~20 | no speculation, no inexact modes; bit for bit the reference |
-| Shadow default (`shadow serve MODEL`) | **39.4** | DFlash 2 drafter, `--tail-skip 3`, AcceptMoE verify, 30 GiB RAM expert tier; same-history fidelity 0.415 (Strata 0.431) |
+| Shadow default (`shadow serve MODEL`) | **39.4** | DFlash 2 drafter, `--tail-skip 3`, AcceptMoE verify, 36 GiB RAM expert tier (30 when under 49 GiB of RAM is free); same-history fidelity 0.415 (Strata 0.431) |
 | Strata (its tuned config, same model, prompts, context) | **47.2** | interleaved with Shadow in the same session |
 
 **Shadow is about 17% slower than Strata on this bench** (Strata 21% faster; at matched fidelity Shadow runs 39.4 to 42.8 tok/s against Strata's 47.2, see docs/STATUS.md). The resource record
@@ -54,7 +54,7 @@ shadow serve path/to/model.gguf            # the fastest mode by default; add --
 ```
 
 What the defaults are, every flag and every environment variable: [docs/USAGE.md](docs/USAGE.md). Shadow never pins memory
-that would leave less than 4 GiB of RAM available, and the default 30 GiB expert tier peaks around 35 GiB resident, so on a
+that would leave less than 4 GiB of RAM available, and the default 36 GiB expert tier (30 GiB when under 49 GiB is free) peaks around 41 GiB resident, so on a
 smaller machine pass `--ram-tier-gib` explicitly.
 
 ## Documentation
