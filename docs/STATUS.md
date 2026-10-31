@@ -1140,3 +1140,10 @@ Single-prompt runs, "Write a Rust function that parses a comma separated list...
   grouped `iq2_s` 67-70%, `iq4_nl` 53-54%), `wait` 7-12%, `selected` (issuing) only 7-16%. The kernels are memory-latency-bound: each lane loads a few bytes of a quantized block, uses them, then loads the next; the per-lane accumulation order (which the reference arithmetic fixes) leaves little to hoist.
 - Tried `#pragma unroll 4` on `matvec_cols_m`'s chunk loop (independent loads can then be issued together; same accumulation order, `--exact` text identical): decode per-turn median 48.4 / 49.1 / 49.1 against 48.9 / 48.9 / 48.9, i.e. nothing; reverted. What would help is staging each warp's weight bytes with wide
   (16-byte) loads into shared memory and reading them from there, in the same lane order: a rewrite per quantization type (Q6_K, IQ4_XS, IQ4_NL, IQ2_S, IQ3_XXS, IQ3_S, Q2_0, Q5_K, Q4_K, Q8_0), each checked against the reference. Not started.
+
+## 2026-10-31: fewer rows a warp in the plain `matvec_cols_*` kernels (+5% decode)
+
+- The stall data (long-scoreboard bound, 30% occupancy, small grids) says the kernels lack loads in flight, not bandwidth. `COLS_PLAIN` (`kernels/matvec.cu`, the plain `matvec_cols_*` kernels and `matvec_cols_multi`): 4 rows a warp -> **1**, so a block covers 8 rows
+  (was 32) and a matrix gets 4x the warps; each row's lane-ordered sum is unchanged, so every output is the same bit for bit (the `--exact` 3,003-token prompt gives the same text; `tests/matvec.rs`'s one-at-a-time against many-at-once comparison passes with its grid updated to 8 rows a block;
+  `cols_rows_per_block` and `matvec_cols_multi`'s block count follow `COLS_PLAIN_ROWS`).
+- Varied bench, 3 runs, 30 GiB tier: per-turn median **50.1 / 51.0 / 51.25** (2 rows a warp: 49.8 / 50.7 / 50.7; 4 rows: 48.9 / 48.9 / 48.9), total throughput **50.67** tok/s (50.2, 50.9, 50.9) against 48.5-48.7: **+4.5%**, ahead of Strata's 48.6. Taking the reference-order kernels (BF16/F32, `COLS_REF_SPLIT`) to 1 row a warp at every size changed nothing (50.6 / 50.9 / 50.95).

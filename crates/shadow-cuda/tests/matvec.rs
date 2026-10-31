@@ -219,7 +219,7 @@ fn several_inputs_at_once_match_one_at_a_time() {
         };
         let many = |m: usize| unsafe {
             // SAFETY: m inputs of cols floats at stride cols, m outputs of rows floats at stride rows.
-            prog.launch(&cols_entry, ((rows as u32).div_ceil(32), 1, 1), (256, 1, 1), 0, None,
+            prog.launch(&cols_entry, ((rows as u32).div_ceil(8), 1, 1), (256, 1, 1), 0, None,
                         &[Arg::Ptr(dw.ptr), Arg::Ptr(dx.ptr), Arg::U32(cols as u32), Arg::Ptr(dy8.ptr), Arg::U32(rows as u32),
                           Arg::U32(rows as u32), Arg::U32(cols as u32), Arg::U32(m as u32)]).unwrap();
         };

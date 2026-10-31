@@ -811,8 +811,11 @@ fn floats(b: &[u8]) -> Vec<f32> {
 /// COLS_REF_SPLIT (2048) rows (matvec.cu), the others COLS_ROWS (4).
 fn cols_rows_per_block(entry: &str, rows: usize) -> u32 {
     let reference = entry.starts_with("matvec_cols_ref") || entry.starts_with("hc_down_inject_cols");
-    if reference && rows < 2048 { 8 } else { 32 }
+    if reference && rows < 2048 { 8 } else if reference { 32 } else { COLS_PLAIN_ROWS }
 }
+
+/// Rows a block of the plain `matvec_cols_*` kernels (and `matvec_cols_multi`) covers: 8 warps x `COLS_PLAIN` (matvec.cu) rows (tests/matvec.rs assumes 8).
+const COLS_PLAIN_ROWS: u32 = 8 * 1;
 
 /// `moe_batch`'s grouped routed experts for tokens start..end, as one upload: per phase (0: experts resident before
 /// this group's copies, 1: the ones being copied) the groups - an expert and up to 8 of its tokens - as matrix
@@ -3395,7 +3398,7 @@ impl<'c, 'm> GpuSession<'c, 'm> {
             for v in [*ys as u32, rows as u32, ty, first] {
                 bytes.extend_from_slice(&v.to_le_bytes());
             }
-            first += (rows as u32).div_ceil(32);
+            first += (rows as u32).div_ceil(COLS_PLAIN_ROWS);
         }
         Some((bytes, first))
     }

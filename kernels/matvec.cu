@@ -678,19 +678,24 @@ extern "C" __global__ void matvec_pair_f32(const u8* w0, float* y0, unsigned int
 // Each warp takes COLS_ROWS consecutive rows, so every input chunk it loads serves COLS_ROWS rows.  The inputs must be
 // 16-byte aligned with xs a multiple of 4 (float4 loads).
 #define COLS_ROWS 4
+// rows a warp takes in the plain matvec_cols kernels (the reference-order ones below keep COLS_ROWS): fewer rows a warp = more warps = more
+// loads in flight on a small matrix; each row's sums are the same lane-ordered sums, so every output is unchanged
+#ifndef COLS_PLAIN
+#define COLS_PLAIN 1
+#endif
 
 template <typename Q, unsigned int M>
 static __device__ __forceinline__ void matvec_cols_m(const u8* w, const float* x, unsigned int xs, float* y,
                                                      unsigned int ys, unsigned int row0, unsigned int nr,
                                                      unsigned int lane, unsigned int cols) {
     const u64 rb = (u64) (cols / Q::QK) * Q::BYTES;
-    float acc[COLS_ROWS][M];
+    float acc[COLS_PLAIN][M];
 #pragma unroll
-    for (unsigned int k = 0; k < COLS_ROWS; k++)
+    for (unsigned int k = 0; k < COLS_PLAIN; k++)
 #pragma unroll
         for (unsigned int j = 0; j < M; j++) acc[k][j] = 0.0f;
     for (unsigned int c = lane; c < cols / 8; c += 32) {
-        // this chunk of every input, loaded once into registers and used for all COLS_ROWS rows
+        // this chunk of every input, loaded once into registers and used for all COLS_PLAIN rows
         float xr[M * 8];
 #pragma unroll
         for (unsigned int j = 0; j < M; j++) {
@@ -700,11 +705,11 @@ static __device__ __forceinline__ void matvec_cols_m(const u8* w, const float* x
             xr[j * 8 + 4] = b.x; xr[j * 8 + 5] = b.y; xr[j * 8 + 6] = b.z; xr[j * 8 + 7] = b.w;
         }
 #pragma unroll
-        for (unsigned int k = 0; k < COLS_ROWS; k++)
+        for (unsigned int k = 0; k < COLS_PLAIN; k++)
             if (k < nr) Fast<Q>::template dotm<M>(w + (row0 + k) * rb, c * 8, xr, 8, acc[k]);
     }
 #pragma unroll
-    for (unsigned int k = 0; k < COLS_ROWS; k++) {
+    for (unsigned int k = 0; k < COLS_PLAIN; k++) {
         if (k >= nr) break;
 #pragma unroll
         for (unsigned int j = 0; j < M; j++) {
@@ -715,14 +720,14 @@ static __device__ __forceinline__ void matvec_cols_m(const u8* w, const float* x
     }
 }
 
-// Launch: block = 256 threads (8 warps x COLS_ROWS rows = 32 rows), grid = ceil(rows / 32).
+// Launch: block = 256 threads (8 warps x COLS_PLAIN rows = 16 rows), grid = ceil(rows / 16).
 template <typename Q>
 static __device__ __forceinline__ void matvec_cols_rows_b(const u8* w, const float* x, unsigned int xs, float* y,
                                                           unsigned int ys, unsigned int rows, unsigned int cols,
                                                           unsigned int m, unsigned int bx) {
-    unsigned int row0 = (bx * (blockDim.x / 32) + threadIdx.x / 32) * COLS_ROWS, lane = threadIdx.x % 32;
+    unsigned int row0 = (bx * (blockDim.x / 32) + threadIdx.x / 32) * COLS_PLAIN, lane = threadIdx.x % 32;
     if (row0 >= rows) return;
-    unsigned int nr = min(rows - row0, (unsigned int) COLS_ROWS);
+    unsigned int nr = min(rows - row0, (unsigned int) COLS_PLAIN);
     switch (m) {
         case 1: matvec_cols_m<Q, 1>(w, x, xs, y, ys, row0, nr, lane, cols); break;
         case 2: matvec_cols_m<Q, 2>(w, x, xs, y, ys, row0, nr, lane, cols); break;
