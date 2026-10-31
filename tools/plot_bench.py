@@ -65,7 +65,7 @@ def read_gpu(path):
         t = ts(c[0]) if c else None
         if t is None or len(c) < 11:
             continue
-        thr = int(c[10], 16) if c[10].startswith("0x") else 0
+        thr = int(c[10], 16) if len(c[10]) > 2 and c[10].startswith("0x") else 0  # a truncated last sample is just "0x"
         rows.append((t, num(c[1]), num(c[2]), num(c[3]) / 1024, num(c[4]), num(c[5]), num(c[6]), num(c[7]), float(bool(thr & THROTTLE_MASK))))
     return rows
 

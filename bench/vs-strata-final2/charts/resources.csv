@@ -1,0 +1,3 @@
+arm,runs,tok_s,gpu_util_mean,gpu_util_p95,gpu_power_mean,joules_per_token,gpu_mem_mean,gpu_temp_mean,gpu_sm_mean,gpu_throttle_mean,pcie_rx_mean,pcie_rx_p95,pcie_tx_mean,cpu_mean,cpu_p95,ram_mean,ram_min,disk_read_mean,disk_write_mean,paging_mean
+shadow,3,39.895,86.702,97.467,114.796,4.507,11.041,53.605,2904.195,0.000,10.341,24.623,1.163,12.941,21.075,9.765,9.198,153.522,0.331,37506.253
+strata,3,48.314,77.809,100.000,92.424,4.907,11.061,51.730,2903.533,0.000,10.103,16.801,1.676,51.899,63.142,6.975,6.355,474.407,3.688,760.967

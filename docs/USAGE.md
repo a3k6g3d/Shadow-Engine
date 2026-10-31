@@ -73,7 +73,7 @@ RAM, expert-cache hit rates, memory tiers).
 | `--tail-skip R` | 3 | routed experts of rank >= R are skipped when not in VRAM (0: exact; 4: the earlier default, fidelity 0.572 and 6% slower) |
 | `--accept-moe`, `--accept-beta B`, `--accept-scale S`, `--accept-budget F` | on, 1.0, 1, 1 | AcceptMoE verifier expert sets (docs/SPECULATION.md); B sharpens the commitment weights, S scales the set, F the pruning budget |
 | `--verify-resident` | off | **can truncate answers**: a verify pass's extra positions use only the experts already in VRAM; on varied text 11 of 14 replies ended early against 3 |
-| `--verify-rank R` | off | like `--verify-resident` but each extra position keeps its top R experts even when they must be copied; R=1: about +18% tok/s and about 17% fewer generated tokens |
+| `--verify-rank R` | off | like `--verify-resident` but each extra position keeps its top R experts even when they must be copied; R=1: about +18% tok/s and about 17% fewer generated tokens; R=2 (`shadow serve MODEL --verify-rank 2`, replaces AcceptMoE): 42.8 tok/s against the default's 39.4 on the varied bench, replies 11.5% shorter, same-history fidelity above Strata's (STATUS.md) |
 | `--dflash DIR` or `off` | `models/dflash2` | the DFlash 2 drafter |
 | `--dflash-bf16` | off | keep the drafter's matrices BF16 instead of Q8_0 (about 0.4 GB more VRAM) |
 | `--dflash-min-p P` | 0.5 | stop a draft chain after a draft the selector gives under P |

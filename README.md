@@ -36,11 +36,11 @@ time; the bench's per-turn median misranks arms that generate different text, se
 | Shadow default (`shadow serve MODEL`) | **39.4** | DFlash 2 drafter, `--tail-skip 3`, AcceptMoE verify, 30 GiB RAM expert tier; same-history fidelity 0.415 (Strata 0.431) |
 | Strata (its tuned config, same model, prompts, context) | **47.2** | interleaved with Shadow in the same session |
 
-**Shadow is about 17% slower than Strata on this bench** (Strata 20% faster; at matched fidelity Shadow runs 39.4 to 42.8 tok/s against Strata's 47.2, see docs/STATUS.md; the resource record below was taken at 34.7 tok/s, before the n-gram prefetch fix and the tail-skip 3 default). The resource record
-(`bench/vs-strata-final/charts/`) shows where: GPU utilisation is *higher* for Shadow (86% against 79%) and PCIe throughput
-similar (11.6 against 10.1 GB/s), so Shadow moves about 334 MB of expert weights per generated token against Strata's 215 MB:
-the gap is expert traffic per token, not an idle GPU. Strata also uses the CPU (49% against 13%) and reads the disk harder (490
-against 159 MB/s). Earlier figures in this repository's history that put Shadow at 43 to 47 tok/s came from a mode that cut
+**Shadow is about 17% slower than Strata on this bench** (Strata 21% faster; at matched fidelity Shadow runs 39.4 to 42.8 tok/s against Strata's 47.2, see docs/STATUS.md). The resource record
+(`bench/vs-strata-final2/charts/`, 3 interleaved runs of the 36-prompt set with the current defaults: Shadow 39.9 tok/s, Strata 48.3) shows where: GPU utilisation is *higher* for Shadow (87% against 78%) and PCIe throughput
+similar (10.3 against 10.1 GB/s), so Shadow moves about 259 MB of expert weights per generated token against Strata's 209 MB:
+the gap is expert traffic per token, not an idle GPU. Strata also uses the CPU (52% against 13%) and reads the disk harder (474
+against 154 MB/s). Earlier figures in this repository's history that put Shadow at 43 to 47 tok/s came from a mode that cut
 answers short (`--verify-resident`) and from per-turn medians; both are documented in
 [docs/STATUS.md](docs/STATUS.md). Shadow's noise floor is 0.8% median on the exact engine
 (`bench/floor-2026-10-27`), about 0.1 to 0.5% for total throughput in the fastest mode.
