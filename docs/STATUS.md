@@ -996,3 +996,11 @@ Single-prompt runs, "Write a Rust function that parses a comma separated list...
 - What is left: a 256-token pass copies ~250 experts a layer (~0.5 GiB, 22 ms of PCIe) and reads the ones the RAM tier lacks (36%) from the SSD; the pass sits near the bus
   and disk limit, so a bigger chunk is the lever but VRAM for its per-token buffers is not available. Strata's 1,376 tok/s is 16x this; this PC's gap on prompts is
   larger than on decode.
+- **Bigger chunks do not help (measured, not built):** a temporary `MAX_BATCH` = 1024 build (1024-token chunks, 512 staging slots), four 1.8k-4.6k-token prompts: 88.6, 84.3,
+  77.8, 75.0 tok/s - the same as 256-token chunks (66-86). Three passes at 256 (`SHADOW_LTIME=1`, 740 tokens, 78.7 tok/s) and one at 1024 (87.0 tok/s) show the same split:
+  host waits per prompt token, router 3-5 ms and file 4-5 ms, i.e. file reads are ~36-40% of the prompt time and the router wait (GPU compute plus the copies queued before it)
+  ~25%. The file reads already go through the parallel read pool; what is left is the SSD itself (36% of experts are outside the 30 GiB RAM tier).
+- A bigger RAM tier is not an answer on this PC: `--ram-tier-gib 40` is refused by the RAM floor (42 GiB available, 4 GiB must stay), and 36 GiB loaded but the server died
+  mid-prompt. A read-ahead (the next layer's non-resident experts read from the SSD under this layer's compute) would hide up to ~36% but the next layer's experts are not
+  known until this layer ends; with 1024-token chunks it would be "all the non-resident ones" (~180 experts a layer, 0.35 GiB), which needs those chunks' buffers
+  (0.6 MiB a token, ~0.6 GiB at 1024) allocated only while a prompt is read. Not built.
