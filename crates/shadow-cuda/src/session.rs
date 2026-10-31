@@ -448,7 +448,7 @@ struct PendingRead {
 pub struct Tiers {
     /// The VRAM expert cache in bytes; `None`: the free VRAM less `VRAM_RESERVE`.
     pub vram_cache: Option<usize>,
-    /// The pinned RAM tier in bytes (0: none).  Refused if it would leave less than `pinned::RAM_FLOOR` available.
+    /// The pinned RAM tier in bytes (0: none).  Refused if it would leave less than the RAM floor (`pinned::ram_floor`, `--ram-floor-gib`) available.
     pub ram_bytes: usize,
     /// Size the RAM tier as `pinned::auto_tier_bytes()` says, measured when the session fills it - after the dense
     /// weights are loaded and uploaded, so the figure is what is really left (`ram_bytes` is then ignored).
@@ -513,6 +513,13 @@ impl Tiers {
             flag(f).map(|v| v.parse::<f64>().map(|g| (g * GIB) as usize).map_err(|_| format!("{f}: not a number: {v}")))
                 .transpose()
         };
+        if let Some(g) = gib("--ram-floor-gib")? {
+            crate::pinned::set_ram_floor(g as u64);
+            if (g as u64) < crate::pinned::RAM_FLOOR {
+                eprintln!("RAM floor: {:.1} GiB (default {:.0}): a pinned tier cannot be paged out, and this PC has frozen hard at 0.4 GiB free",
+                          g as f64 / GIB, crate::pinned::RAM_FLOOR as f64 / GIB);
+            }
+        }
         let order = match flag("--placement") {
             Some(p) => {
                 let rc = RoutingCounts::load(std::path::Path::new(p)).map_err(|e| format!("--placement: {e}"))?;
@@ -1052,7 +1059,7 @@ impl<'c, 'm> GpuSession<'c, 'm> {
             let b = crate::pinned::auto_tier_bytes() as usize;
             eprintln!("RAM tier: auto = {:.2} GiB ({:.2} GiB available less a {:.0} GiB margin)", b as f64 / (1u64 << 30) as f64,
                       crate::pinned::available_ram() as f64 / (1u64 << 30) as f64,
-                      crate::pinned::AUTO_MARGIN as f64 / (1u64 << 30) as f64);
+                      crate::pinned::auto_margin() as f64 / (1u64 << 30) as f64);
             b
         } else {
             tiers.ram_bytes

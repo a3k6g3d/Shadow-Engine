@@ -1,7 +1,7 @@
 //! Pinned host memory for the RAM tier (docs/SHADOW_PLAN.md, stage 3), and the RAM rule in code: **Shadow refuses to
 //! pin memory that would leave less than 4 GiB of RAM available**, checks again once the pages are locked, and its
-//! users check again as they fill it (`check_floor`).  There is no setting that lowers `RAM_FLOOR`: a pinned tier
-//! cannot be paged out, and this PC has frozen hard at 0.4 GiB free.
+//! users check again as they fill it (`check_floor`).  A pinned tier cannot be paged out, and this PC has frozen hard at
+//! 0.4 GiB free, so the floor stays `RAM_FLOOR` unless the user passes `--ram-floor-gib N` (0 turns the check off).
 //!
 //! The region is plain `VirtualAlloc` memory registered with `cuMemHostRegister`, so the GPU copies from it by DMA.
 //! It is its own small allocator rather than `shadow-host::Buffer` (which the plan names) because `shadow-host` still
@@ -10,26 +10,44 @@
 use crate::driver::Context;
 use std::ffi::c_void;
 
-/// RAM that must stay available after pinning, in bytes.  Not configurable, by design.
+/// RAM that must stay available after pinning, in bytes: the default of `--ram-floor-gib`.
 pub const RAM_FLOOR: u64 = 4 << 30;
+
+static FLOOR: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(RAM_FLOOR);
+
+/// The floor in force: `RAM_FLOOR` unless `set_ram_floor` changed it.
+pub fn ram_floor() -> u64 {
+    FLOOR.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// `--ram-floor-gib`: the RAM that must stay available after pinning (0: no check).
+pub fn set_ram_floor(bytes: u64) {
+    FLOOR.store(bytes, std::sync::atomic::Ordering::Relaxed);
+}
 
 /// What `auto` leaves available when it sizes a pinned tier: the floor plus room for what moves after the fill
 /// (the file cache, the desktop, other programs).  With a 32 GiB tier filled at ~41 GiB available, available RAM
 /// later dipped to 5.6 GiB in one of 8 runs - 2.4 GiB below what was left at the fill - so the margin is the floor
 /// plus 6 GiB.
-pub const AUTO_MARGIN: u64 = RAM_FLOOR + (6 << 30);
+pub const AUTO_MARGIN_EXTRA: u64 = 6 << 30;
+
+/// What `auto` leaves available: the floor in force plus `AUTO_MARGIN_EXTRA`.
+pub fn auto_margin() -> u64 {
+    ram_floor() + AUTO_MARGIN_EXTRA
+}
 
 /// The pinned tier `auto` asks for right now: the RAM available less `AUTO_MARGIN` (0 if that is nothing).
 pub fn auto_tier_bytes() -> u64 {
-    available_ram().saturating_sub(AUTO_MARGIN)
+    available_ram().saturating_sub(auto_margin())
 }
 
-/// Whether pinning `bytes` more leaves at least `RAM_FLOOR` available out of `available`.
+/// Whether pinning `bytes` more leaves at least the floor (`ram_floor`) available out of `available`.
 pub fn headroom(bytes: u64, available: u64) -> Result<(), String> {
     let gib = |b: u64| b as f64 / (1u64 << 30) as f64;
-    if bytes.checked_add(RAM_FLOOR).is_none_or(|need| available < need) {
-        return Err(format!("refusing to pin {:.2} GiB: {:.2} GiB of RAM available, and at least {:.0} GiB must stay \
-                            available (RAM_FLOOR)", gib(bytes), gib(available), gib(RAM_FLOOR)));
+    let floor = ram_floor();
+    if bytes.checked_add(floor).is_none_or(|need| available < need) {
+        return Err(format!("refusing to pin {:.2} GiB: {:.2} GiB of RAM available, and at least {:.1} GiB must stay \
+                            available (RAM_FLOOR; --ram-floor-gib N changes it, 0 turns it off)", gib(bytes), gib(available), gib(floor)));
     }
     Ok(())
 }
@@ -147,7 +165,7 @@ impl<'c> PinnedRegion<'c> {
         unsafe { std::slice::from_raw_parts_mut(self.base, self.len) }
     }
 
-    /// Err if available RAM has fallen below `RAM_FLOOR` (call it while filling the region and after).
+    /// Err if available RAM has fallen below the floor (call it while filling the region and after).
     pub fn check_floor(&self) -> Result<(), String> {
         headroom(0, (self.available)())
     }

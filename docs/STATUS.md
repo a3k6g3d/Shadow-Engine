@@ -1023,3 +1023,14 @@ Single-prompt runs, "Write a Rust function that parses a comma separated list...
   traffic per token against Strata's 209**; CPU 13% against 52%, disk 154 against 474 MB/s. README updated.
 - **The CPU rows without a per-layer join** were not built: the join was measured at 3-12 ms of a 105 ms verify pass (2026-10-31, "the CPU join, measured") and the host-planning
   ceiling at 3.9 ms (6.5%), so removing the join needs Strata's whole-window graph with device-side flags for at most that much.
+
+## 2026-10-31: `--ram-floor-gib`, and what a 36 GiB RAM tier buys
+
+- The RAM floor is now a flag: `--ram-floor-gib N` (default 4, 0 turns the check off) for the engine's refusal and its checks while the tier fills, `-FloorGiB` on
+  `tools/run_capped.ps1` / `run_strata.ps1` for the watchdog that kills a run below it. The default is unchanged. `auto` sizes against the floor in force plus 6 GiB.
+- Measured with `--ram-tier-gib 36 --ram-floor-gib 3` (watchdog at 3; available RAM bottomed at 4.5 GiB, peak working set 41.5 GiB), against the default 30 GiB tier, same build:
+  prompts (1.8k-4.6k tokens) **85.4 / 77.8 / 74.8 / 71.6** against 74.0 / 70.6 / 68.7 / 65.4 tok/s (+15%, +10%, +9%, +9.5%); decode on the varied bench (3 runs each, total
+  throughput) **40.79** against **39.79** tok/s (+2.5%, outside the 0.1-0.5% noise), identical answers (0 differing). Minimum available RAM during the bench: 4.9-5.1 GiB
+  against 10.4-10.7 GiB for 30.
+- So a bigger tier pays a little (+2.5% decode, ~+10% prompts) for ~5.5 GiB less free RAM. The default stays 30 with the 4 GiB floor; 36 needs `--ram-floor-gib 3` or less
+  on this PC and leaves about 5 GiB free in steady state.

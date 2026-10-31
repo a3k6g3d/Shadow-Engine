@@ -66,6 +66,7 @@ RAM, expert-cache hit rates, memory tiers).
 | `--ctx N` | 16384 | positions the session is built for (KV and drafter rings scale with it) |
 | `--exact` | off | no speculation, no inexact modes, none of the defaults above |
 | `--ram-tier-gib G` or `auto` | 30 | pinned host memory for the expert tier; `auto` sizes it from the RAM available now less 10 GiB |
+| `--ram-floor-gib N` | 4 | RAM that must stay available after pinning (0: no check); see "The RAM rule" |
 | `--placement FILE` | the six-prompt profile | a routing profile (`SHRC`) ranking which experts the tier holds |
 | `--expert-cache-gib G` | all free VRAM less 384 MiB | the VRAM expert cache (LRU per layer) |
 | `--admit-after N` | 0 | a VRAM-cache miss gets a slot only from its (N+1)th miss (N=1: about +1%; STATUS.md) |
@@ -109,8 +110,9 @@ Defaults are right for normal use; these are for measurement and diagnosis.
 ## The RAM rule
 
 Shadow never pins memory that would leave less than **4 GiB** of RAM available, checks again after the pages are locked and
-again as the tier fills, and there is no setting that lowers it: a pinned tier cannot be paged out, and the test machine
-has frozen hard at 0.4 GiB free. The default 30 GiB tier peaks around 35 GiB resident for the process. On a smaller
+again as the tier fills: a pinned tier cannot be paged out, and the test machine has frozen hard at 0.4 GiB free.
+`--ram-floor-gib N` changes the floor (0 turns the check off); `tools/run_capped.ps1 -FloorGiB N` and `tools/run_strata.ps1` do the same for the
+watchdog that kills a run below it. Lower it only to try a bigger `--ram-tier-gib`, and measure that it pays. The default 30 GiB tier peaks around 35 GiB resident for the process. On a smaller
 machine pass `--ram-tier-gib` explicitly (or `auto`), or `--exact` with a small tier.
 
 ## The API

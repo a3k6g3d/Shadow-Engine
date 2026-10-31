@@ -4,7 +4,7 @@
 #
 #   $L = "& 'tools/run_strata.ps1' -Port {port} -Out '{log}' -Config 'path/to/strata-bench.json'"
 #   shadow-bench run ... --arm "strata=-" --arm-launch "strata=$L"
-param([int]$Port = 8091, [string]$Out = 'strata.txt', [string]$Config, [string]$StrataDir = 'J:\Strata-work\Strata-0140')
+param([double]$FloorGiB = 4, [int]$Port = 8091, [string]$Out = 'strata.txt', [string]$Config, [string]$StrataDir = 'J:\Strata-work\Strata-0140')
 $env:PYTHONUTF8 = '1'
 $env:PYTHONUNBUFFERED = '1'
 $t0 = Get-Date
@@ -14,7 +14,7 @@ $min = 999
 while (-not $p.HasExited) {
   $av = (Get-Counter '\Memory\Available MBytes').CounterSamples[0].CookedValue / 1024
   if ($av -lt $min) { $min = $av }
-  if ($av -lt 4) { taskkill /T /F /PID $p.Id | Out-Null; "KILLED at {0:N2} GiB available" -f $av; break }
+  if ($FloorGiB -gt 0 -and $av -lt $FloorGiB) { taskkill /T /F /PID $p.Id | Out-Null; "KILLED at {0:N2} GiB available" -f $av; break }
   Start-Sleep -Milliseconds 1000
 }
 "exit $($p.ExitCode), wall {0:N0} s, min available {1:N1} GiB (strata, tree floor 4 GiB)" -f ((Get-Date) - $t0).TotalSeconds, $min
