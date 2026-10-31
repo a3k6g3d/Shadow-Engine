@@ -5,7 +5,7 @@
 //! rewound, so anything less than an exact prefix resets the session and reads the prompt whole.  Greedy decoding
 //! only (the plan's open item); a request's sampling parameters are accepted and not used, and `/props` says so.
 
-use shadow_cuda::session::{GpuSession, Tiers, MAX_BATCH};
+use shadow_cuda::session::{GpuSession, Tiers};
 use shadow_model::chat::{render_for_arch, Message, Options};
 use shadow_model::forward::{check_layout, Model};
 use shadow_model::gguf::Gguf;
@@ -325,9 +325,9 @@ fn answer<'c>(arch: &str, req: &Request, tok: &Tokenizer, sess: &mut GpuSession<
     PREFILL.1.store(unread.len(), Relaxed);
     // MAX_BATCH tokens at a time through the layers (`step_batch`), a chunk ending where the snapshot goes
     // a long prompt borrows the tail of the VRAM expert cache as staging and reads in big chunks; a short one, 64 at a time
-    let lent = unread.len() >= 128 && !std::env::var("SHADOW_NO_LEND").is_ok_and(|v| v == "1") && sess.lend_cache();
+    let lent = unread.len() >= 128 && !std::env::var("SHADOW_NO_LEND").is_ok_and(|v| v == "1") && sess.lend_cache(unread.len() >= shadow_cuda::session::LONG_PROMPT);
     let chunk = std::env::var("SHADOW_PREFILL_CHUNK").ok().and_then(|v| v.parse().ok())
-        .unwrap_or(if lent { MAX_BATCH } else { 64usize }).clamp(1, MAX_BATCH);
+        .unwrap_or(if lent { sess.batch_rows() } else { 64usize }).clamp(1, sess.batch_rows());
     let mut i = 0;
     while i < unread.len() {
         let mut end = (i + chunk).min(unread.len());

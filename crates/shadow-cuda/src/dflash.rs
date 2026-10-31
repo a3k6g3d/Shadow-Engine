@@ -280,7 +280,7 @@ impl<'c> DflashModel<'c> {
             }
         }
         let a = |n: usize| ctx.alloc(n.max(1) * 4).map_err(e);
-        let fr = crate::session::MAX_BATCH;
+        let fr = crate::session::BIG_BATCH;
         let bufs = DflashBufs {
             feat: a(fr * NFEAT)?,
             feat_rows: fr,

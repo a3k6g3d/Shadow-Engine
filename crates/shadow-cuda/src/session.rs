@@ -45,6 +45,23 @@ struct Lent {
     evict_saved: Vec<std::ops::Range<usize>>,
 }
 
+/// A long prompt's layer-ahead pipeline (`moe_staged`): two halves of the lent cache hold the experts of the layer being computed and of
+/// the next one (slot = expert number), the next layer's are copied in while this one runs, and the file-only ones (in neither the VRAM
+/// cache nor the RAM tier) are read from the file on the read pool one layer further ahead, into two pinned buffers by layer parity.
+struct StagePipe<'c> {
+    /// device address of half 0; half p is at base + p * n_expert * slot_bytes
+    base: u64,
+    /// the copy of the layer in `ready[p]` into half p is queued (and done when `events[p]` is)
+    events: [Event<'c>; 2],
+    ready: [usize; 2],
+    bufs: [PinnedRegion<'c>; 2],
+    /// the layer whose file-only experts buffer p holds, and expert -> slot in it
+    layer: [usize; 2],
+    at: [HashMap<usize, usize>; 2],
+    slots: usize,
+    pending: bool,
+}
+
 /// Routed experts resident in VRAM: either partitioned per layer at each layer's exact expert size (0 wasted padding
 /// across mixed-quant layers) or shared `slots` of `slot_bytes` when the budget is too small to give every layer its
 /// minimum slots.
@@ -161,6 +178,10 @@ struct Bufs<'c> {
 /// (matvec_cols' limit); the MoE fetches the union of all of them, which grows slowly: on an 1,271-token prompt a
 /// token needs 5.95 experts of its 10 a layer in groups of 8, 3.60 in groups of 32, 2.51 in groups of 64.
 pub const MAX_BATCH: usize = 256;
+/// Tokens a long prompt reads together in the lent cache (`big_batch_on`): per-token buffers carved from it, not kept.
+pub const BIG_BATCH: usize = 1024;
+/// Unread prompt tokens from which the layer-ahead pipeline and the big batch are used.
+pub const LONG_PROMPT: usize = 1024;
 const COLS_MAX: usize = 8;
 /// Tokens a batched attention launch takes (its score scratch is per token).
 const ATT_ROWS: usize = 8;
@@ -229,6 +250,47 @@ struct BatchBufs<'c> {
     eo: DeviceBuffer<'c>,
 }
 
+/// The buffers of a `BatchBufs` that do not grow with the batch (`make_bb`'s `fixed`).
+struct FixedBufs<'c> {
+    att: DeviceBuffer<'c>,
+    sel_iqn: DeviceBuffer<'c>,
+    sel_scores: DeviceBuffer<'c>,
+    sel_toks: DeviceBuffer<'c>,
+    logits: DeviceBuffer<'c>,
+}
+
+/// Floats a row of `BatchBufs` takes, all the buffers that grow with the batch.
+fn bb_row_floats(c: &shadow_model::forward::Config) -> usize {
+    let (h, cs, k) = (c.hidden, c.streams, c.n_expert_used);
+    let ch = cs * h;
+    let kd = c.ssm_k_heads * c.ssm_head_dim;
+    let vd = c.ssm_v_heads * c.ssm_head_dim;
+    let (qd, kvd) = (c.n_head * c.head_dim, c.n_kv_head * c.head_dim);
+    3 * ch + 2 * h + cs + c.hc_rank + 2 * (2 * kd + vd) + 2 * vd + 2 * c.ssm_v_heads + 2 * qd + qd + qd + qd + kvd
+        + c.idx_heads * c.idx_dim + c.n_expert + 1 + 3 * c.shared_ff + h + 64 * k + 2 * k * c.expert_ff + k * c.expert_ff + k * h
+}
+
+/// `BatchBufs` for `rows` tokens, each buffer from `take(floats)`, with the buffers that do not grow with the batch given.
+fn make_bb<'c>(c: &shadow_model::forward::Config, rows: usize,
+               take: &mut dyn FnMut(usize) -> Result<DeviceBuffer<'c>, String>, fixed: FixedBufs<'c>) -> Result<BatchBufs<'c>, String> {
+    let (h, cs, k) = (c.hidden, c.streams, c.n_expert_used);
+    let ch = cs * h;
+    let kd = c.ssm_k_heads * c.ssm_head_dim;
+    let vd = c.ssm_v_heads * c.ssm_head_dim;
+    let (qd, kvd) = (c.n_head * c.head_dim, c.n_kv_head * c.head_dim);
+    let id = c.idx_dim;
+    let mut ab = |n: usize| take(rows * n);
+    Ok(BatchBufs {
+        r: ab(ch)?, rn: ab(ch)?, u: ab(h)?, g: ab(cs)?, y: ab(h)?, down: ab(c.hc_rank)?, up: ab(ch)?,
+        qkv: ab(2 * kd + vd)?, x: ab(2 * kd + vd)?, z: ab(vd)?, beta: ab(c.ssm_v_heads)?, alpha: ab(c.ssm_v_heads)?, o: ab(vd)?,
+        qg: ab(2 * qd)?, q: ab(qd)?, gate: ab(qd)?, att: fixed.att, kk: ab(kvd)?, iq: ab(c.idx_heads * id)?, ao: ab(qd)?,
+        rl: ab(c.n_expert)?, sgl: ab(1)?,
+        sel_iqn: fixed.sel_iqn, sel_scores: fixed.sel_scores, sel_toks: fixed.sel_toks,
+        sg: ab(c.shared_ff)?, su: ab(c.shared_ff)?, sa: ab(c.shared_ff)?, so: ab(h)?, logits: fixed.logits,
+        gtab: ab(64 * k)?, eg: ab(2 * k * c.expert_ff)?, act: ab(k * c.expert_ff)?, eo: ab(k * h)?,
+    })
+}
+
 pub struct GpuSession<'c, 'm> {
     ctx: &'c Context,
     m: &'m Model,
@@ -274,6 +336,10 @@ pub struct GpuSession<'c, 'm> {
     cpu_host: (f64, f64),
     /// the tail of the VRAM expert cache, lent to a long prompt as staging (`lend_cache` / `restore_cache`)
     lent: Option<Lent>,
+    sp: Option<StagePipe<'c>>,
+    /// rows of `bb` now (`MAX_BATCH`, or `BIG_BATCH` while a long prompt is read), and the small buffers while the big ones are in
+    rows: usize,
+    small_bb: Option<BatchBufs<'c>>,
     /// `--pipeline`: a verify pass as two token groups (session_pipeline.rs); `pipe_active` while one runs, `row_shift` the
     /// first row of the group whose view of the batch buffers is current, `ticket_stage` the staging mark of each group's
     /// queued router read
@@ -911,17 +977,14 @@ impl<'c, 'm> GpuSession<'c, 'm> {
             pe: a(h)?, key: a(ch)?, keyn: a(ch)?, val: a(h)?, qry: a(ch)?, gv: a(ch)?, gvn: a(ch)?,
             logits: a(c.vocab)?,
         };
-        let ab = |n: usize| a(MAX_BATCH * n);
-        let bb = BatchBufs {
-            r: ab(ch)?, rn: ab(ch)?, u: ab(h)?, g: ab(cs)?, y: ab(h)?, down: ab(c.hc_rank)?, up: ab(ch)?,
-            qkv: ab(2 * kd + vd)?, x: ab(2 * kd + vd)?, z: ab(vd)?, beta: ab(c.ssm_v_heads)?, alpha: ab(c.ssm_v_heads)?, o: ab(vd)?,
-            qg: ab(2 * qd)?, q: ab(qd)?, gate: ab(qd)?, att: ctx.alloc(ATT_ROWS * c.n_head * cap * 8).map_err(e)?, kk: ab(kvd)?, iq: ab(c.idx_heads * id)?, ao: ab(qd)?, rl: ab(c.n_expert)?, sgl: ab(1)?,
+        let fixed = FixedBufs {
+            att: ctx.alloc(ATT_ROWS * c.n_head * cap * 8).map_err(e)?,
             sel_iqn: a(SEL_ROWS * c.idx_heads * id)?,
             sel_scores: a(SEL_ROWS * (cap / c.compress.iter().copied().filter(|&r| r > 0).min().unwrap_or(1) + 1))?,
             sel_toks: a(SEL_ROWS * (c.idx_budget + ratio) + SEL_ROWS)?,
-            sg: ab(c.shared_ff)?, su: ab(c.shared_ff)?, sa: ab(c.shared_ff)?, so: ab(h)?, logits: a(COLS_MAX * c.vocab)?,
-            gtab: ab(64 * k)?, eg: ab(2 * k * c.expert_ff)?, act: ab(k * c.expert_ff)?, eo: ab(k * h)?,
+            logits: a(COLS_MAX * c.vocab)?,
         };
+        let bb = make_bb(c, MAX_BATCH, &mut |n| a(n), fixed)?;
         let replay = Replay {
             qkv: a(c.n_layer * MAX_VERIFY * (2 * kd + vd))?, ba: a(c.n_layer * MAX_VERIFY * 2 * c.ssm_v_heads)?,
             ple: a(MAX_VERIFY * ch)?, pass: None, on: std::cell::Cell::new(false),
@@ -1183,6 +1246,9 @@ impl<'c, 'm> GpuSession<'c, 'm> {
             cpu_join: (0, 0.0, 0.0),
             cpu_host: (0.0, 0.0),
             lent: None,
+            sp: None,
+            rows: MAX_BATCH,
+            small_bb: None,
             pipeline: tiers.pipeline,
             pipe_active: false,
             pipelined_passes: 0,
@@ -1191,7 +1257,7 @@ impl<'c, 'm> GpuSession<'c, 'm> {
             mapped_event2: ctx.event().map_err(e)?,
             group_event: ctx.event().map_err(e)?,
             ticket_stage: [usize::MAX; 2],
-            mapped: PinnedRegion::new(ctx, MAX_BATCH.max(2) * c.n_expert * 4)?,
+            mapped: PinnedRegion::new(ctx, BIG_BATCH.max(2) * c.n_expert * 4)?,
             mapped_event: ctx.event().map_err(e)?,
             waits: [0.0; 3],
             stage_ptr: std::ptr::null_mut(),
@@ -2269,13 +2335,23 @@ impl<'c, 'm> GpuSession<'c, 'm> {
     /// of it) to a long prompt as staging: a prompt chunk's whole expert union for a layer is then copied once and run in one
     /// group, instead of in groups of the few free slots.  The evicted entries come back with `restore_cache`.  False when
     /// there is nothing to lend (no cache, a pinned placement).
-    pub fn lend_cache(&mut self) -> bool {
+    /// Tokens a pass can take now: `MAX_BATCH`, more while a long prompt has the cache lent.
+    pub fn batch_rows(&self) -> usize {
+        self.rows
+    }
+
+    /// `long`: a prompt long enough (`LONG_PROMPT` tokens) to pay for the layer-ahead pipeline and the big batch (which allocate pinned
+    /// buffers and read the evicted experts back from the file afterwards); a shorter one lends the tail only.
+    pub fn lend_cache(&mut self, long: bool) -> bool {
         if self.lent.is_some() || self.cache.slots == 0 || self.cache.arena.is_none() || self.cache.layer_range != self.cache.evict_range {
             return false;
         }
+        let pipe = long && !std::env::var("SHADOW_PREFILL_PIPE").is_ok_and(|v| v == "0");
+        let big = !std::env::var("SHADOW_PREFILL_BIG").is_ok_and(|v| v == "0");
         let want = std::env::var("SHADOW_PREFILL_LEND_MIB").ok().and_then(|v| v.parse::<usize>().ok()).map(|m| m << 20)
-            .unwrap_or(self.m.cfg.n_expert * self.cache.slot_bytes)
-            .min(self.cache.arena_bytes / 2);
+            .unwrap_or((self.m.cfg.n_expert * if pipe { 2 } else { 1 } + if pipe { 2 } else { 0 }) * self.cache.slot_bytes
+                       + if pipe && big { bb_row_floats(&self.m.cfg) * BIG_BATCH * 4 + (1 << 16) } else { 0 })
+            .min(self.cache.arena_bytes / 10 * 9);
         let target = self.cache.arena_bytes - want;
         let s0 = self.cache.slot_offset.partition_point(|&o| (o as usize) < target);
         if s0 >= self.cache.slots {
@@ -2313,17 +2389,283 @@ impl<'c, 'm> GpuSession<'c, 'm> {
         }
         let ptr = self.cache.arena.as_ref().unwrap().ptr + start as u64;
         self.lent = Some(Lent { ptr, n, saved, evict_saved });
+        if pipe && n >= 2 * self.m.cfg.n_expert {
+            self.stage_pipe_init(ptr);
+            if big {
+                self.big_batch_on();
+            }
+        }
         true
+    }
+
+    /// Two pinned read-ahead buffers (a slot for the most file-only experts a layer has) and the copy events, for the lent cache at `base`.
+    fn stage_pipe_init(&mut self, base: u64) {
+        let ne = self.m.cfg.n_expert;
+        let mut per_layer = vec![0usize; self.m.cfg.n_layer];
+        for &(l, _) in self.ram.at.keys() {
+            per_layer[l] += 1;
+        }
+        let slots = per_layer.iter().map(|&n| ne.saturating_sub(n)).max().unwrap_or(ne).max(1);
+        let bytes = slots * self.cache.slot_bytes;
+        let (Ok(a), Ok(b), Ok(e0), Ok(e1)) =
+            (PinnedRegion::new(self.ctx, bytes), PinnedRegion::new(self.ctx, bytes), self.ctx.event(), self.ctx.event()) else { return };
+        self.sp = Some(StagePipe { base, events: [e0, e1], ready: [usize::MAX; 2], bufs: [a, b], layer: [usize::MAX; 2],
+                                   at: [HashMap::new(), HashMap::new()], slots, pending: false });
+    }
+
+    /// Waits for the read-ahead's file reads.
+    fn stage_pipe_wait(&mut self) {
+        if let Some(sp) = self.sp.as_mut() {
+            if sp.pending {
+                let t0 = std::time::Instant::now();
+                self.m.experts_wait();
+                self.waits[2] += t0.elapsed().as_secs_f64();
+                sp.pending = false;
+            }
+        }
+    }
+
+    /// Starts reading layer `l`'s file-only experts (in neither the VRAM cache nor the RAM tier) on the read pool into the buffer of l's parity.
+    fn stage_pipe_read(&mut self, l: usize) {
+        if self.sp.is_none() || l >= self.m.cfg.n_layer {
+            return;
+        }
+        self.stage_pipe_wait();
+        let names = ["gate", "up", "down"].map(|p| format!("blk.{l}.ffn_{p}_exps.weight"));
+        let sizes: Vec<usize> = names.iter().map(|n| self.m.expert_bytes(n)).collect();
+        let total: usize = sizes.iter().sum();
+        let stride = self.cache.slot_bytes;
+        let want: Vec<usize> = (0..self.m.cfg.n_expert)
+            .filter(|&e| !self.cache.map.contains_key(&(l, e)) && !self.ram.at.contains_key(&(l, e))).collect();
+        let sp = self.sp.as_mut().unwrap();
+        let p = l & 1;
+        let want = &want[..want.len().min(sp.slots)];
+        sp.layer[p] = l;
+        sp.at[p] = want.iter().enumerate().map(|(s, &e)| (e, s)).collect();
+        if want.is_empty() {
+            return;
+        }
+        let mut jobs: Vec<(&str, usize, &mut [u8])> = Vec::with_capacity(3 * want.len());
+        for (&e, slot) in want.iter().zip(sp.bufs[p].as_mut_slice().chunks_mut(stride)) {
+            let (gate, more) = slot[..total].split_at_mut(sizes[0]);
+            let (up, down) = more.split_at_mut(sizes[1]);
+            jobs.push((&names[2], e, down));
+            jobs.push((&names[0], e, gate));
+            jobs.push((&names[1], e, up));
+        }
+        // SAFETY: buffer p is not touched again until `stage_pipe_wait` (the next `stage_pipe_read`, the copies out of it in
+        // `stage_copy`, `restore_cache`); its previous contents (layer l - 2's) were copied out by a transfer the caller has seen finish.
+        unsafe { self.m.experts_submit(&mut jobs) };
+        sp.pending = true;
+    }
+
+    /// Queues the copy of all of layer `l`'s experts that the VRAM cache does not hold into stage half l & 1 (slot = expert number), from the
+    /// RAM tier or the read-ahead buffer (waiting for its reads), and records the half's event.
+    fn stage_copy(&mut self, l: usize) {
+        self.stage_pipe_wait();
+        let names = ["gate", "up", "down"].map(|p| format!("blk.{l}.ffn_{p}_exps.weight"));
+        let total: usize = names.iter().map(|n| self.m.expert_bytes(n)).sum();
+        let stream = self.copy_stream.raw();
+        let p = l & 1;
+        let half = self.sp.as_ref().unwrap().base + (p * self.m.cfg.n_expert * self.cache.slot_bytes) as u64;
+        let mut n = 0u64;
+        for e in 0..self.m.cfg.n_expert {
+            if self.cache.map.contains_key(&(l, e)) {
+                continue;
+            }
+            let dst = half + (e * self.cache.slot_bytes) as u64;
+            if let Some(&off) = self.ram.at.get(&(l, e)) {
+                let src = &self.ram.region.as_ref().unwrap().as_slice()[off..off + total];
+                self.upload_pinned_on(dst, src, stream);
+                self.ram.served += 1;
+            } else {
+                let sp = self.sp.as_ref().unwrap();
+                let slot = *sp.at[p].get(&e).expect("a staged expert in neither the RAM tier nor the read-ahead");
+                debug_assert_eq!(sp.layer[p], l);
+                let src = &sp.bufs[p].as_slice()[slot * self.cache.slot_bytes..slot * self.cache.slot_bytes + total];
+                self.upload_pinned_on(dst, src, stream);
+                self.ram.drive += 1;
+            }
+            n += 1;
+        }
+        self.expert_uploads += 3 * n as usize;
+        let sp = self.sp.as_mut().unwrap();
+        sp.events[p].record(Some(&self.copy_stream)).unwrap();
+        sp.ready[p] = l;
+    }
+
+    /// Layer `l`'s routed experts for a long prompt's m tokens, all in one group: the resident ones from the cache, the rest from stage
+    /// half l & 1, which the previous layer's `moe_staged` has been copying in while it ran (the first layer of a pass fills it here);
+    /// then layer l + 1's copy is queued behind the resident experts' launches and layer l + 2's file reads started.
+    fn moe_staged(&mut self, l: usize, m: usize, tops: &[Vec<(usize, f64)>], infos: &[TensorInfo], sizes: &[usize], _names: &[String; 3]) {
+        let c = &self.m.cfg;
+        let (h, k, ne) = (c.hidden, c.n_expert_used, c.n_expert);
+        let p = l & 1;
+        if self.sp.as_ref().unwrap().ready[p] != l {
+            // the first layer of a pass: read and copy it here, and start layer l + 1's reads
+            self.stage_pipe_read(l);
+            self.stage_copy(l);
+            self.stage_pipe_read(l + 1);
+        }
+        let mut seen = vec![false; ne];
+        let mut set: Vec<usize> = Vec::new();
+        for top in tops {
+            for &(e, _) in top {
+                if !seen[e] {
+                    seen[e] = true;
+                    set.push(e);
+                }
+            }
+        }
+        let t_a = std::time::Instant::now();
+        let arena = self.cache.arena.as_ref().unwrap().ptr;
+        let half = self.sp.as_ref().unwrap().base + (p * ne * self.cache.slot_bytes) as u64;
+        for &e in &set {
+            if self.cache.touch((l, e)).is_some() {
+                self.cache.hits += 1;
+            } else {
+                self.cache.misses += 1;
+            }
+        }
+        let part = [0u64, sizes[0] as u64, (sizes[0] + sizes[1]) as u64];
+        let addr = |e: usize| match self.cache.map.get(&(l, e)) {
+            Some(&s) => arena + self.cache.slot_offset[s],
+            None => half + (e * self.cache.slot_bytes) as u64,
+        };
+        let copied = |e: usize| !self.cache.map.contains_key(&(l, e));
+        let plan = grouped_plan(tops, 0, m, &set, k, self.rows * k, addr, copied, part);
+        assert!(plan.bytes.len() <= self.bb.gtab.bytes, "grouped experts: {} bytes of tables", plan.bytes.len());
+        self.upload_to(self.bb.gtab.ptr, &plan.bytes);
+        self.routed_grouped(&plan, 0, 0, m, infos);
+        self.ctx.stream_wait_event(None, &self.sp.as_ref().unwrap().events[p]).unwrap();
+        self.routed_grouped(&plan, 1, 0, m, infos);
+        let bb = &self.bb;
+        self.k2("moe_combine_qwen_rows", (h as u32).div_ceil(256), m as u32, 256, &[
+            Arg::Ptr(row(&bb.y, h, 0)), Arg::Ptr(row(&bb.eo, k * h, 0)), Arg::Ptr(bb.gtab.ptr + plan.weights),
+            Arg::Ptr(row(&bb.so, h, 0)), Arg::Ptr(row(&bb.sgl, 1, 0)), Arg::Ptr(bb.gtab.ptr + plan.counts),
+            Arg::U32(h as u32), Arg::U32(k as u32)]);
+        // now the next layer's copy and the one after's reads, behind this layer's launches: the GPU runs this layer while the host queues them
+        let t_b = std::time::Instant::now();
+        if l + 1 < self.m.cfg.n_layer {
+            self.stage_copy(l + 1);
+            let t_c = std::time::Instant::now();
+            // buffer l & 1 held layer l's file-only experts: its copy (queued before the previous layer's compute) has finished
+            self.sp.as_ref().unwrap().events[p].synchronize().unwrap();
+            let t_d = std::time::Instant::now();
+            self.stage_pipe_read(l + 2);
+            if std::env::var_os("SHADOW_SP_PROF").is_some() {
+                static ACC: std::sync::Mutex<(u64, [f64; 5])> = std::sync::Mutex::new((0, [0.0; 5]));
+                let mut a = ACC.lock().unwrap();
+                a.0 += 1;
+                a.1[0] += (t_b - t_a).as_secs_f64(); // plan + upload + resident launch
+                a.1[1] += (t_c - t_b).as_secs_f64(); // stage_copy(l+1) host time (incl. waiting for reads)
+                a.1[2] += (t_d - t_c).as_secs_f64(); // event sync
+                a.1[3] += t_d.elapsed().as_secs_f64(); // starting l+2's reads
+                if a.0 % 96 == 0 {
+                    let n = a.0 as f64;
+                    eprintln!("sp-prof ({} layers, ms each): plan+launch0 {:.1}, copy(l+1) {:.1}, event wait {:.1}, start reads {:.1}; router wait {:.1}",
+                              a.0, 1e3 * a.1[0] / n, 1e3 * a.1[1] / n, 1e3 * a.1[2] / n, 1e3 * a.1[3] / n, 1e3 * self.waits[0] / n);
+                }
+            }
+        }
+    }
+
+    /// The per-token buffers for `BIG_BATCH` tokens, carved from the lent cache after the stage halves, swapped in for the ones for
+    /// `MAX_BATCH` (the buffers that do not grow with the batch are shared); false if the lent room is too small.
+    fn big_batch_on(&mut self) -> bool {
+        let (Some(lent), true) = (self.lent.as_ref(), self.sp.is_some()) else { return false };
+        let c = &self.m.cfg;
+        let need = bb_row_floats(c) * BIG_BATCH * 4 + 64 * 40; // the 256-byte rounding of ~40 buffers
+        let start = self.sp.as_ref().unwrap().base + (2 * c.n_expert * self.cache.slot_bytes) as u64;
+        let end = lent.ptr + (lent.n * self.cache.slot_bytes) as u64;
+        if start + need as u64 > end {
+            return false;
+        }
+        let ctx = self.ctx;
+        let mut at = start;
+        let mut take = |floats: usize| -> Result<DeviceBuffer<'c>, String> {
+            let bytes = floats.max(1) * 4;
+            let p = at;
+            at += bytes.next_multiple_of(256) as u64;
+            // SAFETY: inside the lent cache, past the stage halves: nothing else uses it until `big_batch_off`, which swaps these away.
+            Ok(unsafe { DeviceBuffer::view(ctx, p, bytes) })
+        };
+        let dummy = |ctx: &'c Context| unsafe { DeviceBuffer::view(ctx, 0, 0) };
+        let fixed = FixedBufs {
+            att: std::mem::replace(&mut self.bb.att, dummy(ctx)), sel_iqn: std::mem::replace(&mut self.bb.sel_iqn, dummy(ctx)),
+            sel_scores: std::mem::replace(&mut self.bb.sel_scores, dummy(ctx)), sel_toks: std::mem::replace(&mut self.bb.sel_toks, dummy(ctx)),
+            logits: std::mem::replace(&mut self.bb.logits, dummy(ctx)),
+        };
+        let built = make_bb(c, BIG_BATCH, &mut take, fixed);
+        assert!(at <= end, "big batch buffers: {} bytes carved of {} lent", at - start, end - start);
+        match built {
+            Ok(big) => {
+                self.small_bb = Some(std::mem::replace(&mut self.bb, big));
+                self.rows = BIG_BATCH;
+                self.batch_max = BIG_BATCH;
+                true
+            }
+            Err(_) => false, // cannot happen: `take` does not fail; the fixed buffers are dropped views
+        }
+    }
+
+    /// Back to the buffers for `MAX_BATCH` tokens (the shared ones move back).
+    fn big_batch_off(&mut self) {
+        let Some(mut small) = self.small_bb.take() else { return };
+        for (a, b) in [(&mut small.att, &mut self.bb.att), (&mut small.sel_iqn, &mut self.bb.sel_iqn), (&mut small.sel_scores, &mut self.bb.sel_scores),
+                       (&mut small.sel_toks, &mut self.bb.sel_toks), (&mut small.logits, &mut self.bb.logits)] {
+            std::mem::swap(a, b);
+        }
+        self.bb = small;
+        self.rows = MAX_BATCH;
+        self.batch_max = MAX_BATCH;
     }
 
     /// Gives the lent cache back: the layers' ranges as they were, and the evicted entries read again from the RAM tier
     /// (the ones it holds; the rest warm up by demand).
     pub fn restore_cache(&mut self) {
         let Some(lent) = self.lent.take() else { return };
+        self.stage_pipe_wait();
         self.ctx.synchronize().unwrap();
+        self.big_batch_off();
         self.cache.evict_range = lent.evict_saved;
         let arena = self.cache.arena.as_ref().unwrap().ptr;
         let stream = self.copy_stream.raw();
+        // the evicted experts the RAM tier does not hold come back from the file, through the pipeline's pinned read-ahead buffer
+        if let Some(mut sp) = self.sp.take() {
+            let cold: Vec<(usize, usize, usize)> = lent.saved.iter().copied()
+                .filter(|&(_, l, e)| !self.cache.map.contains_key(&(l, e)) && !self.ram.at.contains_key(&(l, e))).collect();
+            let stride = self.cache.slot_bytes;
+            for batch in cold.chunks(sp.slots.max(1)) {
+                let mut sizes_of: Vec<[usize; 3]> = vec![];
+                let mut names_of: Vec<[String; 3]> = vec![];
+                for &(_, l, _) in batch {
+                    let names = ["gate", "up", "down"].map(|p| format!("blk.{l}.ffn_{p}_exps.weight"));
+                    sizes_of.push([self.m.expert_bytes(&names[0]), self.m.expert_bytes(&names[1]), self.m.expert_bytes(&names[2])]);
+                    names_of.push(names);
+                }
+                {
+                    let mut jobs: Vec<(&str, usize, &mut [u8])> = Vec::with_capacity(3 * batch.len());
+                    for (((&(_, _, e), names), sz), slot) in batch.iter().zip(&names_of).zip(&sizes_of).zip(sp.bufs[0].as_mut_slice().chunks_mut(stride)) {
+                        let (gate, more) = slot[..sz[0] + sz[1] + sz[2]].split_at_mut(sz[0]);
+                        let (up, down) = more.split_at_mut(sz[1]);
+                        jobs.push((&names[2], e, down));
+                        jobs.push((&names[0], e, gate));
+                        jobs.push((&names[1], e, up));
+                    }
+                    self.m.experts_into_many(&mut jobs);
+                }
+                for (i, &(s, l, e)) in batch.iter().enumerate() {
+                    let total: usize = sizes_of[i].iter().sum();
+                    let src = &sp.bufs[0].as_slice()[i * stride..i * stride + total];
+                    self.upload_pinned_on(arena + self.cache.slot_offset[s], src, stream);
+                    self.cache.owner[s] = Some((l, e));
+                    self.cache.map.insert((l, e), s);
+                    self.cache.stamp[s] = 0;
+                }
+                self.copy_stream.synchronize().unwrap();
+            }
+        }
         for (s, l, e) in lent.saved {
             // the prompt may have loaded this expert again into another slot: one owner only
             if self.cache.map.contains_key(&(l, e)) {
@@ -2933,7 +3275,7 @@ impl<'c, 'm> GpuSession<'c, 'm> {
             if graphs && !c.is_attention(l) && l != c.ple_layer {
                 // a DeltaNet layer up to its router is the same launches for every batch of m: one graph
                 let on = self.replay.on.get();
-                self.batch_graph_segment((l, rn_ready, m, on, 0), |s| {
+                self.batch_graph_segment((l, rn_ready, m, on, (self.rows > MAX_BATCH) as usize), |s| {
                     s.hc_read_batch(&format!("blk.{l}.hc_attn"), true, rn_ready, m);
                     s.delta_batch(l, m);
                     s.hc_write_batch(Some(&format!("blk.{l}.hc_ffn_norm.weight")), m);
@@ -3543,6 +3885,10 @@ impl<'c, 'm> GpuSession<'c, 'm> {
         if cpu_pending {
             self.cpu_host.0 += t_plan.elapsed().as_secs_f64();
         }
+        if self.sp.is_some() && m > MAX_VERIFY && !cpu_pending {
+            self.moe_staged(l, m, &tops, &infos, &sizes, &names);
+            return;
+        }
         // misses read from the file may wait in the staging buffer, a slot each
         let max_file = self.staging.as_ref().map_or(usize::MAX, |s| s.len() / self.cache.slot_bytes.max(1));
         let scratch = match self.lent.as_ref() {
@@ -3633,7 +3979,7 @@ impl<'c, 'm> GpuSession<'c, 'm> {
                     None => extra.iter().find(|x| x.0 == e).expect("a routed expert neither cached nor fetched").1,
                 };
                 let copied = |e: usize| copying.iter().any(|c| c.0 == e);
-                let p = grouped_plan(&tops, start, end, &set, k, MAX_BATCH * k, addr, copied, part);
+                let p = grouped_plan(&tops, start, end, &set, k, self.rows * k, addr, copied, part);
                 assert!(p.bytes.len() <= self.bb.gtab.bytes, "grouped experts: {} bytes of tables", p.bytes.len());
                 self.upload_to(self.bb.gtab.ptr, &p.bytes);
                 if start == 0 {
@@ -3714,7 +4060,7 @@ impl<'c, 'm> GpuSession<'c, 'm> {
         if n == 0 {
             return;
         }
-        let up = (MAX_BATCH * k * ff * 4) as u64;
+        let up = (self.rows * k * ff * 4) as u64;
         let grouped = |t: &TensorInfo, wt: u64, gt: u64, count: usize, x: u64, xs: usize, y: u64, ys: usize| {
             let ty = t.ty.name().to_lowercase();
             let (rows, cols) = (t.dims[1] as u32, t.dims[0] as u32);

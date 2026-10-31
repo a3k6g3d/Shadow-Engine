@@ -206,7 +206,7 @@ impl Context {
         self.bind()?;
         let mut p: CuDevicePtr = 0;
         call!(self.api, cuMemAlloc(&mut p, bytes.max(1)))?;
-        Ok(DeviceBuffer { ctx: self, ptr: p, bytes })
+        Ok(DeviceBuffer { ctx: self, ptr: p, bytes, owned: true })
     }
 
     /// A module from a CUBIN (or PTX) image.
@@ -266,6 +266,18 @@ pub struct DeviceBuffer<'c> {
     ctx: &'c Context,
     pub ptr: CuDevicePtr,
     pub bytes: usize,
+    /// false for a `view` of memory another buffer owns: dropping it frees nothing
+    owned: bool,
+}
+
+impl<'c> DeviceBuffer<'c> {
+    /// A buffer over `bytes` at `ptr`, inside memory that another buffer owns and that outlives this one.
+    ///
+    /// # Safety
+    /// `[ptr, ptr + bytes)` must stay allocated, and not be used through another buffer, while this value (or anything made from it) is used.
+    pub unsafe fn view(ctx: &'c Context, ptr: CuDevicePtr, bytes: usize) -> DeviceBuffer<'c> {
+        DeviceBuffer { ctx, ptr, bytes, owned: false }
+    }
 }
 
 impl DeviceBuffer<'_> {
@@ -299,7 +311,7 @@ impl DeviceBuffer<'_> {
 
 impl Drop for DeviceBuffer<'_> {
     fn drop(&mut self) {
-        if self.ctx.bind().is_ok() {
+        if self.owned && self.ctx.bind().is_ok() {
             // SAFETY: the allocation cuMemAlloc made for this value, freed once.
             unsafe { (self.ctx.api.cuMemFree)(self.ptr) };
         }

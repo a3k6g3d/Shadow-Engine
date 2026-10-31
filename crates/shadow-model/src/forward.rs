@@ -454,6 +454,26 @@ impl Model {
         self.pool.read_many(&mut reads).unwrap();
     }
 
+    /// `experts_into_many` without the wait.
+    ///
+    /// # Safety
+    /// The buffers must stay allocated and untouched until `experts_wait` has returned.
+    pub unsafe fn experts_submit(&self, jobs: &mut [(&str, usize, &mut [u8])]) {
+        let mut reads: Vec<(usize, u64, &mut [u8])> = jobs.iter_mut().map(|(name, e, out)| {
+            let t = self.g.tensor(name).unwrap_or_else(|| panic!("no tensor {name}"));
+            let per = (t.nbytes() / t.dims[2]) as usize;
+            assert_eq!(out.len(), per, "{name}: {} bytes for a {per}-byte expert slice", out.len());
+            (t.shard, t.offset + (*e * per) as u64, &mut **out)
+        }).collect();
+        // SAFETY: the caller's contract.
+        unsafe { self.pool.submit(&mut reads) };
+    }
+
+    /// Returns when every `experts_submit`ted slice is in.
+    pub fn experts_wait(&self) {
+        self.pool.wait_async().unwrap();
+    }
+
     /// One row of the n-gram table (ple_head_dim weights), cached in RAM.
     /// Reads and caches the n-gram rows that are not cached yet, in parallel (a pass's rows are random places in a
     /// 27 GB table, most of them not in the file cache: one read after another costs ~0.1 ms each).

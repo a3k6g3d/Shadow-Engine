@@ -1100,3 +1100,18 @@ Single-prompt runs, "Write a Rust function that parses a comma separated list...
 - `bench/vs-strata-final3` (3 interleaved runs, 36 varied prompts, total throughput): Shadow default **48.74** tok/s (48.7, 48.8, 48.7; 1,801 tokens a run, 17 of 35 turns ended early), Strata **48.63** (47.5, 49.3, 49.1; 1,385 tokens a run, 23.7 ended early).
   Shadow +0.2%, inside Strata's run-to-run spread. Fidelity 0.423 against 0.431. PCIe 10.95 against 11.06 GB/s, so **225 against 227 MB of expert traffic per token** (259 against 209 this morning); GPU 86% against 78% busy, 4.2 against 5.2 J a token, CPU 12% against 48%, disk 189 against 480 MB/s.
 - Still behind: prompt reading (~80 against Strata's 1,376 tok/s) and the fidelity is 0.008 under. Ahead: bit-exact `--exact` path, CPU and disk use.
+
+## 2026-10-31: prompt reading with a layer-ahead pipeline and big batches (77-87 -> 128-144 tok/s)
+
+- Nsight Systems on a 3,001-token prompt (`nsys profile --trace=cuda`, no admin needed): kernels busy 9.8 s of a 21.6 s window, host-to-device copies 9.2 s (147 GB), the two overlapped for only 4.1 s and neither ran for 6.6 s: the copies, the SSD reads and the
+  kernels took turns. Bigger chunks alone plateaued (256 -> 1024 -> 2048 tokens: 77-87 -> 94-107 -> 100-110 tok/s).
+- `moe_staged` (`session.rs`), used for prompts of `LONG_PROMPT` = 1,024 or more unread tokens: the lent cache holds two stage halves (slot = expert number, 1 GiB each); while layer l computes, layer l + 1's experts that the VRAM cache lacks are copied into the other half
+  (from the RAM tier, or from a pinned buffer that the read pool filled from the file one layer earlier), and layer l + 2's file reads start. All of a layer's tokens run in one group, so no expert is copied twice; the bytes are the model's, so the arithmetic is unchanged.
+  `ReadPool::submit` / `wait_async` and `Model::experts_submit` / `experts_wait` are the asynchronous reads.
+- The per-token buffers for `BIG_BATCH` = 1,024 tokens are carved from the lent cache too (`DeviceBuffer::view`, `make_bb`, `big_batch_on`; 0.62 MiB a token), swapped in for the 256-token ones and swapped back, so decode keeps its VRAM
+  (a permanent 512-token batch cost decode 5.4%). `rows`/`batch_rows()` replaces `MAX_BATCH` where a buffer's row count matters; the CUDA-graph key says which. After the prompt the evicted experts that the RAM tier lacks are read back from the file, so the cache is warm again.
+- Prompts of 1.8k-4.6k tokens, 30 GiB tier, default mode: **127.8, 143.8, 133.0, 139.2 tok/s** against 74.0 / 70.6 / 68.7 / 65.4 this morning and 77-87 with the staged-load kernels; `--exact` (no RAM tier) 40 -> **62 tok/s**, same text.
+  Prompts of 128-1,023 tokens keep the old lend (256-token chunks): the pipeline's pinned buffers and cache restore cost more than they save below ~1,024 (a 24-turn chat with 250-token continuations ran at 5.6 tok/s end to end with it, 14 without).
+- Decode unchanged: varied bench 3 runs, total throughput **48.53** tok/s (48.5, 48.6, 48.6) against 47.96 before; `cargo test --release` passes.
+- Fidelity noise: the 24-turn same-history fidelity is deterministic for a build but moves with tiny cache-state differences between builds: this build 0.375 (`--verify-rank 2`) and 0.447 (`--accept-moe`), earlier builds 0.423 and 0.415. Differences of 0.04 between builds or modes (and the 0.008 to Strata) are inside that noise; treat all of them as "about 0.4".
+- Still ahead of Shadow: Strata's 1,376 tok/s prompt reading (about 10x). Now per layer: ~68 ms of GPU kernels, ~64 ms of copies (1 GB a layer: all experts the cache lacks, ~30% more than a chunk uses), ~46 ms with neither busy.

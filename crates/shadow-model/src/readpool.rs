@@ -24,6 +24,8 @@ struct Job {
 pub struct ReadPool {
     work: Vec<Sender<Job>>,
     done: Mutex<Receiver<std::io::Result<()>>>,
+    /// answers still owed for pieces sent by `submit` (taken, in `done`'s lock order, by `wait_async` or the next `read_many`)
+    owed: Mutex<usize>,
     threads: Vec<JoinHandle<()>>,
 }
 
@@ -51,14 +53,14 @@ impl ReadPool {
             work.push(tx);
             threads.push(t);
         }
-        Ok(ReadPool { work, done: Mutex::new(done), threads })
+        Ok(ReadPool { work, done: Mutex::new(done), owed: Mutex::new(0), threads })
     }
 
     /// Reads every `(shard, offset, buffer)` in full, in parallel, and returns when all of them are in.
     pub fn read_many(&self, jobs: &mut [(usize, u64, &mut [u8])]) -> std::io::Result<()> {
         let done = self.done.lock().unwrap_or_else(|p| p.into_inner());
+        let mut result = self.drain(&done);
         let mut sent = 0usize;
-        let mut result = Ok(());
         'send: for (shard, offset, buf) in jobs.iter_mut() {
             for (k, piece) in buf.chunks_mut(CHUNK).enumerate() {
                 let job = Job { shard: *shard, offset: *offset + (k * CHUNK) as u64, ptr: piece.as_mut_ptr() as usize,
@@ -78,6 +80,46 @@ impl ReadPool {
             }
         }
         result
+    }
+}
+
+impl ReadPool {
+    /// The answers owed for `submit`ted pieces.
+    fn drain(&self, done: &Receiver<std::io::Result<()>>) -> std::io::Result<()> {
+        let owed = std::mem::take(&mut *self.owed.lock().unwrap_or_else(|p| p.into_inner()));
+        let mut result = Ok(());
+        for _ in 0..owed {
+            let r = done.recv().expect("read worker gone");
+            if result.is_ok() {
+                result = r;
+            }
+        }
+        result
+    }
+
+    /// `read_many` without the wait: queues every `(shard, offset, buffer)` and returns.
+    ///
+    /// # Safety
+    /// The buffers must stay allocated and untouched until `wait_async` (or any `read_many`, which waits first) has returned.
+    pub unsafe fn submit(&self, jobs: &mut [(usize, u64, &mut [u8])]) {
+        let _done = self.done.lock().unwrap_or_else(|p| p.into_inner());
+        let mut owed = self.owed.lock().unwrap_or_else(|p| p.into_inner());
+        let mut sent = *owed;
+        for (shard, offset, buf) in jobs.iter_mut() {
+            for (k, piece) in buf.chunks_mut(CHUNK).enumerate() {
+                let job = Job { shard: *shard, offset: *offset + (k * CHUNK) as u64, ptr: piece.as_mut_ptr() as usize,
+                                len: piece.len() };
+                self.work[sent % self.work.len()].send(job).expect("read worker gone");
+                sent += 1;
+                *owed += 1;
+            }
+        }
+    }
+
+    /// Returns when every `submit`ted piece is in.
+    pub fn wait_async(&self) -> std::io::Result<()> {
+        let done = self.done.lock().unwrap_or_else(|p| p.into_inner());
+        self.drain(&done)
     }
 }
 
