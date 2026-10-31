@@ -955,3 +955,24 @@ Single-prompt runs, "Write a Rust function that parses a comma separated list...
 - Earlier attempts on the bus all moved the wait instead of removing it: pre-gated prefetch (the DMA slows the layer's own work), zero-copy reads (7 GB/s), CPU experts
   (the join). What removes bytes from the bus: more hits (the cache is at the VRAM edge, see above), skipping (a fidelity trade), computing on the CPU without a per-layer join.
 - Decision: device-side planning is not built; a 6.5% ceiling for a large change is the worst ratio of the remaining ideas.
+
+## 2026-10-31: speed at matched fidelity (the skip ladder)
+
+- Same-history fidelity (`tools/quality_test.py`, 24 turns, the exact run's replies as history; Strata measured 0.431 the same way) against speed (varied bench, 3 runs, total
+  throughput, no turn ended early in any arm):
+
+  | config | fidelity | tok/s | tokens a run |
+  |---|---|---|---|
+  | default (`--tail-skip 4 --accept-moe`) | 0.572 | 37.01 | 2,041 |
+  | `--accept-scale 0.5` | 0.525 | not benched | |
+  | `--verify-rank 2` | 0.475 | **42.79** (+15.6%) | 1,806 (-11.5%) |
+  | `--tail-skip 3` | 0.415 | **39.39** (+6.4%) | 2,034 |
+  | `--tail-skip 3 --accept-scale 0.5` | 0.410 | not benched | |
+  | `--tail-skip 2` | 0.328 | not benched | |
+  | Strata (earlier bench) | 0.431 | 47.2 | 1,417 |
+
+- At Strata's fidelity (0.415 to 0.475 brackets 0.431) Shadow runs **39.4 to 42.8 tok/s against Strata's 47.2: 83% to 91%**, the gap at equal quality being narrower than at the
+  default (78%). `--verify-rank 2` buys the most speed but its replies are 11.5% shorter (shorter replies enter the history; the earlier `--verify-resident` truncation started the
+  same way, though no turn ended early here), so `--tail-skip 3` is the like-for-like step: +6.4% at the same length. Defaults unchanged; both stay options. `--tail-skip 3` is
+  slightly below Strata's fidelity, `--verify-rank 2` slightly above.
+- Hit rate stays at 49-50% in all of these (50.0% for rank 2): the skips remove copies, not misses.
