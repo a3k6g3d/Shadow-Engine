@@ -245,7 +245,7 @@ fn compare(path: &std::path::Path, fixture: &std::path::Path, mode: Mode, rest: 
 }
 
 /// The fastest measured serving mode that keeps replies at Strata's fidelity (docs/STATUS.md: ~39 tok/s by total throughput,
-/// exact mode ~20) is what `shadow serve` runs unless the flags say otherwise: tail-skip 3, AcceptMoE, the DFlash 2 drafter (Q8_0) with
+/// exact mode ~20) is what `shadow serve` runs unless the flags say otherwise: tail-skip 3, `--verify-rank 2`, the DFlash 2 drafter (Q8_0) with
 /// 3 drafts a pass, a 36 GiB RAM expert tier (30 when under 49 GiB of RAM is available now) and the routing profile.  Each is only a default (give the flag to change
 /// it; `--dflash off`, `--tail-skip 0`); `--exact` turns all of them off - the exact, unspeculated path, bit for bit
 /// the reference.
@@ -266,10 +266,11 @@ fn fastest_defaults(rest: &[String]) -> Vec<String> {
     if !has("--tail-skip") {
         set.extend(["--tail-skip".into(), "3".into()]);
     }
-    // AcceptMoE's verifier expert sets: the most faithful inexact verify measured (same-history prefix match 0.57 against
-    // 0.48 for plain tail skip) at the same speed (docs/SPECULATION.md)
+    // `--verify-rank 2`: the verify pass's drafted positions keep their top 2 routed experts and drop the rest that are not in VRAM:
+    // +8.6% over AcceptMoE (42.8 against 39.4 tok/s on the varied bench) for replies ~11.5% shorter, fidelity level with Strata's
+    // (docs/STATUS.md).  `--accept-moe` (the most faithful inexact verify measured, same speed as plain tail skip) is the opt-out.
     if !has("--accept-moe") && !has("--verify-resident") && !has("--verify-rank") {
-        set.push("--accept-moe".into());
+        set.extend(["--verify-rank".into(), "2".into()]);
     }
     // NOT `--verify-resident`: it computes a verify pass's extra positions with the resident experts only, and the logits
     // that pick the next token come from those positions - 11 of 14 varied-text answers ended early (EOS), against 3 of 14

@@ -2325,6 +2325,10 @@ impl<'c, 'm> GpuSession<'c, 'm> {
         let arena = self.cache.arena.as_ref().unwrap().ptr;
         let stream = self.copy_stream.raw();
         for (s, l, e) in lent.saved {
+            // the prompt may have loaded this expert again into another slot: one owner only
+            if self.cache.map.contains_key(&(l, e)) {
+                continue;
+            }
             let Some(&off) = self.ram.at.get(&(l, e)) else { continue };
             let Some(region) = self.ram.region.as_ref() else { continue };
             let total: usize = ["gate", "up", "down"].iter().map(|p| self.m.expert_bytes(&format!("blk.{l}.ffn_{p}_exps.weight"))).sum();

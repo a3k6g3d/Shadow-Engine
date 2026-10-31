@@ -7,6 +7,8 @@ All notable changes to Shadow will be documented in this file.
 - Long prompts (128+ unread tokens) borrow the tail of the VRAM expert cache as staging and are read in 256-token chunks; the cache is restored from the RAM tier afterwards.
   Prompt reading 51 -> 78-86 tok/s in the default mode (2.3x in `--exact`), output unchanged, decode unaffected. `SHADOW_NO_LEND=1` turns it off (docs/STATUS.md).
 ### Changed
+- **Fix:** ending a prompt's cache lending could leave an expert owned by two cache slots (loaded again during the prompt, then restored into its old slot), which crashed a later chat turn with "a routed expert neither cached nor fetched" (HTTP 500) - seen at turn 14 of a 24-turn history with 250-token continuations.
+- `shadow serve` defaults to `--verify-rank 2` instead of `--accept-moe`: decode 47.96 against 45.11 tok/s (varied bench), replies 10.6% shorter, same-history fidelity 0.423 (AcceptMoE 0.415, Strata 0.431). `--accept-moe` restores the old default.
 - Attention kernel 2.7x faster (shared-memory q, 16-byte K loads, staged score tiles; same arithmetic order, bit-identical) and the indexer's scores in row launches: prompts of 1.8k-4.6k tokens read 4-28% faster.
 - Long prompts: past the indexer budget (2,051 positions) attention selects each token's positions SEL_ROWS at a time and runs them in one launch per 8 tokens, instead of one synchronous round trip per token and layer; bit-identical, prompt reading +16% on a 4.5k-token prompt.
 - `shadow serve` defaults to a 36 GiB RAM tier when 49 GiB of RAM is available at start (30 GiB otherwise): +2.5% decode, ~+10% prompt reading; `--ram-floor-gib N` makes the 4 GiB RAM floor a flag.

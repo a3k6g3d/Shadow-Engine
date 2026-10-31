@@ -1086,3 +1086,11 @@ Single-prompt runs, "Write a Rust function that parses a comma separated list...
   Used when `hd` is a multiple of 16 and at most 256 (else the per-head kernel).
 - Attention layers on a 4.5k-token prompt (`SHADOW_LTIME=1`, 30 GiB tier): 675 ms (after the staged-load kernel; 1,251 before any of it) -> **267 ms** a pass (hb 4; hb 8: 277). Prompt reading 80.1 -> **81.2 tok/s**: attention
   is now ~9% of a pass, so the rest of the gain is small; the MoE segment (2.2 s of ~3 s) and the file reads are what is left.
+
+## 2026-10-31: `--verify-rank 2` is the default; a lending bug fixed
+
+- **Decode got faster from the attention work, not only prompts.** Verify passes (2-8 tokens) past 2,051 positions went through the per-token sparse path with a synchronous scores download per token and layer; they now use the grouped path. Varied bench, 3 runs each, 30 GiB tier,
+  total throughput: `--verify-rank 2` **47.96** tok/s (47.4, 48.2, 48.2; 1,801 tokens a run, 17 of 35 turns ended early), AcceptMoE **45.11** (45.0, 45.1, 45.2; 2,015 tokens a run) against 42.8 and 39.8 before (and Strata's 48.3 earlier today).
+- Same-history fidelity of `--verify-rank 2` as the default (24 turns, 3 runs, identical each time): **0.423**, 6 of 24 replies identical (AcceptMoE 0.415, Strata 0.431). `shadow serve` now runs `--verify-rank 2` unless `--accept-moe`, `--verify-resident` or `--verify-rank` is given.
+- **Bug fixed (introduced with prompt lending, 65c5f27):** `restore_cache` put each evicted expert back into its old slot without checking that the prompt had not loaded it again into another slot, leaving two slots owning one expert; a later eviction then dropped the live mapping and
+  `moe_batch` panicked with "a routed expert neither cached nor fetched" (HTTP 500). It showed on the 24-turn same-history test at turn 14 (250-token continuations; it needs a prompt of 128+ unread tokens), every run, and not with `SHADOW_NO_LEND=1`. Fixed by skipping entries already cached; all 24 turns pass.
