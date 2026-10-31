@@ -554,6 +554,17 @@ extern "C" __global__ void attention_heads_rows(const float* q, const float* kc,
                    scratch + j * nh * stride, stride, nkv, hd, group, blockIdx.x);
 }
 
+// Tokens j = blockIdx.y attending over their own selected positions: toks + j * tstride, ntoks[j] of them (the sparse
+// selection).  q, gate and o rows nh * hd apart, scratch rows nh * stride doubles.  grid = (nh, rows).
+extern "C" __global__ void attention_heads_sel_rows(const float* q, const float* kc, const float* vc, const u32* toks,
+                                                    unsigned int tstride, const u32* ntoks, const float* gate, float* o,
+                                                    double* scratch, unsigned int stride, unsigned int nkv, unsigned int hd,
+                                                    unsigned int group, unsigned int nh) {
+    const u64 j = blockIdx.y, qd = (u64) nh * hd;
+    attention_head(q + j * qd, kc, vc, toks + j * tstride, ntoks[j], gate + j * qd, o + j * qd,
+                   scratch + j * nh * stride, stride, nkv, hd, group, blockIdx.x);
+}
+
 // Softmax attention of each query head over positions start_pos .. start_pos + ntok, GQA, with a learned per-head
 // sink logit included in the softmax max and denominator (zero value contribution) and no output gate (Flint).
 extern "C" __global__ void attention_sinks_heads(const float* q, const float* kc, const float* vc,

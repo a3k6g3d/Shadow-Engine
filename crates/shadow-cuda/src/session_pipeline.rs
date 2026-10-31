@@ -2,7 +2,9 @@
 //!
 //! A verify window of m tokens is cut into two groups, A = rows [0, ma) and B = the rest.  Per layer the GPU stream runs
 //!
-//!     pre(l, A)  pre(l, B)  |  post(l, A)  pre(l + 1, A)  |  post(l, B)  pre(l + 1, B)  |  ...
+//! ```text
+//! pre(l, A)  pre(l, B)  |  post(l, A)  pre(l + 1, A)  |  post(l, B)  pre(l + 1, B)  |  ...
+//! ```
 //!
 //! where `pre` is a group's mixer and router and `post` its experts, combine and hyper-connection write.  The host's
 //! work for a group's experts (reading its router logits, choosing and issuing the copies, the file reads, the CPU

@@ -1036,3 +1036,18 @@ Single-prompt runs, "Write a Rust function that parses a comma separated list...
   on this PC and leaves about 5 GiB free in steady state.
 - **Default tier is now 36 GiB** when 49 GiB or more of RAM is available at start (30 otherwise; `shadow serve` says which). Checked with the defaults: 740-token prompt 93 tok/s, peak working
   set 41.3 GiB, available RAM bottomed at 5.1 GiB, floor still 4. `shadow-ui` no longer passes `--ram-tier-gib 30`.
+
+## 2026-10-31: batched sparse attention for long prompts (+16%), default tier 36 with floor 3
+
+- `attention_batch` ran every token past the indexer budget (2,051 positions) through `attention_mid`: per token and layer an indexer query, a block-scores kernel, a **synchronous scores download**,
+  a full host sort, a selection upload and one attention launch. Now (`session.rs`, the `jt`/`SEL_ROWS` code) the tokens before the first one needing a selection still use
+  `attention_heads_rows`; the rest go SEL_ROWS (32) at a time: per token the same `head_norm_rope` and `index_scores` kernels, **one scores download per group**, the host selects the `keep` best blocks
+  with `select_nth_unstable_by` under the same total order (score, then block number: the same set as the full sort), one upload of the selections and their lengths, and the new
+  `attention_heads_sel_rows` kernel (`kernels/forward.cu`; the same `attention_head` body, 8 tokens per launch, each over its own position list). The `--trace` path keeps the per-token code.
+- Bit-identical: `--exact`, 3,003-token prompt (about 950 tokens past the budget), 48 tokens, temperature 0: the same text as the per-token path (checked against it in the same build with a
+  temporary switch). Whole `cargo test --release` passes (and a doctest in `session_pipeline.rs` that failed on an indented diagram is fixed).
+- Speed (`SHADOW_LTIME=1`, 4,574-token prompt, 30 GiB tier, 256-token chunks): the 12 attention layers 1,251 -> 1,003 ms (one download per group) -> **675 ms** a pass (the kernel); prompt 62.0 -> **72.2 tok/s** (+16%).
+  SEL_ROWS 128 changed nothing (686 ms): the rest is the kernels' own time (FP64 scores for exactness), not the syncs.
+- With the default 36 GiB tier: prompts of 1.8k-4.6k tokens **86.0 / 84.4 / 87.0 / 82.9 tok/s** against 79.0 / 73.4 / 72.8 / 69.6 before (+9% to +19%); decode right after them 43.8 tok/s.
+- The 36 GiB tier started from 49.05 GiB available bottoms out at **4.1 GiB**, a hair above the 4 GiB floor, so the default 36 GiB tier now comes with `--ram-floor-gib 3` (an explicit tier keeps 4); the watchdog
+  needs `-FloorGiB 3` for it. Under 49 GiB available the default stays 30.

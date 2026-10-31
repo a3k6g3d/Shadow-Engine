@@ -1,6 +1,6 @@
 # Runs a program under a HARD working-set cap and a free-RAM watchdog (kill below -FloorGiB, default 4, available; 0 = no watchdog kill), the way every
 # load of this model on this PC has to run (J:\Strata-work\RUN.md: an uncapped mmap load took available RAM from 55 to
-# 0.73 GiB in 49 s).  Changes no system setting.
+# 0.73 GiB in 49 s).  Changes no system setting.  `shadow serve`'s default 36 GiB tier dips to ~4.1 GiB available: run it with -FloorGiB 3.
 #
 #   powershell -File tools/run_capped.ps1 -CapGiB 16 -Out log.txt -Exe target/release/shadow.exe -Arguments 'generate M "text" -n 6'
 param([int]$CapGiB = 16, [double]$FloorGiB = 4, [string]$Out = 'run.out.txt', [Parameter(Mandatory = $true)] [string]$Exe, [string]$Arguments = '')

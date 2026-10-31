@@ -111,7 +111,7 @@ Defaults are right for normal use; these are for measurement and diagnosis.
 
 Shadow never pins memory that would leave less than **4 GiB** of RAM available, checks again after the pages are locked and
 again as the tier fills: a pinned tier cannot be paged out, and the test machine has frozen hard at 0.4 GiB free.
-`--ram-floor-gib N` changes the floor (0 turns the check off); `tools/run_capped.ps1 -FloorGiB N` and `tools/run_strata.ps1` do the same for the
+The default 36 GiB tier runs with `--ram-floor-gib 3` (available RAM bottoms out at 4.1-5.1 GiB from a start of ~49); any tier you give keeps the 4 GiB floor unless you pass the flag. `--ram-floor-gib N` changes the floor (0 turns the check off); `tools/run_capped.ps1 -FloorGiB N` and `tools/run_strata.ps1` do the same for the
 watchdog that kills a run below it. Lower it only to try a bigger `--ram-tier-gib`, and measure that it pays. The default 36 GiB tier peaks around 41 GiB resident (the 30 GiB one around 35) for the process. On a smaller
 machine pass `--ram-tier-gib` explicitly (or `auto`), or `--exact` with a small tier.
 

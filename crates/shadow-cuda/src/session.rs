@@ -164,6 +164,8 @@ pub const MAX_BATCH: usize = 256;
 const COLS_MAX: usize = 8;
 /// Tokens a batched attention launch takes (its score scratch is per token).
 const ATT_ROWS: usize = 8;
+/// Tokens of a long prompt whose indexer selections are made together (`attention_batch`): one scores download for all of them.
+const SEL_ROWS: usize = 32;
 
 /// The most tokens a speculative verify pass (`step_batch_verify`) keeps the recurrences' inputs of.
 pub const MAX_VERIFY: usize = 8;
@@ -209,6 +211,10 @@ struct BatchBufs<'c> {
     /// attention_heads_rows' scores for ATT_ROWS tokens (heads x cap doubles each)
     att: DeviceBuffer<'c>,
     rl: DeviceBuffer<'c>,
+    /// SEL_ROWS tokens' indexer queries (normalized, rotated), block scores and selected positions (`attention_batch`)
+    sel_iqn: DeviceBuffer<'c>,
+    sel_scores: DeviceBuffer<'c>,
+    sel_toks: DeviceBuffer<'c>,
     sgl: DeviceBuffer<'c>,
     sg: DeviceBuffer<'c>,
     su: DeviceBuffer<'c>,
@@ -910,6 +916,9 @@ impl<'c, 'm> GpuSession<'c, 'm> {
             r: ab(ch)?, rn: ab(ch)?, u: ab(h)?, g: ab(cs)?, y: ab(h)?, down: ab(c.hc_rank)?, up: ab(ch)?,
             qkv: ab(2 * kd + vd)?, x: ab(2 * kd + vd)?, z: ab(vd)?, beta: ab(c.ssm_v_heads)?, alpha: ab(c.ssm_v_heads)?, o: ab(vd)?,
             qg: ab(2 * qd)?, q: ab(qd)?, gate: ab(qd)?, att: ctx.alloc(ATT_ROWS * c.n_head * cap * 8).map_err(e)?, kk: ab(kvd)?, iq: ab(c.idx_heads * id)?, ao: ab(qd)?, rl: ab(c.n_expert)?, sgl: ab(1)?,
+            sel_iqn: a(SEL_ROWS * c.idx_heads * id)?,
+            sel_scores: a(SEL_ROWS * (cap / c.compress.iter().copied().filter(|&r| r > 0).min().unwrap_or(1) + 1))?,
+            sel_toks: a(SEL_ROWS * (c.idx_budget + ratio) + SEL_ROWS)?,
             sg: ab(c.shared_ff)?, su: ab(c.shared_ff)?, sa: ab(c.shared_ff)?, so: ab(h)?, logits: a(COLS_MAX * c.vocab)?,
             gtab: ab(64 * k)?, eg: ab(2 * k * c.expert_ff)?, act: ab(k * c.expert_ff)?, eo: ab(k * h)?,
         };
@@ -3256,8 +3265,9 @@ impl<'c, 'm> GpuSession<'c, 'm> {
             self.mv_cols(&format!("{p}.indexer.k_proj.weight"), bb.u.ptr, h, at.raw.ptr + (p0 * id * 4) as u64, id, m);
         }
         let ratio = c.compress[l].max(1);
-        if (p0 + m) / ratio <= c.idx_budget / ratio && self.trace.is_none() {
-            // no token needs the sparse selection: everything per token in one launch per step, in token order
+        if self.trace.is_none() {
+            // the tokens before the first one that needs the sparse selection: everything per token in one launch per step, in
+            // token order; the rest select their positions SEL_ROWS at a time (one scores download for each group)
             let (nh, nkv, hd) = (c.n_head, c.n_kv_head, c.head_dim);
             let (rd, th, eps) = (c.rope_dims as u32, c.rope_theta as f32, c.eps);
             let done = self.attn[l].as_ref().unwrap().nblocks;
@@ -3275,13 +3285,71 @@ impl<'c, 'm> GpuSession<'c, 'm> {
                 Arg::Ptr(bb.kk.ptr), Arg::Ptr(at.k.ptr), Arg::Ptr(self.sv(&format!("{p}.attn_k_norm.weight"))),
                 Arg::U32(nh as u32), Arg::U32(nkv as u32), Arg::U32(hd as u32), Arg::F32(eps), Arg::U32(p0 as u32),
                 Arg::U32(rd), Arg::F32(th)]);
-            for j0 in (0..m).step_by(ATT_ROWS) {
-                let n = (m - j0).min(ATT_ROWS);
+            let keep = c.idx_budget / ratio;
+            // the first token with more complete blocks than the budget keeps
+            let jt = (0..m).find(|&j| (p0 + j + 1) / ratio > keep).unwrap_or(m);
+            for j0 in (0..jt).step_by(ATT_ROWS) {
+                let n = (jt - j0).min(ATT_ROWS);
                 self.k2("attention_heads_rows", nh as u32, n as u32, 256, &[
                     Arg::Ptr(row(&bb.q, qd, j0)), Arg::Ptr(at.k.ptr), Arg::Ptr(at.v.ptr), Arg::U32((p0 + j0 + 1) as u32),
                     Arg::Ptr(row(&bb.gate, qd, j0)), Arg::Ptr(row(&bb.ao, qd, j0)), Arg::Ptr(bb.att.ptr),
                     Arg::U32(self.cap as u32), Arg::U32(nkv as u32), Arg::U32(hd as u32), Arg::U32((nh / nkv) as u32),
                     Arg::U32(nh as u32)]);
+            }
+            // the same kernels, inputs and tie-breaking as `attention_mid`, so the same numbers: per token the indexer's query and
+            // block scores, then (after one download for the group) the selection, then attention over the selected positions
+            let sstride = self.cap / ratio + 1;
+            let tstride = c.idx_budget + ratio;
+            let idx_heads = c.idx_heads;
+            let mut j = jt;
+            while j < m {
+                let e = (j + SEL_ROWS).min(m);
+                for jj in j..e {
+                    let r = jj - j;
+                    let nb = (p0 + jj + 1) / ratio;
+                    self.k("head_norm_rope", idx_heads as u32, 128, &[
+                        Arg::Ptr(row(&bb.iq, iqd, jj)), Arg::U32(id as u32), Arg::Ptr(row(&bb.sel_iqn, iqd, r)), Arg::U32(id as u32),
+                        Arg::Ptr(self.sv(&format!("{p}.indexer.q_norm.weight"))), Arg::U32(id as u32), Arg::F32(eps),
+                        Arg::U32((p0 + jj) as u32), Arg::U32(rd), Arg::F32(th)]);
+                    self.k1("index_scores", nb, &[Arg::Ptr(row(&bb.sel_iqn, iqd, r)), Arg::Ptr(at.blocks.ptr),
+                                                  Arg::Ptr(row(&bb.sel_scores, sstride, r)), Arg::U32(nb as u32),
+                                                  Arg::U32(idx_heads as u32), Arg::U32(id as u32)]);
+                }
+                let mut sb = vec![0u8; (e - j) * sstride * 4];
+                self.download(bb.sel_scores.ptr, &mut sb);
+                let all = floats(&sb);
+                let mut toks_host = vec![0u32; (e - j) * tstride];
+                let mut ntoks = Vec::with_capacity(e - j);
+                for jj in j..e {
+                    let r = jj - j;
+                    let n = p0 + jj + 1;
+                    let nb = n / ratio;
+                    let mut scored: Vec<(f32, usize)> = all[r * sstride..r * sstride + nb].iter().copied().zip(0..nb).collect();
+                    let by_score = |a: &(f32, usize), b: &(f32, usize)| b.0.partial_cmp(&a.0).unwrap().then(a.1.cmp(&b.1));
+                    // the `keep` best blocks, by score then block number: a total order, so the set is the full sort's
+                    scored.select_nth_unstable_by(keep - 1, by_score);
+                    let mut toks: Vec<u32> = scored[..keep].iter().flat_map(|&(_, blk)| (blk * ratio) as u32..((blk + 1) * ratio) as u32).collect();
+                    toks.extend((nb * ratio) as u32..n as u32);
+                    toks.sort_unstable();
+                    toks_host[r * tstride..r * tstride + toks.len()].copy_from_slice(&toks);
+                    ntoks.push(toks.len());
+                }
+                // the selections, then their lengths (one word each) after the SEL_ROWS rows
+                toks_host.resize(SEL_ROWS * tstride + SEL_ROWS, 0);
+                for (r, &n) in ntoks.iter().enumerate() {
+                    toks_host[SEL_ROWS * tstride + r] = n as u32;
+                }
+                self.upload_to(bb.sel_toks.ptr, &toks_host.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>());
+                let lens = bb.sel_toks.ptr + (SEL_ROWS * tstride * 4) as u64;
+                for r0 in (0..e - j).step_by(ATT_ROWS) {
+                    let n = (e - j - r0).min(ATT_ROWS);
+                    self.k2("attention_heads_sel_rows", nh as u32, n as u32, 256, &[
+                        Arg::Ptr(row(&bb.q, qd, j + r0)), Arg::Ptr(at.k.ptr), Arg::Ptr(at.v.ptr), Arg::Ptr(row(&bb.sel_toks, tstride, r0)),
+                        Arg::U32(tstride as u32), Arg::Ptr(lens + (r0 * 4) as u64), Arg::Ptr(row(&bb.gate, qd, j + r0)),
+                        Arg::Ptr(row(&bb.ao, qd, j + r0)), Arg::Ptr(bb.att.ptr), Arg::U32(self.cap as u32), Arg::U32(nkv as u32),
+                        Arg::U32(hd as u32), Arg::U32((nh / nkv) as u32), Arg::U32(nh as u32)]);
+                }
+                j = e;
             }
         } else {
             for j in 0..m {

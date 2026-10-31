@@ -281,6 +281,9 @@ fn fastest_defaults(rest: &[String]) -> Vec<String> {
         set.extend(["--ram-tier-gib".into(), if avail >= 49.0 { "36" } else { "30" }.into()]);
         if avail < 49.0 {
             eprintln!("shadow serve: {avail:.1} GiB of RAM available (49 needed for the 36 GiB tier): using the 30 GiB tier");
+        } else if !has("--ram-floor-gib") {
+            // starting from ~49 GiB, available RAM bottoms out at 4.1-5.1 GiB once the tier is pinned and the file cache fills
+            set.extend(["--ram-floor-gib".into(), "3".into()]);
         }
     }
     if !has("--placement") {

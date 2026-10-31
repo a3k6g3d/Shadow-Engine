@@ -243,6 +243,7 @@ pub const FILES: &[File] = &[
             e("gated_rmsnorm_rows", &[W, C, C, U, F, U]),
             e("head_norm_rope_qgk_rows", &[C, W, W, C, C, W, C, U, U, U, F, U, U, F]),
             e("attention_heads_rows", &[C, C, C, U, C, W, W, U, U, U, U, U]),
+            e("attention_heads_sel_rows", &[C, C, C, C, U, C, C, W, W, U, U, U, U, U]),
             e("moe_combine_qwen_rows", &[W, C, C, C, C, C, U, U]),
             e("hc_write", &[W, C, C, U, U]),
             e("hc_write_rmsnorm_groups", &[W, C, C, C, W, U, F]),
