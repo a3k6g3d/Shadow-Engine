@@ -589,6 +589,10 @@ impl Tiers {
             flag(f).map(|v| v.parse::<f64>().map(|g| (g * GIB) as usize).map_err(|_| format!("{f}: not a number: {v}")))
                 .transpose()
         };
+        if let Some(v) = flag("--vram-reserve-mib") {
+            let mib: usize = v.parse().map_err(|_| format!("--vram-reserve-mib: not a number: {v}"))?;
+            VRAM_RESERVE_SET.store(mib << 20, std::sync::atomic::Ordering::Relaxed);
+        }
         if let Some(g) = gib("--ram-floor-gib")? {
             crate::pinned::set_ram_floor(g as u64);
             if (g as u64) < crate::pinned::RAM_FLOOR {
@@ -802,7 +806,17 @@ impl<'c> RamTier<'c> {
 }
 
 /// VRAM left free for everything else when the expert cache sizes itself (the desktop, the driver, other programs).
-pub const VRAM_RESERVE: usize = 384 << 20;
+// 96 MiB: the display runs off the integrated GPU here, so the RTX card's VRAM is Shadow's alone (384 MiB left 288 MiB, ~147 expert slots, unused:
+// +4.5% decode, 52.26 against 50.01 tok/s, 3 runs; 16 MiB tied with 96).  `--vram-reserve-mib` raises it for a card that also drives the display.
+pub const VRAM_RESERVE: usize = 96 << 20;
+/// `--vram-reserve-mib`: the VRAM left unused by the expert cache, in bytes (`usize::MAX`: `VRAM_RESERVE`).
+static VRAM_RESERVE_SET: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(usize::MAX);
+fn vram_reserve() -> usize {
+    match VRAM_RESERVE_SET.load(std::sync::atomic::Ordering::Relaxed) {
+        usize::MAX => VRAM_RESERVE,
+        b => b,
+    }
+}
 
 fn f32s(v: &[f32]) -> Vec<u8> {
     v.iter().flat_map(|x| x.to_le_bytes()).collect()
@@ -1069,7 +1083,7 @@ impl<'c, 'm> GpuSession<'c, 'm> {
         };
         let mut budget = match cache_bytes {
             Some(b) => b,
-            None => ctx.mem_info().map_err(e)?.0.saturating_sub(VRAM_RESERVE),
+            None => ctx.mem_info().map_err(e)?.0.saturating_sub(vram_reserve()),
         };
         let order = tiers.order.clone().unwrap_or_else(|| uniform_order(c.n_layer, c.n_expert));
         let mut arena = None;
