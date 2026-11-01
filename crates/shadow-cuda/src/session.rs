@@ -334,6 +334,7 @@ pub struct GpuSession<'c, 'm> {
     cpu_join: (u64, f64, f64),
     /// seconds of host time choosing and submitting the CPU experts / uploading their outputs
     cpu_host: (f64, f64),
+    tensor_prompt: bool,
     /// the tail of the VRAM expert cache, lent to a long prompt as staging (`lend_cache` / `restore_cache`)
     lent: Option<Lent>,
     sp: Option<StagePipe<'c>>,
@@ -559,6 +560,9 @@ pub struct Tiers {
     /// `--verify-rank R` (inexact, implies `--verify-resident`): the drafted positions keep their top R routed experts even
     /// when they are not in VRAM (copied as usual) and drop only the non-resident ones below that; 0 = `--verify-resident`.
     pub verify_rank: usize,
+    /// `--tensor-prompt` (or `SHADOW_TENSOR_PROMPT=1`): a prompt's Q6_K and IQ4_XS projections (16 or more inputs at once) run on the tensor cores with
+    /// FP16 operands and FP32 accumulation (relative error ~3e-4 against the reference sums): inexact, so default mode only.
+    pub tensor_prompt: bool,
     /// `--pipeline` (or `SHADOW_PIPELINE=1`): a verify pass as two token groups, one group's expert phase running under the
     /// other group's mixer (session_pipeline.rs).  Same arithmetic per token.
     pub pipeline: bool,
@@ -626,6 +630,7 @@ impl Tiers {
                    accept_scale: flag("--accept-scale").and_then(|v| v.parse().ok()).unwrap_or(1.0),
                    accept_budget: flag("--accept-budget").and_then(|v| v.parse().ok()).unwrap_or(1.0),
                    pipeline: args.iter().any(|a| a == "--pipeline") || std::env::var("SHADOW_PIPELINE").is_ok_and(|v| v == "1"),
+                   tensor_prompt: args.iter().any(|a| a == "--tensor-prompt") || std::env::var("SHADOW_TENSOR_PROMPT").is_ok_and(|v| v == "1"),
                    verify_rank: flag("--verify-rank").and_then(|v| v.parse().ok()).unwrap_or(0),
                    fuse: flag("--fuse").and_then(|v| v.parse().ok()),
                    admit_after: num("--admit-after", 0)?,
@@ -1248,6 +1253,7 @@ impl<'c, 'm> GpuSession<'c, 'm> {
             cpu_served: 0,
             cpu_join: (0, 0.0, 0.0),
             cpu_host: (0.0, 0.0),
+            tensor_prompt: tiers.tensor_prompt,
             lent: None,
             sp: None,
             rows: MAX_BATCH,
@@ -3363,6 +3369,18 @@ impl<'c, 'm> GpuSession<'c, 'm> {
             return;
         };
         let wptr = self.w.get(name).unwrap_or_else(|| panic!("{name} is not resident")).ptr;
+        if self.tensor_prompt && m >= 16 && matches!(ty.as_str(), "Q6_K" | "IQ4_XS") && t.dims[0].is_multiple_of(64)
+            && entry.starts_with("matvec_cols_") && !entry.starts_with("matvec_cols_ref_") {
+            // SAFETY: as the launches below: `rows` rows of t.dims[0] weights, m inputs of t.dims[0] floats at x + j * xs, m outputs of `rows`
+            // floats at y + j * ys; the kernel reads 16-byte groups of the inputs (x and xs checked above) and guards the last tiles.
+            unsafe {
+                self.mvp.launch(&format!("mma_cols_{}", ty.to_lowercase()), ((rows as u32).div_ceil(64), (m as u32).div_ceil(32), 1), (128, 1, 1), 0,
+                                self.ls(), &[Arg::Ptr(wptr), Arg::Ptr(x), Arg::U32(xs as u32), Arg::Ptr(y), Arg::U32(ys as u32),
+                                             Arg::U32(rows as u32), Arg::U32(t.dims[0] as u32), Arg::U32(m as u32)])
+            }
+            .unwrap_or_else(|err| panic!("{name}: {err}"));
+            return;
+        }
         for j0 in (0..m).step_by(COLS_MAX) {
             let (x, y, n) = (x + (j0 * xs * 4) as u64, y + (j0 * ys * 4) as u64, (m - j0).min(COLS_MAX));
             // SAFETY: `rows` whole rows of t.dims[0] weights at wptr; n inputs of t.dims[0] floats at x + j * xs and n

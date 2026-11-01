@@ -761,6 +761,132 @@ extern "C" __global__ void matvec_cols_iq3_s(const u8* w, const float* x, unsign
 extern "C" __global__ void matvec_cols_bf16(const u8* w, const float* x, unsigned int xs, float* y, unsigned int ys, unsigned int rows, unsigned int cols, unsigned int m) { matvec_cols_rows<BF16>(w, x, xs, y, ys, rows, cols, m); }
 extern "C" __global__ void matvec_cols_f32(const u8* w, const float* x, unsigned int xs, float* y, unsigned int ys, unsigned int rows, unsigned int cols, unsigned int m) { matvec_cols_rows<F32>(w, x, xs, y, ys, rows, cols, m); }
 
+// ------------------------------------------------------------------ tensor cores for a long prompt's projections (inexact)
+// Y[token][row] = sum_k W[row][k] * X[token][k] for 32 tokens x 64 rows a block: each warp takes 16 rows and all 32 tokens, as 4
+// m16n8k16 FP16 multiply-accumulates (FP32 accumulate) per 16 values of k.  The weight tile (64 rows x 64 k) is decoded to FP16 in
+// shared memory with the reference decode (the same float value w = d * q, then rounded to FP16), the input tile converted to FP16 on
+// the way in.  Not the reference arithmetic (FP16 rounding of both operands, a different order of sum): the host uses it only in the
+// default (inexact) mode.  Needs cols % 64 == 0.  Launch: block = 128 threads, grid = (ceil(rows / 64), ceil(m / 32)).
+#define MMA_ROWS 64
+#define MMA_TOK 32
+#define MMA_K 64
+#define MMA_PAD 8
+
+static __device__ __forceinline__ unsigned int pack_half2(float lo, float hi) {
+    unsigned int r;
+    asm("cvt.rn.f16x2.f32 %0, %2, %1;" : "=r"(r) : "f"(lo), "f"(hi));
+    return r;
+}
+
+template <typename Q> struct Dec8 {};
+
+// 8 weights i..i+8 of a row, as floats exactly as `Fast<Q>::dotm` computes them
+template <> struct Dec8<Q6K> {
+    static __device__ __forceinline__ void dec8(const u8* r, unsigned int i, float* o) {
+        const u8* b = r + (i / 256) * 210;
+        unsigned int e0 = i % 256, r_idx = e0 / 32, c0 = e0 % 32;
+        unsigned int g = r_idx / 4, h = (r_idx % 4) / 2, k_idx = r_idx % 2, s_idx = r_idx % 4;
+        float d = __fmul_rn(qf16(b + 208), (float) (signed char) b[192 + e0 / 16]);
+        const u16* ql = (const u16*) (b + g * 64 + k_idx * 32 + c0);
+        const u16* qh = (const u16*) (b + 128 + g * 32 + c0);
+#pragma unroll
+        for (unsigned int k = 0; k < 4; k++) {
+            u16 wl = ql[k], wh = qh[k];
+            u8 lo0 = (wl >> (h * 4)) & 0x0f, hi0 = (wh >> (2 * s_idx)) & 0x03;
+            u8 lo1 = (wl >> (8 + h * 4)) & 0x0f, hi1 = (wh >> (8 + 2 * s_idx)) & 0x03;
+            int q0 = (int) (signed char) (u8) (lo0 | (hi0 << 4)) - 32;
+            int q1 = (int) (signed char) (u8) (lo1 | (hi1 << 4)) - 32;
+            o[2 * k] = __fmul_rn(d, (float) q0);
+            o[2 * k + 1] = __fmul_rn(d, (float) q1);
+        }
+    }
+};
+
+template <> struct Dec8<IQ4XS> {
+    static __device__ __forceinline__ void dec8(const u8* r, unsigned int i, float* o) {
+        const u8* b = r + (i / 256) * 136;
+        unsigned int e0 = i % 256, g = e0 / 32, c0 = e0 % 32, sh_nib = (c0 >= 16) ? 4u : 0u;
+        u32 hdr = *(const u32*) b;
+        u16 sh = (u16) (hdr >> 16);
+        u8 lo = (b[4 + g / 2] >> (4 * (g % 2))) & 0x0f;
+        u8 hi = (sh >> (2 * g)) & 3;
+        float dl = __fmul_rn(f16_to_f32((u16) hdr), (float) ((int) (u8) (lo | (hi << 4)) - 32));
+        const u8* q = b + 8 + g * 16 + (c0 & 15);
+        u32 q0 = *(const u32*) q, q1 = *(const u32*) (q + 4);
+#pragma unroll
+        for (unsigned int k = 0; k < 4; k++) o[k] = __fmul_rn(dl, iq4nl_val((q0 >> (8 * k + sh_nib)) & 0x0f));
+#pragma unroll
+        for (unsigned int k = 0; k < 4; k++) o[4 + k] = __fmul_rn(dl, iq4nl_val((q1 >> (8 * k + sh_nib)) & 0x0f));
+    }
+};
+
+template <typename Q>
+static __device__ __forceinline__ void mma_cols(const u8* w, const float* x, unsigned int xs, float* y, unsigned int ys,
+                                                unsigned int rows, unsigned int cols, unsigned int m) {
+    __shared__ __align__(16) unsigned short ws[MMA_ROWS][MMA_K + MMA_PAD];
+    __shared__ __align__(16) unsigned short xt[MMA_TOK][MMA_K + MMA_PAD];
+    const unsigned int tid = threadIdx.x, warp = tid / 32, lane = tid % 32, grp = lane / 4, tig = lane % 4;
+    const unsigned int row_base = blockIdx.x * MMA_ROWS, tok_base = blockIdx.y * MMA_TOK;
+    const u64 rb = (u64) (cols / Q::QK) * Q::BYTES;
+    float acc[4][4];
+#pragma unroll
+    for (unsigned int n = 0; n < 4; n++)
+#pragma unroll
+        for (unsigned int e = 0; e < 4; e++) acc[n][e] = 0.0f;
+    for (unsigned int kc = 0; kc < cols; kc += MMA_K) {
+#pragma unroll
+        for (unsigned int t = 0; t < 4; t++) {
+            unsigned int ch = tid + 128 * t, row = ch / 8, kk = (ch % 8) * 8;
+            float v[8];
+            if (row_base + row < rows) {
+                Dec8<Q>::dec8(w + (u64) (row_base + row) * rb, kc + kk, v);
+            } else {
+#pragma unroll
+                for (unsigned int e = 0; e < 8; e++) v[e] = 0.0f;
+            }
+            uint4 p;
+            p.x = pack_half2(v[0], v[1]); p.y = pack_half2(v[2], v[3]); p.z = pack_half2(v[4], v[5]); p.w = pack_half2(v[6], v[7]);
+            *(uint4*) &ws[row][kk] = p;
+        }
+#pragma unroll
+        for (unsigned int t = 0; t < 4; t++) {
+            unsigned int idx = tid + 128 * t, tok = idx / 16, kq = (idx % 16) * 4;
+            float4 f = make_float4(0.f, 0.f, 0.f, 0.f);
+            if (tok_base + tok < m) f = *(const float4*) (x + (u64) (tok_base + tok) * xs + kc + kq);
+            uint2 p;
+            p.x = pack_half2(f.x, f.y); p.y = pack_half2(f.z, f.w);
+            *(uint2*) &xt[tok][kq] = p;
+        }
+        __syncthreads();
+#pragma unroll
+        for (unsigned int ks = 0; ks < MMA_K / 16; ks++) {
+            const unsigned int k0 = ks * 16 + tig * 2;
+            unsigned int a0 = *(const unsigned int*) &ws[warp * 16 + grp][k0];
+            unsigned int a1 = *(const unsigned int*) &ws[warp * 16 + grp + 8][k0];
+            unsigned int a2 = *(const unsigned int*) &ws[warp * 16 + grp][k0 + 8];
+            unsigned int a3 = *(const unsigned int*) &ws[warp * 16 + grp + 8][k0 + 8];
+#pragma unroll
+            for (unsigned int n = 0; n < 4; n++) {
+                unsigned int b0 = *(const unsigned int*) &xt[n * 8 + grp][k0];
+                unsigned int b1 = *(const unsigned int*) &xt[n * 8 + grp][k0 + 8];
+                asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
+                             : "+f"(acc[n][0]), "+f"(acc[n][1]), "+f"(acc[n][2]), "+f"(acc[n][3])
+                             : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+            }
+        }
+        __syncthreads();
+    }
+#pragma unroll
+    for (unsigned int n = 0; n < 4; n++)
+#pragma unroll
+        for (unsigned int e = 0; e < 4; e++) {
+            unsigned int row = row_base + warp * 16 + grp + (e >= 2 ? 8 : 0), tok = tok_base + n * 8 + tig * 2 + (e & 1);
+            if (row < rows && tok < m) y[(u64) tok * ys + row] = acc[n][e];
+        }
+}
+extern "C" __global__ void mma_cols_q6_k(const u8* w, const float* x, unsigned int xs, float* y, unsigned int ys, unsigned int rows, unsigned int cols, unsigned int m) { mma_cols<Q6K>(w, x, xs, y, ys, rows, cols, m); }
+extern "C" __global__ void mma_cols_iq4_xs(const u8* w, const float* x, unsigned int xs, float* y, unsigned int ys, unsigned int rows, unsigned int cols, unsigned int m) { mma_cols<IQ4XS>(w, x, xs, y, ys, rows, cols, m); }
+
 // ------------------------------------------------------------------ several inputs at once, in the reference order
 // One token runs BF16 and F32 matrices through the reference order (matvec_rows, matvec_pair_bf16/f32 and
 // hc_down_inject_bf16: lane l adds the products of weights l, l+32, ... one at a time), not dot8's, so a batched step

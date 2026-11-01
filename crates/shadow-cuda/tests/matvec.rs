@@ -259,3 +259,93 @@ fn several_inputs_at_once_match_one_at_a_time() {
     }
     assert!(tested >= 6, "only {tested} types found");
 }
+
+/// `mma_cols_*` (tensor cores, FP16 operands, the inexact prompt path) against `matvec_cols_*` (the reference sums), 64 inputs, on a real tensor:
+/// the relative error of each output vector, and the time of 64 inputs as 8 launches of 8 against one launch.
+#[test]
+fn tensor_core_projections_are_close_to_the_exact_ones() {
+    let ctx = match Context::new(0) {
+        Ok(c) => c,
+        Err(e) => return eprintln!("SKIPPED, not passed: no CUDA device ({e})"),
+    };
+    if nvrtc::version().is_err() {
+        return eprintln!("SKIPPED, not passed: no NVRTC");
+    }
+    let p = std::env::var("SHADOW_MODEL").unwrap_or_else(|_| MODEL.into());
+    if !std::path::Path::new(&p).is_file() {
+        return eprintln!("SKIPPED, not passed: no model at {p}");
+    }
+    let g = Gguf::open(std::path::Path::new(&p)).unwrap();
+    let prog = Program::load(&ctx, file("matvec.cu").unwrap()).unwrap();
+    let mut seed = 0x1234_5678_9abc_def1u64;
+    let mut rnd = || {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        (seed >> 40) as f32 / (1u64 << 24) as f32 * 2.0 - 1.0
+    };
+    let m = 64usize;
+    for (ty, exact, mma) in [("Q6_K", "matvec_cols_q6_k", "mma_cols_q6_k"), ("IQ4_XS", "matvec_cols_iq4_xs", "mma_cols_iq4_xs")] {
+        let Some(t) = g.tensors.iter().filter(|t| t.ty.name() == ty && t.dims.len() == 2 && t.dims[0] % 64 == 0 && !t.name.contains("token_embd"))
+            .max_by_key(|t| t.dims[1] * t.dims[0])
+        else {
+            continue;
+        };
+        let (cols, rows) = (t.dims[0] as usize, t.dims[1] as usize);
+        let w = read(&g, t, t.nbytes() as usize);
+        let x: Vec<f32> = (0..m * cols).map(|_| rnd()).collect();
+        let dw = ctx.alloc(w.len()).unwrap();
+        let dx = ctx.alloc(m * cols * 4).unwrap();
+        let (dy_e, dy_m) = (ctx.alloc(m * rows * 4).unwrap(), ctx.alloc(m * rows * 4).unwrap());
+        dw.upload(&w).unwrap();
+        dx.upload(&x.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>()).unwrap();
+        let run_exact = || unsafe {
+            for j0 in (0..m).step_by(8) {
+                // SAFETY: 8 inputs of cols floats, 8 outputs of rows floats, inside the buffers.
+                prog.launch(exact, ((rows as u32).div_ceil(8), 1, 1), (256, 1, 1), 0, None,
+                            &[Arg::Ptr(dw.ptr), Arg::Ptr(dx.ptr + (j0 * cols * 4) as u64), Arg::U32(cols as u32),
+                              Arg::Ptr(dy_e.ptr + (j0 * rows * 4) as u64), Arg::U32(rows as u32), Arg::U32(rows as u32),
+                              Arg::U32(cols as u32), Arg::U32(8)]).unwrap();
+            }
+        };
+        let run_mma = || unsafe {
+            // SAFETY: as above, all 64 inputs at once.
+            prog.launch(mma, ((rows as u32).div_ceil(64), (m as u32).div_ceil(32), 1), (128, 1, 1), 0, None,
+                        &[Arg::Ptr(dw.ptr), Arg::Ptr(dx.ptr), Arg::U32(cols as u32), Arg::Ptr(dy_m.ptr), Arg::U32(rows as u32),
+                          Arg::U32(rows as u32), Arg::U32(cols as u32), Arg::U32(m as u32)]).unwrap();
+        };
+        run_exact();
+        run_mma();
+        ctx.synchronize().unwrap();
+        let (mut ge, mut gm) = (vec![0u8; m * rows * 4], vec![0u8; m * rows * 4]);
+        dy_e.download(&mut ge).unwrap();
+        dy_m.download(&mut gm).unwrap();
+        let (fe, fm): (Vec<f32>, Vec<f32>) = (
+            ge.chunks(4).map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])).collect(),
+            gm.chunks(4).map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])).collect());
+        let mut worst = 0f64;
+        for j in 0..m {
+            let (a, b) = (&fe[j * rows..(j + 1) * rows], &fm[j * rows..(j + 1) * rows]);
+            let num: f64 = a.iter().zip(b).map(|(p, q)| ((p - q) as f64).powi(2)).sum();
+            let den: f64 = a.iter().map(|p| (*p as f64).powi(2)).sum();
+            worst = worst.max((num / den.max(1e-30)).sqrt());
+        }
+        let (start, end) = (ctx.event().unwrap(), ctx.event().unwrap());
+        start.record(None).unwrap();
+        for _ in 0..20 {
+            run_exact();
+        }
+        end.record(None).unwrap();
+        end.synchronize().unwrap();
+        let te = end.since(&start).unwrap() / 20.0;
+        start.record(None).unwrap();
+        for _ in 0..20 {
+            run_mma();
+        }
+        end.record(None).unwrap();
+        end.synchronize().unwrap();
+        let tm = end.since(&start).unwrap() / 20.0;
+        eprintln!("{ty:7} {} ({rows}x{cols}): relative error {:.2e}; 64 inputs {:.3} ms exact (8 launches), {:.3} ms tensor cores ({:.1}x)", t.name, worst, te, tm, te / tm);
+        assert!(worst < 5e-3, "{ty}: relative error {worst}");
+    }
+}

@@ -269,6 +269,10 @@ fn fastest_defaults(rest: &[String]) -> Vec<String> {
     // `--verify-rank 2`: the verify pass's drafted positions keep their top 2 routed experts and drop the rest that are not in VRAM:
     // +8.6% over AcceptMoE (42.8 against 39.4 tok/s on the varied bench) for replies ~11.5% shorter, fidelity level with Strata's
     // (docs/STATUS.md).  `--accept-moe` (the most faithful inexact verify measured, same speed as plain tail skip) is the opt-out.
+    // tensor-core projections for long prompts' dense weights (docs/STATUS.md): inexact (FP16 operands), so not in --exact
+    if !has("--tensor-prompt") {
+        set.push("--tensor-prompt".into());
+    }
     if !has("--accept-moe") && !has("--verify-resident") && !has("--verify-rank") {
         set.extend(["--verify-rank".into(), "2".into()]);
     }

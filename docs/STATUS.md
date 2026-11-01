@@ -1165,3 +1165,13 @@ Single-prompt runs, "Write a Rust function that parses a comma separated list...
   no change, so the dense kernels are not limited by re-reading the weights (they come from the L2 cache) but by FP32 decode-and-FMA throughput. Both reverted.
 - What would move prompt reading from here: tensor-core matrix multiplies for the dense and expert projections (dequantize a weight tile to FP16 in shared memory, `mma` against FP16 activations, FP32 accumulation, as llama.cpp's prompt kernels do). That is an inexact path (FP16 rounding of weights and activations
   where the reference sums in FP32), so default mode only, with a fidelity check against `--exact`; one kernel family per quantization type. Not started.
+
+## 2026-10-31: tensor-core projections for a long prompt (`--tensor-prompt`, Q6_K and IQ4_XS)
+
+- `mma_cols_q6_k` / `mma_cols_iq4_xs` (`kernels/matvec.cu`): Y = X W^T for 32 tokens x 64 rows a block (4 warps, `mma.sync.m16n8k16` FP16 operands, FP32 accumulation); the weight tile is decoded to FP16 in shared memory with the reference decode (same float `d * q`, then rounded to FP16), the input tile converted on the way in.
+  `tests/matvec.rs::tensor_core_projections_are_close_to_the_exact_ones` on real tensors: relative error **3.4e-4** (`output.weight` Q6_K 248320 x 2560) and **2.9e-4** (an IQ4_XS attention projection), and 64 inputs in **0.143 ms against 1.032 ms** (7.2x) and 3.26 against 22.0 ms (6.8x) for the exact kernel's 8 launches of 8.
+- Used by `mv_cols` for 16 or more inputs on those two types (cols a multiple of 64), when `--tensor-prompt` is on: `shadow serve` adds it unless `--exact`, so default mode only (FP16 rounding of both operands is not the reference arithmetic). Decode and verify passes (fewer than 16 inputs) are untouched.
+- A 3,001-token prompt (Nsight Systems): kernel time 15.4 -> **12.0 s**, the two projection kernels gone from the top of the list; prompt reading 125 -> 137 tok/s under the profiler, 128-144 -> 129 / 146 / 135 / 140 tok/s plain: the pass is copy-bound again (kernels idle 4.4 s waiting for host-to-device copies, 3.6 s idle for the host; 9.5 s of copies).
+  Same-history fidelity of the 24-turn test with it on: 0.467 (the metric's build-to-build noise is ~0.04: 0.375 / 0.403 / 0.423 / 0.447 on earlier builds).
+- Tried and reverted: starting layer l + 1's expert copy before layer l's router answer (the copy stream waits on a GPU event instead of the host): 122 / 138 / 127 / 128 tok/s against 129 / 146 / 135 / 140, exact prompt 59.0 against 62.8 tok/s: slower.
+- Next: the same kernels for BF16 / Q5_K / Q4_K / F32 (about 3.5 s of the 12 s) and for the grouped expert matvecs (5.4 s, needs 32-token entries in the plan and decodes for IQ4_NL, IQ2_S, IQ3_XXS, IQ3_S, Q2_0).
