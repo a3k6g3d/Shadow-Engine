@@ -42,7 +42,7 @@ With no tier flags this is the **fastest measured mode**, an OpenAI-compatible s
 | inexact tail skip | `--tail-skip 3` | a routed expert past the 3rd by router weight is skipped unless it is already in VRAM |
 | AcceptMoE verify | `--accept-moe --accept-beta 1.0` | a verify pass routes its drafted positions through one block-wide expert set (the anchor's top-k plus the experts the likely-to-be-accepted positions demand); each token still takes k experts, re-picked inside the set |
 | RAM expert tier | `--ram-tier-gib 36` | 36 GiB (30 when under 49 GiB of RAM is available at start) of pinned host memory holds the likeliest experts, copied to the GPU by DMA |
-| placement | `--placement profiles/routing-6prompts.shrc` | which experts the RAM tier holds (a routing profile) |
+| placement | `--placement profiles/routing-varied300.shrc` | which experts the RAM tier holds (a routing profile) |
 | drafter | `--dflash models/dflash2` | the DFlash 2 drafter, matrices as Q8_0 |
 | draft length | `--spec 3` | up to 3 drafted tokens checked per pass |
 | draft cutoff | `--dflash-min-p 0.5` | a draft chain stops after a draft the selector gives under 0.5 |

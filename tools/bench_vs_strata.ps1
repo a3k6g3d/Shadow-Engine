@@ -11,7 +11,7 @@ param(
   [int]$Runs = 3,
   [string]$PromptsFile = '',
   [int]$Turns = 6,
-  [string]$Placement = 'profiles/routing-6prompts.shrc',
+  [string]$Placement = 'profiles/routing-varied300.shrc',
   [string]$ShadowFlags = '',
   [string]$ShadowExe = 'target/release/shadow.exe',
   [string]$Bench = 'target/release/shadow-bench.exe'

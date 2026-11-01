@@ -292,7 +292,8 @@ fn fastest_defaults(rest: &[String]) -> Vec<String> {
         }
     }
     if !has("--placement") {
-        if let Some(p) = found("profiles/routing-6prompts.shrc") {
+        // the profile of 300 varied prompts (docs/STATUS.md, 2026-10-30), else the six hash-table prompts' one
+        if let Some(p) = found("profiles/routing-varied300.shrc").or_else(|| found("profiles/routing-6prompts.shrc")) {
             set.extend(["--placement".into(), p.display().to_string()]);
         }
     }
