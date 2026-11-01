@@ -1296,3 +1296,14 @@ Single-prompt runs, "Write a Rust function that parses a comma separated list...
   a core, L3 16 MB shared) and **the temperature**. `crates/shadow-serve/src/cpuinfo.rs`: CPUID, `GetLogicalProcessorInformation` and PDH counters, no driver; telemetry `cpu.info`.
 - The temperature is the ACPI thermal zone Windows exposes without a driver (28 C here, the board's; `MSAcpi_ThermalZoneTemperature` is access-denied unelevated). A core's own temperature
   needs a kernel driver (HWiNFO, LibreHardwareMonitor): not loaded; the card labels the value "(board)".
+
+## 2026-11-01: web tools and MCP tools
+
+- The agent layer had six local tools (read_file, glob, grep, edit_file, write_file, cmd); asked for web access the model improvised with `Invoke-WebRequest` through `cmd` and got raw HTML (118k characters, clipped).
+  New: **`web_search`** (DuckDuckGo's HTML results: title, URL, snippet) and **`web_fetch`** (a page as readable text: scripts, styles and tags dropped, entities decoded, long pages in parts with `start`), `webtools.rs`,
+  over `curl.exe` (in Windows 10+, its own TLS: no HTTP library in Shadow). The default persona names them.
+- **MCP client** (`mcp.rs`, stdio transport): servers listed in `mcp.json` (Claude Desktop / Claude Code format: `SHADOW_MCP_CONFIG`, else `mcp.json` in the working directory, else `%APPDATA%\Shadow\mcp.json`) are started with
+  `shadow serve`; their tools (`initialize`, `tools/list`, `tools/call`) join `/v1/tools` as `mcp__<server>__<tool>` and run through `/v1/tools/execute`. `npx` (a .cmd on Windows) is started through `cmd /C`. Tested with a stub server
+  and the real `@modelcontextprotocol/server-filesystem` (14 tools); the dashboard has a Tools card with each server's tool count or error. In the chat page the model called an MCP tool and `web_search` in one turn.
+- Tool parameters are written by the model as text; they are now converted to the types the tool's schema declares (`coerce_arguments`): the stub's `add` returned "1725" for "17" and "25", and the built-in tools' integer
+  parameters (`read_file` start / end, `grep`, `glob` limits) were silently ignored when written as text. Tool calls run on a blocking thread (`spawn_blocking`) instead of the server's async threads.

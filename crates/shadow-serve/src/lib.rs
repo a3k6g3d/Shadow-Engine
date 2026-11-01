@@ -6,6 +6,7 @@
 
 pub mod cpuinfo;
 pub mod engine;
+pub mod mcp;
 pub mod orchestrator;
 pub mod telemetry;
 pub mod ui;
@@ -40,6 +41,7 @@ pub struct ServeConfig {
 
 /// Runs the server until the process ends.
 pub fn run(cfg: ServeConfig) -> Result<(), String> {
+    mcp::start_background();
     let status = Arc::new(Mutex::new(Status { state: "loading", ..Status::default() }));
     let tx = engine::start(cfg.engine, status.clone());
     let app = Arc::new(App {
@@ -427,7 +429,10 @@ async fn tool_execute(req: Request<Incoming>) -> Response<Body> {
     let name = v.get("name").and_then(Value::as_str).unwrap_or("").to_string();
     let arguments = v.get("arguments").cloned().unwrap_or(Value::Null);
     let inv = orchestrator::ToolInvocation { name, arguments };
-    let res = orchestrator::execute_tool(&inv);
+    // a tool can take a while (a command, a web page, an MCP server): not on the server's async threads
+    let name = inv.name.clone();
+    let res = tokio::task::spawn_blocking(move || orchestrator::execute_tool(&inv)).await
+        .unwrap_or_else(|e| orchestrator::ToolResult { name, output: format!("the tool crashed: {e}"), is_error: true });
     json_resp(StatusCode::OK, &res.to_json())
 }
 

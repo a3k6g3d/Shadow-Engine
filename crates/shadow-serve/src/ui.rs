@@ -1052,6 +1052,11 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
           <h3>Conversations <span class="tag" id="d-chatcount">--</span></h3>
           <div id="d-chats" class="dash-empty">No saved conversations yet.</div>
         </div>
+        <div class="dcard">
+          <h3>Tools <span class="tag" id="d-toolcount">--</span></h3>
+          <div class="kv"><span>Built in</span><b>read, write, edit, glob, grep, cmd, web search, web fetch</b></div>
+          <div id="d-mcp" class="dash-empty">No MCP servers.</div>
+        </div>
         <div class="dcard wide">
           <h3>Recent requests <span class="tag">newest first</span></h3>
           <div id="d-recent" class="dash-empty">Nothing answered yet.</div>
@@ -2469,6 +2474,10 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
       html('d-tps', (tps.length ? tps[tps.length - 1].toFixed(1) : '--') + '<small>tok/s</small>');
       spark('c-tps', tps, 0, '#6366f1', true);
       const tail = rec.slice(-10), tt = tail.reduce((a, r) => a + r.completion_tokens, 0), ts = tail.reduce((a, r) => a + r.predicted_ms / 1000, 0);
+      const mcp = d.mcp || [], mcpTools = mcp.reduce((n, m) => n + m.tools, 0);
+      set('d-toolcount', (8 + mcpTools) + ' available (' + mcpTools + ' from MCP)');
+      html('d-mcp', mcp.length ? mcp.map(m => `<div class="kv"><span>MCP server <b>${escapeHtml(m.name)}</b></span><b style="color:${m.error ? 'var(--danger)' : 'var(--success)'}" title="${escapeHtml(m.error || '')}">${m.error ? 'failed' : m.tools + ' tools'}</b></div>`).join('')
+        : 'No MCP servers. List them in mcp.json (Claude Desktop / Claude Code format) in the Shadow folder or %APPDATA%\\Shadow, then restart.');
       set('d-tps-avg', ts > 0 ? (tt / ts).toFixed(1) + ' tok/s (last ' + tail.length + ')' : '--');
       const read = last ? last.prompt_tokens - last.cached_tokens : 0;
       set('d-pps', last && last.prompt_ms > 0 && read > 0 ? (read / (last.prompt_ms / 1000)).toFixed(0) + ' tok/s, ' + read + ' new' : last ? 'all ' + last.prompt_tokens + ' cached' : '--');

@@ -399,6 +399,7 @@ impl TelemetryService {
                 "prefill_done": crate::engine::PREFILL.0.load(std::sync::atomic::Ordering::Relaxed),
                 "prefill_total": crate::engine::PREFILL.1.load(std::sync::atomic::Ordering::Relaxed)
             },
+            "mcp": crate::mcp::status().into_iter().map(|(name, tools, error)| json!({"name": name, "tools": tools, "error": error})).collect::<Vec<_>>(),
             "recent": s.recent.iter().map(|r| json!({
                 "at": r.at, "prompt_tokens": r.prompt_tokens, "cached_tokens": r.cached_tokens, "completion_tokens": r.completion_tokens,
                 "prompt_ms": r.prompt_ms.round(), "predicted_ms": r.predicted_ms.round(), "finish": r.finish, "pictures": r.pictures,

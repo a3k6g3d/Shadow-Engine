@@ -39,7 +39,33 @@ fn tail_clip(s: String) -> String {
     }
 }
 
+/// The model writes every parameter as text (`<parameter=a>17</parameter>`); a tool's schema says which are numbers, booleans, lists or objects.
+/// Text that parses as the declared type becomes that type (the rest is left as it is, for the tool to refuse).
+pub fn coerce_arguments(name: &str, arguments: &Value) -> Value {
+    let defs = tool_definitions();
+    let props = defs.as_array().and_then(|a| a.iter().find(|d| d.get("name").and_then(Value::as_str) == Some(name)))
+        .and_then(|d| d.pointer("/input_schema/properties")).and_then(Value::as_object).cloned().unwrap_or_default();
+    let Some(obj) = arguments.as_object() else { return arguments.clone() };
+    let mut out = obj.clone();
+    for (k, v) in obj {
+        let (Some(s), Some(ty)) = (v.as_str(), props.get(k).and_then(|p| p.get("type")).and_then(Value::as_str)) else { continue };
+        let parsed = match ty {
+            "integer" => s.trim().parse::<i64>().ok().map(Value::from),
+            "number" => s.trim().parse::<f64>().ok().map(|f| if f.fract() == 0.0 && f.abs() < 9e15 { Value::from(f as i64) } else { Value::from(f) }),
+            "boolean" => match s.trim().to_ascii_lowercase().as_str() { "true" => Some(Value::Bool(true)), "false" => Some(Value::Bool(false)), _ => None },
+            "array" | "object" => serde_json::from_str::<Value>(s.trim()).ok().filter(|p| if ty == "array" { p.is_array() } else { p.is_object() }),
+            _ => None,
+        };
+        if let Some(p) = parsed {
+            out.insert(k.clone(), p);
+        }
+    }
+    Value::Object(out)
+}
+
 pub fn execute_tool(inv: &ToolInvocation) -> ToolResult {
+    let fixed = ToolInvocation { name: inv.name.clone(), arguments: coerce_arguments(&inv.name, &inv.arguments) };
+    let inv = &fixed;
     match inv.name.as_str() {
         "web_search" => {
             let q = inv.arguments.get("query").and_then(Value::as_str).unwrap_or("");
@@ -282,6 +308,11 @@ pub fn execute_tool(inv: &ToolInvocation) -> ToolResult {
             }
         }
 
+        other if other.starts_with("mcp__") => match crate::mcp::call(other, &inv.arguments) {
+            Ok(s) => ToolResult { name: inv.name.clone(), output: tail_clip(s), is_error: false },
+            Err(e) => ToolResult { name: inv.name.clone(), output: format!("error: {e}"), is_error: true },
+        },
+
         other => ToolResult {
             name: other.to_string(),
             output: format!("unknown tool '{other}'"),
@@ -290,7 +321,14 @@ pub fn execute_tool(inv: &ToolInvocation) -> ToolResult {
     }
 }
 
+/// Shadow's own tools and those of the MCP servers that are up (`mcp.rs`).
 pub fn tool_definitions() -> Value {
+    let mut v = builtin_tool_definitions();
+    v.as_array_mut().expect("an array").extend(crate::mcp::tool_definitions());
+    v
+}
+
+fn builtin_tool_definitions() -> Value {
     json!([
         {
             "name": "web_search",
@@ -400,6 +438,16 @@ pub fn tool_definitions() -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn text_parameters_take_the_schema_types() {
+        let a = coerce_arguments("read_file", &json!({"path": "C:\\x.txt", "start": "5", "end": "20"}));
+        assert_eq!(a["start"], json!(5));
+        assert_eq!(a["end"], json!(20));
+        assert_eq!(a["path"], json!("C:\\x.txt"));
+        assert_eq!(coerce_arguments("read_file", &json!({"start": "abc"}))["start"], json!("abc"));
+        assert_eq!(coerce_arguments("nope", &json!({"a": "1"}))["a"], json!("1"));
+    }
 
     #[test]
     fn executes_read_and_cmd() {
