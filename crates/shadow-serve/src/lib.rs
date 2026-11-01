@@ -7,6 +7,7 @@
 pub mod cpuinfo;
 pub mod engine;
 pub mod mcp;
+pub mod memory;
 pub mod orchestrator;
 pub mod telemetry;
 pub mod ui;
@@ -146,6 +147,8 @@ async fn handle(req: Request<Incoming>, app: Arc<App>) -> Result<Response<Body>,
             full(StatusCode::OK, "text/plain; version=0.0.4", text)
         }
         (&Method::GET, "/v1/tools") => json_resp(StatusCode::OK, &orchestrator::tool_definitions()),
+        (&Method::GET, "/v1/memory") => json_resp(StatusCode::OK, &memory::list()),
+        (&Method::POST, "/v1/memory") | (&Method::PUT, _) | (&Method::DELETE, _) if path.starts_with("/v1/memory") => memory_api(req, &path).await,
         (&Method::POST, "/v1/tools/execute") => tool_execute(req).await,
         (&Method::POST, "/v1/chat/completions") => chat(req, app).await,
         // for shadow-bench, which ends each run's server this way; only ever bound to what --host says
@@ -415,6 +418,31 @@ fn usage(st: &engine::Stats) -> (Value, Value) {
             "predicted_n": st.completion_tokens, "predicted_ms": st.predicted_ms,
             "predicted_per_second": st.completion_tokens as f64 / (st.predicted_ms / 1e3).max(1e-9),
             "cache_n": st.cached_tokens}))
+}
+
+/// POST /v1/memory {text, kind}: add a note; PUT /v1/memory/<id> {text}: reword it; DELETE /v1/memory/<id>: forget it.
+async fn memory_api(req: Request<Incoming>, path: &str) -> Response<Body> {
+    let method = req.method().clone();
+    let id: Option<u64> = path.strip_prefix("/v1/memory/").and_then(|s| s.parse().ok());
+    let bytes = match req.into_body().collect().await {
+        Ok(b) => b.to_bytes(),
+        Err(e) => return error(StatusCode::BAD_REQUEST, &e.to_string()),
+    };
+    let body: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+    let text = body.get("text").and_then(Value::as_str).unwrap_or("");
+    let done = |r: Result<(), String>| match r {
+        Ok(()) => json_resp(StatusCode::OK, &memory::list()),
+        Err(e) => error(StatusCode::BAD_REQUEST, &e),
+    };
+    match (method, id) {
+        (Method::POST, None) => match memory::add(body.get("kind").and_then(Value::as_str).unwrap_or("user"), text) {
+            Ok(_) => json_resp(StatusCode::OK, &memory::list()),
+            Err(e) => error(StatusCode::BAD_REQUEST, &e),
+        },
+        (Method::PUT, Some(id)) => done(memory::update(id, text)),
+        (Method::DELETE, Some(id)) => done(memory::forget(id)),
+        _ => error(StatusCode::NOT_FOUND, "no such memory request"),
+    }
 }
 
 async fn tool_execute(req: Request<Incoming>) -> Response<Body> {

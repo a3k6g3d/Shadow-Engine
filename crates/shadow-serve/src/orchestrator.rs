@@ -67,6 +67,22 @@ pub fn execute_tool(inv: &ToolInvocation) -> ToolResult {
     let fixed = ToolInvocation { name: inv.name.clone(), arguments: coerce_arguments(&inv.name, &inv.arguments) };
     let inv = &fixed;
     match inv.name.as_str() {
+        "memory_save" => {
+            let text = inv.arguments.get("text").and_then(Value::as_str).unwrap_or("");
+            let kind = inv.arguments.get("kind").and_then(Value::as_str).unwrap_or("user");
+            match crate::memory::add(kind, text) {
+                Ok(n) => ToolResult { name: inv.name.clone(), output: format!("Saved note {}: {}", n.id, n.text), is_error: false },
+                Err(e) => ToolResult { name: inv.name.clone(), output: format!("error: {e}"), is_error: true },
+            }
+        }
+        "memory_list" => ToolResult { name: inv.name.clone(), output: crate::memory::as_text(), is_error: false },
+        "memory_forget" => {
+            let id = inv.arguments.get("id").and_then(Value::as_u64).unwrap_or(0);
+            match crate::memory::forget(id) {
+                Ok(()) => ToolResult { name: inv.name.clone(), output: format!("Forgot note {id}."), is_error: false },
+                Err(e) => ToolResult { name: inv.name.clone(), output: format!("error: {e}"), is_error: true },
+            }
+        }
         "web_search" => {
             let q = inv.arguments.get("query").and_then(Value::as_str).unwrap_or("");
             let n = inv.arguments.get("max_results").and_then(Value::as_u64).unwrap_or(8) as usize;
@@ -330,6 +346,32 @@ pub fn tool_definitions() -> Value {
 
 fn builtin_tool_definitions() -> Value {
     json!([
+        {
+            "name": "memory_save",
+            "description": "Remember something about the user for future conversations: one short note (a fact, a preference, a project, how they like answers). Not passwords, keys or private data.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "text": { "type": "string", "description": "The note, one or two sentences" },
+                    "kind": { "type": "string", "description": "user, project, preference or reference" }
+                },
+                "required": ["text"]
+            }
+        },
+        {
+            "name": "memory_list",
+            "description": "List the notes remembered about the user (each with its id).",
+            "input_schema": { "type": "object", "properties": {} }
+        },
+        {
+            "name": "memory_forget",
+            "description": "Forget a note by its id (see memory_list), when it is wrong, outdated or the user asks.",
+            "input_schema": {
+                "type": "object",
+                "properties": { "id": { "type": "integer", "description": "The note's id" } },
+                "required": ["id"]
+            }
+        },
         {
             "name": "web_search",
             "description": "Search the web (DuckDuckGo) and get titles, URLs and snippets. Use web_fetch to read a result.",
