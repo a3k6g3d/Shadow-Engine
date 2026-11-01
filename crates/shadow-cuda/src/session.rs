@@ -835,18 +835,20 @@ struct GroupedPlan {
     weights: u64,
     /// byte offset of each token's expert count (u32, from token 0)
     counts: u64,
+    /// tokens a group holds (8: `matvec_grouped_*`; 32: `mma_grouped_*`)
+    chunk_n: usize,
 }
 
 #[allow(clippy::too_many_arguments)]
 fn grouped_plan(tops: &[Vec<(usize, f64)>], start: usize, end: usize, set: &[usize], k: usize, up: usize,
-                addr: impl Fn(usize) -> u64, copied: impl Fn(usize) -> bool, part: [u64; 3]) -> GroupedPlan {
-    // (expert, [(token, rank)]) per phase, at most 8 tokens a group
+                addr: impl Fn(usize) -> u64, copied: impl Fn(usize) -> bool, part: [u64; 3], chunk_n: usize) -> GroupedPlan {
+    // (expert, [(token, rank)]) per phase, at most `chunk_n` (8, or 32 for the tensor-core kernels) tokens a group
     let mut groups: [Vec<(usize, Vec<(usize, usize)>)>; 2] = [vec![], vec![]];
     for &e in set {
         let users: Vec<(usize, usize)> = (start..end)
             .filter_map(|j| tops[j].iter().position(|&(x, _)| x == e).map(|i| (j, i)))
             .collect();
-        for chunk in users.chunks(8) {
+        for chunk in users.chunks(chunk_n) {
             groups[copied(e) as usize].push((e, chunk.to_vec()));
         }
     }
@@ -858,11 +860,11 @@ fn grouped_plan(tops: &[Vec<(usize, f64)>], start: usize, end: usize, set: &[usi
         for (pi, p) in part.iter().enumerate() {
             for (e, users) in gs {
                 addrs.extend_from_slice(&(addr(*e) + p).to_le_bytes());
-                let mut r = [0u32; 17];
+                let mut r = vec![0u32; 1 + 2 * chunk_n];
                 r[0] = users.len() as u32;
                 for (u, &(j, i)) in users.iter().enumerate() {
                     let pair = (j * k + i) as u32;
-                    (r[1 + u], r[9 + u]) = match pi {
+                    (r[1 + u], r[1 + chunk_n + u]) = match pi {
                         0 => (j as u32, pair),
                         1 => (j as u32, up as u32 + pair),
                         _ => (pair, pair),
@@ -890,7 +892,7 @@ fn grouped_plan(tops: &[Vec<(usize, f64)>], start: usize, end: usize, set: &[usi
         bytes.extend_from_slice(&(top.len() as u32).to_le_bytes());
     }
     let phase = spans.map(|(n, a, r)| (n, a as u64, (rec_at + 4 * r) as u64));
-    GroupedPlan { bytes, phase, weights, counts }
+    GroupedPlan { bytes, phase, weights, counts, chunk_n }
 }
 
 /// Row j of a [rows][stride] f32 buffer.
@@ -1743,6 +1745,33 @@ impl<'c, 'm> GpuSession<'c, 'm> {
     }
 
     /// Asynchronous host-to-device DMA from pinned memory (`PinnedRegion`) on `stream` (null = default stream).
+    /// Queues `n` copies (device `dsts`, pinned host `srcs`, `lens` bytes) on `stream`: one `cuMemcpyBatchAsync` call when the driver has it (the host
+    /// time of 450 single calls was the longest step of a long prompt's layer), else one by one.
+    /// `srcs` are the sources' device-mapped addresses (`PinnedRegion::dev_ptr` + offset: the batch call wants those), `host_srcs` the same bytes' host
+    /// addresses (for the one-by-one fallback).
+    fn upload_batch(&self, dsts: &mut [u64], srcs: &mut [u64], host_srcs: &[u64], lens: &mut [usize], stream: *mut std::ffi::c_void) {
+        let api = self.ctx.api;
+        if dsts.is_empty() {
+            return;
+        }
+        self.ctx.bind().unwrap();
+        if let Some(batch) = api.cuMemcpyBatchAsync {
+            // CUmemcpyAttributes: source access order (STREAM = 1), two location hints (type, id), flags
+            let mut attr = [1u32, 0, 0, 0, 0, 0];
+            let mut idx = 0usize;
+            // SAFETY: `n` device destinations inside this session's buffers and `n` sources inside pinned regions (the callers' slices), `lens`
+            // bytes each, one attribute for all of them (index 0); the sources stay put until the stream is done with them (the callers' contract).
+            let r = unsafe { batch(dsts.as_mut_ptr(), srcs.as_mut_ptr(), lens.as_mut_ptr(), dsts.len(), attr.as_mut_ptr() as *mut std::ffi::c_void, &mut idx, 1, stream) };
+            assert_eq!(r, 0, "cuMemcpyBatchAsync failed ({r})");
+            return;
+        }
+        for i in 0..dsts.len() {
+            // SAFETY: as `upload_pinned_on`.
+            let r = unsafe { (api.cuMemcpyHtoDAsync)(dsts[i], host_srcs[i] as *const std::ffi::c_void, lens[i], stream) };
+            assert_eq!(r, 0, "cuMemcpyHtoDAsync failed ({r})");
+        }
+    }
+
     fn upload_pinned_on(&self, ptr: u64, data: &[u8], stream: *mut std::ffi::c_void) {
         let api = self.ctx.api;
         self.ctx.bind().unwrap();
@@ -2478,25 +2507,31 @@ impl<'c, 'm> GpuSession<'c, 'm> {
         let p = l & 1;
         let half = self.sp.as_ref().unwrap().base + (p * self.m.cfg.n_expert * self.cache.slot_bytes) as u64;
         let mut n = 0u64;
+        let (mut dsts, mut srcs, mut host_srcs, mut lens): (Vec<u64>, Vec<u64>, Vec<u64>, Vec<usize>) = (vec![], vec![], vec![], vec![]);
         for e in 0..self.m.cfg.n_expert {
             if self.cache.map.contains_key(&(l, e)) {
                 continue;
             }
             let dst = half + (e * self.cache.slot_bytes) as u64;
             if let Some(&off) = self.ram.at.get(&(l, e)) {
-                let src = &self.ram.region.as_ref().unwrap().as_slice()[off..off + total];
-                self.upload_pinned_on(dst, src, stream);
+                let region = self.ram.region.as_ref().unwrap();
+                srcs.push(region.dev_ptr + off as u64);
+                host_srcs.push(region.as_slice()[off..off + total].as_ptr() as u64);
                 self.ram.served += 1;
             } else {
                 let sp = self.sp.as_ref().unwrap();
                 let slot = *sp.at[p].get(&e).expect("a staged expert in neither the RAM tier nor the read-ahead");
                 debug_assert_eq!(sp.layer[p], l);
-                let src = &sp.bufs[p].as_slice()[slot * self.cache.slot_bytes..slot * self.cache.slot_bytes + total];
-                self.upload_pinned_on(dst, src, stream);
+                let at = slot * self.cache.slot_bytes;
+                srcs.push(sp.bufs[p].dev_ptr + at as u64);
+                host_srcs.push(sp.bufs[p].as_slice()[at..at + total].as_ptr() as u64);
                 self.ram.drive += 1;
             }
+            dsts.push(dst);
+            lens.push(total);
             n += 1;
         }
+        self.upload_batch(&mut dsts, &mut srcs, &host_srcs, &mut lens, stream);
         self.expert_uploads += 3 * n as usize;
         let sp = self.sp.as_mut().unwrap();
         sp.events[p].record(Some(&self.copy_stream)).unwrap();
@@ -2526,7 +2561,6 @@ impl<'c, 'm> GpuSession<'c, 'm> {
                 }
             }
         }
-        let t_a = std::time::Instant::now();
         let arena = self.cache.arena.as_ref().unwrap().ptr;
         let half = self.sp.as_ref().unwrap().base + (p * ne * self.cache.slot_bytes) as u64;
         for &e in &set {
@@ -2542,7 +2576,8 @@ impl<'c, 'm> GpuSession<'c, 'm> {
             None => half + (e * self.cache.slot_bytes) as u64,
         };
         let copied = |e: usize| !self.cache.map.contains_key(&(l, e));
-        let plan = grouped_plan(tops, 0, m, &set, k, self.rows * k, addr, copied, part);
+        let chunk_n = if self.mma_experts_ok(infos) { 32 } else { 8 };
+        let plan = grouped_plan(tops, 0, m, &set, k, self.rows * k, addr, copied, part, chunk_n);
         assert!(plan.bytes.len() <= self.bb.gtab.bytes, "grouped experts: {} bytes of tables", plan.bytes.len());
         self.upload_to(self.bb.gtab.ptr, &plan.bytes);
         self.routed_grouped(&plan, 0, 0, m, infos);
@@ -2554,28 +2589,11 @@ impl<'c, 'm> GpuSession<'c, 'm> {
             Arg::Ptr(row(&bb.so, h, 0)), Arg::Ptr(row(&bb.sgl, 1, 0)), Arg::Ptr(bb.gtab.ptr + plan.counts),
             Arg::U32(h as u32), Arg::U32(k as u32)]);
         // now the next layer's copy and the one after's reads, behind this layer's launches: the GPU runs this layer while the host queues them
-        let t_b = std::time::Instant::now();
         if l + 1 < self.m.cfg.n_layer {
             self.stage_copy(l + 1);
-            let t_c = std::time::Instant::now();
             // buffer l & 1 held layer l's file-only experts: its copy (queued before the previous layer's compute) has finished
             self.sp.as_ref().unwrap().events[p].synchronize().unwrap();
-            let t_d = std::time::Instant::now();
             self.stage_pipe_read(l + 2);
-            if std::env::var_os("SHADOW_SP_PROF").is_some() {
-                static ACC: std::sync::Mutex<(u64, [f64; 5])> = std::sync::Mutex::new((0, [0.0; 5]));
-                let mut a = ACC.lock().unwrap();
-                a.0 += 1;
-                a.1[0] += (t_b - t_a).as_secs_f64(); // plan + upload + resident launch
-                a.1[1] += (t_c - t_b).as_secs_f64(); // stage_copy(l+1) host time (incl. waiting for reads)
-                a.1[2] += (t_d - t_c).as_secs_f64(); // event sync
-                a.1[3] += t_d.elapsed().as_secs_f64(); // starting l+2's reads
-                if a.0 % 96 == 0 {
-                    let n = a.0 as f64;
-                    eprintln!("sp-prof ({} layers, ms each): plan+launch0 {:.1}, copy(l+1) {:.1}, event wait {:.1}, start reads {:.1}; router wait {:.1}",
-                              a.0, 1e3 * a.1[0] / n, 1e3 * a.1[1] / n, 1e3 * a.1[2] / n, 1e3 * a.1[3] / n, 1e3 * self.waits[0] / n);
-                }
-            }
         }
     }
 
@@ -4000,7 +4018,8 @@ impl<'c, 'm> GpuSession<'c, 'm> {
                     None => extra.iter().find(|x| x.0 == e).expect("a routed expert neither cached nor fetched").1,
                 };
                 let copied = |e: usize| copying.iter().any(|c| c.0 == e);
-                let p = grouped_plan(&tops, start, end, &set, k, self.rows * k, addr, copied, part);
+                let chunk_n = if end - start >= 64 && self.mma_experts_ok(&infos) { 32 } else { 8 };
+                let p = grouped_plan(&tops, start, end, &set, k, self.rows * k, addr, copied, part, chunk_n);
                 assert!(p.bytes.len() <= self.bb.gtab.bytes, "grouped experts: {} bytes of tables", p.bytes.len());
                 self.upload_to(self.bb.gtab.ptr, &p.bytes);
                 if start == 0 {
@@ -4071,6 +4090,13 @@ impl<'c, 'm> GpuSession<'c, 'm> {
         }
     }
 
+    /// Whether a layer's three expert matrices can run on the tensor cores (`--tensor-prompt`: types with an FP16 decode, columns a multiple of 64).
+    fn mma_experts_ok(&self, infos: &[TensorInfo]) -> bool {
+        self.tensor_prompt
+            && infos.iter().all(|t| matches!(t.ty.name().as_str(), "Q6_K" | "IQ4_XS" | "IQ4_NL" | "Q2_0" | "IQ2_S" | "IQ3_XXS" | "IQ3_S")
+                                    && t.dims[0] % 64 == 0 && t.dims[1] % 8 == 0)
+    }
+
     /// Phase `ph` (0: the resident experts, 1: the copied ones) of `grouped_plan`'s routed experts for tokens
     /// start..end: gate+up grouped, swiglu over the tokens' rows, down grouped, into bb.eo row (token, rank).
     fn routed_grouped(&self, p: &GroupedPlan, ph: usize, start: usize, end: usize, infos: &[TensorInfo]) {
@@ -4086,11 +4112,16 @@ impl<'c, 'm> GpuSession<'c, 'm> {
             let ty = t.ty.name().to_lowercase();
             let (rows, cols) = (t.dims[1] as u32, t.dims[0] as u32);
             // SAFETY: `count` table entries at gtab + wt (matrix addresses) and + gt (17 u32 each: count, input rows,
-            // output rows), each a rows x cols matrix in the cache or the scratch slots; the rows they name are inside
-            // the batch's buffers at the strides given.
-            unsafe {
+            // output rows; 65 for the 32-token records), each a rows x cols matrix in the cache or the scratch slots; the rows
+            // they name are inside the batch's buffers at the strides given.
+            let (kernel, grid, block) = if p.chunk_n == 32 {
+                (format!("mma_grouped_{ty}"), (rows.div_ceil(64), count as u32, 1), 128)
+            } else {
                 // 8 rows a block: matvec.cu's GROUPED_RW = 1
-                self.mvp.launch(&format!("matvec_grouped_{ty}"), (rows.div_ceil(8), count as u32, 1), (256, 1, 1), 0, self.ls(),
+                (format!("matvec_grouped_{ty}"), (rows.div_ceil(8), count as u32, 1), 256)
+            };
+            unsafe {
+                self.mvp.launch(&kernel, grid, (block, 1, 1), 0, self.ls(),
                                 &[Arg::Ptr(bb.gtab.ptr + wt), Arg::Ptr(bb.gtab.ptr + gt), Arg::Ptr(x), Arg::U32(xs as u32),
                                   Arg::Ptr(y), Arg::U32(ys as u32), Arg::U32(rows), Arg::U32(cols)])
             }
@@ -4101,7 +4132,7 @@ impl<'c, 'm> GpuSession<'c, 'm> {
         let len = (end - start) * k * ff;
         self.k1("swiglu", len, &[Arg::Ptr(bb.eg.ptr + rows), Arg::Ptr(bb.eg.ptr + up + rows), Arg::Ptr(bb.act.ptr + rows),
                                  Arg::U32(len as u32)]);
-        grouped(&infos[2], w + 16 * n as u64, g + (2 * n * 68) as u64, n, bb.act.ptr, ff, bb.eo.ptr, h);
+        grouped(&infos[2], w + 16 * n as u64, g + (2 * n * 4 * (1 + 2 * p.chunk_n)) as u64, n, bb.act.ptr, ff, bb.eo.ptr, h);
     }
 
     /// Token j's routed experts (resident in the cache, or at `extra`'s scratch addresses) and the combine with its

@@ -820,13 +820,93 @@ template <> struct Dec8<IQ4XS> {
     }
 };
 
+template <> struct Dec8<IQ4NL> {
+    static __device__ __forceinline__ void dec8(const u8* r, unsigned int i, float* o) {
+        const u8* b = r + (i / 32) * 18;
+        unsigned int e0 = i % 32, sh = (e0 >= 16) ? 4u : 0u;
+        float d = qf16(b);
+        const u16* q = (const u16*) (b + 2 + (e0 & 15));
+#pragma unroll
+        for (unsigned int k = 0; k < 4; k++) {
+            u16 w = q[k];
+            o[2 * k] = __fmul_rn(d, iq4nl_val((w >> sh) & 0x0f));
+            o[2 * k + 1] = __fmul_rn(d, iq4nl_val((w >> (8 + sh)) & 0x0f));
+        }
+    }
+};
+
+template <> struct Dec8<Q20> {
+    static __device__ __forceinline__ void dec8(const u8* r, unsigned int i, float* o) {
+        const u8* b = r + (i / 64) * 18;
+        unsigned int e0 = i % 64;
+        float d = qf16(b);
+        u16 q16 = *(const u16*) (b + 2 + e0 / 4);
+#pragma unroll
+        for (unsigned int k = 0; k < 8; k++) o[k] = __fmul_rn((float) ((int) ((q16 >> (2 * k)) & 0x03) - 1), d);
+    }
+};
+
+template <> struct Dec8<IQ2S> {
+    static __device__ __forceinline__ void dec8(const u8* r, unsigned int i, float* o) {
+        const u8* b = r + (i / 256) * 82;
+        unsigned int e0 = i % 256, j = e0 / 8;
+        unsigned int idx = b[2 + j] | (((b[66 + j / 4] >> (2 * (j % 4))) & 3) << 8);
+        unsigned int sc = (b[74 + e0 / 32] >> (4 * ((e0 / 16) % 2))) & 0x0f;
+        float db = __fmul_rn(__fmul_rn(qf16(b), __fadd_rn(0.5f, (float) sc)), 0.25f);
+        u8 signs = b[34 + j];
+        u64 row = *(const u64*) kIQ2SGrid[idx];
+#pragma unroll
+        for (unsigned int k = 0; k < 8; k++) o[k] = qsign(__fmul_rn(db, (float) (u8) (row >> (8 * k))), signs >> k);
+    }
+};
+
+template <> struct Dec8<IQ3XXS> {
+    static __device__ __forceinline__ void dec8(const u8* r, unsigned int i, float* o) {
+        const u8* b = r + (i / 256) * 98;
+        unsigned int e0 = i % 256, g = e0 / 32, kk = (e0 % 32) / 8;
+        const u16* sp = (const u16*) (b + 66 + g * 4);
+        unsigned int s32 = (unsigned int) sp[0] | ((unsigned int) sp[1] << 16);
+        float db = __fmul_rn(__fmul_rn(qf16(b), __fadd_rn(0.5f, (float) (s32 >> 28))), 0.5f);
+        u8 signs = kKSigns[(s32 >> (7 * kk)) & 0x7f];
+        u16 q2 = *(const u16*) (b + 2 + e0 / 4);
+        u32 r0 = *(const u32*) kIQ3XXSGrid[q2 & 0xff], r1 = *(const u32*) kIQ3XXSGrid[q2 >> 8];
+#pragma unroll
+        for (unsigned int k = 0; k < 8; k++) {
+            u8 v = (u8) ((k < 4 ? r0 : r1) >> (8 * (k % 4)));
+            o[k] = qsign(__fmul_rn(db, (float) v), signs >> k);
+        }
+    }
+};
+
+template <> struct Dec8<IQ3S> {
+    static __device__ __forceinline__ void dec8(const u8* r, unsigned int i, float* o) {
+        const u8* b = r + (i / 256) * 110;
+        unsigned int e0 = i % 256, j0 = e0 / 4, g = e0 / 32;
+        unsigned int sc = (b[106 + g / 2] >> (4 * (g % 2))) & 0x0f;
+        float db = __fmul_rn(qf16(b), (float) (1 + 2 * sc));
+        u8 signs = b[74 + e0 / 8], qh = b[66 + g];
+        u16 q2 = *(const u16*) (b + 2 + j0);
+        unsigned int sh0 = j0 % 8;
+        u32 rr[2] = {
+            *(const u32*) kIQ3SGrid[(q2 & 0xff) | (((qh >> sh0) & 1u) << 8)],
+            *(const u32*) kIQ3SGrid[(q2 >> 8) | (((qh >> (sh0 + 1)) & 1u) << 8)],
+        };
+#pragma unroll
+        for (unsigned int k = 0; k < 8; k++) {
+            u8 v = (u8) (rr[k / 4] >> (8 * (k % 4)));
+            o[k] = qsign(__fmul_rn(db, (float) v), signs >> k);
+        }
+    }
+};
+
 template <typename Q>
-static __device__ __forceinline__ void mma_cols(const u8* w, const float* x, unsigned int xs, float* y, unsigned int ys,
-                                                unsigned int rows, unsigned int cols, unsigned int m) {
+static __device__ __forceinline__ void mma_core(const u8* w, const float* x, unsigned int xs, float* y, unsigned int ys,
+                                                unsigned int rows, unsigned int cols, unsigned int m, unsigned int tok_tile,
+                                                const unsigned int* xi, const unsigned int* yi) {
     __shared__ __align__(16) unsigned short ws[MMA_ROWS][MMA_K + MMA_PAD];
     __shared__ __align__(16) unsigned short xt[MMA_TOK][MMA_K + MMA_PAD];
     const unsigned int tid = threadIdx.x, warp = tid / 32, lane = tid % 32, grp = lane / 4, tig = lane % 4;
-    const unsigned int row_base = blockIdx.x * MMA_ROWS, tok_base = blockIdx.y * MMA_TOK;
+    const unsigned int row_base = blockIdx.x * MMA_ROWS, tok_base = tok_tile * MMA_TOK;
     const u64 rb = (u64) (cols / Q::QK) * Q::BYTES;
     float acc[4][4];
 #pragma unroll
@@ -852,7 +932,7 @@ static __device__ __forceinline__ void mma_cols(const u8* w, const float* x, uns
         for (unsigned int t = 0; t < 4; t++) {
             unsigned int idx = tid + 128 * t, tok = idx / 16, kq = (idx % 16) * 4;
             float4 f = make_float4(0.f, 0.f, 0.f, 0.f);
-            if (tok_base + tok < m) f = *(const float4*) (x + (u64) (tok_base + tok) * xs + kc + kq);
+            if (tok_base + tok < m) f = *(const float4*) (x + (u64) (xi ? xi[tok_base + tok] : tok_base + tok) * xs + kc + kq);
             uint2 p;
             p.x = pack_half2(f.x, f.y); p.y = pack_half2(f.z, f.w);
             *(uint2*) &xt[tok][kq] = p;
@@ -881,11 +961,36 @@ static __device__ __forceinline__ void mma_cols(const u8* w, const float* x, uns
 #pragma unroll
         for (unsigned int e = 0; e < 4; e++) {
             unsigned int row = row_base + warp * 16 + grp + (e >= 2 ? 8 : 0), tok = tok_base + n * 8 + tig * 2 + (e & 1);
-            if (row < rows && tok < m) y[(u64) tok * ys + row] = acc[n][e];
+            if (row < rows && tok < m) y[(u64) (yi ? yi[tok] : tok) * ys + row] = acc[n][e];
         }
 }
+template <typename Q>
+static __device__ __forceinline__ void mma_cols(const u8* w, const float* x, unsigned int xs, float* y, unsigned int ys,
+                                                unsigned int rows, unsigned int cols, unsigned int m) {
+    mma_core<Q>(w, x, xs, y, ys, rows, cols, m, blockIdx.y, nullptr, nullptr);
+}
+// The grouped experts of a long prompt: entry blockIdx.y of the table is an expert (matrix address wtab[y]) and up to 32 of the tokens that route to it:
+// record gtab[y * 65] = count, then 32 input rows, then 32 output rows (the layout of `matvec_grouped_*`'s 17-u32 records, with 32 tokens).
+template <typename Q>
+static __device__ __forceinline__ void mma_grouped(const u64* wtab, const unsigned int* gtab, const float* x, unsigned int xs, float* y,
+                                                   unsigned int ys, unsigned int rows, unsigned int cols) {
+    const unsigned int* gi = gtab + (u64) blockIdx.y * 65;
+    mma_core<Q>((const u8*) wtab[blockIdx.y], x, xs, y, ys, rows, cols, gi[0], 0, gi + 1, gi + 33);
+}
 extern "C" __global__ void mma_cols_q6_k(const u8* w, const float* x, unsigned int xs, float* y, unsigned int ys, unsigned int rows, unsigned int cols, unsigned int m) { mma_cols<Q6K>(w, x, xs, y, ys, rows, cols, m); }
+extern "C" __global__ void mma_grouped_q6_k(const u64* wtab, const unsigned int* gtab, const float* x, unsigned int xs, float* y, unsigned int ys, unsigned int rows, unsigned int cols) { mma_grouped<Q6K>(wtab, gtab, x, xs, y, ys, rows, cols); }
 extern "C" __global__ void mma_cols_iq4_xs(const u8* w, const float* x, unsigned int xs, float* y, unsigned int ys, unsigned int rows, unsigned int cols, unsigned int m) { mma_cols<IQ4XS>(w, x, xs, y, ys, rows, cols, m); }
+extern "C" __global__ void mma_grouped_iq4_xs(const u64* wtab, const unsigned int* gtab, const float* x, unsigned int xs, float* y, unsigned int ys, unsigned int rows, unsigned int cols) { mma_grouped<IQ4XS>(wtab, gtab, x, xs, y, ys, rows, cols); }
+extern "C" __global__ void mma_cols_iq4_nl(const u8* w, const float* x, unsigned int xs, float* y, unsigned int ys, unsigned int rows, unsigned int cols, unsigned int m) { mma_cols<IQ4NL>(w, x, xs, y, ys, rows, cols, m); }
+extern "C" __global__ void mma_grouped_iq4_nl(const u64* wtab, const unsigned int* gtab, const float* x, unsigned int xs, float* y, unsigned int ys, unsigned int rows, unsigned int cols) { mma_grouped<IQ4NL>(wtab, gtab, x, xs, y, ys, rows, cols); }
+extern "C" __global__ void mma_cols_q2_0(const u8* w, const float* x, unsigned int xs, float* y, unsigned int ys, unsigned int rows, unsigned int cols, unsigned int m) { mma_cols<Q20>(w, x, xs, y, ys, rows, cols, m); }
+extern "C" __global__ void mma_grouped_q2_0(const u64* wtab, const unsigned int* gtab, const float* x, unsigned int xs, float* y, unsigned int ys, unsigned int rows, unsigned int cols) { mma_grouped<Q20>(wtab, gtab, x, xs, y, ys, rows, cols); }
+extern "C" __global__ void mma_cols_iq2_s(const u8* w, const float* x, unsigned int xs, float* y, unsigned int ys, unsigned int rows, unsigned int cols, unsigned int m) { mma_cols<IQ2S>(w, x, xs, y, ys, rows, cols, m); }
+extern "C" __global__ void mma_grouped_iq2_s(const u64* wtab, const unsigned int* gtab, const float* x, unsigned int xs, float* y, unsigned int ys, unsigned int rows, unsigned int cols) { mma_grouped<IQ2S>(wtab, gtab, x, xs, y, ys, rows, cols); }
+extern "C" __global__ void mma_cols_iq3_xxs(const u8* w, const float* x, unsigned int xs, float* y, unsigned int ys, unsigned int rows, unsigned int cols, unsigned int m) { mma_cols<IQ3XXS>(w, x, xs, y, ys, rows, cols, m); }
+extern "C" __global__ void mma_grouped_iq3_xxs(const u64* wtab, const unsigned int* gtab, const float* x, unsigned int xs, float* y, unsigned int ys, unsigned int rows, unsigned int cols) { mma_grouped<IQ3XXS>(wtab, gtab, x, xs, y, ys, rows, cols); }
+extern "C" __global__ void mma_cols_iq3_s(const u8* w, const float* x, unsigned int xs, float* y, unsigned int ys, unsigned int rows, unsigned int cols, unsigned int m) { mma_cols<IQ3S>(w, x, xs, y, ys, rows, cols, m); }
+extern "C" __global__ void mma_grouped_iq3_s(const u64* wtab, const unsigned int* gtab, const float* x, unsigned int xs, float* y, unsigned int ys, unsigned int rows, unsigned int cols) { mma_grouped<IQ3S>(wtab, gtab, x, xs, y, ys, rows, cols); }
 
 // ------------------------------------------------------------------ several inputs at once, in the reference order
 // One token runs BF16 and F32 matrices through the reference order (matvec_rows, matvec_pair_bf16/f32 and

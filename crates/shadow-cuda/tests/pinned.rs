@@ -100,3 +100,36 @@ fn host_to_device_bandwidth() {
         }
     }
 }
+
+/// `cuMemcpyBatchAsync_v2`: 64 copies of 2 MiB from a pinned region into scattered device spots come out exactly, and the call is cheap on the host.
+#[test]
+fn batched_host_to_device_copies_are_exact() {
+    let Some(ctx) = context() else { return };
+    let Some(batch) = ctx.api.cuMemcpyBatchAsync else { return eprintln!("SKIPPED, not passed: the driver has no cuMemcpyBatchAsync") };
+    let chunk = 2usize << 20;
+    let n = 64usize;
+    let mut region = PinnedRegion::new(&ctx, n * chunk).expect("128 MiB pinned");
+    for (i, b) in region.as_mut_slice().iter_mut().enumerate() {
+        *b = (i.wrapping_mul(31) ^ (i >> 12)) as u8;
+    }
+    let dev = ctx.alloc(2 * n * chunk).unwrap();
+    let stream = ctx.stream().unwrap();
+    // copy i goes to slot (n - 1 - i) * 2 (every other slot, reversed)
+    let mut dsts: Vec<u64> = (0..n).map(|i| dev.ptr + (((n - 1 - i) * 2) * chunk) as u64).collect();
+    let mut srcs: Vec<u64> = (0..n).map(|i| region.dev_ptr + (i * chunk) as u64).collect();
+    let mut lens = vec![chunk; n];
+    let mut attr = [1u32, 0, 0, 0, 0, 0];
+    let mut idx = 0usize;
+    let t0 = std::time::Instant::now();
+    let r = unsafe { batch(dsts.as_mut_ptr(), srcs.as_mut_ptr(), lens.as_mut_ptr(), n, attr.as_mut_ptr() as *mut _, &mut idx, 1, stream.raw()) };
+    let host_us = t0.elapsed().as_secs_f64() * 1e6;
+    assert_eq!(r, 0, "cuMemcpyBatchAsync returned {r}");
+    stream.synchronize().unwrap();
+    eprintln!("batched copy: host time {host_us:.0} us for {n} copies");
+    let mut got = vec![0u8; 2 * n * chunk];
+    dev.download(&mut got).unwrap();
+    for i in 0..n {
+        let slot = (n - 1 - i) * 2;
+        assert_eq!(&got[slot * chunk..(slot + 1) * chunk], &region.as_slice()[i * chunk..(i + 1) * chunk], "copy {i} differs");
+    }
+}

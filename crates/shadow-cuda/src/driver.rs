@@ -39,6 +39,8 @@ macro_rules! table {
         pub struct Api {
             pub lib: Dylib,
             $(pub $field: unsafe extern "system" fn($($a),*) -> CuResult,)*
+            /// `cuMemcpyBatchAsync_v2` (CUDA 12.8+ drivers): many copies in one call; None on an older driver (the callers copy one by one)
+            pub cuMemcpyBatchAsync: Option<unsafe extern "system" fn(*mut u64, *mut u64, *mut usize, usize, *mut c_void, *mut usize, usize, H) -> CuResult>,
         }
         impl Api {
             fn load(lib: Dylib) -> Result<Api, String> {
@@ -46,6 +48,10 @@ macro_rules! table {
                     // SAFETY: each symbol is the driver's own export of that name, and the type written here is its
                     // documented signature for the versioned name asked for first.
                     $($field: unsafe { std::mem::transmute::<*mut c_void, unsafe extern "system" fn($($a),*) -> CuResult>(lib.sym_any(&[$($name),+])?) },)*
+                    // SAFETY: the documented signature of `cuMemcpyBatchAsync_v2`.
+                    cuMemcpyBatchAsync: lib.sym_any(&["cuMemcpyBatchAsync_v2"]).ok().map(|p| unsafe {
+                        std::mem::transmute::<*mut c_void, unsafe extern "system" fn(*mut u64, *mut u64, *mut usize, usize, *mut c_void, *mut usize, usize, H) -> CuResult>(p)
+                    }),
                     lib,
                 })
             }
