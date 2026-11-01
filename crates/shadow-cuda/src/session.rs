@@ -179,7 +179,7 @@ struct Bufs<'c> {
 /// token needs 5.95 experts of its 10 a layer in groups of 8, 3.60 in groups of 32, 2.51 in groups of 64.
 pub const MAX_BATCH: usize = 256;
 /// Tokens a long prompt reads together in the lent cache (`big_batch_on`): per-token buffers carved from it, not kept.
-pub const BIG_BATCH: usize = 1024;
+pub const BIG_BATCH: usize = 2048;
 /// Unread prompt tokens from which the layer-ahead pipeline and the big batch are used.
 pub const LONG_PROMPT: usize = 1024;
 const COLS_MAX: usize = 8;

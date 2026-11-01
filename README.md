@@ -37,7 +37,7 @@ time; the bench's per-turn median misranks arms that generate different text, se
 | Strata (its tuned config, same model, prompts, context) | **47.7** | interleaved with Shadow in the same session |
 
 **Shadow is about 9% faster than Strata on this bench** (52.1 against 47.7 tok/s by total throughput, 3 interleaved runs of 36 prompts each: Shadow 51.8, 52.2, 52.2, Strata 47.7, 47.4, 48.0). Shadow's replies are longer (1,781 tokens a run against Strata's 1,518) and its fidelity to the exact model
-is about the same. With AcceptMoE verification (`--accept-moe`) Shadow runs about 3% slower. Prompt reading is slower: 165 to 190 tok/s on prompts of 1,024 tokens or more with the default 36 GiB tier (about 80 below that) against Strata's 1,376. The resource record
+is about the same. With AcceptMoE verification (`--accept-moe`) Shadow runs about 3% slower. Prompt reading is slower: 185 to 225 tok/s on prompts of 1,024 tokens or more with the default 36 GiB tier (about 80 below that) against Strata's 1,376. The resource record
 (`bench/vs-strata-final4/charts/`) shows where the time goes: Shadow's GPU is busier (84% against 78%), it moves more over PCIe (15.4 against 10.1 GB/s, about 296 against 212 MB of expert weights per generated token: the bigger RAM tier serves more of its misses) and uses the CPU and disk far less
 (12% against 51% CPU, 150 against 468 MB/s of disk), but it keeps only about 4-5 GiB of RAM free (Strata 8-9 GiB). Earlier figures in this repository's history that put Shadow at 43 to 47 tok/s came from a mode that cut
 answers short (`--verify-resident`) and from per-turn medians; both are documented in

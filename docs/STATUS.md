@@ -1186,3 +1186,10 @@ Single-prompt runs, "Write a Rust function that parses a comma separated list...
 - With the default 36 GiB tier (25% of the experts file-only instead of 36%, about 30% fewer file reads): 4 prompts of 1.8k-4.6k tokens at **165 / 191 / 178 / 178 tok/s** (first run 103 / 191 / 184 / 184) against 129-146 at 30 GiB; same-history fidelity 0.421 (noise ~0.04); decode after the prompts 43-45 tok/s;
   24-turn chat 15.9 tok/s end to end (14.5 before). `cargo test --release` passes (the drift test wants every entry point written out, not made by a macro).
 - So a long prompt is bound by reading the file-only experts from the SSD (~6 GB/s while the pipeline also copies and computes) and then by the host-to-device copies: more RAM tier, or a faster read path (unbuffered reads straight into the pinned buffers), is what is left; the kernels are not the limit any more.
+
+## 2026-10-31: the SSD is the limit of a long prompt; 2,048-token batches
+
+- Raw reads of the model file (`tests/pinned.rs::ssd_read_bandwidth`, ignored by default; random 2 MiB reads over the first shard): **buffered 9.5 GB/s** at 8 threads (the Windows file cache serving most of it) but **unbuffered (`FILE_FLAG_NO_BUFFERING`) 3.5 GB/s**, the drive itself. A long prompt reads every file-only expert (25% of them at the 36 GiB tier, ~11.9 GB a pass)
+  while the 36 GiB tier leaves the file cache a few GB, so it runs near 3.5 GB/s: ~3.4 s a pass, an upper bound of ~300 tok/s at 1,024 tokens a pass. Unbuffered reads would not help (slower than the cache when it hits); more tokens a pass (the same bytes for more tokens) does.
+- `BIG_BATCH` 1,024 -> **2,048** (per-token buffers 1.27 GiB carved from the lent cache; the drafter's feature rows 2,048 as well, +52 MB of VRAM): 4 prompts of 1.8k-4.6k tokens at the 36 GiB tier **184 / 197 / 220 / 226 tok/s** (1,024: 165 / 191 / 178 / 178); at the 30 GiB tier 173 / 177 / 188 / 164 (1,024: 129 / 147 / 135 / 140).
+  Decode unchanged: varied bench, 3 runs, default flags, total throughput **51.89** tok/s (52.09 before, inside the noise); the RAM floor in use 3.9-4.5 GiB free. `cargo test --release` passes.
