@@ -1269,3 +1269,14 @@ Single-prompt runs, "Write a Rust function that parses a comma separated list...
 - Tested with a generated STL (a 40 x 20 x 10 plate with a 12 mm cylinder to z = 35) and a hand-written STEP box: the sheets are right; the model answered from the sheet and
   the summary ("rectangular base plate with a vertical cylinder, 40 x 20 x 35, cylinder diameter about 12, base about 10-12").
 - Limits: no surfaces for STEP (a curved part is a wire frame of chords); STL volume is meaningful only for a closed mesh; very fine detail is limited by the 768-pixel sheet.
+
+## 2026-11-01: a Dashboard and a conversation sidebar in the web UI
+
+- **Dashboard tab** (between Chat and Process Monitor): engine (state, model, uptime, speculation on/off, requests answered, context in use with a bar), decode speed per reply (bar
+  chart of the last 40, last and average tok/s, last prompt-reading speed), GPU (busy %, a 2-minute line, VRAM bar, temperature), expert tiers (VRAM cache hit rate, the pinned RAM tier,
+  the share of misses served from RAM against the drive), system memory (free RAM line, Shadow's working set, CPU), saved conversations, a table of the last 12 requests (prompt and
+  cached tokens, reading speed, tokens written, decode speed, how it ended, a picture mark) and quick actions (new chat, resume the last chat, persona, Windows tools on/off, the
+  process monitor). The server keeps the last 40 answered requests (`engine::Recent`, telemetry `recent`) and now reports `session_tokens`.
+- **Conversation sidebar** in the chat view (hide with «, reopen with ☰): every conversation is saved in the browser's localStorage after each reply (pictures included until the space
+  runs out, then the oldest conversation's pictures go first), grouped Today / Yesterday / This week / Earlier, searchable, deletable, restorable (attached files and pictures shown again).
+- Tested live: the sidebar after a real reply, a fabricated second conversation (open, switch back, delete), the dashboard on the running server with real numbers.

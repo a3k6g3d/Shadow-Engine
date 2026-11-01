@@ -384,6 +384,7 @@ impl TelemetryService {
                 "state": s.state,
                 "busy": s.busy,
                 "n_ctx": s.n_ctx,
+                "session_tokens": s.session_tokens,
                 "queued": queued,
                 "tok_per_sec": (tok_s * 100.0).round() / 100.0,
                 "prompt_tokens": s.prompt_tokens,
@@ -394,7 +395,11 @@ impl TelemetryService {
                 "dflash_active": s.dflash_active,
                 "prefill_done": crate::engine::PREFILL.0.load(std::sync::atomic::Ordering::Relaxed),
                 "prefill_total": crate::engine::PREFILL.1.load(std::sync::atomic::Ordering::Relaxed)
-            }
+            },
+            "recent": s.recent.iter().map(|r| json!({
+                "at": r.at, "prompt_tokens": r.prompt_tokens, "cached_tokens": r.cached_tokens, "completion_tokens": r.completion_tokens,
+                "prompt_ms": r.prompt_ms.round(), "predicted_ms": r.predicted_ms.round(), "finish": r.finish, "pictures": r.pictures,
+            })).collect::<Vec<_>>()
         })
     }
 }

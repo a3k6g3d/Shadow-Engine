@@ -74,6 +74,24 @@ pub struct Status {
     pub mtp_active: bool,
     /// the DFlash drafter is loaded (`--dflash`; the default)
     pub dflash_active: bool,
+    /// The last answered requests, oldest first (at most `RECENT_MAX`): what the dashboard's table and charts show.
+    pub recent: std::collections::VecDeque<Recent>,
+}
+
+pub const RECENT_MAX: usize = 40;
+
+/// One answered request, for the dashboard.
+#[derive(Debug, Clone)]
+pub struct Recent {
+    /// Unix seconds when it finished.
+    pub at: f64,
+    pub prompt_tokens: usize,
+    pub cached_tokens: usize,
+    pub completion_tokens: usize,
+    pub prompt_ms: f64,
+    pub predicted_ms: f64,
+    pub finish: &'static str,
+    pub pictures: usize,
 }
 
 /// Prompt-reading progress of the request being answered, (tokens read, tokens to read): the UI shows it while the
@@ -272,6 +290,13 @@ fn run(cfg: Config, rx: std::sync::mpsc::Receiver<Request>, status: &Mutex<Statu
                 s.completion_tokens += st.completion_tokens as u64;
                 s.prompt_secs += st.prompt_ms / 1e3;
                 s.decode_secs += st.predicted_ms / 1e3;
+                let at = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0.0, |d| d.as_secs_f64());
+                if s.recent.len() >= RECENT_MAX {
+                    s.recent.pop_front();
+                }
+                s.recent.push_back(Recent { at, prompt_tokens: st.prompt_tokens, cached_tokens: st.cached_tokens,
+                                            completion_tokens: st.completion_tokens, prompt_ms: st.prompt_ms, predicted_ms: st.predicted_ms,
+                                            finish: st.finish_reason, pictures: req.images.len() });
                 let _ = req.tx.send(Event::Done(st));
             }
             Err(e) => {

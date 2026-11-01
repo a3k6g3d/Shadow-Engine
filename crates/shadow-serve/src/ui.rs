@@ -192,6 +192,59 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
       height: 100%;
     }
 
+    /* Chat history sidebar */
+    #chat-sidebar { display: none; flex-direction: column; width: 270px; flex: none; border-right: 1px solid var(--border); background: var(--surface); min-height: 0; }
+    body.view-chat #chat-sidebar { display: flex; }
+    body.side-closed #chat-sidebar { display: none; }
+    .side-head { display: flex; gap: 0.5rem; padding: 0.75rem; }
+    .side-new { flex: 1; background: var(--accent); color: #fff; border: none; border-radius: 0.6rem; padding: 0.55rem 0.8rem; font-weight: 600; cursor: pointer; }
+    .side-new:hover { background: var(--accent-hover); }
+    .side-search { margin: 0 0.75rem 0.5rem; padding: 0.45rem 0.7rem; background: var(--bg); border: 1px solid var(--border); border-radius: 0.5rem; color: var(--text); font-size: 0.85rem; }
+    #chat-list { flex: 1; overflow-y: auto; padding: 0 0.5rem 0.75rem; display: flex; flex-direction: column; gap: 2px; }
+    .side-group { font-size: 0.7rem; letter-spacing: 0.06em; text-transform: uppercase; color: var(--text-dim); padding: 0.7rem 0.5rem 0.25rem; }
+    .chat-item { display: flex; align-items: center; gap: 0.4rem; padding: 0.5rem 0.6rem; border-radius: 0.5rem; cursor: pointer; color: var(--text-muted); font-size: 0.85rem; }
+    .chat-item:hover { background: var(--surface-hover); color: var(--text); }
+    .chat-item.active { background: var(--accent-light); color: var(--text); }
+    .chat-item .t { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .chat-item .x { opacity: 0; background: none; border: none; color: var(--text-dim); cursor: pointer; }
+    .chat-item:hover .x { opacity: 1; }
+    .chat-item .x:hover { color: var(--danger); }
+    .side-empty { padding: 1rem 0.75rem; color: var(--text-dim); font-size: 0.82rem; }
+    .side-toggle { background: var(--surface-hover); border: 1px solid var(--border); color: var(--text-muted); border-radius: 0.5rem; padding: 0.25rem 0.55rem; cursor: pointer; }
+    .side-toggle:hover { color: var(--text); }
+
+    /* Dashboard */
+    #dash-panel { overflow-y: auto; padding: 1.25rem 1.5rem 2rem; }
+    .dash-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 1rem; flex-wrap: wrap; gap: 0.75rem; }
+    .dash-head h1 { font-size: 1.25rem; margin: 0; }
+    .dash-head p { margin: 0.2rem 0 0; color: var(--text-muted); font-size: 0.85rem; }
+    .dash-actions { display: flex; gap: 0.5rem; flex-wrap: wrap; }
+    .dash-btn { background: var(--surface-hover); border: 1px solid var(--border); color: var(--text); border-radius: 0.6rem; padding: 0.5rem 0.85rem; cursor: pointer; font-size: 0.85rem; }
+    .dash-btn:hover { border-color: var(--accent); }
+    .dash-btn.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+    .dash-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 1rem; }
+    .dcard { background: var(--surface); border: 1px solid var(--border); border-radius: 0.9rem; padding: 1rem 1.1rem; display: flex; flex-direction: column; gap: 0.6rem; min-width: 0; }
+    .dcard.wide { grid-column: 1 / -1; }
+    .dcard h3 { margin: 0; font-size: 0.78rem; letter-spacing: 0.06em; text-transform: uppercase; color: var(--text-muted); font-weight: 600; display: flex; justify-content: space-between; align-items: center; }
+    .dcard h3 .tag { text-transform: none; letter-spacing: 0; font-weight: 500; color: var(--text-dim); font-size: 0.75rem; }
+    .big { font-size: 1.9rem; font-weight: 700; line-height: 1.1; }
+    .big small { font-size: 0.85rem; font-weight: 500; color: var(--text-muted); margin-left: 0.3rem; }
+    .kv { display: flex; justify-content: space-between; gap: 1rem; font-size: 0.84rem; color: var(--text-muted); }
+    .kv b { color: var(--text); font-weight: 600; text-align: right; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .bar { height: 8px; border-radius: 9999px; background: var(--bg); overflow: hidden; display: flex; }
+    .bar > i { display: block; height: 100%; background: var(--accent); }
+    .bar > i.b { background: #10b981; }
+    .bar > i.c { background: #f59e0b; }
+    canvas.spark { width: 100%; height: 64px; display: block; }
+    table.recent { width: 100%; border-collapse: collapse; font-size: 0.82rem; }
+    table.recent th { text-align: right; color: var(--text-dim); font-weight: 600; font-size: 0.72rem; text-transform: uppercase; letter-spacing: 0.05em; padding: 0.3rem 0.5rem; }
+    table.recent td { text-align: right; padding: 0.4rem 0.5rem; border-top: 1px solid var(--border-subtle); color: var(--text-muted); }
+    table.recent th:first-child, table.recent td:first-child { text-align: left; }
+    table.recent td b { color: var(--text); font-weight: 600; }
+    .dash-empty { color: var(--text-dim); font-size: 0.85rem; padding: 0.5rem 0; }
+    #side-open { display: none; }
+    body.side-closed.view-chat #side-open { display: inline-block; }
+
     /* Views - Strict Tab Display */
     .view-panel {
       flex: 1;
@@ -870,9 +923,13 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
         <svg viewBox="0 0 24 24"><path d="M12 2L2 7l10 5 10-5-10-5zM2 17l10 5 10-5M2 12l10 5 10-5"/></svg>
         <span>Shadow</span>
       </div>
+      <button class="side-toggle" id="side-open" title="Show the conversation list" onclick="toggleSidebar()">☰</button>
       <div class="nav-tabs">
         <button class="nav-tab active" id="tab-chat" onclick="switchView('chat')">
           <span>💬</span> Chat
+        </button>
+        <button class="nav-tab" id="tab-dash" onclick="switchView('dash')">
+          <span>🏠</span> Dashboard
         </button>
         <button class="nav-tab" id="tab-monitor" onclick="switchView('monitor')">
           <span>📊</span> Process Monitor
@@ -888,6 +945,82 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
   </header>
 
   <div class="main-wrap">
+    <aside id="chat-sidebar">
+      <div class="side-head">
+        <button class="side-new" onclick="newChat()">＋ New chat</button>
+        <button class="side-toggle" title="Hide the conversation list" onclick="toggleSidebar()">«</button>
+      </div>
+      <input class="side-search" id="chat-search" placeholder="Search conversations" oninput="renderChatList()">
+      <div id="chat-list"></div>
+    </aside>
+
+    <!-- VIEW: DASHBOARD -->
+    <div class="view-panel" id="dash-panel">
+      <div class="dash-head">
+        <div>
+          <h1>Dashboard</h1>
+          <p id="dash-sub">Shadow running locally on this PC.</p>
+        </div>
+        <div class="dash-actions">
+          <button class="dash-btn primary" onclick="newChat(); switchView('chat')">＋ New chat</button>
+          <button class="dash-btn" id="dash-last" onclick="openLastChat()">Resume last chat</button>
+          <button class="dash-btn" onclick="openPersonaModal()">Persona</button>
+          <button class="dash-btn" id="dash-tools" onclick="toggleTools(); dashRefresh()">Windows tools</button>
+          <button class="dash-btn" onclick="switchView('monitor')">Process monitor</button>
+        </div>
+      </div>
+      <div class="dash-grid">
+        <div class="dcard">
+          <h3>Engine <span class="tag" id="d-state">--</span></h3>
+          <div class="big" id="d-model" style="font-size:1.05rem;word-break:break-all">--</div>
+          <div class="kv"><span>Uptime</span><b id="d-uptime">--</b></div>
+          <div class="kv"><span>Speculative decoding</span><b id="d-spec">--</b></div>
+          <div class="kv"><span>Requests answered</span><b id="d-reqs">--</b></div>
+          <div class="kv"><span>Context in use</span><b id="d-ctx">--</b></div>
+          <div class="bar"><i id="d-ctxbar" style="width:0"></i></div>
+        </div>
+        <div class="dcard">
+          <h3>Decode speed <span class="tag">last 40 replies</span></h3>
+          <div class="big" id="d-tps">--<small>tok/s</small></div>
+          <canvas class="spark" id="c-tps"></canvas>
+          <div class="kv"><span>Average</span><b id="d-tps-avg">--</b></div>
+          <div class="kv"><span>Prompt reading (last)</span><b id="d-pps">--</b></div>
+        </div>
+        <div class="dcard">
+          <h3>GPU <span class="tag" id="d-gpuname">--</span></h3>
+          <div class="big" id="d-gpu">--<small>% busy</small></div>
+          <canvas class="spark" id="c-gpu"></canvas>
+          <div class="kv"><span>VRAM</span><b id="d-vram">--</b></div>
+          <div class="bar"><i id="d-vrambar" style="width:0"></i></div>
+          <div class="kv"><span>Temperature</span><b id="d-temp">--</b></div>
+        </div>
+        <div class="dcard">
+          <h3>Expert tiers <span class="tag">where the model's experts live</span></h3>
+          <div class="kv"><span>VRAM cache hit rate</span><b id="d-hit">--</b></div>
+          <div class="bar"><i id="d-hitbar" style="width:0"></i></div>
+          <div class="kv"><span>RAM tier (pinned)</span><b id="d-pin">--</b></div>
+          <div class="kv"><span>Misses served from RAM / drive</span><b id="d-served">--</b></div>
+          <div class="bar"><i class="b" id="d-ramserved" style="width:0"></i><i class="c" id="d-fileserved" style="width:0"></i></div>
+          <div class="kv"><span>Expert cache</span><b id="d-slots">--</b></div>
+        </div>
+        <div class="dcard">
+          <h3>System memory <span class="tag" id="d-ramtag">--</span></h3>
+          <div class="big" id="d-ramfree">--<small>GiB free</small></div>
+          <canvas class="spark" id="c-ram"></canvas>
+          <div class="kv"><span>Shadow's working set</span><b id="d-ws">--</b></div>
+          <div class="kv"><span>CPU (Shadow / system)</span><b id="d-cpu">--</b></div>
+        </div>
+        <div class="dcard">
+          <h3>Conversations <span class="tag" id="d-chatcount">--</span></h3>
+          <div id="d-chats" class="dash-empty">No saved conversations yet.</div>
+        </div>
+        <div class="dcard wide">
+          <h3>Recent requests <span class="tag">newest first</span></h3>
+          <div id="d-recent" class="dash-empty">Nothing answered yet.</div>
+        </div>
+      </div>
+    </div>
+
     <!-- VIEW: CHAT -->
     <div class="view-panel active" id="chat-panel">
       <div id="messages">
@@ -1247,20 +1380,16 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
     // View Switching: Chat and Process Monitor are completely separate tabs
     function switchView(view) {
       currentView = view;
-      if (view === 'chat') {
-        chatPanel.classList.add('active');
-        monitorPanel.classList.remove('active');
-        tabChat.classList.add('active');
-        tabMonitor.classList.remove('active');
-        window.location.hash = '';
-      } else {
-        chatPanel.classList.remove('active');
-        monitorPanel.classList.add('active');
-        tabChat.classList.remove('active');
-        tabMonitor.classList.add('active');
-        window.location.hash = '#monitor';
-        pollTelemetry();
+      const panels = { chat: chatPanel, dash: document.getElementById('dash-panel'), monitor: monitorPanel };
+      const tabs = { chat: tabChat, dash: document.getElementById('tab-dash'), monitor: tabMonitor };
+      for (const k of Object.keys(panels)) {
+        panels[k].classList.toggle('active', k === view);
+        tabs[k].classList.toggle('active', k === view);
       }
+      document.body.classList.toggle('view-chat', view === 'chat');
+      window.location.hash = view === 'chat' ? '' : '#' + view;
+      if (view === 'monitor') pollTelemetry();
+      if (view === 'dash') dashRefresh();
     }
 
     document.getElementById('brand-logo').addEventListener('click', () => switchView('chat'));
@@ -1668,6 +1797,9 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
     const welcomeHTML = messagesEl.innerHTML;
     function newChat() {
       if (isGenerating && currentAbortController) currentAbortController.abort();
+      saveCurrent();
+      currentChatId = null;
+      renderChatList();
       history.length = 0;
       attachments.length = 0;
       renderTray();
@@ -1956,6 +2088,7 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
       }
       isGenerating = false;
       currentAbortController = null;
+      saveCurrent();
       sendBtn.style.display = 'flex';
       stopBtn.style.display = 'none';
       sendBtn.disabled = false;
@@ -1990,6 +2123,7 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
         const res = await fetch('/v1/telemetry');
         if (!res.ok) return;
         const d = await res.json();
+        dashPush(d);
 
         // Header pills
         if (d.process) {
@@ -2105,6 +2239,227 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
         statusPill.className = 'pill offline';
       }
     }
+
+    // ---- saved conversations (the sidebar): in this browser's localStorage, pictures included until the space runs out
+    const CHATS_KEY = 'shadow_chats_v1';
+    let chats = [];
+    try { chats = JSON.parse(localStorage.getItem(CHATS_KEY) || '[]'); } catch (_) { chats = []; }
+    let currentChatId = null;
+    function stripPics(m) {
+      if (!Array.isArray(m.content)) return m;
+      return { ...m, content: m.content.map(p => p.type === 'image_url' ? { type: 'text', text: '[picture removed to save space]' } : p) };
+    }
+    function persistChats() {
+      for (let tries = 0; tries < 40; tries++) {
+        try { localStorage.setItem(CHATS_KEY, JSON.stringify(chats)); return; } catch (_) {
+          // out of space: drop the pictures of the oldest conversation that has any, else the oldest conversation
+          const old = chats.filter(c => c.id !== currentChatId).sort((a, b) => a.ts - b.ts);
+          const withPics = old.find(c => c.history.some(m => Array.isArray(m.content) && m.content.some(p => p.type === 'image_url')));
+          if (withPics) withPics.history = withPics.history.map(stripPics);
+          else if (old.length) chats.splice(chats.indexOf(old[0]), 1);
+          else return;
+        }
+      }
+    }
+    function messageText(m) {
+      return Array.isArray(m.content) ? m.content.filter(p => p.type === 'text').map(p => p.text).join(' ') : String(m.content || '');
+    }
+    function chatTitle(h) {
+      const u = h.find(m => m.role === 'user');
+      let t = u ? messageText(u) : '';
+      const i = t.lastIndexOf('```');
+      if (t.startsWith('File: ') && i >= 0) t = t.slice(i + 3);
+      t = t.replace(/\s+/g, ' ').trim();
+      return t ? (t.length > 52 ? t.slice(0, 50) + '...' : t) : 'New chat';
+    }
+    function saveCurrent() {
+      if (!history.length) return;
+      let c = chats.find(x => x.id === currentChatId);
+      if (!c) { c = { id: 'c' + Date.now().toString(36), title: '', ts: 0, history: [] }; chats.push(c); currentChatId = c.id; }
+      c.history = JSON.parse(JSON.stringify(history));
+      c.ts = Date.now();
+      c.title = chatTitle(c.history);
+      persistChats();
+      renderChatList();
+    }
+    function dayLabel(ts) {
+      const s = x => new Date(x.getFullYear(), x.getMonth(), x.getDate()).getTime();
+      const diff = Math.round((s(new Date()) - s(new Date(ts))) / 864e5);
+      return diff <= 0 ? 'Today' : diff === 1 ? 'Yesterday' : diff < 7 ? 'This week' : 'Earlier';
+    }
+    function renderChatList() {
+      const box = document.getElementById('chat-list');
+      if (!box) return;
+      const q = (document.getElementById('chat-search').value || '').toLowerCase();
+      const list = chats.filter(c => !q || c.title.toLowerCase().includes(q) || c.history.some(m => messageText(m).toLowerCase().includes(q))).sort((a, b) => b.ts - a.ts);
+      if (!list.length) { box.innerHTML = `<div class="side-empty">${q ? 'No conversation matches.' : 'Your conversations will be listed here.'}</div>`; return; }
+      let last = '', html = '';
+      for (const c of list) {
+        const g = dayLabel(c.ts);
+        if (g !== last) { html += `<div class="side-group">${g}</div>`; last = g; }
+        html += `<div class="chat-item${c.id === currentChatId ? ' active' : ''}" onclick="openChat('${c.id}')"><span class="t">${escapeHtml(c.title || 'New chat')}</span>` +
+                `<button class="x" title="Delete" onclick="event.stopPropagation(); deleteChat('${c.id}')">✕</button></div>`;
+      }
+      box.innerHTML = html;
+      if (typeof dashChats === 'function') dashChats();
+    }
+    function renderSaved(m) {
+      if (m.role === 'tool') return;
+      const row = document.createElement('div');
+      row.className = 'msg-row ' + (m.role === 'user' ? 'user' : 'assistant');
+      if (m.role === 'user') {
+        const txt = messageText(m);
+        const pics = Array.isArray(m.content) ? m.content.filter(p => p.type === 'image_url') : [];
+        const names = [...txt.matchAll(/^File: (.+)$/gm)].map(x => x[1]);
+        const shown = names.length ? txt.slice(txt.lastIndexOf('```') + 3).trim() : txt;
+        row.innerHTML = `<div class="avatar">U</div><div class="bubble">${escapeHtml(shown).replace(/\n/g, '<br>')}` +
+          pics.map(p => `<div class="att-note"><img src="${p.image_url.url}" style="max-height:120px;border-radius:0.4rem"></div>`).join('') +
+          (names.length ? `<div class="att-note">${names.map(n => '📎 ' + escapeHtml(n)).join(' &nbsp; ')}</div>` : '') + '</div>';
+      } else {
+        row.innerHTML = `<div class="avatar">S</div><div class="bubble"><div class="msg-content">${renderMarkdown(messageText(m))}</div></div>`;
+      }
+      messagesEl.appendChild(row);
+    }
+    function openChat(id) {
+      const c = chats.find(x => x.id === id);
+      if (!c) return;
+      if (isGenerating && currentAbortController) currentAbortController.abort();
+      saveCurrent();
+      currentChatId = id;
+      history.length = 0;
+      history.push(...JSON.parse(JSON.stringify(c.history)));
+      attachments.length = 0;
+      renderTray();
+      messagesEl.innerHTML = '';
+      for (const m of history) renderSaved(m);
+      messagesEl.scrollTop = messagesEl.scrollHeight;
+      timingInfo.textContent = '';
+      switchView('chat');
+      renderChatList();
+    }
+    function openLastChat() {
+      const c = chats.slice().sort((a, b) => b.ts - a.ts)[0];
+      if (c) openChat(c.id); else switchView('chat');
+    }
+    function deleteChat(id) {
+      chats = chats.filter(c => c.id !== id);
+      if (id === currentChatId) { currentChatId = null; history.length = 0; messagesEl.innerHTML = welcomeHTML; }
+      persistChats();
+      renderChatList();
+    }
+    function toggleSidebar() {
+      document.body.classList.toggle('side-closed');
+      localStorage.setItem('shadow_side_closed', document.body.classList.contains('side-closed') ? '1' : '0');
+    }
+    if (localStorage.getItem('shadow_side_closed') === '1') document.body.classList.add('side-closed');
+    renderChatList();
+
+    // ---- the dashboard: what the engine is doing, from /v1/telemetry (every second) and its log of recent requests
+    const dashHist = { gpu: [], ram: [] };
+    let lastTel = null;
+    function dashPush(d) {
+      const keep = (a, v) => { a.push(v); if (a.length > 120) a.shift(); };
+      keep(dashHist.gpu, d.gpu ? d.gpu.utilization_percent : 0);
+      keep(dashHist.ram, d.ram ? d.ram.system_available_bytes / 2 ** 30 : 0);
+      lastTel = d;
+      if (currentView === 'dash') dashRender(d);
+    }
+    function dashRefresh() { if (lastTel) dashRender(lastTel); }
+    function spark(id, vals, max, color, bars) {
+      const cv = document.getElementById(id);
+      if (!cv || !cv.clientWidth) return;
+      const w = cv.clientWidth, h = cv.clientHeight, dpr = window.devicePixelRatio || 1;
+      if (cv.width !== Math.round(w * dpr)) { cv.width = Math.round(w * dpr); cv.height = Math.round(h * dpr); }
+      const g = cv.getContext('2d');
+      g.setTransform(dpr, 0, 0, dpr, 0, 0);
+      g.clearRect(0, 0, w, h);
+      g.strokeStyle = 'rgba(132,146,166,0.18)';
+      g.beginPath(); g.moveTo(0, h - 0.5); g.lineTo(w, h - 0.5); g.stroke();
+      if (!vals.length) return;
+      const m = max || Math.max(...vals, 1e-9);
+      if (bars) {
+        const bw = w / Math.max(vals.length, 12);
+        vals.forEach((v, i) => { const bh = Math.max(1, v / m * (h - 4)); g.fillStyle = color; g.fillRect(i * bw + 1, h - bh, bw - 2, bh); });
+        return;
+      }
+      const x = i => vals.length < 2 ? w : i / (vals.length - 1) * w, y = v => h - 2 - Math.min(1, v / m) * (h - 6);
+      g.beginPath();
+      vals.forEach((v, i) => i ? g.lineTo(x(i), y(v)) : g.moveTo(x(i), y(v)));
+      g.strokeStyle = color; g.lineWidth = 1.6; g.stroke();
+      g.lineTo(w, h); g.lineTo(x(0), h); g.closePath();
+      g.fillStyle = color + '22'; g.fill();
+    }
+    function ago(sec) {
+      const s = Math.max(0, Math.round(Date.now() / 1000 - sec));
+      return s < 60 ? s + ' s ago' : s < 3600 ? Math.round(s / 60) + ' min ago' : Math.round(s / 3600) + ' h ago';
+    }
+    function dashChats() {
+      const box = document.getElementById('d-chats');
+      if (!box) return;
+      const top = chats.slice().sort((a, b) => b.ts - a.ts);
+      document.getElementById('d-chatcount').textContent = chats.length + ' saved';
+      box.className = top.length ? '' : 'dash-empty';
+      box.innerHTML = top.length ? top.slice(0, 6).map(c => `<div class="chat-item" onclick="openChat('${c.id}')"><span class="t">${escapeHtml(c.title)}</span><small>${dayLabel(c.ts)}</small></div>`).join('') : 'No saved conversations yet.';
+    }
+    function dashRender(d) {
+      const set = (id, v) => { const e = document.getElementById(id); if (e) e.textContent = v; };
+      const html = (id, v) => { const e = document.getElementById(id); if (e) e.innerHTML = v; };
+      const wid = (id, pct) => { const e = document.getElementById(id); if (e) e.style.width = Math.max(0, Math.min(100, pct)) + '%'; };
+      const gib = b => (b / 2 ** 30).toFixed(1), p = d.process || {}, gpu = d.gpu || {}, ram = d.ram || {}, cpu = d.cpu || {}, rec = d.recent || [];
+      set('d-state', p.state === 'loading' ? 'loading the model' : p.busy ? 'generating' : 'ready');
+      set('d-model', p.model || '--');
+      const up = p.uptime_s || 0;
+      set('d-uptime', up >= 3600 ? Math.floor(up / 3600) + ' h ' + Math.floor(up % 3600 / 60) + ' min' : Math.floor(up / 60) + ' min ' + Math.floor(up % 60) + ' s');
+      set('d-spec', p.dflash_active ? 'On (DFlash + lookup)' : p.mtp_active ? 'On (MTP head)' : 'Prompt lookup only');
+      set('d-reqs', (p.requests || 0).toLocaleString() + ' (' + (p.completion_tokens || 0).toLocaleString() + ' tokens written)');
+      set('d-ctx', (p.session_tokens || 0).toLocaleString() + ' / ' + (p.n_ctx || 0).toLocaleString() + ' tokens');
+      wid('d-ctxbar', p.n_ctx ? 100 * (p.session_tokens || 0) / p.n_ctx : 0);
+      const tps = rec.map(r => r.predicted_ms > 0 ? r.completion_tokens / (r.predicted_ms / 1000) : 0);
+      const last = rec[rec.length - 1];
+      html('d-tps', (tps.length ? tps[tps.length - 1].toFixed(1) : '--') + '<small>tok/s</small>');
+      spark('c-tps', tps, 0, '#6366f1', true);
+      const tail = rec.slice(-10), tt = tail.reduce((a, r) => a + r.completion_tokens, 0), ts = tail.reduce((a, r) => a + r.predicted_ms / 1000, 0);
+      set('d-tps-avg', ts > 0 ? (tt / ts).toFixed(1) + ' tok/s (last ' + tail.length + ')' : '--');
+      const read = last ? last.prompt_tokens - last.cached_tokens : 0;
+      set('d-pps', last && last.prompt_ms > 0 && read > 0 ? (read / (last.prompt_ms / 1000)).toFixed(0) + ' tok/s, ' + read + ' new' : last ? 'all ' + last.prompt_tokens + ' cached' : '--');
+      set('d-gpuname', gpu.name || '--');
+      html('d-gpu', (gpu.utilization_percent != null ? Math.round(gpu.utilization_percent) : '--') + '<small>% busy</small>');
+      spark('c-gpu', dashHist.gpu, 100, '#10b981');
+      set('d-vram', gib(gpu.vram_used_bytes || 0) + ' / ' + gib(gpu.vram_total_bytes || 0) + ' GiB');
+      wid('d-vrambar', gpu.vram_total_bytes ? 100 * gpu.vram_used_bytes / gpu.vram_total_bytes : 0);
+      set('d-temp', gpu.temperature_c ? gpu.temperature_c + ' °C' : '--');
+      set('d-hit', (gpu.expert_cache_hit_rate || 0).toFixed(1) + '%');
+      wid('d-hitbar', gpu.expert_cache_hit_rate || 0);
+      set('d-pin', gib(ram.pinned_tier_bytes || 0) + ' GiB (' + (ram.pinned_tier_experts || 0).toLocaleString() + ' experts)');
+      const rs = ram.ram_served_hits || 0, fs = ram.file_served_misses || 0, tot = rs + fs;
+      set('d-served', tot ? Math.round(100 * rs / tot) + '% RAM / ' + Math.round(100 * fs / tot) + '% drive' : '--');
+      wid('d-ramserved', tot ? 100 * rs / tot : 0);
+      wid('d-fileserved', tot ? 100 * fs / tot : 0);
+      set('d-slots', (gpu.expert_cache_slots || 0).toLocaleString() + ' slots in VRAM');
+      html('d-ramfree', gib(ram.system_available_bytes || 0) + '<small>GiB free</small>');
+      set('d-ramtag', gib(ram.system_total_bytes || 0) + ' GiB total');
+      spark('c-ram', dashHist.ram, 0, '#f59e0b');
+      set('d-ws', gib(ram.process_working_set_bytes || 0) + ' GiB');
+      set('d-cpu', (cpu.process_percent || 0).toFixed(0) + '% / ' + (cpu.system_percent || 0).toFixed(0) + '% (' + (cpu.logical_cores || '?') + ' threads)');
+      set('dash-sub', (p.state === 'loading' ? 'Loading the model...' : 'Shadow is running locally on this PC.') + (p.queued ? ' ' + p.queued + ' request(s) waiting.' : ''));
+      const tb = document.getElementById('dash-tools');
+      if (tb) tb.textContent = 'Windows tools: ' + (toolsEnabled ? 'ON' : 'OFF');
+      const box = document.getElementById('d-recent');
+      if (!rec.length) { box.className = 'dash-empty'; box.textContent = 'Nothing answered yet.'; }
+      else {
+        box.className = '';
+        box.innerHTML = '<table class="recent"><tr><th>When</th><th>Prompt</th><th>Read at</th><th>Written</th><th>Decode</th><th>Ended</th></tr>' +
+          rec.slice().reverse().slice(0, 12).map(r => {
+            const nr = r.prompt_tokens - r.cached_tokens;
+            return `<tr><td>${ago(r.at)}${r.pictures ? ' 🖼' : ''}</td><td><b>${r.prompt_tokens}</b> (${r.cached_tokens} cached)</td>` +
+              `<td>${nr > 0 && r.prompt_ms > 0 ? Math.round(nr / (r.prompt_ms / 1000)) + ' tok/s' : '-'}</td><td><b>${r.completion_tokens}</b> tokens</td>` +
+              `<td>${r.predicted_ms > 0 ? (r.completion_tokens / (r.predicted_ms / 1000)).toFixed(1) + ' tok/s' : '-'}</td><td>${r.finish}</td></tr>`;
+          }).join('') + '</table>';
+      }
+      dashChats();
+    }
+    document.body.classList.toggle('view-chat', currentView === 'chat');
+    if (window.location.hash === '#dash') switchView('dash');
 
     pollTelemetry();
     setInterval(pollTelemetry, 1000);
