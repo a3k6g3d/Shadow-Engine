@@ -224,6 +224,27 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
     .q-note { font-size: 0.78rem; color: var(--text-dim); }
     .q-note button { background: var(--accent); color: #fff; border: none; border-radius: 0.4rem; padding: 0.1rem 0.5rem; cursor: pointer; margin-left: 0.4rem; }
 
+    /* Settings */
+    #settings-panel { overflow-y: auto; padding: 1.25rem 1.5rem 2rem; }
+    .set-wrap { max-width: 840px; width: 100%; margin: 0 auto; display: flex; flex-direction: column; gap: 1rem; }
+    .set-wrap h1 { font-size: 1.25rem; margin: 0; }
+    .set-wrap textarea { width: 100%; flex: none; background: var(--bg); border: 1px solid var(--border); border-radius: 0.6rem; padding: 0.7rem 0.85rem; color: var(--text); font: inherit; font-size: 0.88rem; line-height: 1.45; min-height: 150px; resize: vertical; }
+    .set-wrap textarea:focus, .set-wrap input[type=text]:focus { border-color: var(--accent); outline: none; }
+    .set-row { display: flex; gap: 0.5rem; align-items: center; flex-wrap: wrap; }
+    .set-row input[type=text] { flex: 1; min-width: 200px; background: var(--bg); border: 1px solid var(--border); border-radius: 0.5rem; padding: 0.5rem 0.7rem; color: var(--text); font: inherit; font-size: 0.88rem; }
+    .set-row select { background: var(--bg); border: 1px solid var(--border); border-radius: 0.5rem; padding: 0.5rem; color: var(--text); font: inherit; font-size: 0.85rem; }
+    .set-help { margin: 0; font-size: 0.8rem; color: var(--text-muted); line-height: 1.5; }
+    .set-toggle { display: flex; gap: 0.5rem; align-items: center; font-size: 0.88rem; cursor: pointer; }
+    #set-mem-list { display: flex; flex-direction: column; gap: 0.3rem; }
+    .mem-item { display: flex; align-items: center; gap: 0.6rem; background: var(--bg); border: 1px solid var(--border-subtle); border-radius: 0.5rem; padding: 0.4rem 0.6rem; font-size: 0.86rem; }
+    .mem-item .badge { font-size: 0.68rem; text-transform: uppercase; letter-spacing: 0.05em; color: var(--accent); background: var(--accent-light); border-radius: 9999px; padding: 0.1rem 0.5rem; flex: none; }
+    .mem-item .mem-text { flex: 1; cursor: text; color: var(--text); }
+    .mem-item .mem-edit { flex: 1; background: var(--surface); border: 1px solid var(--accent); border-radius: 0.4rem; padding: 0.2rem 0.4rem; color: var(--text); font: inherit; }
+    .mem-item button { background: none; border: none; color: var(--text-dim); cursor: pointer; }
+    .mem-item button:hover { color: var(--danger); }
+    .sug { display: flex; gap: 0.5rem; align-items: flex-start; font-size: 0.86rem; padding: 0.3rem 0; }
+    .sug input { margin-top: 0.2rem; }
+
     /* Dashboard */
     #dash-panel { overflow-y: auto; padding: 1.25rem 1.5rem 2rem; }
     .dash-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 1rem; flex-wrap: wrap; gap: 0.75rem; }
@@ -959,6 +980,9 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
         <button class="nav-tab" id="tab-dash" onclick="switchView('dash')">
           <span>🏠</span> Dashboard
         </button>
+        <button class="nav-tab" id="tab-settings" onclick="switchView('settings')">
+          <span>⚙</span> Settings
+        </button>
         <button class="nav-tab" id="tab-monitor" onclick="switchView('monitor')">
           <span>📊</span> Process Monitor
         </button>
@@ -992,7 +1016,7 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
         <div class="dash-actions">
           <button class="dash-btn primary" onclick="newChat(); switchView('chat')">＋ New chat</button>
           <button class="dash-btn" id="dash-last" onclick="openLastChat()">Resume last chat</button>
-          <button class="dash-btn" onclick="openPersonaModal()">Persona</button>
+          <button class="dash-btn" onclick="switchView('settings')">Settings</button>
           <button class="dash-btn" id="dash-tools" onclick="toggleTools(); dashRefresh()">Windows tools</button>
           <button class="dash-btn" onclick="switchView('monitor')">Process monitor</button>
         </div>
@@ -1060,6 +1084,39 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
         <div class="dcard wide">
           <h3>Recent requests <span class="tag">newest first</span></h3>
           <div id="d-recent" class="dash-empty">Nothing answered yet.</div>
+        </div>
+      </div>
+    </div>
+
+    <!-- VIEW: SETTINGS -->
+    <div class="view-panel" id="settings-panel">
+      <div class="set-wrap">
+        <h1>Settings</h1>
+        <div class="dcard">
+          <h3>Default persona <span class="tag">how Shadow behaves in every new chat</span></h3>
+          <textarea id="set-persona" spellcheck="false"></textarea>
+          <div class="set-row">
+            <button class="dash-btn primary" onclick="savePersonaSetting()">Save</button>
+            <button class="dash-btn" onclick="resetPersonaSetting()">Reset to the built-in default</button>
+            <span class="tag" id="set-persona-note"></span>
+          </div>
+          <p class="set-help">This is the starting point of every chat. For a one-off, just say it in the chat: "act as a software engineer and design this", "review this like a security auditor", "be brief". The persona itself changes only here.</p>
+        </div>
+        <div class="dcard">
+          <h3>Memory <span class="tag" id="set-mem-count">--</span></h3>
+          <label class="set-toggle"><input type="checkbox" id="set-mem-on" onchange="setMemoryOn(this.checked)"> Use memory in chats</label>
+          <p class="set-help">Short notes about you that Shadow reads at the start of every chat. It adds notes itself when you tell it something lasting about you or your work (or say "remember ..."); edit one by clicking it, delete with the cross. Kept on this PC only, in %APPDATA%\Shadow\memory.json.</p>
+          <div id="set-mem-list"></div>
+          <div class="set-row">
+            <input type="text" id="set-mem-new" placeholder="Add a note, e.g. I prefer short answers with the code first" onkeydown="if (event.key === 'Enter') addMemory()">
+            <select id="set-mem-kind"><option value="user">about me</option><option value="preference">preference</option><option value="project">project</option><option value="reference">reference</option></select>
+            <button class="dash-btn" onclick="addMemory()">Add</button>
+          </div>
+          <div class="set-row">
+            <button class="dash-btn" id="set-learn" onclick="learnFromChats()">Learn from my past chats</button>
+            <span class="tag" id="set-learn-note"></span>
+          </div>
+          <div id="set-suggest"></div>
         </div>
       </div>
     </div>
@@ -1157,11 +1214,6 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
               <span id="tools-btn-label">Windows Tools: ON</span>
             </button>
 
-            <!-- System Persona Selector Pill -->
-            <button class="menu-pill-btn" id="persona-btn" onclick="openPersonaModal()">
-              <span>⚙</span>
-              <span id="persona-btn-label">Persona: Windows Dev</span>
-            </button>
           </div>
 
           <span id="timing-info">Ready</span>
@@ -1325,7 +1377,7 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
     let currentEffort = localStorage.getItem('shadow_effort') || 'medium';
     if (currentEffort === 'high') currentEffort = 'medium'; // the High level was removed from the menu
     let toolsEnabled = localStorage.getItem('shadow_tools_enabled') !== 'false';
-    const DEFAULT_PERSONA = "You are Shadow, a sovereign, high-performance local AI assistant running natively on the user's Windows workstation. You have full permission and local authority from the user to analyze, inspect, refactor, and modify files and code within this project and previous sessions (such as J:\\Strata-work\\sessions and J:\\Strata-work\\conversations). You have access to native Windows tools: read_file, glob, grep, edit_file, write_file, cmd (PowerShell), and for the web web_search and web_fetch (use them for anything current or that you are not sure of, and cite the page). When asked to inspect past chats, run tests, or edit code, invoke the appropriate tools directly without hesitation.";
+    const DEFAULT_PERSONA = "You are Shadow, a capable AI assistant running locally on the user's Windows PC: nothing you are told leaves this machine. Be direct and accurate, keep answers as short as the question allows, and say so when you are unsure. You can use tools: read_file, glob, grep, edit_file, write_file, cmd (PowerShell), web_search and web_fetch (use these for anything current or that you are not sure of, and cite the page), and any mcp__ tools you are given. When asked to look at, test or change files, use the tools instead of describing what you would do. If the user asks you to take a role for a task (for example 'act as a software engineer and design this'), do that for the task.";
     let currentPersona = localStorage.getItem('shadow_persona') || DEFAULT_PERSONA;
 
     // Elements
@@ -1425,8 +1477,8 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
     // View Switching: Chat and Process Monitor are completely separate tabs
     function switchView(view) {
       currentView = view;
-      const panels = { chat: chatPanel, dash: document.getElementById('dash-panel'), monitor: monitorPanel };
-      const tabs = { chat: tabChat, dash: document.getElementById('tab-dash'), monitor: tabMonitor };
+      const panels = { chat: chatPanel, dash: document.getElementById('dash-panel'), settings: document.getElementById('settings-panel'), monitor: monitorPanel };
+      const tabs = { chat: tabChat, dash: document.getElementById('tab-dash'), settings: document.getElementById('tab-settings'), monitor: tabMonitor };
       for (const k of Object.keys(panels)) {
         panels[k].classList.toggle('active', k === view);
         tabs[k].classList.toggle('active', k === view);
@@ -1435,6 +1487,7 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
       window.location.hash = view === 'chat' ? '' : '#' + view;
       if (view === 'monitor') pollTelemetry();
       if (view === 'dash') dashRefresh();
+      if (view === 'settings') settingsOpen();
     }
 
     document.getElementById('brand-logo').addEventListener('click', () => switchView('chat'));
@@ -1614,13 +1667,14 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
     // would replace it).
     let warmedKey = '';
     async function warmPrompt(cachedTokens) {
-      if (modelState !== 'ready' || isGenerating || history.length || cachedTokens > 0) return;
+      if (modelState !== 'ready' || isGenerating || history.length || cachedTokens > 0 || !memoryLoaded) return;
       if (toolsEnabled && availableTools.length === 0) return;
-      const key = JSON.stringify([currentPersona, toolsEnabled]);
+      const key = JSON.stringify([systemPrompt(), toolsEnabled]);
       if (key === warmedKey) return;
       warmedKey = key;
       const msgs = [];
-      if (currentPersona && currentPersona.trim()) msgs.push({ role: 'system', content: currentPersona.trim() });
+      const sys = systemPrompt();
+      if (sys) msgs.push({ role: 'system', content: sys });
       msgs.push({ role: 'user', content: 'Hi' });
       const body = { messages: msgs, max_tokens: 1, stream: false, reasoning_effort: currentEffort,
                      chat_template_kwargs: { enable_thinking: currentEffort !== 'off' } };
@@ -1846,6 +1900,7 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
       if (isGenerating && currentAbortController) currentAbortController.abort();
       saveCurrent();
       currentChatId = null;
+      frozenMemory = null;
       sendQueue.length = 0;
       queuePaused = false;
       renderQueue();
@@ -1889,6 +1944,7 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
       inputEl.value = '';
       inputEl.style.height = 'auto';
 
+      if (history.length === 0) frozenMemory = memoryBlock();
       const sentFiles = attachments.map(a => a.name);
       history.push({ role: 'user', content: withAttachments(text) });
       attachments.length = 0;
@@ -1945,9 +2001,8 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
         let isThinking = false;
 
         const payloadMessages = [];
-        if (currentPersona && currentPersona.trim()) {
-          payloadMessages.push({ role: 'system', content: currentPersona.trim() });
-        }
+        const sys = systemPrompt();
+        if (sys) payloadMessages.push({ role: 'system', content: sys });
         payloadMessages.push(...history);
 
         const requestBody = {
@@ -2088,6 +2143,7 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
               messagesEl.scrollTop = messagesEl.scrollHeight;
 
               const result = await executeLocalTool(tc.name, tc.arguments);
+              if (tc.name.startsWith('memory_')) loadMemory();
               const outputEl = toolCard.querySelector('.tool-output');
               toolCard.querySelector('.tool-header span:last-child').textContent = result.is_error ? 'Error' : 'Complete';
               outputEl.textContent = result.output;
@@ -2379,6 +2435,7 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
       if (isGenerating && currentAbortController) currentAbortController.abort();
       saveCurrent();
       currentChatId = id;
+      frozenMemory = null;
       history.length = 0;
       history.push(...JSON.parse(JSON.stringify(c.history)));
       attachments.length = 0;
@@ -2536,6 +2593,137 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
       }
       dashChats();
     }
+    // ---- Settings: the default persona, and the memory (notes kept on the server, read at the start of every chat)
+    let memories = [];
+    let memoryOn = localStorage.getItem('shadow_memory_on') !== 'false';
+    let memoryLoaded = false;
+    // the notes a chat starts with are fixed for that chat: a note saved in the middle must not change the start of the prompt (the server would read the chat again)
+    let frozenMemory = null;
+    const MEMORY_HINT = 'You have memory tools (memory_save, memory_list, memory_forget). When the user tells you something lasting about themselves, their work or how they like things done, ' +
+      'or asks you to remember something, save it as one short note. Never save passwords, keys or other private data. Do not announce every note you save.';
+    function memoryBlock() {
+      if (!memoryOn) return '';
+      const lines = [];
+      let size = 0;
+      for (const m of memories.slice().sort((a, b) => b.at - a.at)) {
+        if (size + m.text.length > 2400) break;
+        lines.push('- ' + m.text);
+        size += m.text.length;
+      }
+      const notes = lines.length ? 'What you remember about the user, from earlier chats (use it naturally, do not recite it, ignore what does not apply):\n' + lines.join('\n') : '';
+      return [notes, toolsEnabled ? MEMORY_HINT : ''].filter(Boolean).join('\n\n');
+    }
+    function systemPrompt() {
+      return [(currentPersona || '').trim(), frozenMemory !== null ? frozenMemory : memoryBlock()].filter(Boolean).join('\n\n');
+    }
+    async function loadMemory() {
+      try { const r = await fetch('/v1/memory'); if (r.ok) memories = await r.json(); } catch (_) {}
+      memoryLoaded = true;
+      renderMemory();
+    }
+    async function memCall(method, url, body) {
+      const note = document.getElementById('set-learn-note');
+      try {
+        const r = await fetch(url, { method, headers: { 'Content-Type': 'application/json' }, body: body ? JSON.stringify(body) : undefined });
+        if (r.ok) { memories = await r.json(); renderMemory(); return true; }
+        const j = await r.json().catch(() => ({}));
+        note.textContent = (j.error && j.error.message) || 'The server refused that.';
+      } catch (e) { note.textContent = 'Could not reach the server.'; }
+      return false;
+    }
+    function renderMemory() {
+      const box = document.getElementById('set-mem-list');
+      if (!box) return;
+      document.getElementById('set-mem-count').textContent = memories.length + ' of 60 notes';
+      box.innerHTML = memories.length ? memories.slice().sort((a, b) => b.at - a.at).map(m =>
+        `<div class="mem-item"><span class="badge">${escapeHtml(m.kind)}</span><span class="mem-text" title="Click to edit" onclick="editMemory(${m.id}, this)">${escapeHtml(m.text)}</span>` +
+        `<button title="Forget this" onclick="deleteMemory(${m.id})">✕</button></div>`).join('')
+        : '<div class="dash-empty">Nothing remembered yet. Tell Shadow something lasting ("remember that I ..."), add a note below, or use Learn from my past chats.</div>';
+    }
+    function editMemory(id, el) {
+      const old = el.textContent, inp = document.createElement('input');
+      inp.value = old; inp.className = 'mem-edit';
+      el.replaceWith(inp); inp.focus();
+      let done = false;
+      const finish = async save => {
+        if (done) return;
+        done = true;
+        if (save && inp.value.trim() && inp.value.trim() !== old) await memCall('PUT', '/v1/memory/' + id, { text: inp.value });
+        else renderMemory();
+      };
+      inp.onkeydown = e => { if (e.key === 'Enter') finish(true); if (e.key === 'Escape') finish(false); };
+      inp.onblur = () => finish(true);
+    }
+    function deleteMemory(id) { memCall('DELETE', '/v1/memory/' + id); }
+    async function addMemory() {
+      const inp = document.getElementById('set-mem-new');
+      if (!inp.value.trim()) return;
+      if (await memCall('POST', '/v1/memory', { text: inp.value, kind: document.getElementById('set-mem-kind').value })) { inp.value = ''; document.getElementById('set-learn-note').textContent = ''; }
+    }
+    function setMemoryOn(on) { memoryOn = on; localStorage.setItem('shadow_memory_on', on); }
+    function settingsOpen() {
+      document.getElementById('set-persona').value = currentPersona;
+      document.getElementById('set-mem-on').checked = memoryOn;
+      loadMemory();
+    }
+    function savePersonaSetting() {
+      currentPersona = document.getElementById('set-persona').value.trim() || DEFAULT_PERSONA;
+      localStorage.setItem('shadow_persona', currentPersona);
+      document.getElementById('set-persona').value = currentPersona;
+      document.getElementById('set-persona-note').textContent = 'Saved: new chats use it.';
+    }
+    function resetPersonaSetting() {
+      document.getElementById('set-persona').value = DEFAULT_PERSONA;
+      savePersonaSetting();
+      document.getElementById('set-persona-note').textContent = 'Back to the built-in default.';
+    }
+
+    // Learn from past chats: the model reads what you asked in your saved conversations and proposes notes; nothing is saved until you tick it
+    async function learnFromChats() {
+      const note = document.getElementById('set-learn-note'), box = document.getElementById('set-suggest'), btn = document.getElementById('set-learn');
+      if (isGenerating) { note.textContent = 'Wait for the reply in progress.'; return; }
+      const asked = [];
+      let size = 0;
+      for (const c of chats.slice().sort((a, b) => b.ts - a.ts)) {
+        for (const m of c.history) {
+          if (m.role !== 'user') continue;
+          let t = messageText(m);
+          if (t.startsWith('File: ') && t.lastIndexOf('```') >= 0) t = t.slice(t.lastIndexOf('```') + 3);
+          t = t.replace(/\s+/g, ' ').trim().slice(0, 280);
+          if (t.length < 8 || size + t.length > 12000 || asked.length >= 80) continue;
+          asked.push(t); size += t.length;
+        }
+      }
+      if (asked.length < 3) { note.textContent = 'Not enough saved chats yet: chat a little first.'; return; }
+      btn.disabled = true; box.innerHTML = '';
+      note.textContent = `Shadow is reading ${asked.length} of your messages...`;
+      const prompt = 'Below are messages a user sent to an AI assistant in earlier chats. Write up to 10 short notes, one per line, each starting with "- ", that capture lasting facts about this user: ' +
+        'what they work on, the tools and languages they use, how they like answers (length, format, tone), and the kinds of request they make again and again. ' +
+        'Only what the messages clearly show; no guesses; nothing about passwords, keys or other private data; no one-off questions. Each note is a plain statement about the user, ' +
+        'for example "Works on a Rust and CUDA inference engine called Shadow".\n\nMessages:\n' + asked.map((t, i) => `${i + 1}. ${t}`).join('\n');
+      try {
+        const r = await fetch('/v1/chat/completions', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ messages: [{ role: 'user', content: prompt }], max_tokens: 600, stream: false, chat_template_kwargs: { enable_thinking: false } }) });
+        const j = await r.json();
+        if (!r.ok) throw new Error((j.error && j.error.message) || r.status);
+        const have = memories.map(m => m.text.toLowerCase());
+        const notes = String(j.choices[0].message.content || '').split('\n').map(l => l.trim()).filter(l => l.startsWith('- ')).map(l => l.slice(2).trim())
+          .filter(l => l.length >= 8 && l.length <= 400 && !have.includes(l.toLowerCase()));
+        if (!notes.length) { note.textContent = 'Nothing new to suggest from those chats.'; }
+        else {
+          note.textContent = 'Tick the ones that are right:';
+          box.innerHTML = notes.map((n, i) => `<label class="sug"><input type="checkbox" checked data-i="${i}"><span>${escapeHtml(n)}</span></label>`).join('') +
+            '<div class="set-row"><button class="dash-btn primary" id="sug-save">Save the ticked notes</button></div>';
+          document.getElementById('sug-save').onclick = async () => {
+            for (const cb of box.querySelectorAll('input:checked')) await memCall('POST', '/v1/memory', { text: notes[+cb.dataset.i], kind: 'user' });
+            box.innerHTML = ''; note.textContent = 'Saved.';
+          };
+        }
+      } catch (e) { note.textContent = 'That did not work: ' + e.message; }
+      btn.disabled = false;
+    }
+    loadMemory();
+
     // ---- queued messages: typed while a reply is being written, sent in order when it ends (each one needs the one before it answered)
     const sendQueue = [];
     let queuePaused = false;
@@ -2569,7 +2757,7 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
     }
 
     document.body.classList.toggle('view-chat', currentView === 'chat');
-    if (window.location.hash === '#dash') switchView('dash');
+    if (['#dash', '#settings'].includes(window.location.hash)) switchView(window.location.hash.slice(1));
 
     pollTelemetry();
     setInterval(pollTelemetry, 1000);

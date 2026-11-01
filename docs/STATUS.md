@@ -1307,3 +1307,13 @@ Single-prompt runs, "Write a Rust function that parses a comma separated list...
   and the real `@modelcontextprotocol/server-filesystem` (14 tools); the dashboard has a Tools card with each server's tool count or error. In the chat page the model called an MCP tool and `web_search` in one turn.
 - Tool parameters are written by the model as text; they are now converted to the types the tool's schema declares (`coerce_arguments`): the stub's `add` returned "1725" for "17" and "25", and the built-in tools' integer
   parameters (`read_file` start / end, `grep`, `glob` limits) were silently ignored when written as text. Tool calls run on a blocking thread (`spawn_blocking`) instead of the server's async threads.
+
+## 2026-11-01: memory, and the persona moves to Settings
+
+- **Memory** (`memory.rs`): short notes about the user in one JSON file (`%APPDATA%\Shadow\memory.json`, `SHADOW_MEMORY_FILE`), at most 60 notes of 400 characters; HTTP `GET/POST /v1/memory`, `PUT/DELETE /v1/memory/<id>`; the tools `memory_save`,
+  `memory_list`, `memory_forget`. The page puts the notes (newest first, at most ~2,400 characters) and a one-line hint about the memory tools at the end of the system prompt of every chat, **frozen for that chat** (a note saved in
+  the middle would change the start of the prompt and make the server read the whole conversation again; it applies from the next chat). Tested: told "remember that I am building ... Shadow ..." the model called `memory_save`
+  by itself with a clean note; in a new chat it answered "what do you know about me" from the notes, no tool call.
+- **Learn from my past chats** (Settings): the model reads up to 80 of your earlier messages from the saved conversations (12,000 characters at most) and proposes up to 10 notes as tick boxes; nothing is saved until you tick and save.
+- **Settings tab** (between Dashboard and Process Monitor): the default persona (editable, reset to the built-in one), the memory (list, click a note to edit, delete, add, the on/off switch). The persona button left the chat bar; the
+  persona is now a default for every new chat, and a one-off role goes in the chat ("act as a software engineer and design this"). The built-in persona is shorter and no longer names Strata folders; it lists the tools.
