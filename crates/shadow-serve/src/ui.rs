@@ -158,6 +158,18 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
             padding: 6px 12px; font: inherit; font-size: 0.85rem; cursor: pointer; }
     .chip:hover { border-color: rgba(99, 102, 241, 0.6); background: rgba(99, 102, 241, 0.12); }
     .msg-error { color: var(--danger); }
+    .attach-btn { background: var(--surface-hover); border: 1px solid var(--border); color: var(--text-muted); border-radius: 0.6rem;
+      padding: 0 0.8rem; cursor: pointer; font-size: 1.05rem; }
+    .attach-btn:hover { color: var(--text); border-color: var(--accent, #6366f1); }
+    #attach-tray { max-width: 880px; width: 100%; margin: 0 auto 0.5rem; display: flex; flex-wrap: wrap; gap: 0.4rem; }
+    #attach-tray:empty { display: none; }
+    .att-chip { display: flex; align-items: center; gap: 0.4rem; background: var(--surface-hover); border: 1px solid var(--border);
+      border-radius: 9999px; padding: 0.2rem 0.4rem 0.2rem 0.7rem; font-size: 0.78rem; color: var(--text); }
+    .att-chip small { color: var(--text-muted); }
+    .att-chip button { background: none; border: none; color: var(--text-muted); cursor: pointer; font-size: 0.9rem; }
+    .att-chip button:hover { color: var(--danger); }
+    .bubble .att-note { margin-top: 0.4rem; font-size: 0.78rem; color: var(--text-muted); }
+    body.dragging #input-pane { outline: 2px dashed var(--accent, #6366f1); outline-offset: -4px; }
     .msg-meta { margin-top: 0.6rem; font-size: 0.74rem; color: var(--text-muted); opacity: 0.8; }
     .pill.action { cursor: pointer; }
     .pill.action:hover { color: var(--text); border-color: var(--accent, #6366f1); }
@@ -894,7 +906,10 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
       </div>
 
       <div id="input-pane">
+        <div id="attach-tray"></div>
         <div class="input-box">
+          <input type="file" id="file-input" multiple hidden>
+          <button class="attach-btn" id="attach-btn" title="Attach text or code files (or drop / paste them)" onclick="document.getElementById('file-input').click()">📎</button>
           <textarea id="prompt-input" rows="1" placeholder="Message Shadow (Enter to send, Shift+Enter for a new line)"></textarea>
           <button id="send-btn" class="send-btn">Send</button>
           <button id="stop-btn" class="stop-btn" onclick="stopGeneration(event)">
@@ -942,17 +957,6 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
                   <div class="item-info">
                     <div class="item-title">Medium (Default)</div>
                     <div class="item-desc">Balanced thought process (~4k tokens)</div>
-                  </div>
-                </div>
-                <div class="item-check">✓</div>
-              </div>
-
-              <div class="dropdown-item" data-effort="high" onclick="selectEffort('high')">
-                <div class="item-left">
-                  <div class="item-icon">🔬</div>
-                  <div class="item-info">
-                    <div class="item-title">High</div>
-                    <div class="item-desc">Deep problem solving & verification (~16k)</div>
                   </div>
                 </div>
                 <div class="item-check">✓</div>
@@ -1142,6 +1146,7 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
     // State
     let currentView = 'chat';
     let currentEffort = localStorage.getItem('shadow_effort') || 'medium';
+    if (currentEffort === 'high') currentEffort = 'medium'; // the High level was removed from the menu
     let toolsEnabled = localStorage.getItem('shadow_tools_enabled') !== 'false';
     const DEFAULT_PERSONA = "You are Shadow, a sovereign, high-performance local AI assistant running natively on the user's Windows workstation. You have full permission and local authority from the user to analyze, inspect, refactor, and modify files and code within this project and previous sessions (such as J:\\Strata-work\\sessions and J:\\Strata-work\\conversations). You have access to native Windows tools: read_file, glob, grep, edit_file, write_file, and cmd (PowerShell). When asked to inspect past chats, run tests, or edit code, invoke the appropriate tools directly without hesitation.";
     let currentPersona = localStorage.getItem('shadow_persona') || DEFAULT_PERSONA;
@@ -1451,11 +1456,65 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
       if (timingInfo.textContent === 'Warming up the prompt...') timingInfo.textContent = '';
     }
 
+
+    // Attached files: text and code, read in the browser and put in front of the message (the model reads text only: no vision support in this
+    // engine, so an image is refused with a note rather than silently dropped).
+    const attachments = [];
+    const MAX_FILE_BYTES = 256 * 1024, MAX_ATTACH_CHARS = 150000;
+    let attachNotes = [];
+    function attachNote(msg) { attachNotes.push(msg); timingInfo.textContent = attachNotes.join(' '); }
+    function renderTray() {
+      const tray = document.getElementById('attach-tray');
+      tray.innerHTML = '';
+      attachments.forEach((a, i) => {
+        const chip = document.createElement('span');
+        chip.className = 'att-chip';
+        chip.innerHTML = `📎 ${escapeHtml(a.name)} <small>${a.text.length < 1000 ? a.text.length + ' chars' : (a.text.length / 1000).toFixed(1) + 'k chars'}</small><button title="Remove" onclick="removeAttachment(${i})">✕</button>`;
+        tray.appendChild(chip);
+      });
+    }
+    function removeAttachment(i) { attachments.splice(i, 1); renderTray(); }
+    async function addFiles(files) {
+      attachNotes = [];
+      for (const f of files) {
+        if (f.type.startsWith('image/')) { attachNote(`Shadow cannot see images yet (no vision support): ${f.name} was not attached.`); continue; }
+        if (f.size > MAX_FILE_BYTES) { attachNote(`${f.name} is ${(f.size / 1024).toFixed(0)} KB: files over ${MAX_FILE_BYTES / 1024} KB are not attached.`); continue; }
+        let text;
+        try { text = await f.text(); } catch (_) { attachNote(`Could not read ${f.name}.`); continue; }
+        if (text.includes('\u0000')) { attachNote(`${f.name} is a binary file: only text and code can be attached.`); continue; }
+        const total = attachments.reduce((n, a) => n + a.text.length, 0) + text.length;
+        if (total > MAX_ATTACH_CHARS) { attachNote(`${f.name} would make the attachments over ${MAX_ATTACH_CHARS / 1000}k characters: not attached.`); continue; }
+        attachments.push({ name: f.name, text });
+      }
+      renderTray();
+      inputEl.focus();
+    }
+    document.getElementById('file-input').addEventListener('change', e => { addFiles(Array.from(e.target.files)); e.target.value = ''; });
+    ['dragenter', 'dragover'].forEach(t => document.addEventListener(t, e => {
+      if (e.dataTransfer && Array.from(e.dataTransfer.types || []).includes('Files')) { e.preventDefault(); document.body.classList.add('dragging'); }
+    }));
+    ['dragleave', 'drop'].forEach(t => document.addEventListener(t, e => {
+      if (t === 'drop' && e.dataTransfer && e.dataTransfer.files.length) { e.preventDefault(); addFiles(Array.from(e.dataTransfer.files)); }
+      if (t === 'drop' || e.target === document.documentElement || !e.relatedTarget) document.body.classList.remove('dragging');
+    }));
+    inputEl.addEventListener('paste', e => {
+      const files = Array.from((e.clipboardData && e.clipboardData.files) || []);
+      if (files.length) { e.preventDefault(); addFiles(files); }
+    });
+    // the message the model gets: each file as a fenced block in front of the words
+    function withAttachments(text) {
+      if (!attachments.length) return text;
+      const blocks = attachments.map(a => `File: ${a.name}\n\`\`\`\n${a.text}\n\`\`\``).join('\n\n');
+      return blocks + '\n\n' + (text || 'Please read the attached file(s).');
+    }
+
     // A fresh conversation: stops a running reply, forgets the history, puts the welcome card back.
     const welcomeHTML = messagesEl.innerHTML;
     function newChat() {
       if (isGenerating && currentAbortController) currentAbortController.abort();
       history.length = 0;
+      attachments.length = 0;
+      renderTray();
       messagesEl.innerHTML = welcomeHTML;
       timingInfo.textContent = '';
       inputEl.focus();
@@ -1475,7 +1534,7 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
 
     async function sendMessage() {
       const text = inputEl.value.trim();
-      if (!text || isGenerating) return;
+      if ((!text && !attachments.length) || isGenerating) return;
       if (modelState === 'loading') {
         timingInfo.textContent = 'The model is still loading - your message is still in the box.';
         return;
@@ -1491,12 +1550,15 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
       inputEl.value = '';
       inputEl.style.height = 'auto';
 
-      history.push({ role: 'user', content: text });
+      const sentFiles = attachments.map(a => a.name);
+      history.push({ role: 'user', content: withAttachments(text) });
+      attachments.length = 0;
+      renderTray();
 
       // User Bubble
       const userRow = document.createElement('div');
       userRow.className = 'msg-row user';
-      userRow.innerHTML = `<div class="avatar">U</div><div class="bubble">${escapeHtml(text).replace(/\n/g, '<br>')}</div>`;
+      userRow.innerHTML = `<div class="avatar">U</div><div class="bubble">${escapeHtml(text).replace(/\n/g, '<br>')}${sentFiles.length ? `<div class="att-note">${sentFiles.map(n => '📎 ' + escapeHtml(n)).join(' &nbsp; ')}</div>` : ''}</div>`;
       messagesEl.appendChild(userRow);
 
       const t0 = performance.now();
