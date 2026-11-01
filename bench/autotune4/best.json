@@ -1,0 +1,10 @@
+{
+ "--ctx": 8192,
+ "--ram-tier-gib": 30,
+ "--placement": "J:/Shadow/profiles/routing-varied300.shrc",
+ "--tail-skip": 3,
+ "--verify-rank": 2,
+ "--dflash": "J:/Shadow/models/dflash2",
+ "--spec": 3,
+ "--dflash-min-p": 0.7
+}

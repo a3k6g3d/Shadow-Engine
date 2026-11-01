@@ -349,3 +349,57 @@ fn tensor_core_projections_are_close_to_the_exact_ones() {
         assert!(worst < 5e-3, "{ty}: relative error {worst}");
     }
 }
+
+/// Decode-shape speed of the plain `matvec_cols_*` kernels on the model's real tensors: 4 inputs (a verify pass), the achieved weight bandwidth per type
+/// and the share of the card's memory bandwidth (`cargo test --release -p shadow-cuda --test matvec -- --ignored --nocapture cols_bandwidth`).
+#[test]
+#[ignore]
+fn cols_bandwidth() {
+    let ctx = match Context::new(0) {
+        Ok(c) => c,
+        Err(e) => return eprintln!("SKIPPED: no CUDA device ({e})"),
+    };
+    let p = std::env::var("SHADOW_MODEL").unwrap_or_else(|_| MODEL.into());
+    if !std::path::Path::new(&p).is_file() {
+        return eprintln!("SKIPPED: no model at {p}");
+    }
+    let g = Gguf::open(std::path::Path::new(&p)).unwrap();
+    let prog = Program::load(&ctx, file("matvec.cu").unwrap()).unwrap();
+    let m = 4usize;
+    let mut seen = std::collections::HashSet::new();
+    for t in g.tensors.iter().filter(|t| t.dims.len() == 2 && t.dims[0] % 256 == 0 && t.nbytes() > (1 << 20) && !t.name.contains("exps")) {
+        let ty = t.ty.name();
+        if !seen.insert((ty.clone(), t.dims[0], t.dims[1])) || seen.len() > 24 {
+            continue;
+        }
+        let entry = match ty.as_str() {
+            "Q4_K" | "Q5_K" | "Q6_K" | "IQ4_NL" | "IQ4_XS" | "Q8_0" | "BF16" | "F32" => format!("matvec_cols_{}", ty.to_lowercase()),
+            _ => continue,
+        };
+        let (cols, rows) = (t.dims[0] as usize, t.dims[1] as usize);
+        let w = read(&g, t, t.nbytes() as usize);
+        let dw = ctx.alloc(w.len()).unwrap();
+        dw.upload(&w).unwrap();
+        let dx = ctx.alloc(m * cols * 4).unwrap();
+        let dy = ctx.alloc(m * rows * 4).unwrap();
+        dx.upload(&vec![1u8; m * cols * 4]).unwrap();
+        let run = || unsafe {
+            // SAFETY: rows x cols weights, m inputs of cols floats, m outputs of rows floats.
+            prog.launch(&entry, ((rows as u32).div_ceil(8), 1, 1), (256, 1, 1), 0, None,
+                        &[Arg::Ptr(dw.ptr), Arg::Ptr(dx.ptr), Arg::U32(cols as u32), Arg::Ptr(dy.ptr), Arg::U32(rows as u32),
+                          Arg::U32(rows as u32), Arg::U32(cols as u32), Arg::U32(m as u32)]).unwrap();
+        };
+        run();
+        ctx.synchronize().unwrap();
+        let (start, end) = (ctx.event().unwrap(), ctx.event().unwrap());
+        start.record(None).unwrap();
+        for _ in 0..50 {
+            run();
+        }
+        end.record(None).unwrap();
+        end.synchronize().unwrap();
+        let ms = end.since(&start).unwrap() as f64 / 50.0;
+        let gbs = w.len() as f64 / (ms / 1e3) / 1e9;
+        println!("{ty:7} {:36} {rows:6}x{cols:5} {:7.1} MB  {:7.1} us  {:6.1} GB/s  ({:4.1}% of 672)", t.name, w.len() as f64 / 1e6, ms * 1e3, gbs, 100.0 * gbs / 672.0);
+    }
+}

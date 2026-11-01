@@ -1,0 +1,1 @@
+{"--spec": [3, 4, 5], "--dflash-min-p": [0.4, 0.5, 0.6, 0.7], "--admit-after": [null, 1, 2], "--pin-margin": [null, 2, 4]}
