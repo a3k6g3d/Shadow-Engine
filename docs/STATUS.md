@@ -1258,3 +1258,14 @@ Single-prompt runs, "Write a Rust function that parses a comma separated list...
   the invoice picture now gives its line items too (widgets x 12, gears x 7, springs x 30) besides "INVOICE 20261014" and "1337 EUR"; a follow-up in the same conversation reuses the
   350 cached tokens including the picture ("the shape on the far right" green triangle, "the one in the middle" blue). Text-only: 17 x 23 = 391. `cargo test --release` passes.
 - Not compared against llama.cpp's answers on the same pictures yet (no reference run); the positions follow its `mtmd_helper_image_get_decoder_pos` and `ggml_mrope_cache_init`.
+
+## 2026-11-01: 3-D files in the chat page (STL, OBJ, STEP)
+
+- Attach (button, drop, paste) a `.stl`, `.obj`, `.step` or `.stp` and the page turns it into what the model can read: **a 768 x 768 contact sheet of four views**
+  (isometric, front, top, right; an STL / OBJ is a shaded mesh drawn by a small painter's-algorithm rasteriser on a canvas, up to ~150k triangles) **plus a text summary**
+  (triangles, bounding box, volume, surface area, centre; the file states no units). A STEP file has no mesh and the page has no CAD kernel: it is drawn as a
+  **wireframe of its vertices and edges** (curved edges as straight chords) and summarised from its header, schema, units, product names, vertex bounding box and
+  the most frequent entities. Everything is browser-side (`view3d` block in `crates/shadow-serve/src/ui.rs`); the server sees a picture and a text block.
+- Tested with a generated STL (a 40 x 20 x 10 plate with a 12 mm cylinder to z = 35) and a hand-written STEP box: the sheets are right; the model answered from the sheet and
+  the summary ("rectangular base plate with a vertical cylinder, 40 x 20 x 35, cylinder diameter about 12, base about 10-12").
+- Limits: no surfaces for STEP (a curved part is a wire frame of chords); STL volume is meaningful only for a closed mesh; very fine detail is limited by the 768-pixel sheet.

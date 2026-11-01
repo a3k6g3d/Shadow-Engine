@@ -1483,7 +1483,7 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
       attachments.forEach((a, i) => {
         const chip = document.createElement('span');
         chip.className = 'att-chip';
-        chip.innerHTML = `${a.image ? `<img src="${a.image}" style="height:1.6rem;border-radius:0.3rem;">` : '📎'} ${escapeHtml(a.name)} <small>${a.image ? 'picture' : a.text.length < 1000 ? a.text.length + ' chars' : (a.text.length / 1000).toFixed(1) + 'k chars'}</small><button title="Remove" onclick="removeAttachment(${i})">✕</button>`;
+        chip.innerHTML = `${a.image ? `<img src="${a.image}" style="height:1.6rem;border-radius:0.3rem;">` : '📎'} ${escapeHtml(a.name)} <small>${a.model ? '3-D model' : a.image ? 'picture' :a.text.length < 1000 ? a.text.length + ' chars' : (a.text.length / 1000).toFixed(1) + 'k chars'}</small><button title="Remove" onclick="removeAttachment(${i})">✕</button>`;
         tray.appendChild(chip);
       });
     }
@@ -1491,6 +1491,13 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
     async function addFiles(files) {
       attachNotes = [];
       for (const f of files) {
+        if (MODEL_EXT.test(f.name)) {
+          try {
+            const m = await load3D(f);
+            attachments.push({ name: f.name, image: m.image, text: m.summary, model: true });
+          } catch (e) { attachNote(`Could not read the 3-D file ${f.name}: ${e.message}`); }
+          continue;
+        }
         if (f.type.startsWith('image/')) {
           try {
             const url = await shrinkImage(f);
@@ -1521,10 +1528,133 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
       const files = Array.from((e.clipboardData && e.clipboardData.files) || []);
       if (files.length) { e.preventDefault(); addFiles(files); }
     });
+    // 3-D files (STL, OBJ, STEP): the model reads pictures and text, so the page turns one into both: a contact sheet of four views (isometric,
+    // front, top, right) and a geometry summary.  STL / OBJ are meshes (shaded); STEP is read for its vertices and edges (a wireframe, curved
+    // edges as chords) and its header, units, product names and entity counts: there is no CAD kernel here to tessellate its surfaces.
+    const MODEL_EXT = /\.(stl|obj|step|stp)$/i;
+    function parseSTL(buf) {
+      const dv = new DataView(buf);
+      if (buf.byteLength >= 84 && 84 + 50 * dv.getUint32(80, true) === buf.byteLength) {
+        const n = dv.getUint32(80, true), t = new Float32Array(n * 9);
+        for (let i = 0; i < n; i++) for (let k = 0; k < 9; k++) t[i * 9 + k] = dv.getFloat32(84 + i * 50 + 12 + k * 4, true);
+        return { tris: t, kind: 'binary STL' };
+      }
+      const v = [], re = /vertex\s+(\S+)\s+(\S+)\s+(\S+)/g, s = new TextDecoder().decode(buf);
+      let m; while ((m = re.exec(s))) v.push(+m[1], +m[2], +m[3]);
+      return { tris: Float32Array.from(v), kind: 'ASCII STL' };
+    }
+    function parseOBJ(s) {
+      const p = [], t = [];
+      for (const line of s.split(/\r?\n/)) {
+        const f = line.trim().split(/\s+/);
+        if (f[0] === 'v') p.push([+f[1], +f[2], +f[3]]);
+        else if (f[0] === 'f') {
+          const ix = f.slice(1).map(x => { const i = parseInt(x, 10); return i < 0 ? p.length + i : i - 1; });
+          for (let k = 1; k + 1 < ix.length; k++) for (const j of [ix[0], ix[k], ix[k + 1]]) t.push(...(p[j] || [0, 0, 0]));
+        }
+      }
+      return { tris: Float32Array.from(t), kind: 'OBJ' };
+    }
+    function parseSTEP(s) {
+      const pt = new Map(), vx = new Map(), edges = [], count = {};
+      for (const m of s.matchAll(/#(\d+)\s*=\s*([A-Z_0-9]+)\s*\(/g)) count[m[2]] = (count[m[2]] || 0) + 1;
+      for (const m of s.matchAll(/#(\d+)\s*=\s*CARTESIAN_POINT\s*\([^(]*\(\s*([^)]*)\)/g)) pt.set(m[1], m[2].split(',').map(Number));
+      for (const m of s.matchAll(/#(\d+)\s*=\s*VERTEX_POINT\s*\([^#]*#(\d+)/g)) vx.set(m[1], pt.get(m[2]));
+      for (const m of s.matchAll(/#\d+\s*=\s*EDGE_CURVE\s*\([^#]*#(\d+)\s*,\s*#(\d+)/g)) { const a = vx.get(m[1]), b = vx.get(m[2]); if (a && b) edges.push(a, b); }
+      const one = re => { const m = s.match(re); return m ? m[1].trim() : ''; };
+      const names = [...s.matchAll(/PRODUCT\s*\(\s*'([^']*)'/g)].map(m => m[1]).filter(x => x).slice(0, 6);
+      const units = /SI_UNIT\s*\(\s*\.MILLI\.\s*,\s*\.METRE\./.test(s) ? 'millimetres' : /INCH/i.test(s) ? 'inches' : /SI_UNIT\s*\(\s*\$\s*,\s*\.METRE\./.test(s) ? 'metres' : 'not stated';
+      return { pts: [...vx.values()].filter(Boolean), edges, count, names, units, schema: one(/FILE_SCHEMA\s*\(\s*\(\s*'([^']*)'/), desc: one(/FILE_DESCRIPTION\s*\(\s*\(\s*'([^']*)'/) };
+    }
+    function meshStats(t) {
+      const lo = [1e30, 1e30, 1e30], hi = [-1e30, -1e30, -1e30];
+      let vol = 0, area = 0;
+      for (let i = 0; i < t.length; i += 9) {
+        for (let k = 0; k < 3; k++) for (let c = 0; c < 3; c++) { const v = t[i + k * 3 + c]; if (v < lo[c]) lo[c] = v; if (v > hi[c]) hi[c] = v; }
+        const [ax, ay, az, bx, by, bz, cx, cy, cz] = t.subarray(i, i + 9);
+        vol += (ax * (by * cz - bz * cy) - ay * (bx * cz - bz * cx) + az * (bx * cy - by * cx)) / 6;
+        const ux = bx - ax, uy = by - ay, uz = bz - az, vx = cx - ax, vy = cy - ay, vz = cz - az;
+        area += Math.hypot(uy * vz - uz * vy, uz * vx - ux * vz, ux * vy - uy * vx) / 2;
+      }
+      return { lo, hi, vol: Math.abs(vol), area };
+    }
+    const VIEWS = [['isometric', 35, 30], ['front', 0, 0], ['top', 0, 90], ['right', 90, 0]];
+    function project(p, az, el) {
+      const a = az * Math.PI / 180, e = el * Math.PI / 180, x1 = p[0] * Math.cos(a) + p[1] * Math.sin(a), y1 = -p[0] * Math.sin(a) + p[1] * Math.cos(a);
+      return [x1, y1 * Math.sin(e) + p[2] * Math.cos(e), y1 * Math.cos(e) - p[2] * Math.sin(e)];
+    }
+    function renderSheet(model) {
+      const S = 768, H = S / 2, cv = document.createElement('canvas');
+      cv.width = cv.height = S;
+      const g = cv.getContext('2d');
+      g.fillStyle = '#fff'; g.fillRect(0, 0, S, S);
+      const tris = model.tris, step = tris && tris.length / 9 > 150000 ? Math.ceil(tris.length / 9 / 150000) : 1;
+      VIEWS.forEach(([name, az, el], vi) => {
+        const ox = (vi % 2) * H, oy = Math.floor(vi / 2) * H;
+        g.save(); g.beginPath(); g.rect(ox, oy, H, H); g.clip();
+        const list = [];
+        if (tris) {
+          for (let i = 0; i < tris.length; i += 9 * step) {
+            const q = [0, 1, 2].map(k => project([tris[i + k * 3], tris[i + k * 3 + 1], tris[i + k * 3 + 2]], az, el));
+            const nx = (q[1][1] - q[0][1]) * (q[2][2] - q[0][2]) - (q[1][2] - q[0][2]) * (q[2][1] - q[0][1]);
+            const ny = (q[1][2] - q[0][2]) * (q[2][0] - q[0][0]) - (q[1][0] - q[0][0]) * (q[2][2] - q[0][2]);
+            const nz = (q[1][0] - q[0][0]) * (q[2][1] - q[0][1]) - (q[1][1] - q[0][1]) * (q[2][0] - q[0][0]);
+            const len = Math.hypot(nx, ny, nz) || 1;
+            list.push({ q, depth: (q[0][2] + q[1][2] + q[2][2]) / 3, shade: 0.3 + 0.7 * Math.abs((-0.4 * nx + 0.6 * ny - 0.7 * nz) / len) });
+          }
+          list.sort((a, b) => b.depth - a.depth);
+        }
+        const pts = model.pts ? model.pts.map(p => project(p, az, el)) : [];
+        const all = tris ? list.flatMap(t => t.q) : pts;
+        let x0 = 1e30, x1 = -1e30, y0 = 1e30, y1 = -1e30;
+        for (const p of all) { x0 = Math.min(x0, p[0]); x1 = Math.max(x1, p[0]); y0 = Math.min(y0, p[1]); y1 = Math.max(y1, p[1]); }
+        const sc = 0.82 * H / Math.max(x1 - x0, y1 - y0, 1e-9), cx = ox + H / 2 - sc * (x0 + x1) / 2, cy = oy + H / 2 + sc * (y0 + y1) / 2;
+        const X = p => cx + sc * p[0], Y = p => cy - sc * p[1];
+        if (tris) {
+          for (const t of list) {
+            const c = Math.round(60 + 190 * t.shade);
+            g.fillStyle = g.strokeStyle = `rgb(${c},${c},${Math.min(255, c + 25)})`;
+            g.beginPath(); g.moveTo(X(t.q[0]), Y(t.q[0])); g.lineTo(X(t.q[1]), Y(t.q[1])); g.lineTo(X(t.q[2]), Y(t.q[2])); g.closePath(); g.fill(); g.stroke();
+          }
+        } else {
+          g.strokeStyle = '#235'; g.lineWidth = 1.2; g.beginPath();
+          for (let i = 0; i + 1 < model.edges.length; i += 2) { const a = project(model.edges[i], az, el), b = project(model.edges[i + 1], az, el); g.moveTo(X(a), Y(a)); g.lineTo(X(b), Y(b)); }
+          g.stroke(); g.fillStyle = '#c22';
+          for (const p of pts) g.fillRect(X(p) - 1.5, Y(p) - 1.5, 3, 3);
+        }
+        g.restore();
+        g.fillStyle = '#000'; g.font = 'bold 18px sans-serif'; g.fillText(name, ox + 10, oy + 24);
+        g.strokeStyle = '#999'; g.lineWidth = 1; g.strokeRect(ox + 0.5, oy + 0.5, H - 1, H - 1);
+      });
+      return cv.toDataURL('image/jpeg', 0.9);
+    }
+    async function load3D(f) {
+      const ext = f.name.split('.').pop().toLowerCase();
+      const fmt = x => Number(x.toPrecision(4));
+      if (ext === 'stl' || ext === 'obj') {
+        const m = ext === 'stl' ? parseSTL(await f.arrayBuffer()) : parseOBJ(await f.text());
+        if (!m.tris.length) throw new Error('no triangles found');
+        const s = meshStats(m.tris), d = [0, 1, 2].map(c => fmt(s.hi[c] - s.lo[c]));
+        const summary = `3-D model file ${f.name} (${m.kind}): ${m.tris.length / 9} triangles. Bounding box ${d[0]} x ${d[1]} x ${d[2]} (x, y, z; the file states no units), ` +
+          `from (${s.lo.map(fmt).join(', ')}) to (${s.hi.map(fmt).join(', ')}). Volume ${fmt(s.vol)}, surface area ${fmt(s.area)} (cubic / square file units). ` +
+          'The attached picture shows it from four sides: isometric, front, top and right.';
+        return { image: renderSheet(m), summary };
+      }
+      const m = parseSTEP(await f.text());
+      if (!m.pts.length) throw new Error('no vertices found');
+      const lo = [0, 1, 2].map(c => Math.min(...m.pts.map(p => p[c]))), hi = [0, 1, 2].map(c => Math.max(...m.pts.map(p => p[c])));
+      const top = Object.entries(m.count).sort((a, b) => b[1] - a[1]).slice(0, 12).map(([k, v]) => `${k} ${v}`).join(', ');
+      const summary = `3-D model file ${f.name} (STEP${m.schema ? ', ' + m.schema : ''}). Units: ${m.units}. ${m.names.length ? 'Products: ' + m.names.join(', ') + '. ' : ''}` +
+        `${m.desc ? 'Description: ' + m.desc + '. ' : ''}${m.pts.length} vertices, ${m.edges.length / 2} edges (curved edges drawn as straight chords). ` +
+        `Vertex bounding box ${[0, 1, 2].map(c => fmt(hi[c] - lo[c])).join(' x ')} (x, y, z). Most frequent entities: ${top}. ` +
+        'The attached picture is a wireframe of the vertices and edges from four sides: isometric, front, top and right.';
+      return { image: renderSheet({ pts: m.pts, edges: m.edges }), summary };
+    }
+
     // the message the model gets: each file as a fenced block in front of the words
     function withAttachments(text) {
       const pics = attachments.filter(a => a.image);
-      const files = attachments.filter(a => !a.image);
+      const files = attachments.filter(a => a.text);
       const body = files.length ? fileBlocks(files) + '\n\n' + (text || 'Please read the attached file(s).') : (text || (pics.length ? 'Describe the picture.' : text));
       if (!pics.length) return files.length ? body : text;
       return [...pics.map(a => ({ type: 'image_url', image_url: { url: a.image } })), { type: 'text', text: body }];
