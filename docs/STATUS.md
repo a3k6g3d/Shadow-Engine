@@ -1155,3 +1155,13 @@ Single-prompt runs, "Write a Rust function that parses a comma separated list...
 
 - Tried staging a grouped expert block's inputs (up to 4 x 2048 floats) in shared memory (`matvec_grouped_*`: each warp re-read them from the cache chunk by chunk; the L1 throughput was 35-50% busy). Same sums, `--exact` text identical, but decode per-turn median **49.4 / 48.5 / 50.0** against 50.1 / 51.0 / 51.25 and the exact prompt 59.6 against 62.8 tok/s:
   slower (the 32 KB of shared memory a block and the barrier cost more than the reads saved). Reverted.
+
+## 2026-10-31: where a long prompt's GPU time goes; what did not help
+
+- Nsight Systems on a 3,001-token prompt (1,024-token batches, pipeline on): kernels busy **15.4 s** of a 22.0 s window (70%), host-to-device copies 9.4 s (6.6 s overlapped with kernels), neither 3.8 s. The GPU is now the limit, not the copies or the host. Kernel time: dense `matvec_cols_*` (iq4_xs 2.0 s, q6_k 1.8 s, bf16 1.1 s,
+  `hc_down_inject` 0.8 s, q5_k 0.75 s, q4_k 0.5 s, f32 0.4 s, `matvec_fast_bf16` 0.3 s) = ~7.7 s; grouped expert matvecs (iq4_nl 1.9 s, iq2_s 1.3 s, iq3_xxs 1.1 s, iq3_s 0.7 s, q2_0 0.4 s) = ~5.4 s; sparse/dense attention ~1.1 s; the delta layers 0.2 s.
+  Dense work per prompt token is ~16 GFLOP of FP32 FMAs (about 8 G quantized weights): 48 TFLOP for 3,001 tokens, 1.7 s at the card's FP32 peak, 7.7 s measured: ~6 TFLOP/s.
+- Tried: 2,048-token batches (122.8 / 141.9 / 120.2 / 119.3 tok/s against 128-144 at 1,024: slower, the GPU work per token is constant and the buffers cost more); a 16-inputs-a-launch `matvec_cols` (the weights read once for 16 inputs instead of 8; same sums, same text): 126.0 / 141.8 / 131.6 / 138.0 tok/s,
+  no change, so the dense kernels are not limited by re-reading the weights (they come from the L2 cache) but by FP32 decode-and-FMA throughput. Both reverted.
+- What would move prompt reading from here: tensor-core matrix multiplies for the dense and expert projections (dequantize a weight tile to FP16 in shared memory, `mma` against FP16 activations, FP32 accumulation, as llama.cpp's prompt kernels do). That is an inexact path (FP16 rounding of weights and activations
+  where the reference sums in FP32), so default mode only, with a fidelity check against `--exact`; one kernel family per quantization type. Not started.
