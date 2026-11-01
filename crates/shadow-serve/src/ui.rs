@@ -1427,6 +1427,30 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
       if (!isGenerating && modelState !== 'loading') sendMessage();
     }
 
+    // The first message of a conversation reads the persona and the tool list (~960 tokens, ~11 s at prompt speed) before its own words.  The
+    // server keeps the KV of the last conversation, so on a fresh server (nothing cached) a one-token request with the same system part,
+    // sent while the page is idle, makes the first real message start at once.  Not when the server holds someone's conversation (a warm-up
+    // would replace it).
+    let warmedKey = '';
+    async function warmPrompt(cachedTokens) {
+      if (modelState !== 'ready' || isGenerating || history.length || cachedTokens > 0) return;
+      if (toolsEnabled && availableTools.length === 0) return;
+      const key = JSON.stringify([currentPersona, toolsEnabled]);
+      if (key === warmedKey) return;
+      warmedKey = key;
+      const msgs = [];
+      if (currentPersona && currentPersona.trim()) msgs.push({ role: 'system', content: currentPersona.trim() });
+      msgs.push({ role: 'user', content: 'Hi' });
+      const body = { messages: msgs, max_tokens: 1, stream: false, reasoning_effort: currentEffort,
+                     chat_template_kwargs: { enable_thinking: currentEffort !== 'off' } };
+      if (toolsEnabled) body.tools = availableTools;
+      try {
+        timingInfo.textContent = 'Warming up the prompt...';
+        await fetch('/v1/chat/completions', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+      } catch (_) { warmedKey = ''; }
+      if (timingInfo.textContent === 'Warming up the prompt...') timingInfo.textContent = '';
+    }
+
     // A fresh conversation: stops a running reply, forgets the history, puts the welcome card back.
     const welcomeHTML = messagesEl.innerHTML;
     function newChat() {
@@ -1749,6 +1773,7 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
               : 'Thinking...';
           }
           modelState = d.process.state === 'loading' ? 'loading' : 'ready';
+          if (modelState === 'ready' && !d.process.busy) warmPrompt(d.process.cached_tokens || 0);
           const [label, cls] = modelState === 'loading' ? ['Loading model...', 'loading']
             : d.process.busy ? ['Generating', 'busy'] : ['Ready', 'ready'];
           statusPill.textContent = label;

@@ -320,7 +320,20 @@ fn answer<'c>(arch: &str, req: &Request, tok: &Tokenizer, sess: &mut GpuSession<
     let shared = prefix.prev.iter().zip(&ids).take_while(|(a, b)| a == b).count();
     // `SHADOW_NO_PREFIX=1`: no shared-prefix snapshots (every new conversation reads its whole prompt)
     let snap_at = (shared >= PREFIX_MIN && !std::env::var("SHADOW_NO_PREFIX").is_ok_and(|v| v == "1") && shared > cached && shared < ids.len()
-        && prefix.snap.as_ref().is_none_or(|s| s.tokens() != &ids[..shared])).then_some(shared);
+        && prefix.snap.as_ref().is_none_or(|s| s.tokens() != &ids[..shared])).then_some(shared).or_else(|| {
+        // the first prompt after a start has no earlier one to share a start with, so the second conversation would read the persona and the
+        // tool list (~900 tokens, ~10 s) whole again: snapshot where the last user turn begins instead (the chat template's `<|im_start|>user`)
+        if prefix.snap.is_some() || std::env::var("SHADOW_NO_PREFIX").is_ok_and(|v| v == "1") {
+            return None;
+        }
+        let marker = tok.encode("<|im_start|>user
+", true);
+        if marker.is_empty() || ids.len() < marker.len() {
+            return None;
+        }
+        let p = (0..=ids.len() - marker.len()).rev().find(|&p| ids[p..p + marker.len()] == marker[..])?;
+        (p >= PREFIX_MIN && p > cached && p < ids.len()).then_some(p)
+    });
     prefix.prev = ids.clone();
     let unread = &ids[cached..];
     use std::sync::atomic::Ordering::Relaxed;
