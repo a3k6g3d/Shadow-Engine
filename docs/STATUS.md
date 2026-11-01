@@ -1280,3 +1280,11 @@ Single-prompt runs, "Write a Rust function that parses a comma separated list...
 - **Conversation sidebar** in the chat view (hide with «, reopen with ☰): every conversation is saved in the browser's localStorage after each reply (pictures included until the space
   runs out, then the oldest conversation's pictures go first), grouped Today / Yesterday / This week / Earlier, searchable, deletable, restorable (attached files and pictures shown again).
 - Tested live: the sidebar after a real reply, a fabricated second conversation (open, switch back, delete), the dashboard on the running server with real numbers.
+
+## 2026-11-01: queued messages and a compact chat bar
+
+- **Queue:** while a reply is being written, Enter / the button (now "Queue") puts the message, with its attachments, in a list above the box (numbered, each removable); each one is sent when the reply before it
+  ends, so every message sees the answers to the ones before it. A reply that was stopped or failed pauses the queue (a "Resume" button appears); New chat clears it. Tested: three messages sent
+  at once ("one", "two", "three") ran in order, each answered before the next.
+- **Compact bar:** one rounded bar with the attach button, the text and Send / Stop inside it (32 px controls, a one-line box that grows with the text), and a slim status line under it (reasoning
+  depth, Windows tools, persona as quiet text buttons, the status on the right). The reasoning-depth menu opens above the bar instead of over it (`--bar-h`).

@@ -213,6 +213,17 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
     .side-toggle { background: var(--surface-hover); border: 1px solid var(--border); color: var(--text-muted); border-radius: 0.5rem; padding: 0.25rem 0.55rem; cursor: pointer; }
     .side-toggle:hover { color: var(--text); }
 
+    /* Queued messages */
+    #queue-bar { max-width: 880px; width: 100%; margin: 0 auto 0.5rem; display: flex; flex-direction: column; gap: 0.3rem; }
+    #queue-bar:empty { display: none; }
+    .q-item { display: flex; align-items: center; gap: 0.6rem; background: var(--surface-hover); border: 1px dashed var(--border); border-radius: 0.6rem; padding: 0.35rem 0.7rem; font-size: 0.82rem; color: var(--text-muted); }
+    .q-item .n { color: var(--accent); font-weight: 700; }
+    .q-item .t { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text); }
+    .q-item button { background: none; border: none; color: var(--text-muted); cursor: pointer; }
+    .q-item button:hover { color: var(--danger); }
+    .q-note { font-size: 0.78rem; color: var(--text-dim); }
+    .q-note button { background: var(--accent); color: #fff; border: none; border-radius: 0.4rem; padding: 0.1rem 0.5rem; cursor: pointer; margin-left: 0.4rem; }
+
     /* Dashboard */
     #dash-panel { overflow-y: auto; padding: 1.25rem 1.5rem 2rem; }
     .dash-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 1rem; flex-wrap: wrap; gap: 0.75rem; }
@@ -914,6 +925,23 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
       vertical-align: middle;
     }
     @keyframes blink { 0%, 100% { opacity: 1; } 50% { opacity: 0; } }
+    /* Compact chat bar: one rounded bar (attach, text, send / stop inside it) and a slim status line under it */
+    #input-pane { background: transparent; border-top: none; padding: 0.35rem 1.25rem 0.45rem; gap: 0.25rem; }
+    .input-box { align-items: flex-end; gap: 0.3rem; background: var(--surface); border: 1px solid var(--border); border-radius: 1.2rem; padding: 0.28rem 0.35rem; transition: border-color 0.15s; }
+    .input-box:focus-within { border-color: var(--accent); }
+    .input-box textarea { background: transparent; border: none; padding: 0.4rem 0.4rem; min-height: 30px; font-size: 0.92rem; line-height: 1.35; }
+    .input-box textarea:focus { border: none; }
+    .attach-btn { width: 32px; height: 32px; padding: 0; border-radius: 50%; background: transparent; border: none; font-size: 1rem; align-self: flex-end; }
+    .send-btn, .stop-btn { height: 32px; padding: 0 0.95rem; border-radius: 9999px; font-size: 0.8rem; }
+    .stop-btn { box-shadow: none; }
+    .controls-bar { font-size: 0.72rem; }
+    .controls-left { gap: 0.15rem; }
+    .menu-pill-btn { background: transparent; border-color: transparent; padding: 0.15rem 0.55rem; font-size: 0.74rem; color: var(--text-muted); gap: 0.35rem; }
+    .menu-pill-btn:hover { background: var(--surface-hover); color: var(--text); border-color: transparent; }
+    .menu-pill-btn.active-state { border-color: transparent; }
+    #queue-bar, #attach-tray { margin-bottom: 0.15rem; }
+    /* the menus open above the whole bar, whatever its height (--bar-h follows the text box) */
+    .dropdown-popup { bottom: calc(100% + 10px + var(--bar-h, 44px)); }
   </style>
 </head>
 <body>
@@ -1039,6 +1067,7 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
       </div>
 
       <div id="input-pane">
+        <div id="queue-bar"></div>
         <div id="attach-tray"></div>
         <div class="input-box">
           <input type="file" id="file-input" multiple hidden>
@@ -1320,6 +1349,7 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
         currentAbortController = null;
       }
       isGenerating = false;
+      sendBtn.textContent = 'Send';
       sendBtn.style.display = 'flex';
       stopBtn.style.display = 'none';
       sendBtn.disabled = false;
@@ -1400,6 +1430,7 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
 
     // Thinking Level Selection
     function toggleThinkingDropdown(e) {
+      document.documentElement.style.setProperty('--bar-h', document.querySelector('.input-box').offsetHeight + 'px');
       e.stopPropagation();
       thinkingDropdown.classList.toggle('open');
       thinkingBtn.classList.toggle('open');
@@ -1461,6 +1492,7 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
     inputEl.addEventListener('input', () => {
       inputEl.style.height = 'auto';
       inputEl.style.height = Math.min(inputEl.scrollHeight, 200) + 'px';
+      document.documentElement.style.setProperty('--bar-h', document.querySelector('.input-box').offsetHeight + 'px');
     });
 
     inputEl.addEventListener('keydown', (e) => {
@@ -1799,6 +1831,9 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
       if (isGenerating && currentAbortController) currentAbortController.abort();
       saveCurrent();
       currentChatId = null;
+      sendQueue.length = 0;
+      queuePaused = false;
+      renderQueue();
       renderChatList();
       history.length = 0;
       attachments.length = 0;
@@ -1822,7 +1857,8 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
 
     async function sendMessage() {
       const text = inputEl.value.trim();
-      if ((!text && !attachments.length) || isGenerating) return;
+      if (!text && !attachments.length) return;
+      if (isGenerating) { enqueueMessage(text); return; } // a reply is being written: this message waits its turn
       if (modelState === 'loading') {
         timingInfo.textContent = 'The model is still loading - your message is still in the box.';
         return;
@@ -1832,7 +1868,7 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
       let failed = false;
 
       isGenerating = true;
-      sendBtn.style.display = 'none';
+      sendBtn.textContent = 'Queue';
       stopBtn.style.display = 'flex';
       currentAbortController = new AbortController();
       inputEl.value = '';
@@ -2089,11 +2125,13 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
       isGenerating = false;
       currentAbortController = null;
       saveCurrent();
+      sendBtn.textContent = 'Send';
       sendBtn.style.display = 'flex';
       stopBtn.style.display = 'none';
       sendBtn.disabled = false;
       inputEl.focus();
       pollTelemetry();
+      runQueue();
     }
 
     // Telemetry Polling Safe Setters
@@ -2458,6 +2496,38 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
       }
       dashChats();
     }
+    // ---- queued messages: typed while a reply is being written, sent in order when it ends (each one needs the one before it answered)
+    const sendQueue = [];
+    let queuePaused = false;
+    function enqueueMessage(text) {
+      sendQueue.push({ text, atts: attachments.splice(0, attachments.length) });
+      inputEl.value = '';
+      inputEl.style.height = 'auto';
+      renderTray();
+      renderQueue();
+    }
+    function renderQueue() {
+      const bar = document.getElementById('queue-bar');
+      if (!bar) return;
+      bar.innerHTML = sendQueue.map((q, i) => `<div class="q-item"><span class="n">${i + 1}</span><span class="t">${escapeHtml(q.text || '(attachments only)')}</span>` +
+        `${q.atts.length ? `<small>📎 ${q.atts.length}</small>` : ''}<button title="Remove from the queue" onclick="dropQueued(${i})">✕</button></div>`).join('') +
+        (sendQueue.length && queuePaused ? `<div class="q-note">Queue paused (the last reply was stopped or failed).<button onclick="resumeQueue()">Resume</button></div>` : '');
+    }
+    function dropQueued(i) { sendQueue.splice(i, 1); renderQueue(); }
+    function resumeQueue() { queuePaused = false; if (!isGenerating) runQueue(); else renderQueue(); }
+    // after a reply: the next queued message, unless the reply was stopped or failed (then the queue waits for Resume)
+    function runQueue() {
+      if (!sendQueue.length || isGenerating) { renderQueue(); return; }
+      const t = timingInfo.textContent || '';
+      if (queuePaused || t.startsWith('Generation stopped') || t.startsWith('Failed')) { queuePaused = true; renderQueue(); return; }
+      const q = sendQueue.shift();
+      renderQueue();
+      attachments.splice(0, attachments.length, ...q.atts);
+      renderTray();
+      inputEl.value = q.text;
+      setTimeout(sendMessage, 0);
+    }
+
     document.body.classList.toggle('view-chat', currentView === 'chat');
     if (window.location.hash === '#dash') switchView('dash');
 
