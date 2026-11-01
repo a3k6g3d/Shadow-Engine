@@ -183,3 +183,47 @@ fn ssd_read_bandwidth() {
         }
     }
 }
+
+/// Unbuffered random reads of the model file over thread count and read size: is 3.5 GB/s the drive's ceiling, or the way the reads are issued?
+/// (`cargo test --release -p shadow-cuda --test pinned -- --ignored --nocapture ssd_read_sweep`).
+#[test]
+#[ignore]
+fn ssd_read_sweep() {
+    use std::os::windows::fs::{FileExt, OpenOptionsExt};
+    let path = std::env::var("SHADOW_MODEL").unwrap_or_else(|_| "J:/Strata-work/models/swift15/IQ3_S/Swift-Qwen3.8-Flash-Next-GSQ-RCO-abliterated-IQ3_S-00001-of-00002.gguf".into());
+    if !std::path::Path::new(&path).is_file() {
+        return eprintln!("SKIPPED: no model");
+    }
+    let size = std::fs::metadata(&path).unwrap().len();
+    for &chunk in &[128usize << 10, 512 << 10, 2 << 20, 8 << 20] {
+        for &threads in &[1usize, 4, 16, 32, 64] {
+            let total = std::sync::atomic::AtomicU64::new(0);
+            let t0 = std::time::Instant::now();
+            std::thread::scope(|s| {
+                for t in 0..threads {
+                    let (path, total) = (&path, &total);
+                    s.spawn(move || {
+                        let f = std::fs::OpenOptions::new().read(true).custom_flags(0x2000_0000).open(path).unwrap();
+                        let layout = std::alloc::Layout::from_size_align(chunk, 4096).unwrap();
+                        // SAFETY: a 4096-aligned allocation of `chunk` bytes, used only for these reads and freed below.
+                        let buf = unsafe { std::alloc::alloc(layout) };
+                        let mut rnd = 0x9e37_79b9_7f4a_7c15u64 ^ ((t as u64 + 1) * 0x1234_5678_9abc);
+                        while t0.elapsed().as_secs_f64() < 3.0 {
+                            rnd ^= rnd << 13;
+                            rnd ^= rnd >> 7;
+                            rnd ^= rnd << 17;
+                            let off = (rnd % (size - chunk as u64)) & !4095;
+                            // SAFETY: the buffer is `chunk` bytes, exclusively ours.
+                            let n = f.seek_read(unsafe { std::slice::from_raw_parts_mut(buf, chunk) }, off).unwrap();
+                            total.fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
+                        }
+                        // SAFETY: allocated above with this layout.
+                        unsafe { std::alloc::dealloc(buf, layout) };
+                    });
+                }
+            });
+            println!("direct {:5} KiB x {:2} threads: {:.2} GB/s", chunk >> 10, threads,
+                     total.load(std::sync::atomic::Ordering::Relaxed) as f64 / t0.elapsed().as_secs_f64() / 1e9);
+        }
+    }
+}
