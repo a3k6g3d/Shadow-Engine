@@ -1461,6 +1461,20 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
     // engine, so an image is refused with a note rather than silently dropped).
     const attachments = [];
     const MAX_FILE_BYTES = 256 * 1024, MAX_ATTACH_CHARS = 150000;
+    // A picture costs one token per 32 x 32 pixels: scaled down to about 600 of them (768 x 768), the sides a multiple of 32 (the vision
+    // encoder's patch grid), and sent as a JPEG.
+    const MAX_PICTURE_PIXELS = 768 * 768;
+    async function shrinkImage(file) {
+      const bmp = await createImageBitmap(file);
+      let s = Math.min(1, Math.sqrt(MAX_PICTURE_PIXELS / (bmp.width * bmp.height)));
+      const w = Math.max(64, Math.round(bmp.width * s / 32) * 32), h = Math.max(64, Math.round(bmp.height * s / 32) * 32);
+      const cv = document.createElement('canvas');
+      cv.width = w; cv.height = h;
+      const g = cv.getContext('2d');
+      g.fillStyle = '#fff'; g.fillRect(0, 0, w, h);
+      g.drawImage(bmp, 0, 0, w, h);
+      return cv.toDataURL('image/jpeg', 0.92);
+    }
     let attachNotes = [];
     function attachNote(msg) { attachNotes.push(msg); timingInfo.textContent = attachNotes.join(' '); }
     function renderTray() {
@@ -1469,7 +1483,7 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
       attachments.forEach((a, i) => {
         const chip = document.createElement('span');
         chip.className = 'att-chip';
-        chip.innerHTML = `📎 ${escapeHtml(a.name)} <small>${a.text.length < 1000 ? a.text.length + ' chars' : (a.text.length / 1000).toFixed(1) + 'k chars'}</small><button title="Remove" onclick="removeAttachment(${i})">✕</button>`;
+        chip.innerHTML = `${a.image ? `<img src="${a.image}" style="height:1.6rem;border-radius:0.3rem;">` : '📎'} ${escapeHtml(a.name)} <small>${a.image ? 'picture' : a.text.length < 1000 ? a.text.length + ' chars' : (a.text.length / 1000).toFixed(1) + 'k chars'}</small><button title="Remove" onclick="removeAttachment(${i})">✕</button>`;
         tray.appendChild(chip);
       });
     }
@@ -1477,7 +1491,13 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
     async function addFiles(files) {
       attachNotes = [];
       for (const f of files) {
-        if (f.type.startsWith('image/')) { attachNote(`Shadow cannot see images yet (no vision support): ${f.name} was not attached.`); continue; }
+        if (f.type.startsWith('image/')) {
+          try {
+            const url = await shrinkImage(f);
+            attachments.push({ name: f.name, image: url, text: '' });
+          } catch (_) { attachNote(`Could not read the picture ${f.name}.`); }
+          continue;
+        }
         if (f.size > MAX_FILE_BYTES) { attachNote(`${f.name} is ${(f.size / 1024).toFixed(0)} KB: files over ${MAX_FILE_BYTES / 1024} KB are not attached.`); continue; }
         let text;
         try { text = await f.text(); } catch (_) { attachNote(`Could not read ${f.name}.`); continue; }
@@ -1503,9 +1523,15 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
     });
     // the message the model gets: each file as a fenced block in front of the words
     function withAttachments(text) {
-      if (!attachments.length) return text;
-      const blocks = attachments.map(a => `File: ${a.name}\n\`\`\`\n${a.text}\n\`\`\``).join('\n\n');
-      return blocks + '\n\n' + (text || 'Please read the attached file(s).');
+      const pics = attachments.filter(a => a.image);
+      const files = attachments.filter(a => !a.image);
+      const body = files.length ? fileBlocks(files) + '\n\n' + (text || 'Please read the attached file(s).') : (text || (pics.length ? 'Describe the picture.' : text));
+      if (!pics.length) return files.length ? body : text;
+      return [...pics.map(a => ({ type: 'image_url', image_url: { url: a.image } })), { type: 'text', text: body }];
+    }
+    function fileBlocks(list) {
+      const blocks = list.map(a => `File: ${a.name}\n\`\`\`\n${a.text}\n\`\`\``).join('\n\n');
+      return blocks;
     }
 
     // A fresh conversation: stops a running reply, forgets the history, puts the welcome card back.
@@ -1600,6 +1626,7 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
 
         let rawContent = '';
         let rawThinking = '';
+        let streamError = null;
         let lastTimings = null;
         let thinkStart = performance.now();
         let isThinking = false;
@@ -1654,6 +1681,7 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
                 try {
                   const parsed = JSON.parse(trimmed.slice(6));
                   if (parsed.timings) lastTimings = parsed.timings;
+                  if (parsed.error) { streamError = parsed.error.message || 'The server reported an error.'; continue; }
                   const delta = parsed.choices?.[0]?.delta;
                   if (!delta) continue;
 
@@ -1693,6 +1721,15 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
                 } catch (_) {}
               }
             }
+          }
+
+          // the server's error mid-stream (e.g. a picture it could not encode): shown in place of the reply, the question taken back
+          if (streamError) {
+            msgContent.innerHTML = `<div class="msg-error">${escapeHtml(streamError)}</div>`;
+            thinkBlock.style.display = 'none';
+            history.pop();
+            failed = true;
+            break;
           }
 
           if (isThinking) {

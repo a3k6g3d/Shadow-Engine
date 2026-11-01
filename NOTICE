@@ -43,3 +43,7 @@ Shadow borrows from Strata and other projects where it helps, and lists each bor
 
 The model this is built to run - Qwen3.8-Flash-Next, abliterated, IQ3_S - is not part of
 this repository and is not covered by this license.
+
+Pictures (2026-11-01): `bin/strata-vision.exe` (not in git; copied from a Strata build) is Strata's picture encoder, a thin wrapper
+around llama.cpp's mtmd library (MIT, Copyright (c) 2023-2026 The ggml authors). Shadow starts it as a child process
+(`crates/shadow-serve/src/vision.rs`) and does the rest itself; the vision projector it reads is the model's own mmproj file.

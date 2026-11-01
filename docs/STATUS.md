@@ -1228,3 +1228,22 @@ Single-prompt runs, "Write a Rust function that parses a comma separated list...
 
 - The expert cache takes the free VRAM less `VRAM_RESERVE`. The display runs off the integrated GPU on this PC, so the RTX card has nothing else on it; `--vram-reserve-mib` (new) sets the reserve. Varied bench, 3 runs interleaved, 30 GiB tier (the RAM was 47 GiB free): reserve 384 **50.01** against 96 **52.26** tok/s (`bench/vram-ab`, 3 runs each agree to 0.3); 96 against 16 MiB 52.40 / 52.45 (`bench/vram-ab2`, a tie). Long prompts at 96 MiB run (176-184 tok/s at the 30 GiB tier, `longsrc.py`). Default is now **96 MiB**; a card that also drives a display should pass a larger `--vram-reserve-mib`. `cargo test --release` passes.
 - `shadow serve`'s default placement is `profiles/routing-varied300.shrc` (300 varied prompts, the benches' profile), falling back to the six-prompt one. Not A/B'd against the six-prompt profile on its own (the UI's server held the RAM when asked).
+
+## 2026-11-01: pictures (phase 1)
+
+- Shadow reads pictures. `shadow serve` accepts OpenAI-style `image_url` parts (`data:image/...;base64,` URLs); the chat page's 📎 button, drop and paste take pictures
+  (shrunk in the browser to about 768 x 768, the sides multiples of 32, sent as JPEG) and show a thumbnail in the chip.
+- How: **the picture encoder is Strata's `strata-vision.exe`** (llama.cpp's mtmd library on the model's mmproj, `models/Qwen3.8-Flash-Next.mmproj-f16.gguf`, a Qwen3-VL-style
+  27-block ViT), copied to `bin/` (ignored by git; `SHADOW_VISION_EXE` / `SHADOW_MMPROJ` override, Strata's build is the fallback). It runs on the CPU as a child
+  process, started on the first picture and ended once the pictures are encoded (it holds 1-1.3 GiB while alive): 260 rows 2.3 s, 350 rows 3.2 s, 1,024 rows 13.5 s;
+  rows are cached by content hash. Its output (n rows x 2560 floats) replaces the embeddings of the `<|image_pad|>` tokens (`vision.rs`, `engine::expand_pictures`,
+  `GpuSession::set_pictures`); the prompt's `<|vision_start|><|image_pad|><|vision_end|>` becomes one pad token per row; the per-layer inputs of those positions come
+  from the pad id (the model's `ple.image_token_id`), as llama.cpp's qwen4exp does. The prefix cache treats the same ids with other pictures as another prompt
+  and takes no shared-prefix snapshot for a prompt with pictures.
+- **Not yet (phase 2): the 2-D M-RoPE positions.** The model was trained with (t, h, w) positions for picture rows (`rope.dimension_sections = [11, 11, 10, 0]`, interleaved,
+  also for the indexer's q and pooled k); Shadow gives them the plain 1-D position, and the text after a picture is not shifted by `max(nx, ny) - rows`. Measured anyway:
+  shapes picture "red circle, blue square, green triangle, text STRATA 42" correct; `CODE 4217` read exactly; a 1,024-row invoice read "INVOICE 20261014", "Total due: 1337 EUR";
+  a canvas drawing's layout (circle left, square upper right, text at the bottom) right in the chat page. Small spatial errors on dense layouts are to be expected until phase 2.
+- RAM: the RAM tier leaves ~4-5 GiB above the floor, so a picture is refused (HTTP 400 with the numbers) when free RAM is under the floor + 1.8 GiB. A first test
+  under `run_capped -FloorGiB 4` was killed by the watchdog at 3.94 GiB: the 36 GiB tier plus the encoder.
+- The page shows a server error that arrives mid-stream (it used to leave an empty reply bubble).

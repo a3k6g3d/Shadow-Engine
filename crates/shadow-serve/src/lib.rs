@@ -8,6 +8,7 @@ pub mod engine;
 pub mod orchestrator;
 pub mod telemetry;
 pub mod ui;
+pub mod vision;
 
 use bytes::Bytes;
 use engine::{Event, Status};
@@ -155,17 +156,69 @@ async fn handle(req: Request<Incoming>, app: Arc<App>) -> Result<Response<Body>,
     })
 }
 
-/// A message's content: a string, or an array of parts of which the text ones are joined (anything else refused).
+/// What a picture is in the prompt text: the chat template's own marker; the engine widens the one pad token to the picture's rows.
+pub const IMAGE_MARK: &str = "<|vision_start|><|image_pad|><|vision_end|>";
+
+/// The data URL of an `image_url` content part (`{"image_url": {"url": ...}}` or `{"image_url": "..."}`).
+fn image_url(p: &Value) -> Option<&str> {
+    let u = p.get("image_url")?;
+    u.get("url").and_then(Value::as_str).or_else(|| u.as_str())
+}
+
+/// A message's content: a string, or an array of parts: text ones are joined, a picture becomes `IMAGE_MARK` (its bytes come from
+/// `parse_images`); anything else is refused.
 fn content_text(v: &Value) -> Result<String, String> {
     match v {
         Value::String(s) => Ok(s.clone()),
         Value::Null => Ok(String::new()),
         Value::Array(parts) => parts.iter().map(|p| match p.get("type").and_then(Value::as_str) {
             Some("text") => Ok(p.get("text").and_then(Value::as_str).unwrap_or("").to_string()),
-            other => Err(format!("content part type {other:?} is not supported (text only)")),
+            Some("image_url") if image_url(p).is_some() => Ok(IMAGE_MARK.to_string()),
+            other => Err(format!("content part type {other:?} is not supported (text and images only)")),
         }).collect::<Result<Vec<_>, _>>().map(|v| v.concat()),
         _ => Err("message content must be a string or an array of text parts".into()),
     }
+}
+
+/// The pictures of a request, in prompt order: the bytes of each `data:image/...;base64,` URL in the messages' content arrays.
+pub fn parse_images(body: &Value) -> Result<Vec<Vec<u8>>, String> {
+    let mut out = Vec::new();
+    for m in body.get("messages").and_then(Value::as_array).into_iter().flatten() {
+        for p in m.get("content").and_then(Value::as_array).into_iter().flatten() {
+            if p.get("type").and_then(Value::as_str) != Some("image_url") {
+                continue;
+            }
+            let url = image_url(p).ok_or("an image_url part needs a url")?;
+            let b64 = url.strip_prefix("data:").and_then(|r| r.split_once(";base64,")).map(|(_, d)| d)
+                .ok_or("pictures must be data:image/...;base64, URLs")?;
+            out.push(base64_decode(b64)?);
+        }
+    }
+    Ok(out)
+}
+
+fn base64_decode(s: &str) -> Result<Vec<u8>, String> {
+    let mut out = Vec::with_capacity(s.len() / 4 * 3);
+    let (mut acc, mut bits) = (0u32, 0u32);
+    for c in s.bytes() {
+        let v = match c {
+            b'A'..=b'Z' => c - b'A',
+            b'a'..=b'z' => c - b'a' + 26,
+            b'0'..=b'9' => c - b'0' + 52,
+            b'+' | b'-' => 62,
+            b'/' | b'_' => 63,
+            b'=' | b'\n' | b'\r' | b' ' => continue,
+            _ => return Err("the picture's base64 has a bad character".into()),
+        };
+        acc = (acc << 6) | v as u32;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((acc >> bits) as u8);
+            acc &= (1 << bits) - 1;
+        }
+    }
+    Ok(out)
 }
 
 /// Formats a `serde_json::Value` like Jinja's `tojson(ensure_ascii=False)` (`", "` and `": "`), ordering common
@@ -393,10 +446,14 @@ async fn chat(req: Request<Incoming>, app: Arc<App>) -> Response<Body> {
         Ok(p) => p,
         Err(e) => return error(StatusCode::BAD_REQUEST, &e),
     };
+    let images = match parse_images(&body) {
+        Ok(i) => i,
+        Err(e) => return error(StatusCode::BAD_REQUEST, &e),
+    };
     let model = app.status.lock().unwrap().model.clone();
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
     app.sent.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-    if app.engine.lock().unwrap().send(engine::Request { messages, opts, max_tokens, tx }).is_err() {
+    if app.engine.lock().unwrap().send(engine::Request { messages, opts, max_tokens, images, tx }).is_err() {
         return error(StatusCode::INTERNAL_SERVER_ERROR, "the engine has stopped");
     }
     let id = format!("chatcmpl-{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos());
@@ -511,6 +568,13 @@ mod tests {
     fn refuses_what_it_cannot_render() {
         assert!(parse_chat(&json!({"messages": [], "tools": [{"type": "function"}]})).is_err());
         assert!(parse_chat(&json!({"messages": [{"role": "user", "content": [{"type": "image_url"}]}]})).is_err());
+        // a picture becomes the template's marker, and its bytes come out of the data URL in order
+        let b = json!({"messages": [{"role": "user", "content": [
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,aGVsbG8="}}, {"type": "text", "text": "what is this?"}]}]});
+        let (m, ..) = parse_chat(&b).unwrap();
+        assert_eq!(m[0].content, format!("{IMAGE_MARK}what is this?"));
+        assert_eq!(parse_images(&b).unwrap(), vec![b"hello".to_vec()]);
+        assert!(parse_images(&json!({"messages": [{"role": "user", "content": [{"type": "image_url", "image_url": {"url": "http://x/y.png"}}]}]})).is_err());
         assert!(parse_chat(&json!({"messages": [{"role": "wizard", "content": "x"}]})).is_err());
         assert!(parse_chat(&json!({"nope": 1})).is_err());
     }

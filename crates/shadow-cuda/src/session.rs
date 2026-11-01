@@ -305,6 +305,8 @@ pub struct GpuSession<'c, 'm> {
     attn: Vec<Option<Attn<'c>>>,
     ple_state: DeviceBuffer<'c>,
     tokens: Vec<u32>,
+    /// Pictures: (first token index, rows, the rows as n x hidden floats); the embedding of a token inside one is its row (`set_pictures`).
+    pictures: Vec<(usize, usize, std::sync::Arc<Vec<f32>>)>,
     cap: usize,
     pub trace: Option<BTreeMap<String, Vec<f32>>>,
     pub stop_after: Option<usize>,
@@ -1258,7 +1260,7 @@ impl<'c, 'm> GpuSession<'c, 'm> {
             None
         };
         let mut s = GpuSession {
-            ctx, m, mvp, fw, w, v, b, bb, replay, batch_scratch, delta, attn, ple_state, tokens: vec![], cap, trace: None, stop_after: None,
+            ctx, m, mvp, fw, w, v, b, bb, replay, batch_scratch, delta, attn, ple_state, tokens: vec![], pictures: vec![], cap, trace: None, stop_after: None,
             resident_bytes, expert_uploads: 0, cache, ram, copy_stream, copy_event, staging,
             pending: vec![], routing: RoutingCounts::new(c.n_layer, c.n_expert),
             prof: std::env::var("SHADOW_PROFILE").is_ok_and(|v| v == "1")
@@ -1376,6 +1378,17 @@ impl<'c, 'm> GpuSession<'c, 'm> {
     /// Back to the state before any token: every DeltaNet state and conv window, the attention caches (as `new` leaves
     /// them: zeroed, no complete blocks) and the n-gram conv state zeroed, the token list emptied.  The weights, the
     /// expert cache and the RAM tier stay.
+    /// Pictures for the prompt about to be read: (first token index, rows, the rows as rows x hidden floats).  The tokens there
+    /// (the `<|image_pad|>` id, which also gives their per-layer inputs) keep their ids; only their embeddings are the rows.
+    pub fn set_pictures(&mut self, pics: Vec<(usize, usize, std::sync::Arc<Vec<f32>>)>) {
+        self.pictures = pics;
+    }
+
+    fn picture_row(&self, idx: usize) -> Option<&[f32]> {
+        let h = self.m.cfg.hidden;
+        self.pictures.iter().find(|(s, n, _)| idx >= *s && idx < s + n).map(|(s, _, rows)| &rows[(idx - s) * h..(idx - s + 1) * h])
+    }
+
     pub fn reset(&mut self) {
         for (s, conv) in self.delta.iter_mut().flatten() {
             s.zero().unwrap();
@@ -1388,6 +1401,7 @@ impl<'c, 'm> GpuSession<'c, 'm> {
         }
         self.ple_state.zero().unwrap();
         self.tokens.clear();
+        self.pictures.clear();
         if let Some(mt) = self.mtp.as_mut() {
             mt.pending = false;
         }
@@ -1826,13 +1840,16 @@ impl<'c, 'm> GpuSession<'c, 'm> {
         let c = &self.m.cfg;
         let (h, cs) = (c.hidden, c.streams);
 
-        let emb = {
-            let (t, bytes) = self.m.dense("token_embd.weight");
-            let (qk, qb) = t.ty.block().unwrap();
-            let rb = (t.dims[0] / qk * qb) as usize;
-            let mut x = vec![0f32; h];
-            dequantize(t.ty, &bytes[token as usize * rb..(token as usize + 1) * rb], &mut x).unwrap();
-            x
+        let emb = match self.picture_row(self.tokens.len() - 1) {
+            Some(r) => r.to_vec(),
+            None => {
+                let (t, bytes) = self.m.dense("token_embd.weight");
+                let (qk, qb) = t.ty.block().unwrap();
+                let rb = (t.dims[0] / qk * qb) as usize;
+                let mut x = vec![0f32; h];
+                dequantize(t.ty, &bytes[token as usize * rb..(token as usize + 1) * rb], &mut x).unwrap();
+                x
+            }
         };
         self.upload_to(self.b.e.ptr, &f32s(&emb));
         self.k1("broadcast", h * cs, &[Arg::Ptr(self.b.e.ptr), Arg::Ptr(self.b.r.ptr), Arg::U32(h as u32), Arg::U32(cs as u32)]);
@@ -3262,7 +3279,10 @@ impl<'c, 'm> GpuSession<'c, 'm> {
             let rb = (t.dims[0] / qk * qb) as usize;
             for (j, &tok) in toks.iter().enumerate() {
                 let mut x = vec![0f32; h];
-                dequantize(t.ty, &bytes[tok as usize * rb..(tok as usize + 1) * rb], &mut x).unwrap();
+                match self.picture_row(p0 + j) {
+                    Some(r) => x.copy_from_slice(r),
+                    None => dequantize(t.ty, &bytes[tok as usize * rb..(tok as usize + 1) * rb], &mut x).unwrap(),
+                }
                 self.upload_to(self.b.e.ptr, &f32s(&x));
                 self.k1("broadcast", ch, &[Arg::Ptr(self.b.e.ptr), Arg::Ptr(row(&self.bb.r, ch, j)), Arg::U32(h as u32),
                                            Arg::U32(cs as u32)]);

@@ -18,6 +18,8 @@ pub struct Request {
     pub messages: Vec<Message>,
     pub opts: Options,
     pub max_tokens: usize,
+    /// The pictures (file bytes: PNG, JPEG...) of the messages' image parts, in prompt order (`lib::IMAGE_MARK`).
+    pub images: Vec<Vec<u8>>,
     pub tx: tokio::sync::mpsc::UnboundedSender<Event>,
 }
 
@@ -78,6 +80,78 @@ pub struct Status {
 /// prompt is read (`MAX_BATCH` tokens at a time), which is most of the wait on a long prompt.
 pub static PREFILL: (std::sync::atomic::AtomicUsize, std::sync::atomic::AtomicUsize) =
     (std::sync::atomic::AtomicUsize::new(0), std::sync::atomic::AtomicUsize::new(0));
+
+
+/// The pictures the engine has met: the encoder (started with the first one), the rows by content hash, and the spans (first token
+/// index, rows, hash) of the pictures inside the session's tokens now.
+struct Pics {
+    enc: Option<crate::vision::Encoder>,
+    cache: std::collections::HashMap<u64, Arc<crate::vision::Picture>>,
+    cur: Vec<(usize, usize, u64)>,
+}
+
+fn fnv(bytes: &[u8]) -> u64 {
+    bytes.iter().fold(0xcbf2_9ce4_8422_2325u64, |h, &b| (h ^ b as u64).wrapping_mul(0x0100_0000_01b3))
+}
+
+/// The prompt's ids with every `<|image_pad|>` widened to its picture's rows: the ids, and the spans (first index, rows, hash,
+/// the rows as floats).
+#[allow(clippy::type_complexity)]
+fn expand_pictures(tok: &Tokenizer, ids: Vec<u32>, images: &[Vec<u8>], pics: &mut Pics, model: &std::path::Path)
+    -> Result<(Vec<u32>, Vec<(usize, usize, u64, Arc<Vec<f32>>)>), String> {
+    let pad = tok.encode("<|image_pad|>", true);
+    if pad.len() != 1 {
+        return Err("this model has no <|image_pad|> token".into());
+    }
+    let n_pads = ids.iter().filter(|&&t| t == pad[0]).count();
+    if n_pads != images.len() {
+        return Err(format!("{} pictures sent but the prompt has {n_pads} picture slots", images.len()));
+    }
+    if images.is_empty() {
+        return Ok((ids, vec![]));
+    }
+    let mut out = Vec::with_capacity(ids.len() + 1024);
+    let mut spans = vec![];
+    let mut k = 0;
+    let mut encoded = false;
+    for &t in &ids {
+        if t != pad[0] {
+            out.push(t);
+            continue;
+        }
+        let key = fnv(&images[k]);
+        if !pics.cache.contains_key(&key) {
+            if pics.enc.is_none() {
+                // the encoder (the vision tower on the CPU) peaks at ~1.3 GiB for a 1,024-row picture; the RAM tier leaves little above the floor
+                let (free, floor) = (shadow_cuda::pinned::available_ram(), shadow_cuda::pinned::ram_floor());
+                let need = floor + (1800u64 << 20);
+                if free < need {
+                    return Err(format!("not enough free RAM to encode a picture: {:.1} GiB free, {:.1} needed (the {:.1} GiB floor plus 1.8 GiB); \
+                                        close other programs, or restart Shadow with a smaller --ram-tier-gib", free as f64 / (1u64 << 30) as f64,
+                                       need as f64 / (1u64 << 30) as f64, floor as f64 / (1u64 << 30) as f64));
+                }
+                pics.enc = Some(crate::vision::Encoder::start(model)?);
+            }
+            let t0 = Instant::now();
+            let pic = pics.enc.as_mut().unwrap().encode(&images[k])?;
+            eprintln!("shadow serve: picture {}: {} x {} grid, {} rows, encoded in {:.1} s", k + 1, pic.nx, pic.ny, pic.n, t0.elapsed().as_secs_f64());
+            if pics.cache.len() >= 8 {
+                pics.cache.clear();
+            }
+            pics.cache.insert(key, Arc::new(pic));
+        }
+        let pic = pics.cache[&key].clone();
+        encoded = true;
+        spans.push((out.len(), pic.n, key, Arc::new(pic.rows.clone())));
+        out.extend(std::iter::repeat_n(pad[0], pic.n));
+        k += 1;
+    }
+    // the helper holds ~1 GiB while it lives: it goes when the pictures are encoded (the rows are cached by content)
+    if encoded {
+        pics.enc = None;
+    }
+    Ok((out, spans))
+}
 
 /// A snapshot of the session after the start two prompts shared (the system prompt and tool list, usually), kept in
 /// host memory, so a new conversation that starts the same way restores it instead of reading those tokens again.
@@ -158,9 +232,10 @@ fn run(cfg: Config, rx: std::sync::mpsc::Receiver<Request>, status: &Mutex<Statu
     }
     let mut last_logits: Vec<f32> = Vec::new();
     let mut prefix = PrefixCache { snap: None, prev: vec![] };
+    let mut pics = Pics { enc: None, cache: Default::default(), cur: vec![] };
     while let Ok(req) = rx.recv() {
         status.lock().unwrap().busy = true;
-        let r = answer(&arch, &req, &tok, &mut sess, &mut last_logits, &stops, think_end, &mut prefix, cfg.spec);
+        let r = answer(&arch, &req, &tok, &mut sess, &mut last_logits, &stops, think_end, &mut prefix, cfg.spec, &mut pics, &cfg.model);
         let mut s = status.lock().unwrap();
         s.busy = false;
         s.finished += 1;
@@ -283,9 +358,11 @@ fn argmax(v: &[f32]) -> u32 {
 
 #[allow(clippy::too_many_arguments)] // the engine loop's state, passed rather than bundled
 fn answer<'c>(arch: &str, req: &Request, tok: &Tokenizer, sess: &mut GpuSession<'c, '_>, last_logits: &mut Vec<f32>,
-              stops: &[u32], think_end: Option<u32>, prefix: &mut PrefixCache<'c>, spec: usize) -> Result<Stats, String> {
+              stops: &[u32], think_end: Option<u32>, prefix: &mut PrefixCache<'c>, spec: usize, pics: &mut Pics,
+              model: &std::path::Path) -> Result<Stats, String> {
     let text = render_for_arch(arch, &req.messages, &req.opts)?;
     let ids = tok.encode(&text, true);
+    let (ids, spans) = expand_pictures(tok, ids, &req.images, pics, model)?;
     if ids.len() + req.max_tokens > sess.capacity() {
         return Err(format!("{} prompt tokens + {} max_tokens exceed the context of {} positions", ids.len(),
                            req.max_tokens, sess.capacity()));
@@ -293,7 +370,10 @@ fn answer<'c>(arch: &str, req: &Request, tok: &Tokenizer, sess: &mut GpuSession<
     // read the prompt, reusing the session's state when it holds an exact prefix of it
     let t0 = Instant::now();
     let have = sess.tokens().len();
-    let mut cached = if have > 0 && have <= ids.len() && ids[..have] == *sess.tokens() && (have < ids.len() || !last_logits.is_empty()) {
+    // the same ids with other pictures behind them are not the same prompt: the pictures before `have` must be the ones in the session
+    let same_pics = spans.iter().filter(|s| s.0 < have).map(|s| (s.0, s.1, s.2)).eq(pics.cur.iter().filter(|c| c.0 < have).copied());
+    let mut cached = if have > 0 && have <= ids.len() && ids[..have] == *sess.tokens() && same_pics
+        && (have < ids.len() || !last_logits.is_empty()) {
         have
     } else {
         sess.reset();
@@ -316,14 +396,17 @@ fn answer<'c>(arch: &str, req: &Request, tok: &Tokenizer, sess: &mut GpuSession<
             }
         }
     }
+    // the pictures' rows replace their tokens' embeddings while the prompt is read
+    sess.set_pictures(spans.iter().map(|s| (s.0, s.1, s.3.clone())).collect());
+    pics.cur = spans.iter().map(|s| (s.0, s.1, s.2)).collect();
     // the start this prompt shares with the previous one: snapshot the session there while reading, for the next chat
     let shared = prefix.prev.iter().zip(&ids).take_while(|(a, b)| a == b).count();
     // `SHADOW_NO_PREFIX=1`: no shared-prefix snapshots (every new conversation reads its whole prompt)
-    let snap_at = (shared >= PREFIX_MIN && !std::env::var("SHADOW_NO_PREFIX").is_ok_and(|v| v == "1") && shared > cached && shared < ids.len()
+    let snap_at = (spans.is_empty() && shared >= PREFIX_MIN && !std::env::var("SHADOW_NO_PREFIX").is_ok_and(|v| v == "1") && shared > cached && shared < ids.len()
         && prefix.snap.as_ref().is_none_or(|s| s.tokens() != &ids[..shared])).then_some(shared).or_else(|| {
         // the first prompt after a start has no earlier one to share a start with, so the second conversation would read the persona and the
         // tool list (~900 tokens, ~10 s) whole again: snapshot where the last user turn begins instead (the chat template's `<|im_start|>user`)
-        if prefix.snap.is_some() || std::env::var("SHADOW_NO_PREFIX").is_ok_and(|v| v == "1") {
+        if !spans.is_empty() || prefix.snap.is_some() || std::env::var("SHADOW_NO_PREFIX").is_ok_and(|v| v == "1") {
             return None;
         }
         let marker = tok.encode("<|im_start|>user

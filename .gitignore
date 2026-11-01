@@ -20,3 +20,5 @@ models/mtp-basalt-ft1/*.bin
 # trained drafter weights (1.2 GB each) and local logs
 /models/dflash2*/
 /llama.log
+/bin/strata-vision.exe
+/models/Qwen3.8-Flash-Next.mmproj-f16.gguf
