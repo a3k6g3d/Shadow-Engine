@@ -158,6 +158,9 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
             padding: 6px 12px; font: inherit; font-size: 0.85rem; cursor: pointer; }
     .chip:hover { border-color: rgba(99, 102, 241, 0.6); background: rgba(99, 102, 241, 0.12); }
     .msg-error { color: var(--danger); }
+    .msg-meta { margin-top: 0.6rem; font-size: 0.74rem; color: var(--text-muted); opacity: 0.8; }
+    .pill.action { cursor: pointer; }
+    .pill.action:hover { color: var(--text); border-color: var(--accent, #6366f1); }
     .bubble ul, .bubble ol { margin: 4px 0 4px 1.3em; padding: 0; }
     .bubble li { margin: 2px 0; }
     .md-gap { height: 0.6em; }
@@ -865,6 +868,7 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
       </div>
     </div>
     <div class="stats-bar">
+      <button class="pill action" id="newchat-btn" onclick="newChat()" title="Start a new conversation (clears this one)">＋ New chat</button>
       <span class="pill ready" id="status-pill">Ready</span>
       <span class="pill" id="speed-pill">Speed: <strong>-- tok/s</strong></span>
       <span class="pill" id="gpu-header-pill">GPU: <strong>--% • VRAM: -- GiB</strong></span>
@@ -1419,6 +1423,18 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
       inputEl.value = el.textContent;
       inputEl.dispatchEvent(new Event('input'));
       inputEl.focus();
+      // a suggestion is a question to ask: send it now (when the model is up and nothing is running)
+      if (!isGenerating && modelState !== 'loading') sendMessage();
+    }
+
+    // A fresh conversation: stops a running reply, forgets the history, puts the welcome card back.
+    const welcomeHTML = messagesEl.innerHTML;
+    function newChat() {
+      if (isGenerating && currentAbortController) currentAbortController.abort();
+      history.length = 0;
+      messagesEl.innerHTML = welcomeHTML;
+      timingInfo.textContent = '';
+      inputEl.focus();
     }
 
     // The server's model state from /v1/telemetry: 'loading' until the weights are in, then 'ready'.
@@ -1498,6 +1514,7 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
 
         let rawContent = '';
         let rawThinking = '';
+        let lastTimings = null;
         let thinkStart = performance.now();
         let isThinking = false;
 
@@ -1550,6 +1567,7 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
               if (trimmed.startsWith('data: ')) {
                 try {
                   const parsed = JSON.parse(trimmed.slice(6));
+                  if (parsed.timings) lastTimings = parsed.timings;
                   const delta = parsed.choices?.[0]?.delta;
                   if (!delta) continue;
 
@@ -1607,6 +1625,14 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
           }
 
           msgContent.innerHTML = renderMarkdown(rawContent);
+          // what this reply cost: tokens and speed, from the final chunk's timings
+          if (lastTimings && lastTimings.predicted_n) {
+            const t = lastTimings, meta = document.createElement('div');
+            meta.className = 'msg-meta';
+            meta.textContent = `${t.predicted_n} tokens at ${Number(t.predicted_per_second).toFixed(1)} tok/s` +
+              (t.prompt_n ? ` · read ${t.prompt_n} tokens at ${Number(t.prompt_per_second).toFixed(0)} tok/s` : '');
+            bubbleEl.appendChild(meta);
+          }
 
           // Check if assistant called tools
           const toolCalls = parseToolCallsFromText(rawContent);
