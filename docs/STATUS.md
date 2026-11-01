@@ -1152,3 +1152,6 @@ Single-prompt runs, "Write a Rust function that parses a comma separated list...
 
 - `bench/vs-strata-final4` (3 interleaved runs, 36 varied prompts, total throughput; default `shadow serve` flags: 36 GiB tier with floor 3, `--verify-rank 2`, one-row-a-warp `matvec_cols`): Shadow **52.09** tok/s (51.8, 52.2, 52.2; 1,781 tokens a run, 17 of 35 turns ended early), Strata **47.73** (47.7, 47.4, 48.0; 1,518 tokens a run, 21.7 ended early): **+9.1%**.
   Per-turn medians 51.8 against 47.4. PCIe 15.4 against 10.1 GB/s (about 296 against 212 MB of expert weights a token), GPU 84% against 78% busy, CPU 12% against 51%, disk 150 against 468 MB/s, RAM free during the run 4.1 against 8.3 GiB (the 36 GiB tier).
+
+- Tried staging a grouped expert block's inputs (up to 4 x 2048 floats) in shared memory (`matvec_grouped_*`: each warp re-read them from the cache chunk by chunk; the L1 throughput was 35-50% busy). Same sums, `--exact` text identical, but decode per-turn median **49.4 / 48.5 / 50.0** against 50.1 / 51.0 / 51.25 and the exact prompt 59.6 against 62.8 tok/s:
+  slower (the 32 KB of shared memory a block and the barrier cost more than the reads saved). Reverted.
