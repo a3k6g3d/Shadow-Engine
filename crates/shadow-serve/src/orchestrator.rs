@@ -1,5 +1,5 @@
 //! Native Windows Agent Tool Orchestration layer for Shadow.
-//! Executes local tools (read_file, glob, grep, edit_file, write_file, cmd) natively on Windows.
+//! Executes local tools (read_file, glob, grep, edit_file, write_file, cmd) natively on Windows, and the web tools (web_search, web_fetch: `webtools.rs`).
 
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
@@ -41,6 +41,23 @@ fn tail_clip(s: String) -> String {
 
 pub fn execute_tool(inv: &ToolInvocation) -> ToolResult {
     match inv.name.as_str() {
+        "web_search" => {
+            let q = inv.arguments.get("query").and_then(Value::as_str).unwrap_or("");
+            let n = inv.arguments.get("max_results").and_then(Value::as_u64).unwrap_or(8) as usize;
+            match crate::webtools::web_search(q, n) {
+                Ok(s) => ToolResult { name: inv.name.clone(), output: tail_clip(s), is_error: false },
+                Err(e) => ToolResult { name: inv.name.clone(), output: format!("error: {e}"), is_error: true },
+            }
+        }
+        "web_fetch" => {
+            let url = inv.arguments.get("url").and_then(Value::as_str).unwrap_or("");
+            let start = inv.arguments.get("start").and_then(Value::as_u64).unwrap_or(0) as usize;
+            let max = inv.arguments.get("max_chars").and_then(Value::as_u64).unwrap_or(12_000) as usize;
+            match crate::webtools::web_fetch(url, start, max) {
+                Ok(s) => ToolResult { name: inv.name.clone(), output: tail_clip(s), is_error: false },
+                Err(e) => ToolResult { name: inv.name.clone(), output: format!("error: {e}"), is_error: true },
+            }
+        }
         "read_file" => {
             let path_str = inv.arguments.get("path").and_then(Value::as_str).unwrap_or("");
             let start = inv.arguments.get("start").and_then(Value::as_u64).unwrap_or(1) as usize;
@@ -275,6 +292,31 @@ pub fn execute_tool(inv: &ToolInvocation) -> ToolResult {
 
 pub fn tool_definitions() -> Value {
     json!([
+        {
+            "name": "web_search",
+            "description": "Search the web (DuckDuckGo) and get titles, URLs and snippets. Use web_fetch to read a result.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "query": { "type": "string", "description": "What to search for" },
+                    "max_results": { "type": "integer", "description": "How many results (default 8, at most 15)" }
+                },
+                "required": ["query"]
+            }
+        },
+        {
+            "name": "web_fetch",
+            "description": "Fetch a web page (http or https) as readable text; long pages come in parts (use start to continue).",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "url": { "type": "string", "description": "The page address, https://..." },
+                    "start": { "type": "integer", "description": "Character to start from (default 0)" },
+                    "max_chars": { "type": "integer", "description": "Characters to return (default 12000, at most 40000)" }
+                },
+                "required": ["url"]
+            }
+        },
         {
             "name": "read_file",
             "description": "Read file contents with line numbers on Windows.",

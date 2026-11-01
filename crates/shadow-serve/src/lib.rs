@@ -9,6 +9,7 @@ pub mod engine;
 pub mod orchestrator;
 pub mod telemetry;
 pub mod ui;
+pub mod webtools;
 pub mod vision;
 
 use bytes::Bytes;
