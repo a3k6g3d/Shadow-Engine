@@ -8,7 +8,7 @@
 //! { "mcpServers": { "files": { "command": "npx", "args": ["-y", "@modelcontextprotocol/server-filesystem", "J:/work"], "env": {} } } }
 //! ```
 //!
-//! Read from `SHADOW_MCP_CONFIG`, else `mcp.json` in the working directory, else `%APPDATA%\Shadow\mcp.json`.  A tool is offered to the
+//! Read from `SHADOW_MCP_CONFIG`, else the first `mcp.json` in: the working directory, the exe's folder, the checkout Shadow was built from, `%APPDATA%\Shadow`.  A tool is offered to the
 //! model as `mcp__<server>__<tool>`.  The servers start in the background when `shadow serve` does; one that fails is listed with its error.
 
 use serde_json::{json, Value};
@@ -53,11 +53,17 @@ fn config_path() -> Option<PathBuf> {
     if let Ok(p) = std::env::var("SHADOW_MCP_CONFIG") {
         return Some(PathBuf::from(p));
     }
-    let local = PathBuf::from("mcp.json");
-    if local.is_file() {
-        return Some(local);
+    // wherever Shadow was started from (the desktop app does not start in the checkout): the working directory, beside the exe, the checkout it was
+    // built from, then the user's folder
+    let mut places = vec![PathBuf::from("mcp.json")];
+    if let Some(d) = std::env::current_exe().ok().and_then(|e| e.parent().map(|d| d.to_path_buf())) {
+        places.push(d.join("mcp.json"));
     }
-    std::env::var("APPDATA").ok().map(|a| PathBuf::from(a).join("Shadow").join("mcp.json")).filter(|p| p.is_file())
+    places.push(PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/../../mcp.json")));
+    if let Ok(a) = std::env::var("APPDATA") {
+        places.push(PathBuf::from(a).join("Shadow").join("mcp.json"));
+    }
+    places.into_iter().find(|p| p.is_file())
 }
 
 /// The (name, config) pairs of a config file's `mcpServers` (a server with `"disabled": true` is skipped).

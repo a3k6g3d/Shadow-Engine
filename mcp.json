@@ -1,0 +1,22 @@
+{
+  "mcpServers": {
+    "time": {
+      "command": "uvx",
+      "args": ["mcp-server-time"]
+    },
+    "thinking": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-sequential-thinking"]
+    },
+    "git": {
+      "disabled": true,
+      "command": "uvx",
+      "args": ["mcp-server-git"]
+    },
+    "files": {
+      "disabled": true,
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-filesystem", "J:/Shadow"]
+    }
+  }
+}

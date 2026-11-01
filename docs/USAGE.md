@@ -126,3 +126,10 @@ OpenAI-compatible: `POST /v1/chat/completions` (streaming and not; `reasoning_ef
 (CPU, RAM, GPU, expert-cache stats), `/v1/tools` and `/v1/tools/execute` (the native Windows agent tools). The response
 carries llama.cpp-style `timings` (`predicted_n`, `predicted_ms`, `predicted_per_second`, `prompt_n`, ...), which
 `shadow-bench` reads.
+
+## MCP tools
+
+`mcp.json` in the Shadow folder lists the MCP servers `shadow serve` starts (the format of Claude Desktop / Claude Code, so a list can be copied). Shipped on: `time` (current time, time zones) and `thinking`
+(sequential thinking). Shipped off, set `"disabled": false` or delete the line to use them: `git` (`uvx mcp-server-git`) and `files` (the filesystem server on `J:/Shadow`). They need `uvx` / `npx` (installed) and the network
+the first time (the packages are fetched once). Each tool is offered to the model as `mcp__<server>__<tool>` and costs prompt tokens in every chat's start (the first chat reads them once, then the server caches them);
+`mcp.json` is looked for in the working directory, beside the exe, in the checkout Shadow was built from, then `%APPDATA%\Shadow` (`SHADOW_MCP_CONFIG` names one). The Dashboard's Tools card shows each server and its tool count or error.
