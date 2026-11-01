@@ -1147,3 +1147,8 @@ Single-prompt runs, "Write a Rust function that parses a comma separated list...
   (was 32) and a matrix gets 4x the warps; each row's lane-ordered sum is unchanged, so every output is the same bit for bit (the `--exact` 3,003-token prompt gives the same text; `tests/matvec.rs`'s one-at-a-time against many-at-once comparison passes with its grid updated to 8 rows a block;
   `cols_rows_per_block` and `matvec_cols_multi`'s block count follow `COLS_PLAIN_ROWS`).
 - Varied bench, 3 runs, 30 GiB tier: per-turn median **50.1 / 51.0 / 51.25** (2 rows a warp: 49.8 / 50.7 / 50.7; 4 rows: 48.9 / 48.9 / 48.9), total throughput **50.67** tok/s (50.2, 50.9, 50.9) against 48.5-48.7: **+4.5%**, ahead of Strata's 48.6. Taking the reference-order kernels (BF16/F32, `COLS_REF_SPLIT`) to 1 row a warp at every size changed nothing (50.6 / 50.9 / 50.95).
+
+## 2026-10-31: Shadow ahead of Strata with the current defaults (52.1 against 47.7 tok/s)
+
+- `bench/vs-strata-final4` (3 interleaved runs, 36 varied prompts, total throughput; default `shadow serve` flags: 36 GiB tier with floor 3, `--verify-rank 2`, one-row-a-warp `matvec_cols`): Shadow **52.09** tok/s (51.8, 52.2, 52.2; 1,781 tokens a run, 17 of 35 turns ended early), Strata **47.73** (47.7, 47.4, 48.0; 1,518 tokens a run, 21.7 ended early): **+9.1%**.
+  Per-turn medians 51.8 against 47.4. PCIe 15.4 against 10.1 GB/s (about 296 against 212 MB of expert weights a token), GPU 84% against 78% busy, CPU 12% against 51%, disk 150 against 468 MB/s, RAM free during the run 4.1 against 8.3 GiB (the 36 GiB tier).
