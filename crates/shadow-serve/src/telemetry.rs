@@ -259,6 +259,7 @@ impl SysMonitor {
 pub struct TelemetryService {
     monitor: Mutex<SysMonitor>,
     nvml: NvmlGpu,
+    cpu: crate::cpuinfo::CpuLive,
 }
 
 impl Default for TelemetryService {
@@ -272,6 +273,7 @@ impl TelemetryService {
         Self {
             monitor: Mutex::new(SysMonitor::new()),
             nvml: NvmlGpu::new(),
+            cpu: crate::cpuinfo::CpuLive::new(),
         }
     }
 
@@ -350,7 +352,8 @@ impl TelemetryService {
                 "process_percent": (proc_cpu * 10.0).round() / 10.0,
                 "system_percent": (sys_cpu * 10.0).round() / 10.0,
                 "process_cores_used": (proc_cores * 10.0).round() / 10.0,
-                "logical_cores": cores
+                "logical_cores": cores,
+                "info": self.cpu.json()
             },
             "ram": {
                 "system_total_bytes": total_ram,

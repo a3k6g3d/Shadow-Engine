@@ -1288,3 +1288,11 @@ Single-prompt runs, "Write a Rust function that parses a comma separated list...
   at once ("one", "two", "three") ran in order, each answered before the next.
 - **Compact bar:** one rounded bar with the attach button, the text and Send / Stop inside it (32 px controls, a one-line box that grows with the text), and a slim status line under it (reasoning
   depth, Windows tools, persona as quiet text buttons, the status on the right). The reasoning-depth menu opens above the bar instead of over it (`--bar-h`).
+
+## 2026-11-01: a CPU card on the dashboard
+
+- Between Expert tiers and System memory: whole-PC busy % (big number), a two-line 2-minute chart (whole PC, Shadow), Shadow's share, the CPU threads it uses, **the clock** (`% Processor
+  Performance` x the base clock from CPUID leaf 0x16: 4.60 GHz on the 3.6 GHz base of the i7-11700K), **the caches** (`GetLogicalProcessorInformation`: L1 48 KB data + 32 KB instruction and L2 512 KB
+  a core, L3 16 MB shared) and **the temperature**. `crates/shadow-serve/src/cpuinfo.rs`: CPUID, `GetLogicalProcessorInformation` and PDH counters, no driver; telemetry `cpu.info`.
+- The temperature is the ACPI thermal zone Windows exposes without a driver (28 C here, the board's; `MSAcpi_ThermalZoneTemperature` is access-denied unelevated). A core's own temperature
+  needs a kernel driver (HWiNFO, LibreHardwareMonitor): not loaded; the card labels the value "(board)".

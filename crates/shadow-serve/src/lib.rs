@@ -4,6 +4,7 @@
 //!
 //! Not yet: sampling (greedy only), images.
 
+pub mod cpuinfo;
 pub mod engine;
 pub mod orchestrator;
 pub mod telemetry;

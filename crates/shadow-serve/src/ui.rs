@@ -1032,11 +1032,21 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
           <div class="kv"><span>Expert cache</span><b id="d-slots">--</b></div>
         </div>
         <div class="dcard">
+          <h3>CPU <span class="tag" id="d-cputag">--</span></h3>
+          <div class="big" id="d-cpusys">--<small>% busy (whole PC)</small></div>
+          <canvas class="spark" id="c-cpu"></canvas>
+          <div class="kv"><span><i style="color:#a78bfa">&#9632;</i> Shadow</span><b id="d-cpuproc">--</b></div>
+          <div class="kv"><span><i style="color:#38bdf8">&#9632;</i> Whole PC</span><b id="d-cpusys2">--</b></div>
+          <div class="kv"><span>Shadow's CPU threads in use</span><b id="d-cpucores">--</b></div>
+          <div class="kv"><span>Clock</span><b id="d-cpuclk">--</b></div>
+          <div class="kv"><span>Cache</span><b id="d-cpucache">--</b></div>
+          <div class="kv"><span>Temperature</span><b id="d-cputemp">--</b></div>
+        </div>
+        <div class="dcard">
           <h3>System memory <span class="tag" id="d-ramtag">--</span></h3>
           <div class="big" id="d-ramfree">--<small>GiB free</small></div>
           <canvas class="spark" id="c-ram"></canvas>
           <div class="kv"><span>Shadow's working set</span><b id="d-ws">--</b></div>
-          <div class="kv"><span>CPU (Shadow / system)</span><b id="d-cpu">--</b></div>
         </div>
         <div class="dcard">
           <h3>Conversations <span class="tag" id="d-chatcount">--</span></h3>
@@ -2393,24 +2403,26 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
     renderChatList();
 
     // ---- the dashboard: what the engine is doing, from /v1/telemetry (every second) and its log of recent requests
-    const dashHist = { gpu: [], ram: [] };
+    const dashHist = { gpu: [], ram: [], cpu: [], cpuSys: [] };
     let lastTel = null;
     function dashPush(d) {
       const keep = (a, v) => { a.push(v); if (a.length > 120) a.shift(); };
       keep(dashHist.gpu, d.gpu ? d.gpu.utilization_percent : 0);
       keep(dashHist.ram, d.ram ? d.ram.system_available_bytes / 2 ** 30 : 0);
+      keep(dashHist.cpu, d.cpu ? d.cpu.process_percent : 0);
+      keep(dashHist.cpuSys, d.cpu ? d.cpu.system_percent : 0);
       lastTel = d;
       if (currentView === 'dash') dashRender(d);
     }
     function dashRefresh() { if (lastTel) dashRender(lastTel); }
-    function spark(id, vals, max, color, bars) {
+    function spark(id, vals, max, color, bars, overlay) {
       const cv = document.getElementById(id);
       if (!cv || !cv.clientWidth) return;
       const w = cv.clientWidth, h = cv.clientHeight, dpr = window.devicePixelRatio || 1;
       if (cv.width !== Math.round(w * dpr)) { cv.width = Math.round(w * dpr); cv.height = Math.round(h * dpr); }
       const g = cv.getContext('2d');
       g.setTransform(dpr, 0, 0, dpr, 0, 0);
-      g.clearRect(0, 0, w, h);
+      if (!overlay) g.clearRect(0, 0, w, h);
       g.strokeStyle = 'rgba(132,146,166,0.18)';
       g.beginPath(); g.moveTo(0, h - 0.5); g.lineTo(w, h - 0.5); g.stroke();
       if (!vals.length) return;
@@ -2478,7 +2490,26 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
       set('d-ramtag', gib(ram.system_total_bytes || 0) + ' GiB total');
       spark('c-ram', dashHist.ram, 0, '#f59e0b');
       set('d-ws', gib(ram.process_working_set_bytes || 0) + ' GiB');
-      set('d-cpu', (cpu.process_percent || 0).toFixed(0) + '% / ' + (cpu.system_percent || 0).toFixed(0) + '% (' + (cpu.logical_cores || '?') + ' threads)');
+      html('d-cpusys', Math.round(cpu.system_percent || 0) + '<small>% busy (whole PC)</small>');
+      const ci = cpu.info || {};
+      const short = (ci.name || '').replace(/\(R\)|\(TM\)/g, '').replace(/^\d+(st|nd|rd|th) Gen Intel\s*/i, '').replace(/\s*@.*$/, '').replace(/\s+/g, ' ').trim();
+      set('d-cputag', (short || 'CPU') + ' - ' + (cpu.logical_cores || '?') + ' threads');
+      set('d-cpuclk', ci.current_mhz ? (ci.current_mhz / 1000).toFixed(2) + ' GHz (base ' + (ci.base_mhz / 1000).toFixed(1) + ')' : ci.base_mhz ? 'base ' + (ci.base_mhz / 1000).toFixed(1) + ' GHz' : '--');
+      const kb = x => x ? (x.kb >= 1024 ? x.kb / 1024 + ' MB' : x.kb + ' KB') : '?';
+      const cs = ci.caches || [], lv = (l, k) => cs.find(x => x.level === l && (k === undefined || x.kind === k));
+      if (cs.length) {
+        const ce = document.getElementById('d-cpucache');
+        ce.textContent = 'L1 ' + kb(lv(1, 2)) + '+' + kb(lv(1, 1)) + ', L2 ' + kb(lv(2)) + ', L3 ' + kb(lv(3));
+        ce.title = 'L1 data + instruction and L2 are per core (' + ((lv(2) || {}).count || '?') + ' cores); L3 ' + kb(lv(3)) + ' is shared by all of them.';
+      }
+      const zones = ci.thermal_zones || [], te = document.getElementById('d-cputemp');
+      te.textContent = zones.length ? zones.map(z => z.celsius.toFixed(0) + ' °C').join(', ') + ' (board)' : 'not exposed';
+      te.title = 'Windows reports only the board\'s ACPI thermal zone here; the CPU die temperature needs a hardware driver (HWiNFO, LibreHardwareMonitor), which Shadow does not load.';
+      spark('c-cpu', dashHist.cpuSys, 100, '#38bdf8');
+      spark('c-cpu', dashHist.cpu, 100, '#a78bfa', false, true);
+      set('d-cpuproc', (cpu.process_percent || 0).toFixed(1) + '% of the PC');
+      set('d-cpusys2', (cpu.system_percent || 0).toFixed(1) + '%');
+      set('d-cpucores', (cpu.process_cores_used || 0).toFixed(1) + ' of ' + (cpu.logical_cores || '?'));
       set('dash-sub', (p.state === 'loading' ? 'Loading the model...' : 'Shadow is running locally on this PC.') + (p.queued ? ' ' + p.queued + ' request(s) waiting.' : ''));
       const tb = document.getElementById('dash-tools');
       if (tb) tb.textContent = 'Windows tools: ' + (toolsEnabled ? 'ON' : 'OFF');
