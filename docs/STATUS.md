@@ -1247,3 +1247,14 @@ Single-prompt runs, "Write a Rust function that parses a comma separated list...
 - RAM: the RAM tier leaves ~4-5 GiB above the floor, so a picture is refused (HTTP 400 with the numbers) when free RAM is under the floor + 1.8 GiB. A first test
   under `run_capped -FloorGiB 4` was killed by the watchdog at 3.94 GiB: the 36 GiB tier plus the encoder.
 - The page shows a server error that arrives mid-stream (it used to leave an empty reply bubble).
+
+## 2026-11-01: pictures (phase 2): 2-D rotary positions
+
+- The picture rows now get their (t, h, w) positions: `forward.cu` `rope_one` reads an optional device table `g_rope_tab` (token index -> three positions; null with no picture, then
+  the same single-position rotation as before: pair i takes t, h or w as i % 3 is 0, 1, 2, llama.cpp's IMROPE with the model's sections 11, 11, 10). `GpuSession::sync_rope_tab`
+  builds it from the pictures' spans on every request: a text token is the next position; a row at grid (x, y) is (start, start + y, start + x); the token after a picture is
+  `start + max(width, height)`. It covers every rope call (attention q/k, the indexer's q, the pooled indexer keys at their first member) without new kernel arguments.
+- Measured (varied pictures, default flags): "list the shapes left to right, then read the text" correct (red circle, blue square, green triangle, STRATA 42); `CODE 4217` exact;
+  the invoice picture now gives its line items too (widgets x 12, gears x 7, springs x 30) besides "INVOICE 20261014" and "1337 EUR"; a follow-up in the same conversation reuses the
+  350 cached tokens including the picture ("the shape on the far right" green triangle, "the one in the middle" blue). Text-only: 17 x 23 = 391. `cargo test --release` passes.
+- Not compared against llama.cpp's answers on the same pictures yet (no reference run); the positions follow its `mtmd_helper_image_get_decoder_pos` and `ggml_mrope_cache_init`.

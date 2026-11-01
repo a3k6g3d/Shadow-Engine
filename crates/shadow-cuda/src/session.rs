@@ -306,7 +306,10 @@ pub struct GpuSession<'c, 'm> {
     ple_state: DeviceBuffer<'c>,
     tokens: Vec<u32>,
     /// Pictures: (first token index, rows, the rows as n x hidden floats); the embedding of a token inside one is its row (`set_pictures`).
-    pictures: Vec<(usize, usize, std::sync::Arc<Vec<f32>>)>,
+    pictures: Vec<(usize, usize, usize, std::sync::Arc<Vec<f32>>)>,
+    /// The rotary position table (token index -> t, h, w; forward.cu `g_rope_tab`), made with the first picture; `rope_on`: the kernels read it.
+    rope_tab: Option<DeviceBuffer<'c>>,
+    rope_on: bool,
     cap: usize,
     pub trace: Option<BTreeMap<String, Vec<f32>>>,
     pub stop_after: Option<usize>,
@@ -1260,7 +1263,7 @@ impl<'c, 'm> GpuSession<'c, 'm> {
             None
         };
         let mut s = GpuSession {
-            ctx, m, mvp, fw, w, v, b, bb, replay, batch_scratch, delta, attn, ple_state, tokens: vec![], pictures: vec![], cap, trace: None, stop_after: None,
+            ctx, m, mvp, fw, w, v, b, bb, replay, batch_scratch, delta, attn, ple_state, tokens: vec![], pictures: vec![], rope_tab: None, rope_on: false, cap, trace: None, stop_after: None,
             resident_bytes, expert_uploads: 0, cache, ram, copy_stream, copy_event, staging,
             pending: vec![], routing: RoutingCounts::new(c.n_layer, c.n_expert),
             prof: std::env::var("SHADOW_PROFILE").is_ok_and(|v| v == "1")
@@ -1380,13 +1383,53 @@ impl<'c, 'm> GpuSession<'c, 'm> {
     /// expert cache and the RAM tier stay.
     /// Pictures for the prompt about to be read: (first token index, rows, the rows as rows x hidden floats).  The tokens there
     /// (the `<|image_pad|>` id, which also gives their per-layer inputs) keep their ids; only their embeddings are the rows.
-    pub fn set_pictures(&mut self, pics: Vec<(usize, usize, std::sync::Arc<Vec<f32>>)>) {
+    pub fn set_pictures(&mut self, pics: Vec<(usize, usize, usize, std::sync::Arc<Vec<f32>>)>) {
         self.pictures = pics;
+        self.sync_rope_tab();
     }
 
     fn picture_row(&self, idx: usize) -> Option<&[f32]> {
         let h = self.m.cfg.hidden;
-        self.pictures.iter().find(|(s, n, _)| idx >= *s && idx < s + n).map(|(s, _, rows)| &rows[(idx - s) * h..(idx - s + 1) * h])
+        self.pictures.iter().find(|(s, n, _, _)| idx >= *s && idx < s + n).map(|(s, _, _, rows)| &rows[(idx - s) * h..(idx - s + 1) * h])
+    }
+
+    /// The rotary positions when pictures are in the conversation, as a table over every token index (as a Qwen-VL runtime counts them): a text
+    /// token is the next position; a picture row at grid (x, y) is (start, start + y, start + x) for the position `start` the picture begins at;
+    /// the token after the picture is `start + max(width, height)`.  No pictures: the table pointer is cleared (the kernels use plain positions).
+    fn sync_rope_tab(&mut self) {
+        if self.pictures.is_empty() {
+            if self.rope_on {
+                self.fw.module.set_global_ptr("g_rope_tab", 0).unwrap();
+                self.rope_on = false;
+            }
+            return;
+        }
+        let cap = self.cap;
+        let mut tab = vec![0i32; cap * 3];
+        let (mut idx, mut next) = (0usize, 0i32);
+        while idx < cap {
+            if let Some(&(_, n, nx, _)) = self.pictures.iter().find(|p| p.0 == idx) {
+                let (n, nx) = (n.min(cap - idx), nx.max(1));
+                for k in 0..n {
+                    let (y, x) = ((k / nx) as i32, (k % nx) as i32);
+                    tab[(idx + k) * 3..(idx + k) * 3 + 3].copy_from_slice(&[next, next + y, next + x]);
+                }
+                next += nx.max(n.div_ceil(nx)) as i32;
+                idx += n;
+            } else {
+                tab[idx * 3..idx * 3 + 3].copy_from_slice(&[next; 3]);
+                next += 1;
+                idx += 1;
+            }
+        }
+        let bytes: Vec<u8> = tab.iter().flat_map(|v| v.to_le_bytes()).collect();
+        if self.rope_tab.is_none() {
+            self.rope_tab = Some(self.ctx.alloc(cap * 12).unwrap());
+        }
+        let buf = self.rope_tab.as_ref().unwrap();
+        buf.upload(&bytes).unwrap();
+        self.fw.module.set_global_ptr("g_rope_tab", buf.ptr).unwrap();
+        self.rope_on = true;
     }
 
     pub fn reset(&mut self) {

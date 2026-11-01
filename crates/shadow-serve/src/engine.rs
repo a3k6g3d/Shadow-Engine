@@ -98,7 +98,7 @@ fn fnv(bytes: &[u8]) -> u64 {
 /// the rows as floats).
 #[allow(clippy::type_complexity)]
 fn expand_pictures(tok: &Tokenizer, ids: Vec<u32>, images: &[Vec<u8>], pics: &mut Pics, model: &std::path::Path)
-    -> Result<(Vec<u32>, Vec<(usize, usize, u64, Arc<Vec<f32>>)>), String> {
+    -> Result<(Vec<u32>, Vec<(usize, usize, u64, Arc<Vec<f32>>, usize)>), String> {
     let pad = tok.encode("<|image_pad|>", true);
     if pad.len() != 1 {
         return Err("this model has no <|image_pad|> token".into());
@@ -142,7 +142,7 @@ fn expand_pictures(tok: &Tokenizer, ids: Vec<u32>, images: &[Vec<u8>], pics: &mu
         }
         let pic = pics.cache[&key].clone();
         encoded = true;
-        spans.push((out.len(), pic.n, key, Arc::new(pic.rows.clone())));
+        spans.push((out.len(), pic.n, key, Arc::new(pic.rows.clone()), pic.nx));
         out.extend(std::iter::repeat_n(pad[0], pic.n));
         k += 1;
     }
@@ -397,7 +397,7 @@ fn answer<'c>(arch: &str, req: &Request, tok: &Tokenizer, sess: &mut GpuSession<
         }
     }
     // the pictures' rows replace their tokens' embeddings while the prompt is read
-    sess.set_pictures(spans.iter().map(|s| (s.0, s.1, s.3.clone())).collect());
+    sess.set_pictures(spans.iter().map(|s| (s.0, s.1, s.4, s.3.clone())).collect());
     pics.cur = spans.iter().map(|s| (s.0, s.1, s.2)).collect();
     // the start this prompt shares with the previous one: snapshot the session there while reading, for the next chat
     let shared = prefix.prev.iter().zip(&ids).take_while(|(a, b)| a == b).count();

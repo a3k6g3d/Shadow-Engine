@@ -88,6 +88,7 @@ table! {
     cuModuleLoadData: fn(*mut H, *const c_void) = ["cuModuleLoadData"];
     cuModuleUnload: fn(H) = ["cuModuleUnload"];
     cuModuleGetFunction: fn(*mut H, H, *const c_char) = ["cuModuleGetFunction"];
+    cuModuleGetGlobal: fn(*mut CuDevicePtr, *mut usize, H, *const c_char) = ["cuModuleGetGlobal_v2", "cuModuleGetGlobal"];
     cuLaunchKernel: fn(H, c_uint, c_uint, c_uint, c_uint, c_uint, c_uint, c_uint, H, *mut *mut c_void, *mut *mut c_void) = ["cuLaunchKernel"];
     cuStreamCreate: fn(*mut H, c_uint) = ["cuStreamCreate"];
     cuStreamDestroy: fn(H) = ["cuStreamDestroy_v2"];
@@ -332,6 +333,16 @@ pub struct Module<'c> {
 impl<'c> Module<'c> {
     pub fn ctx(&self) -> &'c Context {
         self.ctx
+    }
+
+    /// Sets a `__device__` pointer variable of the module (`name`, an `extern "C"` global of 8 bytes) to `value` (a device address; 0 clears it).
+    pub fn set_global_ptr(&self, name: &str, value: u64) -> Result<(), CudaError> {
+        self.ctx.bind()?;
+        let c = std::ffi::CString::new(name).expect("global names have no NUL");
+        let (mut p, mut size): (CuDevicePtr, usize) = (0, 0);
+        call!(self.ctx.api, cuModuleGetGlobal(&mut p, &mut size, self.module, c.as_ptr()))?;
+        assert_eq!(size, 8, "{name}: not a pointer");
+        call!(self.ctx.api, cuMemcpyHtoD(p, &value as *const u64 as *const c_void, 8))
     }
 
     /// An entry point by its unmangled (`extern "C"`) name.

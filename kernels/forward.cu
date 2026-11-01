@@ -47,10 +47,22 @@ static __device__ void rmsnorm_one(const float* x, const float* w, float* y, uns
 }
 
 // NeoX rotary embedding of x[0 .. dims) at `pos`, one thread per pair, in place
+// Picture rows have a 2-D position (t, h, w) instead of one index.  `g_rope_tab` (set by the host, null when no picture is in the conversation)
+// maps a token index to its three positions, [3 * index + {t, h, w}]; pair i of the rotation takes t, h or w as i % 3 is 0, 1 or 2 (the
+// interleaved sections 11, 11, 10 of the model's 32 pairs: llama.cpp's IMROPE).  With a null table this is the plain one-position rotation.
+extern "C" __device__ const int* g_rope_tab = nullptr;
+
 static __device__ void rope_one(float* x, unsigned int pos, unsigned int dims, float theta) {
     unsigned int half = dims / 2;
+    unsigned int pp[3] = {pos, pos, pos};
+    const int* tab = g_rope_tab;
+    if (tab != nullptr) {
+        pp[0] = (unsigned int) tab[3 * (u64) pos];
+        pp[1] = (unsigned int) tab[3 * (u64) pos + 1];
+        pp[2] = (unsigned int) tab[3 * (u64) pos + 2];
+    }
     for (unsigned int i = threadIdx.x; i < half; i += blockDim.x) {
-        double f = (double) pos / pow((double) theta, 2.0 * (double) i / (double) dims);
+        double f = (double) pp[i % 3] / pow((double) theta, 2.0 * (double) i / (double) dims);
         double cs = cos(f), sn = sin(f);
         double a = x[i], b = x[i + half];
         x[i] = (float) (a * cs - b * sn);
