@@ -1817,7 +1817,7 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
           setTxt('engine-uptime-txt', `${mins}m ${secs}s`);
           setTxt('engine-requests-txt', d.process.requests.toLocaleString());
           setTxt('engine-tokens-txt', d.process.completion_tokens.toLocaleString());
-          setTxt('engine-mtp-txt', d.process.mtp_active ? 'MTP head loaded (experimental)' : 'Off');
+          setTxt('engine-mtp-txt', d.process.dflash_active ? 'On (DFlash drafter)' : d.process.mtp_active ? 'MTP head loaded (experimental)' : 'Off');
           setTxt('engine-queue-txt', d.process.queued);
         }
       } catch (err) {

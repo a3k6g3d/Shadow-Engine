@@ -391,6 +391,7 @@ impl TelemetryService {
                 "completion_tokens": s.completion_tokens,
                 "requests": s.requests,
                 "mtp_active": s.mtp_active,
+                "dflash_active": s.dflash_active,
                 "prefill_done": crate::engine::PREFILL.0.load(std::sync::atomic::Ordering::Relaxed),
                 "prefill_total": crate::engine::PREFILL.1.load(std::sync::atomic::Ordering::Relaxed)
             }

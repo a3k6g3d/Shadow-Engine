@@ -70,6 +70,8 @@ pub struct Status {
     pub ram_served: u64,
     pub file_served: u64,
     pub mtp_active: bool,
+    /// the DFlash drafter is loaded (`--dflash`; the default)
+    pub dflash_active: bool,
 }
 
 /// Prompt-reading progress of the request being answered, (tokens read, tokens to read): the UI shows it while the
@@ -151,6 +153,7 @@ fn run(cfg: Config, rx: std::sync::mpsc::Receiver<Request>, status: &Mutex<Statu
         s.ram_served = ram_serv;
         s.file_served = file_serv;
         s.mtp_active = sess.mtp.is_some();
+        s.dflash_active = sess.dflash.is_some();
         eprintln!("shadow serve: ready in {:.1} s; {}", s.load_secs, s.report);
     }
     let mut last_logits: Vec<f32> = Vec::new();
