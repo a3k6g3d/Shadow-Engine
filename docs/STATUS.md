@@ -1445,3 +1445,24 @@ and with the earlier numbers (a CPU expert at 32 tokens costs ~20x its copy; fil
 
 Where the prompt time is: ~73% in the DeltaNet linear-attention layers and the full-attention layers, ~20% in the experts, ~1.4% waiting on copies. The ~7x gap to Strata's 1,376 tok/s prompt rate is in those two attention kernels at 2,048-row passes, not in expert movement.
 That is the next thing to look at (see the DeltaNet "delta segment" and the sparse-indexer attention paths), as its own experiment.
+
+## 2026-11-02: where the prompt path's GPU time goes (kernel by kernel) - the dense matmuls, not the experts
+
+`SHADOW_KTIME=1 SHADOW_REPORT=1`, 3,001-token prompt twice at ctx 16,384 (graphs off, so ~20% slower: 156-162 tok/s; the split is what counts). GPU kernel time per token **9.51 ms**:
+
+| kernel | ms/token | share | what it is |
+|---|---|---|---|
+| `matvec_cols_bf16` | 1.74 | 18% | dense BF16 projections (DeltaNet/attention q,k,v,o), M<=8 columns a launch |
+| `delta_steps128` | 1.61 | 17% | the DeltaNet recurrence, token after token |
+| `hc_down_inject_cols_fast_bf16` | 1.30 | 14% | hyper-connection down projection |
+| `matvec_cols_q5_k` | 0.60 | 6% | dense Q5_K |
+| `matvec_cols_f32` | 0.56 | 6% | dense F32 |
+| `attention_heads_rows` + `attention_group_sel_rows` | 0.76 | 8% | attention |
+| `matvec_cols_q4_k` | 0.47 | 5% | dense Q4_K |
+| `matvec_cols_iq4_nl`, `matvec_fast_bf16`, `matvec_cols_q6_k` | 0.73 | 8% | other dense |
+| `mma_grouped_*`, `mma_cols_*` (tensor-core experts and dense) | ~0.6 listed | ~6% | |
+
+- The `matvec_cols_*` kernels take at most 8 tokens a launch, so with a 2,048-token pass each weight row is read ~256 times from L2/DRAM; the four dense kernels with no tensor-core version (bf16, f32, q5_k, q4_k) plus `hc_down_inject` are **~49% of the GPU's kernel time**.
+  The experts (routed, tensor-core `mma_grouped_*`) are a few percent. This matches the pass split above (47% DeltaNet segment, 26% attention, ~20% experts, 1.4% copy stall).
+- `--tensor-prompt` already has `mma_cols_q6_k / iq4_xs / iq4_nl / iq2_s / iq3_xxs / q2_0`; bf16, f32, q5_k, q4_k and the hc projection are the gaps.
+- Not measured: what a tensor-core BF16/F32/Q5_K/Q4_K path would give. If those kernels got 4x faster the kernel time would fall ~37% (an arithmetic estimate, not a result) - the biggest prompt lever found so far, and a CUDA kernel project of its own.
