@@ -1826,7 +1826,8 @@ impl<'c, 'm> GpuSession<'c, 'm> {
             return;
         }
         self.ctx.bind().unwrap();
-        if let Some(batch) = api.cuMemcpyBatchAsync {
+        static NO_BATCH: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if let Some(batch) = api.cuMemcpyBatchAsync.filter(|_| !*NO_BATCH.get_or_init(|| std::env::var("SHADOW_NO_BATCH_COPY").is_ok_and(|v| v == "1"))) {
             // CUmemcpyAttributes: source access order (STREAM = 1), two location hints (type, id), flags
             let mut attr = [1u32, 0, 0, 0, 0, 0];
             let mut idx = 0usize;
@@ -2463,7 +2464,7 @@ impl<'c, 'm> GpuSession<'c, 'm> {
         let want = std::env::var("SHADOW_PREFILL_LEND_MIB").ok().and_then(|v| v.parse::<usize>().ok()).map(|m| m << 20)
             .unwrap_or((self.m.cfg.n_expert * if pipe { 2 } else { 1 } + if pipe { 2 } else { 0 }) * self.cache.slot_bytes
                        + if pipe && big { bb_row_floats(&self.m.cfg) * BIG_BATCH * 4 + (1 << 16) } else { 0 })
-            .min(self.cache.arena_bytes / 10 * 9);
+            .min(self.cache.arena_bytes / 100 * 96);
         let target = self.cache.arena_bytes - want;
         let s0 = self.cache.slot_offset.partition_point(|&o| (o as usize) < target);
         if s0 >= self.cache.slots {
@@ -2627,6 +2628,8 @@ impl<'c, 'm> GpuSession<'c, 'm> {
         let c = &self.m.cfg;
         let (h, k, ne) = (c.hidden, c.n_expert_used, c.n_expert);
         let p = l & 1;
+        let stage_time = std::env::var("SHADOW_STAGE_TIME").is_ok_and(|v| v == "1");
+        let t_start = std::time::Instant::now();
         if self.sp.as_ref().unwrap().ready[p] != l {
             // the first layer of a pass: read and copy it here, and start layer l + 1's reads
             self.stage_pipe_read(l);
@@ -2662,9 +2665,11 @@ impl<'c, 'm> GpuSession<'c, 'm> {
         let plan = grouped_plan(tops, 0, m, &set, k, self.rows * k, addr, copied, part, chunk_n);
         assert!(plan.bytes.len() <= self.bb.gtab.bytes, "grouped experts: {} bytes of tables", plan.bytes.len());
         self.upload_to(self.bb.gtab.ptr, &plan.bytes);
+        let t_plan = t_start.elapsed();
         self.routed_grouped(&plan, 0, 0, m, infos);
         self.ctx.stream_wait_event(None, &self.sp.as_ref().unwrap().events[p]).unwrap();
         self.routed_grouped(&plan, 1, 0, m, infos);
+        let t_launch = t_start.elapsed();
         let bb = &self.bb;
         self.k2("moe_combine_qwen_rows", (h as u32).div_ceil(256), m as u32, 256, &[
             Arg::Ptr(row(&bb.y, h, 0)), Arg::Ptr(row(&bb.eo, k * h, 0)), Arg::Ptr(bb.gtab.ptr + plan.weights),
@@ -2673,9 +2678,16 @@ impl<'c, 'm> GpuSession<'c, 'm> {
         // now the next layer's copy and the one after's reads, behind this layer's launches: the GPU runs this layer while the host queues them
         if l + 1 < self.m.cfg.n_layer {
             self.stage_copy(l + 1);
+            let t_copyq = t_start.elapsed();
             // buffer l & 1 held layer l's file-only experts: its copy (queued before the previous layer's compute) has finished
             self.sp.as_ref().unwrap().events[p].synchronize().unwrap();
+            let t_sync = t_start.elapsed();
             self.stage_pipe_read(l + 2);
+            if stage_time {
+                eprintln!("STAGE L{l} m={m} experts={} plan {:.1} launch {:.1} copy_queued {:.1} event_sync {:.1} read_started {:.1} ms (file waits so far {:.2} s)",
+                          set.len(), t_plan.as_secs_f64() * 1e3, t_launch.as_secs_f64() * 1e3, t_copyq.as_secs_f64() * 1e3, t_sync.as_secs_f64() * 1e3,
+                          t_start.elapsed().as_secs_f64() * 1e3, self.waits[2]);
+            }
         }
     }
 
@@ -2684,9 +2696,22 @@ impl<'c, 'm> GpuSession<'c, 'm> {
     fn big_batch_on(&mut self) -> bool {
         let (Some(lent), true) = (self.lent.as_ref(), self.sp.is_some()) else { return false };
         let c = &self.m.cfg;
-        let need = bb_row_floats(c) * BIG_BATCH * 4 + 64 * 40; // the 256-byte rounding of ~40 buffers
         let start = self.sp.as_ref().unwrap().base + (2 * c.n_expert * self.cache.slot_bytes) as u64;
         let end = lent.ptr + (lent.n * self.cache.slot_bytes) as u64;
+        // As many rows as the lent room holds, up to BIG_BATCH: a longer `--ctx` leaves the expert cache (and so the room) smaller, and a prompt that
+        // read 2,048 tokens at a time must not drop to 256 for want of a few MiB; each pass copies a layer's experts whatever its token count.
+        let fit = (end.saturating_sub(start) as usize).saturating_sub(64 * 40) / (bb_row_floats(c) * 4);
+        let cap = std::env::var("SHADOW_BIG_ROWS").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(BIG_BATCH).min(BIG_BATCH);
+        let rows = fit.min(cap) / 64 * 64;
+        let need = bb_row_floats(c) * rows * 4 + 64 * 40; // the 256-byte rounding of ~40 buffers
+        if rows < 2 * MAX_BATCH {
+            return false;
+        }
+        if std::env::var("SHADOW_STAGE_TIME").is_ok_and(|v| v == "1") {
+            eprintln!("BIGBATCH lent {} slots ({:.2} GiB), halves {:.2} GiB, big rows need {:.2} GiB, room after halves {:.2} GiB",
+                      lent.n, (lent.n * self.cache.slot_bytes) as f64 / 1073741824.0, (2 * c.n_expert * self.cache.slot_bytes) as f64 / 1073741824.0,
+                      need as f64 / 1073741824.0, (end - start) as f64 / 1073741824.0);
+        }
         if start + need as u64 > end {
             return false;
         }
@@ -2705,13 +2730,13 @@ impl<'c, 'm> GpuSession<'c, 'm> {
             sel_scores: std::mem::replace(&mut self.bb.sel_scores, dummy(ctx)), sel_toks: std::mem::replace(&mut self.bb.sel_toks, dummy(ctx)),
             logits: std::mem::replace(&mut self.bb.logits, dummy(ctx)),
         };
-        let built = make_bb(c, BIG_BATCH, &mut take, fixed);
+        let built = make_bb(c, rows, &mut take, fixed);
         assert!(at <= end, "big batch buffers: {} bytes carved of {} lent", at - start, end - start);
         match built {
             Ok(big) => {
                 self.small_bb = Some(std::mem::replace(&mut self.bb, big));
-                self.rows = BIG_BATCH;
-                self.batch_max = BIG_BATCH;
+                self.rows = rows;
+                self.batch_max = rows;
                 true
             }
             Err(_) => false, // cannot happen: `take` does not fail; the fixed buffers are dropped views

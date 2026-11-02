@@ -1394,3 +1394,29 @@ Cause **not found**. Until a valid prompt baseline is re-established (a reboot, 
 - **Follow-up, 2026-11-02 12:50, after a reboot** (boot 12:48; the server started under `run_capped.ps1 -CapGiB 52 -FloorGiB 3`): the same 3,001-token prompt reads at **69.6 and 72.1 tok/s** (43.1 s, 41.6 s). So the slowdown is **not** left-over machine state; it survived a reboot.
   Still unexplained. Remaining suspects: the Windows Insider update KB5127935 (2026-11-01), RAM/BIOS settings that a reboot or the update reset (installed DIMMs: 2 x CMH32GX4M2D3600C18 + 2 x CMW32GX4M2C3200C16, running 2933 MT/s at 1.2 V, i.e. no XMP profile applied; a DRAM speed or timings change
   would show in the CPU-side/RAM-tier reads but is unlikely to be 3x), a GPU power/clock policy change.
+
+## 2026-11-02: the prompt-speed regression found and fixed - it was the context window, not the machine (65-74 -> 165-195 tok/s)
+
+The two entries above blamed the OS; both guesses were wrong ("not `--ctx`" was never actually tested). Bisected on the same 3,001-token prompt (two runs each, tok/s):
+
+| change | tok/s |
+|---|---|
+| as it was (ctx 16,384; also ctx 32,768, the default since 39db7c0) | 70-74 |
+| `SHADOW_PREFILL_PIPE=0` (no layer-ahead pipeline) | 113-118 |
+| `SHADOW_PREFILL_BIG=0` | 70-72 (so the big batch was already off) |
+| `SHADOW_NO_BATCH_COPY=1` (one-by-one copies, not `cuMemcpyBatchAsync`) | 78-79 (not the cause; +10% worse-case noise) |
+| **`--ctx 8192`** | **172-194** |
+
+Per-layer trace (`SHADOW_STAGE_TIME=1`): every pass was `m=256` tokens, not 2,048, so each of the 40 layers copied its ~400 experts (~0.8 GiB) once per 256 tokens, 8x as often.
+Cause: a long prompt lends the expert cache for the staging halves (2.54 GiB) plus the 2,048-row batch buffers (1.15 GiB), capped at 90% of the cache. The cache is what the KV for `--ctx` leaves of VRAM:
+ctx 8k = 4.47 GiB (room after the halves 1.16 GiB: fits), **ctx 16k = 4.01 GiB (1.06 GiB: 0.09 GiB short)**, ctx 32k = 3.11 GiB (0.26 GiB). Short by a little, the batch silently stayed at 256 rows.
+(The earlier 186-229 tok/s were measured at a smaller window; the 32k default of 39db7c0 was measured on decode only, and its "20,802 tokens in 287 s" was this bug.)
+
+Fix (`big_batch_on`, `lend_cache`): the big batch takes as many rows as the lent room holds (up to 2,048, in steps of 64; below 512 it stays off), and the lend cap is 96% of the cache, not 90%.
+`SHADOW_BIG_ROWS=n` caps the rows (testing); `SHADOW_STAGE_TIME=1` prints the per-layer trace and the lent-room sums; `SHADOW_NO_BATCH_COPY=1` forces the one-by-one copies.
+Measured after (3,001 tokens, two runs): **ctx 16,384: 194.8 / 179.7 tok/s (rows 2,048); ctx 32,768, the default: 164.4-180.2 (rows 768); ctx 8,192: 194 / 172.** A 25,260-token prompt at the default window: **145.4 s = 173.7 tok/s** (was ~72), no panic.
+With rows capped at 512 / 768 / 1,024 / 1,536 on ctx 16k the same question is answered the same (151 / 197 / 178 / 168 tok/s).
+
+Open: on this prompt (a STATUS.md excerpt, question "the first heading word") ctx 32,768 and 24,576... differ - 32k answers "Fast", 8k-24k answer "Open" (the right one) - and 32k gives "Fast" with the big batch off as well, so it is not this change: something in the attention or the
+position tables at a 32k window. Not investigated; the next thing to check before trusting long-window answers.
+The CPU-experts experiment (entry above) still stands: its premises fail; its baseline is now valid again (prompt path ~175-195 tok/s).
