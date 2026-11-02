@@ -406,9 +406,12 @@ fn answer<'c>(arch: &str, req: &Request, tok: &Tokenizer, sess: &mut GpuSession<
     let text = render_for_arch(arch, &req.messages, &req.opts)?;
     let ids = tok.encode(&text, true);
     let (ids, spans) = expand_pictures(tok, ids, &req.images, pics, model)?;
-    if ids.len() + req.max_tokens > sess.capacity() {
-        return Err(format!("{} prompt tokens + {} max_tokens exceed the context of {} positions", ids.len(),
-                           req.max_tokens, sess.capacity()));
+    // no `max_tokens` given: as many as fit.  (It used to be 1,024, which a reasoning model can spend on thinking alone: the reply ended
+    // mid-thought with no answer.)
+    let max_tokens = if req.max_tokens == 0 { sess.capacity().saturating_sub(ids.len() + 8) } else { req.max_tokens };
+    if max_tokens == 0 || ids.len() + max_tokens > sess.capacity() {
+        return Err(format!("{} prompt tokens + {} max_tokens exceed the context of {} positions: the conversation is full, start a new chat", ids.len(),
+                           max_tokens, sess.capacity()));
     }
     // read the prompt, reusing the session's state when it holds an exact prefix of it
     let t0 = Instant::now();
@@ -520,7 +523,43 @@ fn answer<'c>(arch: &str, req: &Request, tok: &Tokenizer, sess: &mut GpuSession<
     let df_min_p: f32 = sess.dflash.as_ref().map_or(0.0, |d| d.min_p);
     let mut spec_t = [0f64; 3]; // seconds drafting, checking, rolling back
     let mut snap: Option<shadow_cuda::session::Snapshot> = None;
-    while n < req.max_tokens {
+    // A thinking budget by effort (the menu says Low ~1k, Medium ~4k): a reasoning model left alone can think until the context is full (an
+    // extra-high question ran 17,303 tokens and never answered).  Past the budget the think block is closed for it and it answers; the budget
+    // always leaves 1,200 tokens of the reply (and none is applied to a small `max_tokens`).
+    let think_budget = if max_tokens < 1500 {
+        usize::MAX
+    } else {
+        let by_effort = match req.opts.effort {
+            shadow_model::chat::Effort::Low => 1_000,
+            shadow_model::chat::Effort::Medium => 4_000,
+            shadow_model::chat::Effort::High => 8_000,
+            shadow_model::chat::Effort::XHigh => 12_000,
+        };
+        by_effort.min(max_tokens - 1_200)
+    };
+    let mut forced = false;
+    while n < max_tokens {
+        if em.reasoning && !forced && n >= think_budget {
+            forced = true;
+            let closer = tok.encode("\n\nThat is enough thinking: the answer now.\n</think>\n\n", true);
+            let mut gone = false;
+            for &t in &closer {
+                n += 1;
+                if !em.push(tok, t, think_end, &req.tx) {
+                    gone = true;
+                    break;
+                }
+            }
+            if gone {
+                finish = "cancelled";
+                break;
+            }
+            if spec > 0 {
+                hist.extend_from_slice(&closer);
+            }
+            *last_logits = sess.step_batch(&closer).pop().unwrap();
+            continue;
+        }
         let next = argmax(last_logits);
         if tok.is_eog(next) || stops.contains(&next) {
             finish = "stop";
@@ -534,7 +573,7 @@ fn answer<'c>(arch: &str, req: &Request, tok: &Tokenizer, sess: &mut GpuSession<
         }
         if spec > 0 {
             hist.push(next);
-            let k = spec.min(req.max_tokens - n);
+            let k = spec.min(max_tokens - n);
             let t_d = Instant::now();
             // a long repeat in the conversation drafts for free (and usually right); else the MTP layer
             let repeat = if lookup_min > 0 { lookup_from(&hist, k, &[8, 6, lookup_min]) } else { vec![] };

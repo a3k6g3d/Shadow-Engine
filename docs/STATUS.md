@@ -1347,3 +1347,11 @@ Single-prompt runs, "Write a Rust function that parses a comma separated list...
 - The Process Monitor (CPU, GPU, RAM, engine and three tier cards) duplicated the Dashboard cards. The tab, its panel, styles and poller code are removed (~300 lines); `/monitor` and the old `#monitor` link go to the Dashboard.
   What the monitor showed that the Dashboard did not moved into the Dashboard's cards: GPU: memory-controller activity and free VRAM; Expert tiers: VRAM cache hits / misses and misses read from RAM / drive (counts);
   System memory: RAM in use with its load; Engine: process ID. The rest was already there (CPU usage and cores, GPU busy / VRAM / temperature, working set, pinned tier, uptime, requests, tokens, speculation, queue).
+
+## 2026-11-01: replies that ended mid-thought (the 1,024-token default) and thinking that never ended
+
+- A chat in the page ended with the thinking cut off mid-sentence and no answer, twice ("Continue" did the same): the page sends no `max_tokens`, and the server defaulted to **1,024**, which a reasoning model spends on
+  thinking alone (the stats line said "1024 tokens"). Fix: no `max_tokens` now means as many as fit in the context (`lib.rs` default 0, `engine.rs` computes the room); a reply cut by a limit says so in its bubble.
+- Taking the limit off showed the opposite failure: an Extra-High question thought for **17,303 tokens**, until the context was full, and never answered (301 s). So there is a **thinking budget by effort** (`engine.rs`):
+  Low 1,000, Medium 4,000, High 8,000, Extra-High 12,000 tokens, always leaving 1,200 for the answer (none for a small `max_tokens`); past it the engine feeds the model "That is enough thinking: the answer now. </think>" and it
+  answers. Tested: the same question at Medium thought ~1,600 tokens by itself and answered; at Extra-High the budget closed it at ~12,000 and it answered (14,582 tokens in all, 268 s, finish "stop").

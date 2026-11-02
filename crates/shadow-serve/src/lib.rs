@@ -412,7 +412,7 @@ pub fn parse_chat(body: &Value) -> Result<(Vec<Message>, Options, usize, bool), 
         }
     }
     let max_tokens = body.get("max_completion_tokens").or_else(|| body.get("max_tokens")).and_then(Value::as_u64)
-        .unwrap_or(1024) as usize;
+        .unwrap_or(0) as usize; // 0: no limit given, the engine lets the reply run to the end of the context
     let stream = body.get("stream").and_then(Value::as_bool).unwrap_or(false);
     Ok((out, opts, max_tokens, stream))
 }

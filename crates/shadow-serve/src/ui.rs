@@ -1793,6 +1793,7 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
         let rawContent = '';
         let rawThinking = '';
         let streamError = null;
+        let cutOff = false;
         let lastTimings = null;
         let thinkStart = performance.now();
         let isThinking = false;
@@ -1846,6 +1847,7 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
                 try {
                   const parsed = JSON.parse(trimmed.slice(6));
                   if (parsed.timings) lastTimings = parsed.timings;
+                  if (parsed.choices && parsed.choices[0] && parsed.choices[0].finish_reason === 'length') cutOff = true;
                   if (parsed.error) { streamError = parsed.error.message || 'The server reported an error.'; continue; }
                   const delta = parsed.choices?.[0]?.delta;
                   if (!delta) continue;
@@ -1913,6 +1915,13 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
           }
 
           msgContent.innerHTML = renderMarkdown(rawContent);
+          // the reply ran into a length limit (the context is full): without a word the bubble would just stop
+          if (cutOff) {
+            const note = document.createElement('div');
+            note.className = 'msg-error';
+            note.innerHTML = 'The reply was cut off: the conversation has no room left. <small>Start a new chat (your notes carry over) or ask for a shorter answer.</small>';
+            bubbleEl.appendChild(note);
+          }
           // what this reply cost: tokens and speed, from the final chunk's timings
           if (lastTimings && lastTimings.predicted_n) {
             const t = lastTimings, meta = document.createElement('div');
