@@ -878,6 +878,17 @@ template <> struct Dec8<IQ3XXS> {
     }
 };
 
+// BF16 weights: 8 of them are one 16-byte load (a row is cols * 2 bytes, cols a multiple of 64)
+template <> struct Dec8<BF16> {
+    static __device__ __forceinline__ void dec8(const u8* r, unsigned int i, float* o) {
+        uint4 p = *(const uint4*) (r + (u64) i * 2);
+        o[0] = __uint_as_float(p.x << 16); o[1] = __uint_as_float(p.x & 0xffff0000u);
+        o[2] = __uint_as_float(p.y << 16); o[3] = __uint_as_float(p.y & 0xffff0000u);
+        o[4] = __uint_as_float(p.z << 16); o[5] = __uint_as_float(p.z & 0xffff0000u);
+        o[6] = __uint_as_float(p.w << 16); o[7] = __uint_as_float(p.w & 0xffff0000u);
+    }
+};
+
 template <> struct Dec8<IQ3S> {
     static __device__ __forceinline__ void dec8(const u8* r, unsigned int i, float* o) {
         const u8* b = r + (i / 256) * 110;
@@ -989,6 +1000,7 @@ extern "C" __global__ void mma_cols_iq2_s(const u8* w, const float* x, unsigned 
 extern "C" __global__ void mma_grouped_iq2_s(const u64* wtab, const unsigned int* gtab, const float* x, unsigned int xs, float* y, unsigned int ys, unsigned int rows, unsigned int cols) { mma_grouped<IQ2S>(wtab, gtab, x, xs, y, ys, rows, cols); }
 extern "C" __global__ void mma_cols_iq3_xxs(const u8* w, const float* x, unsigned int xs, float* y, unsigned int ys, unsigned int rows, unsigned int cols, unsigned int m) { mma_cols<IQ3XXS>(w, x, xs, y, ys, rows, cols, m); }
 extern "C" __global__ void mma_grouped_iq3_xxs(const u64* wtab, const unsigned int* gtab, const float* x, unsigned int xs, float* y, unsigned int ys, unsigned int rows, unsigned int cols) { mma_grouped<IQ3XXS>(wtab, gtab, x, xs, y, ys, rows, cols); }
+extern "C" __global__ void mma_cols_bf16(const u8* w, const float* x, unsigned int xs, float* y, unsigned int ys, unsigned int rows, unsigned int cols, unsigned int m) { mma_cols<BF16>(w, x, xs, y, ys, rows, cols, m); }
 extern "C" __global__ void mma_cols_iq3_s(const u8* w, const float* x, unsigned int xs, float* y, unsigned int ys, unsigned int rows, unsigned int cols, unsigned int m) { mma_cols<IQ3S>(w, x, xs, y, ys, rows, cols, m); }
 extern "C" __global__ void mma_grouped_iq3_s(const u64* wtab, const unsigned int* gtab, const float* x, unsigned int xs, float* y, unsigned int ys, unsigned int rows, unsigned int cols) { mma_grouped<IQ3S>(wtab, gtab, x, xs, y, ys, rows, cols); }
 

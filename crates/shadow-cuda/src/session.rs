@@ -3511,7 +3511,9 @@ impl<'c, 'm> GpuSession<'c, 'm> {
             return;
         };
         let wptr = self.w.get(name).unwrap_or_else(|| panic!("{name} is not resident")).ptr;
-        if self.tensor_prompt && m >= 16 && matches!(ty.as_str(), "Q6_K" | "IQ4_XS") && t.dims[0].is_multiple_of(64)
+        static MMA_BF16: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let mma_bf16 = ty == "BF16" && *MMA_BF16.get_or_init(|| !std::env::var("SHADOW_MMA_BF16").is_ok_and(|v| v == "0"));
+        if self.tensor_prompt && m >= 16 && (matches!(ty.as_str(), "Q6_K" | "IQ4_XS") || mma_bf16) && t.dims[0].is_multiple_of(64)
             && entry.starts_with("matvec_cols_") && !entry.starts_with("matvec_cols_ref_") {
             // SAFETY: as the launches below: `rows` rows of t.dims[0] weights, m inputs of t.dims[0] floats at x + j * xs, m outputs of `rows`
             // floats at y + j * ys; the kernel reads 16-byte groups of the inputs (x and xs checked above) and guards the last tiles.

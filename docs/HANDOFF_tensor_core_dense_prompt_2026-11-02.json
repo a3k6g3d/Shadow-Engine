@@ -1,0 +1,44 @@
+{
+  "title": "Handoff: tensor-core kernels for the dense (non-expert) matmuls of Shadow's prompt path",
+  "written": "2026-11-02, mid-task; the previous AI may have run out of tokens. Read docs/STATUS.md (last 4 entries dated 2026-11-02) first.",
+  "repo": "J:\\Shadow (git, branch main, remote https://github.com/a3k6g3d/Shadow-Engine). Commit trailer: 'Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>'. Windows; use Bash tool with forward slashes or PowerShell. CRLF files: edit with small Python scripts (open(newline='') and convert) or single-line Edit anchors.",
+  "goal": "Raise prompt-reading speed (tokens/s of a long prompt) from ~192-212 tok/s toward Strata's 1,376 by replacing the slow dense `matvec_cols_*` kernels (<=8 tokens per launch, so a 2,048-token pass re-reads every weight row ~256 times) with tensor-core `mma_cols_*` kernels under --tensor-prompt.",
+  "why_this_and_not_cpu_experts": "Measured 2026-11-02 (docs/STATUS.md): the GPU waits only 1.4% of a prompt pass on expert copies, so the 'CPU experts' experiment cannot win and was closed. Kernel profile (SHADOW_KTIME=1): GPU kernel time per token 9.51 ms = matvec_cols_bf16 1.74 (18%), delta_steps128 1.61 (17%), hc_down_inject_cols_fast_bf16 1.30 (14%), matvec_cols_q5_k 0.60, matvec_cols_f32 0.56, attention ~0.76 (8%), matvec_cols_q4_k 0.47, others. Dense kernels with no tensor-core version (bf16, f32, q5_k, q4_k, hc_down_inject) ~49%.",
+  "rules_from_the_user": [
+    "Measure. What loses stays opt-in (off by default). A change under ~1% is a tie and a tie is a loss (noise floor 0.8% median / 2.0% p90).",
+    "Every experiment gets a dated STATUS.md entry (append-only, '## 2026-11-0X: ...') with measured numbers, wins and losses alike.",
+    "Do NOT change the decode path (52 tok/s, already beats Strata 47.7), the pinned RAM tier size (36 GiB), or the RAM floor (3 GiB with the 36 GiB tier; 4 GiB default). The machine froze hard at 0.4 GiB free.",
+    "Every model load runs under tools/run_capped.ps1. Never push destructive changes. Do not kill processes the user started (a Strata server was running once and the user said 'Stop Strata now' explicitly, so only then)."
+  ],
+  "machine": "RTX 5070 12 GB (sm_120), i7-11700K, 64 GB RAM, Windows 11. Model: J:/Strata-work/models/swift15/IQ3_S/Swift-Qwen3.8-Flash-Next-GSQ-RCO-abliterated-IQ3_S-00001-of-00002.gguf (89 GiB). Shadow exe: J:/Shadow/target/release/shadow.exe (cargo build --release -p shadow, ~15 s; stop the server first or the exe is locked).",
+  "state_at_handoff": {
+    "pushed_commits_today": ["13fd1b8 long-prompt batch fits the room (70 -> 175-195 tok/s)", "49dd25b 32k answer difference is fast-mode noise", "b9b39d9 CPU-experts experiment closed (copy stall 1.4%)", "a74771e kernel-level prompt profile"],
+    "update_after_bf16_bench": "mma_cols_bf16 WON: 5 interleaved pairs, total throughput 195.2 tok/s baseline -> 249.9 tok/s (+28%), qa 6/7 (baseline 5/7). It is now ON by default under --tensor-prompt (SHADOW_MMA_BF16=0 turns it off) and committed; STATUS.md has the entry. Next in the plan: Q5_K/Q4_K Dec8 + mma wrappers, hc_down_inject, F32.",
+    "uncommitted_work_before_that_commit": "kernels/matvec.cu: added `Dec8<BF16>` (16-byte load, bf16->f32 by shifting) and `extern \"C\" mma_cols_bf16` (= mma_cols<BF16>); crates/shadow-cuda/src/kernels.rs: registered cols(\"mma_cols_bf16\"); crates/shadow-cuda/src/session.rs mv_cols(): `SHADOW_MMA_BF16=1` (OnceLock) routes BF16 projections to mma_cols_bf16 when --tensor-prompt (default on in serve) and m>=16 and cols%64==0. It builds. NOT yet verified for correctness or speed.",
+    "background_test": "A 4-config loop (m0a/m1a/m0b/m1b = baseline vs SHADOW_MMA_BF16=1, interleaved) was started; outputs in $TEMP (C:\\Users\\a3k6g\\AppData\\Local\\Temp): srv_m*.txt.err, and the task output file; each prints 'N tokens in S s = X tok/s' twice plus a sanity answer (should be 'The first heading word is \"Open\".')."
+  },
+  "how_to_measure": {
+    "scripts_in_TEMP": {
+      "ab.sh": "usage: $TEMP/ab.sh TAG VAR=VAL ... ; stops any shadow, starts a server under run_capped (-CapGiB 52 -FloorGiB 3) with the env vars, CTXV=<n> sets --ctx (default 16384), EXTRA=<flags> appends flags, runs p3k_exact.py twice. Server stderr goes to $TEMP/srv_TAG.txt.err. If $TEMP is cleaned, recreate: it just wraps `powershell -File tools/run_capped.ps1 -CapGiB 52 -FloorGiB 3 -Out OUT -Exe J:/Shadow/target/release/shadow.exe -Arguments 'serve MODEL --port 8081 --ctx N'`, waits for GET /health, then runs the prompt.",
+      "p3k_exact.py": "POSTs docs/STATUS.md[5000:14000] chars (~3,000 tokens) to http://127.0.0.1:8081/v1/chat/completions with max_tokens=2, temperature 0, enable_thinking false; prints prompt_n, prompt_ms, prompt_per_second from r['timings'].",
+      "sane.py": "same text + two questions; the first answer should contain \"Open\".",
+      "qa.py": "8 slices of STATUS.md, asks the first '## ' heading word; baseline default modes 5/7, --exact 6/7. A change that drops below 5/7 is suspect. NOTE the text must not contain picture-token strings (HTTP 400 otherwise); qa.py already handles/prints those."
+    },
+    "protocol": "Interleave arms (A B A B ...), a fresh server launch per run, 2 prompts per launch (first is cold, report both), at least 3 launches per arm; score by prompt tok/s. Baseline today with nothing else running: 192-212 tok/s (3,001 tokens, ctx 16,384). Check no other GPU/RAM hog is running (`nvidia-smi`, Get-Process strata) before benching: another process drops numbers to 140-160.",
+    "profile_commands": "SHADOW_KTIME=1 SHADOW_REPORT=1 prints 'GPU kernel time per token' per kernel in the server stderr (line after 'after this answer:'). SHADOW_LTIME=1 SHADOW_REPORT=1 prints per-pass segment times. SHADOW_STAGE_TIME=1 prints per-layer staging traces."
+  },
+  "plan": [
+    "1. Read the result of the background test. Correctness gate: with SHADOW_MMA_BF16=1 the sanity answer is 'Open' and qa.py >= 5/7; no NaN/panic in the .err. Speed: compare against the interleaved baseline.",
+    "2. If it is a win (> 1% on total tok/s over >= 3 interleaved launches per arm): make it default under --tensor-prompt (keep an env opt-out), else leave it opt-in and record the loss.",
+    "3. Next kernels in order of share: hc_down_inject_cols_fast_bf16 (14%, fused kernel in kernels/matvec.cu ~line 1234, a tensor-core variant needs a rewrite of the fused inject), matvec_cols_f32 (6%; F32 weights in half lose precision: check which tensors use it before enabling), matvec_cols_q5_k and matvec_cols_q4_k (add `Dec8<Q5K>` / `Dec8<Q4K>` specialisations beside Dec8<Q6K> in kernels/matvec.cu; the decode must give bit-identical floats to `Fast<Q>::dotm`'s dequant, see quants.cuh Q4K/Q5K::at), then delta_steps128 (17%: sequential per-token recurrence; a chunked-parallel scan is a rewrite, keep separate).",
+    "4. After each kernel: rebuild, correctness gate, interleaved bench, dated STATUS.md entry, commit only the files you changed, push to origin main.",
+    "5. Add a unit test or fixture check if the repo has one for mma kernels (grep tests/ for mma_cols) - the existing mma_cols_* kernels are validated somewhere; mirror it for bf16."
+  ],
+  "how_the_dispatch_works": "session.rs fn mv_cols(name, x, xs, y, ys, m): chooses `matvec_cols_<type>` (groups of <=8 tokens, 256 threads) or, with self.tensor_prompt && m >= 16 && type in {Q6_K, IQ4_XS, (BF16 if SHADOW_MMA_BF16=1)} && dims[0] % 64 == 0, launches `mma_cols_<type>` with grid ((rows+63)/64, (m+31)/32), block 128. mma_core<Q> in kernels/matvec.cu stages 64 weight rows x 64 k decoded to half in shared memory (Dec8<Q>::dec8 gives 8 floats) and 32 tokens x 64 k of x converted to half, runs mma.sync m16n8k16 f16 with f32 accumulate. Adding a type = add Dec8<T> + `extern \"C\" mma_cols_<t>` wrapper + register `cols(\"mma_cols_<t>\")` in kernels.rs (list near line 209) + allow the type in the mv_cols condition. Other callers of the dense matmuls use matvec_cols_multi (line ~3600, router/shared gates; keep exact) and the fused hc_down_inject kernel.",
+  "known_findings_to_keep_in_mind": [
+    "Prompt batch size: a long prompt reads up to 2,048 tokens per pass when the lent cache has room (fixed 2026-11-02: big_batch_on fits rows to the room; ctx 32,768 default gives 768 rows). rows < 512 turns the big batch off.",
+    "Fast modes (--tail-skip 3, --tensor-prompt, ...) make near-tie answers differ from --exact; that is normal. Use --exact (EXTRA=--exact) for a reference answer.",
+    "SHADOW_STAGE_NO_COPY / SHADOW_STAGE_COPY_EVERY make garbage and crash the router (NaN); do not use them for timing.",
+    "Flint tier-flag autotuning is a deferred item the user wants a reminder about after the Strata comparison."
+  ]
+}

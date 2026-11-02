@@ -1466,3 +1466,19 @@ That is the next thing to look at (see the DeltaNet "delta segment" and the spar
   The experts (routed, tensor-core `mma_grouped_*`) are a few percent. This matches the pass split above (47% DeltaNet segment, 26% attention, ~20% experts, 1.4% copy stall).
 - `--tensor-prompt` already has `mma_cols_q6_k / iq4_xs / iq4_nl / iq2_s / iq3_xxs / q2_0`; bf16, f32, q5_k, q4_k and the hc projection are the gaps.
 - Not measured: what a tensor-core BF16/F32/Q5_K/Q4_K path would give. If those kernels got 4x faster the kernel time would fall ~37% (an arithmetic estimate, not a result) - the biggest prompt lever found so far, and a CUDA kernel project of its own.
+
+## 2026-11-02: tensor-core BF16 dense projections for the prompt path (`mma_cols_bf16`): +28% at ctx 16k, +3% at the 32k default
+
+New: `Dec8<BF16>` + `mma_cols_bf16` (the same tensor-core skeleton as the Q6_K / IQ4_XS prompt kernels: 64 rows x 32 tokens x 64 k tiles, weights and activations as half, f32 accumulate), used by `mv_cols` under `--tensor-prompt` for BF16 tensors with >= 16 tokens (attention/indexer/PLE/ssm projections that are BF16).
+`SHADOW_MMA_BF16=0` turns it off. Bench, ctx 16,384, the 3,001-token prompt, 5 interleaved baseline/new launches, 2 prompts each (first cold), scored by total throughput:
+
+| arm | prompt times (s) | total |
+|---|---|---|
+| baseline (`matvec_cols_bf16`) | 17.0+16.6, 14.9+12.4, 14.3+16.3, 14.7+16.8, 14.3+16.4 | 30,010 tokens / 153.7 s = **195.2 tok/s** |
+| `mma_cols_bf16` | 12.8+10.9, 12.6+10.8, 12.6+10.8, 12.5+10.8, 12.6+13.7 | 30,010 / 120.1 s = **249.9 tok/s (+28%)** |
+
+(Baseline launches swing 177-243 tok/s; every new-kernel launch was above 217.) Correctness: the sanity question gives the same answer ("Open") in all 4 launches checked, and the 7-question check scores 6/7 (default baseline 5/7, `--exact` 6/7): no loss.
+It is now on by default (it wins; the half-precision tensor path is the one `--tensor-prompt` already uses for Q6_K and IQ4_XS).
+At the **default 32k window** the same change reads 181 / 204 tok/s on the 3k prompt and a 25,260-token prompt in 141.7 s = **178.2 tok/s (was 173.7: +2.6%)**: there the pass is 768 rows (the lent room is smaller), so the fixed per-layer expert copy is a larger share and
+the long prompt's attention grows with length; the dense matmuls are a smaller part of the time. Next in the profile: `hc_down_inject_cols_fast_bf16` (14%), Q5_K / Q4_K / F32 dense (17%), the DeltaNet recurrence (17%).
+Hand-over for another AI: `docs/HANDOFF_tensor_core_dense_prompt_2026-11-02.json`.
