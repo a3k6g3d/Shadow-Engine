@@ -1390,3 +1390,7 @@ Nothing was built; the two numbers the idea rests on were measured instead (`car
 The Oct 31 commit cd8be97 (built and run in a separate worktree) is just as slow now, so it is **not the code**, not `--ctx`, not the VRAM reserve, not MCP. During a read the GPU shows 100% utilisation but only 77-90 W of 250 W, clocks 2910 MHz, PCIe Gen4 x16,
 memory utilisation 6-10%, no other compute process. Changed on the machine meanwhile: a Windows Insider cumulative update (KB5127935, installed 2026-11-01; boot 10:23 that morning), nothing seen in the driver (617.42, 2026-09-29).
 Cause **not found**. Until a valid prompt baseline is re-established (a reboot, or finding what changed), no prompt-path A/B is trustworthy; decode (52 tok/s) was not re-measured.
+
+- **Follow-up, 2026-11-02 12:50, after a reboot** (boot 12:48; the server started under `run_capped.ps1 -CapGiB 52 -FloorGiB 3`): the same 3,001-token prompt reads at **69.6 and 72.1 tok/s** (43.1 s, 41.6 s). So the slowdown is **not** left-over machine state; it survived a reboot.
+  Still unexplained. Remaining suspects: the Windows Insider update KB5127935 (2026-11-01), RAM/BIOS settings that a reboot or the update reset (installed DIMMs: 2 x CMH32GX4M2D3600C18 + 2 x CMW32GX4M2C3200C16, running 2933 MT/s at 1.2 V, i.e. no XMP profile applied; a DRAM speed or timings change
+  would show in the CPU-side/RAM-tier reads but is unlikely to be 3x), a GPU power/clock policy change.
