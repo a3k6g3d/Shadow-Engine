@@ -22,3 +22,4 @@ models/mtp-basalt-ft1/*.bin
 /llama.log
 /bin/strata-vision.exe
 /models/Qwen3.8-Flash-Next.mmproj-f16.gguf
+/.playwright-mcp/

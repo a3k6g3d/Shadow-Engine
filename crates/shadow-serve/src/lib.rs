@@ -148,6 +148,14 @@ async fn handle(req: Request<Incoming>, app: Arc<App>) -> Result<Response<Body>,
         }
         (&Method::GET, "/v1/tools") => json_resp(StatusCode::OK, &orchestrator::tool_definitions()),
         (&Method::GET, "/v1/memory") => json_resp(StatusCode::OK, &memory::list()),
+        (&Method::GET, "/v1/browser/screenshot") => {
+            // blocking: the browser server answers in a second or two
+            match tokio::task::spawn_blocking(mcp::screenshot).await {
+                Ok(Ok(o)) => json_resp(StatusCode::OK, &json!({"image": o.images.first(), "text": o.text})),
+                Ok(Err(e)) => error(StatusCode::NOT_FOUND, &e),
+                Err(e) => error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+            }
+        }
         (&Method::POST, "/v1/memory") | (&Method::PUT, _) | (&Method::DELETE, _) if path.starts_with("/v1/memory") => memory_api(req, &path).await,
         (&Method::POST, "/v1/tools/execute") => tool_execute(req).await,
         (&Method::POST, "/v1/chat/completions") => chat(req, app).await,
@@ -460,7 +468,7 @@ async fn tool_execute(req: Request<Incoming>) -> Response<Body> {
     // a tool can take a while (a command, a web page, an MCP server): not on the server's async threads
     let name = inv.name.clone();
     let res = tokio::task::spawn_blocking(move || orchestrator::execute_tool(&inv)).await
-        .unwrap_or_else(|e| orchestrator::ToolResult { name, output: format!("the tool crashed: {e}"), is_error: true });
+        .unwrap_or_else(|e| orchestrator::ToolResult { name, output: format!("the tool crashed: {e}"), is_error: true, images: vec![] });
     json_resp(StatusCode::OK, &res.to_json())
 }
 

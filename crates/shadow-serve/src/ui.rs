@@ -245,6 +245,15 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
     .sug { display: flex; gap: 0.5rem; align-items: flex-start; font-size: 0.86rem; padding: 0.3rem 0; }
     .sug input { margin-top: 0.2rem; }
 
+    /* Browser pane */
+    #browser-pane { display: none; flex-direction: column; width: 46%; min-width: 320px; flex: none; border-left: 1px solid var(--border); background: var(--surface); min-height: 0; }
+    body.view-chat.browser-open #browser-pane { display: flex; }
+    .bp-head { display: flex; align-items: center; gap: 0.5rem; padding: 0.6rem 0.75rem; border-bottom: 1px solid var(--border-subtle); font-size: 0.82rem; }
+    .bp-url { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; background: var(--bg); border: 1px solid var(--border); border-radius: 9999px; padding: 0.25rem 0.8rem; color: var(--text-muted); }
+    .bp-body { flex: 1; overflow: auto; padding: 0.6rem; display: flex; align-items: flex-start; justify-content: center; }
+    .bp-body img { display: none; max-width: 100%; border-radius: 0.5rem; border: 1px solid var(--border); }
+    .bp-status { padding: 0.4rem 0.75rem; font-size: 0.75rem; color: var(--text-dim); border-top: 1px solid var(--border-subtle); }
+
     /* Dashboard */
     #dash-panel { overflow-y: auto; padding: 1.25rem 1.5rem 2rem; }
     .dash-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 1rem; flex-wrap: wrap; gap: 0.75rem; }
@@ -1221,6 +1230,17 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
       </div>
     </div>
 
+    <aside id="browser-pane">
+      <div class="bp-head">
+        <span>🌐</span>
+        <span class="bp-url" id="bp-url">nothing open yet</span>
+        <button class="side-toggle" title="Refresh the picture" onclick="browserRefresh()">⟳</button>
+        <button class="side-toggle" title="Close this pane" onclick="browserClose()">✕</button>
+      </div>
+      <div class="bp-body"><img id="bp-img" alt="The page in the browser"><div class="dash-empty" id="bp-empty">Nothing loaded yet.</div></div>
+      <div class="bp-status" id="bp-status">Shadow's browser</div>
+    </aside>
+
     <!-- VIEW: PROCESS MONITOR (Separate Tab Only) -->
     <div class="view-panel" id="monitor-panel">
       <div class="monitor-grid">
@@ -1958,7 +1978,7 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
 
       const t0 = performance.now();
       let loopTurns = 0;
-      const MAX_AGENT_TURNS = 6;
+      const MAX_AGENT_TURNS = 14;
 
       while (loopTurns < MAX_AGENT_TURNS) {
         loopTurns++;
@@ -2144,6 +2164,7 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
 
               const result = await executeLocalTool(tc.name, tc.arguments);
               if (tc.name.startsWith('memory_')) loadMemory();
+              if (tc.name.startsWith('mcp__browser__')) browserNote(result.output);
               const outputEl = toolCard.querySelector('.tool-output');
               toolCard.querySelector('.tool-header span:last-child').textContent = result.is_error ? 'Error' : 'Complete';
               outputEl.textContent = result.output;
@@ -2723,6 +2744,45 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
       btn.disabled = false;
     }
     loadMemory();
+
+    // ---- the Browser pane: the page the model's browser has open, in the chat view, as a picture that follows it (the browser itself runs headless)
+    let browserTimer = null, browserBusy = false;
+    function browserClose() {
+      document.body.classList.remove('browser-open');
+      clearInterval(browserTimer);
+      browserTimer = null;
+    }
+    async function browserRefresh() {
+      if (browserBusy) return;
+      browserBusy = true;
+      const st = document.getElementById('bp-status');
+      try {
+        const r = await fetch('/v1/browser/screenshot');
+        const j = await r.json();
+        if (!r.ok) { st.textContent = (j.error && j.error.message) || 'No screenshot.'; return; }
+        if (j.image) {
+          const img = document.getElementById('bp-img');
+          img.src = j.image;
+          img.style.display = 'block';
+          document.getElementById('bp-empty').style.display = 'none';
+        }
+        browserPageInfo(j.text || '');
+        st.textContent = 'Updated ' + new Date().toLocaleTimeString();
+      } catch (_) { st.textContent = 'Could not reach the server.'; }
+      finally { browserBusy = false; }
+    }
+    function browserPageInfo(text) {
+      const u = /Page URL: (\S+)/.exec(text), t = /Page Title: (.*)/.exec(text);
+      if (u) document.getElementById('bp-url').textContent = u[1];
+      if (u || t) document.getElementById('bp-url').title = t ? t[1] : '';
+    }
+    // after every call of a browser tool: show the pane, say where the page is, take a fresh picture; while a reply is being written, keep it fresh
+    function browserNote(output) {
+      document.body.classList.add('browser-open');
+      browserPageInfo(output || '');
+      browserRefresh();
+      if (!browserTimer) browserTimer = setInterval(() => { if (isGenerating) browserRefresh(); }, 4000);
+    }
 
     // ---- queued messages: typed while a reply is being written, sent in order when it ends (each one needs the one before it answered)
     const sendQueue = [];

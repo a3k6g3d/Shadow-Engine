@@ -1317,3 +1317,17 @@ Single-prompt runs, "Write a Rust function that parses a comma separated list...
 - **Learn from my past chats** (Settings): the model reads up to 80 of your earlier messages from the saved conversations (12,000 characters at most) and proposes up to 10 notes as tick boxes; nothing is saved until you tick and save.
 - **Settings tab** (between Dashboard and Process Monitor): the default persona (editable, reset to the built-in one), the memory (list, click a note to edit, delete, add, the on/off switch). The persona button left the chat bar; the
   persona is now a default for every new chat, and a one-off role goes in the chat ("act as a software engineer and design this"). The built-in persona is shorter and no longer names Strata folders; it lists the tools.
+
+## 2026-11-01: a real browser for the model, inside the Shadow window
+
+- `mcp.json` now starts **Playwright's MCP server on the installed Chrome** (`@playwright/mcp`, `--browser chrome --headless`): the model navigates, reads a page as a structured text snapshot (every element with a ref), clicks,
+  types, fills forms, presses keys, waits and manages tabs. The server has 25 tools (~4,500 prompt tokens); `"allow"` in the config offers the model the 10 that matter; `"hints"` adds a line to a tool's description
+  ("navigate does not return the page: call browser_snapshot next"), which stopped the model wasting turns re-snapshotting and reading files for the page.
+- **The Browser pane** (chat view, right side; opens by itself on the first browser tool call; close with the cross, refresh with the arrow): the page as a picture that follows the model (`GET /v1/browser/screenshot`
+  calls the server's `browser_take_screenshot`, which `"allow"` keeps from the model but Shadow may call), the address, refreshed after each browser tool and every 4 s while a reply is written. Headless, so the pane is the only
+  view (remove `--headless` for a real Chrome window).
+- Tested in the chat page: "open Hacker News and tell me the top 3 stories": navigate, snapshot, then the right answer (titles, hosts and points) with the page visible in the pane. Slow the first time (the start of the prompt is
+  3,769 tokens with the browser tools, read once at ~85 tok/s, then cached; a page snapshot is ~3-4k tokens, ~45 s to read).
+- A browser server's results are capped at 12,000 characters (`MAX_MCP_OUTPUT_CHARS`); the agent loop allows 14 tool turns (was 6); the tool clip no longer cuts inside a multi-byte character.
+- MCP servers' processes (npx, node, Chrome) are put in a Windows job object that kills them when Shadow ends, however it ends (tested: 16 processes while running, 0 after Shadow was killed).
+- Not done: the model cannot *see* the screenshot (it reads the text snapshot); feeding the picture back to it, now that Shadow reads pictures, is possible (~300-1000 tokens a picture, ~4-12 s to read).

@@ -1,10 +1,23 @@
 {
   "mcpServers": {
+    "browser": {
+      "command": "npx",
+      "args": ["-y", "@playwright/mcp@latest", "--browser", "chrome", "--headless"],
+      "hints": {
+        "browser_navigate": "It does not return the page: call browser_snapshot next to read it.",
+        "browser_snapshot": "Returns the page as text, each element with a ref: use the ref with browser_click or browser_type."
+      },
+      "allow": [
+        "browser_navigate", "browser_snapshot", "browser_click", "browser_type", "browser_fill_form",
+        "browser_press_key", "browser_select_option", "browser_navigate_back", "browser_wait_for", "browser_tabs"
+      ]
+    },
     "time": {
       "command": "uvx",
       "args": ["mcp-server-time"]
     },
     "thinking": {
+      "disabled": true,
       "command": "npx",
       "args": ["-y", "@modelcontextprotocol/server-sequential-thinking"]
     },
