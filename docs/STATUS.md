@@ -1482,3 +1482,16 @@ It is now on by default (it wins; the half-precision tensor path is the one `--t
 At the **default 32k window** the same change reads 181 / 204 tok/s on the 3k prompt and a 25,260-token prompt in 141.7 s = **178.2 tok/s (was 173.7: +2.6%)**: there the pass is 768 rows (the lent room is smaller), so the fixed per-layer expert copy is a larger share and
 the long prompt's attention grows with length; the dense matmuls are a smaller part of the time. Next in the profile: `hc_down_inject_cols_fast_bf16` (14%), Q5_K / Q4_K / F32 dense (17%), the DeltaNet recurrence (17%).
 Hand-over for another AI: `docs/HANDOFF_tensor_core_dense_prompt_2026-11-02.json`.
+
+## 2026-11-02: tensor-core Q4_K and Q5_K dense projections (`mma_cols_q4_k`, `mma_cols_q5_k`): +7.1% at ctx 16k
+
+`Dec8<Q4K>` / `Dec8<Q5K>` (the same floats `Q4K::at` / `Q5K::at` compute, 8 weights a call from one 8-byte nibble load) with the same tensor-core skeleton; used by `mv_cols` under `--tensor-prompt` for those types with >= 16 tokens. `SHADOW_MMA_QK=0` turns them off.
+Bench, ctx 16,384, the 3,001-token prompt, 3 interleaved pairs (new first), 2 prompts each, total throughput; both arms already have `mma_cols_bf16`:
+
+| arm | prompt times (s) | total |
+|---|---|---|
+| `matvec_cols_q4_k/q5_k` (`SHADOW_MMA_QK=0`) | 12.7+11.3, 12.6+10.8, 12.6+10.9 | 18,006 tokens / 70.9 s = **254.0 tok/s** |
+| `mma_cols_q4_k/q5_k` | 11.8+10.1, 11.9+10.2, 12.0+10.2 | 18,006 / 66.2 s = **272.0 tok/s (+7.1%)** |
+
+Every pair favoured the new kernels (cold launch 236-239 -> 250-253, warm 266-277 -> 294-296). Correctness: the 7-question check is 6/7, the same as before; the one-question sanity prompt (a near tie that the fast modes already decide differently from `--exact` at some cache sizes) now answers "Fast" instead of "Open" at ctx 16k -
+the weights go through half precision as in the other `mma_cols_*` kernels, which changes the last digits. On by default. Since the session began the 3k prompt has gone 70 -> ~272 tok/s (the batch fix, BF16, Q4_K/Q5_K). Remaining in the profile: `hc_down_inject_cols_fast_bf16` (14%), F32 dense (6%), the DeltaNet recurrence (17%).

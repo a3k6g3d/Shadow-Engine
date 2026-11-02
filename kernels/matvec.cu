@@ -878,6 +878,44 @@ template <> struct Dec8<IQ3XXS> {
     }
 };
 
+// Q4_K / Q5_K: 8 weights i..i+8 of a row (inside one 32-weight sub-block), as `Q4K::at` / `Q5K::at` compute them.  The 8 nibbles are one 8-byte load.
+template <> struct Dec8<Q4K> {
+    static __device__ __forceinline__ void dec8(const u8* r, unsigned int i, float* o) {
+        const u8* b = r + (i / 256) * 144;
+        unsigned int e0 = i % 256, s = e0 / 32, c0 = e0 % 32;
+        u8 sc, mn;
+        q_scale_min_k4(b + 4, s, &sc, &mn);
+        float ds = __fmul_rn(qf16(b), (float) sc), dm = __fmul_rn(qf16(b + 2), (float) mn);
+        uint2 p = *(const uint2*) (b + 16 + (s / 2) * 32 + c0);
+        unsigned int sh = (s % 2) * 4;
+#pragma unroll
+        for (unsigned int k = 0; k < 8; k++) {
+            unsigned int w = k < 4 ? p.x : p.y;
+            unsigned int q = (w >> (8 * (k % 4) + sh)) & 0x0f;
+            o[k] = __fsub_rn(__fmul_rn(ds, (float) q), dm);
+        }
+    }
+};
+
+template <> struct Dec8<Q5K> {
+    static __device__ __forceinline__ void dec8(const u8* r, unsigned int i, float* o) {
+        const u8* b = r + (i / 256) * 176;
+        unsigned int e0 = i % 256, s = e0 / 32, c0 = e0 % 32;
+        u8 sc, mn;
+        q_scale_min_k4(b + 4, s, &sc, &mn);
+        float ds = __fmul_rn(qf16(b), (float) sc), dm = __fmul_rn(qf16(b + 2), (float) mn);
+        uint2 p = *(const uint2*) (b + 48 + (s / 2) * 32 + c0);
+        uint2 h = *(const uint2*) (b + 16 + c0);
+        unsigned int sh = (s % 2) * 4;
+#pragma unroll
+        for (unsigned int k = 0; k < 8; k++) {
+            unsigned int w = k < 4 ? p.x : p.y, hw = k < 4 ? h.x : h.y;
+            unsigned int q = ((w >> (8 * (k % 4) + sh)) & 0x0f) | (((hw >> (8 * (k % 4) + s)) & 1u) << 4);
+            o[k] = __fsub_rn(__fmul_rn(ds, (float) q), dm);
+        }
+    }
+};
+
 // BF16 weights: 8 of them are one 16-byte load (a row is cols * 2 bytes, cols a multiple of 64)
 template <> struct Dec8<BF16> {
     static __device__ __forceinline__ void dec8(const u8* r, unsigned int i, float* o) {
@@ -1000,6 +1038,8 @@ extern "C" __global__ void mma_cols_iq2_s(const u8* w, const float* x, unsigned 
 extern "C" __global__ void mma_grouped_iq2_s(const u64* wtab, const unsigned int* gtab, const float* x, unsigned int xs, float* y, unsigned int ys, unsigned int rows, unsigned int cols) { mma_grouped<IQ2S>(wtab, gtab, x, xs, y, ys, rows, cols); }
 extern "C" __global__ void mma_cols_iq3_xxs(const u8* w, const float* x, unsigned int xs, float* y, unsigned int ys, unsigned int rows, unsigned int cols, unsigned int m) { mma_cols<IQ3XXS>(w, x, xs, y, ys, rows, cols, m); }
 extern "C" __global__ void mma_grouped_iq3_xxs(const u64* wtab, const unsigned int* gtab, const float* x, unsigned int xs, float* y, unsigned int ys, unsigned int rows, unsigned int cols) { mma_grouped<IQ3XXS>(wtab, gtab, x, xs, y, ys, rows, cols); }
+extern "C" __global__ void mma_cols_q4_k(const u8* w, const float* x, unsigned int xs, float* y, unsigned int ys, unsigned int rows, unsigned int cols, unsigned int m) { mma_cols<Q4K>(w, x, xs, y, ys, rows, cols, m); }
+extern "C" __global__ void mma_cols_q5_k(const u8* w, const float* x, unsigned int xs, float* y, unsigned int ys, unsigned int rows, unsigned int cols, unsigned int m) { mma_cols<Q5K>(w, x, xs, y, ys, rows, cols, m); }
 extern "C" __global__ void mma_cols_bf16(const u8* w, const float* x, unsigned int xs, float* y, unsigned int ys, unsigned int rows, unsigned int cols, unsigned int m) { mma_cols<BF16>(w, x, xs, y, ys, rows, cols, m); }
 extern "C" __global__ void mma_cols_iq3_s(const u8* w, const float* x, unsigned int xs, float* y, unsigned int ys, unsigned int rows, unsigned int cols, unsigned int m) { mma_cols<IQ3S>(w, x, xs, y, ys, rows, cols, m); }
 extern "C" __global__ void mma_grouped_iq3_s(const u64* wtab, const unsigned int* gtab, const float* x, unsigned int xs, float* y, unsigned int ys, unsigned int rows, unsigned int cols) { mma_grouped<IQ3S>(wtab, gtab, x, xs, y, ys, rows, cols); }
