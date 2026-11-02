@@ -1425,3 +1425,23 @@ The CPU-experts experiment (entry above) still stands: its premises fail; its ba
   (`--tail-skip`, `--tensor-prompt`, ...) decide differently as the cache size changes; `--exact` answers it correctly at both windows. The exact-vs-fast gap (1 of 7) is too small a sample to size.
 - **Timing hooks for the CPU-experts question** (what removing copies would buy; a prompt path whose critical path is the GPU gains nothing from fewer copies): `SHADOW_STAGE_COPY_EVERY=k` copies only every k-th staged expert (output wrong, timing only). Trace at 2,048-token passes: the host spends ~6 ms a layer queuing, i.e. the GPU, not the host or the copies, sets the pace.
   The k = 1 / 4 / 16 runs **did not complete**: a Strata server (started 15:21 by the user, 28.8 GiB, GPU 99%) was running and the RAM floor stopped the Shadow launch (correctly: "KILLED at 2.93 GiB available"). Not measured yet; no number is claimed.
+
+## 2026-11-02: CPU experts on the prompt path (the spec of 2026-11-01): closed without building it - the copies are not on the critical path
+
+With Strata stopped (it was running and had the GPU and 28.8 GiB), the prompt baseline is **192-212 tok/s** (3,001 tokens, ctx 16,384, 4 runs; it was 140-208 while other things ran).
+Skipping or thinning the staged copies (`SHADOW_STAGE_NO_COPY`, `SHADOW_STAGE_COPY_EVERY=k`) fed the router garbage, NaN logits, `route()` panicked: no number from that. The direct measure instead, `SHADOW_LTIME=1 SHADOW_REPORT=1`
+with new points in `moe_staged` (event timestamps on the GPU's default stream; per batched pass, averaged over the prompt's passes):
+
+| part of a pass | ms | share |
+|---|---|---|
+| DeltaNet segment (graph) | 1,966 + 336 | ~47% |
+| attention layers | 1,082 | ~26% |
+| routed experts, resident in the cache | 559 | 13% |
+| routed experts, staged (copied) | 274 | 6.5% |
+| **GPU stalled waiting for the expert copy** | **58** | **1.4%** |
+
+So the copy engine and PCIe are **hidden behind the GPU's own work**: the GPU waits 1.4% of a pass for them. Removing *every* weight copy would gain at most ~1.4%; the spec moves 1-3 of ~400 experts a layer: ~0.01%. That is below the noise floor (0.8%), "a tie is a loss",
+and with the earlier numbers (a CPU expert at 32 tokens costs ~20x its copy; file-only experts are mostly not in the page cache) the design cannot win on this path. **Not built; the 4 arms were not run.** The measuring hooks stay (off by default).
+
+Where the prompt time is: ~73% in the DeltaNet linear-attention layers and the full-attention layers, ~20% in the experts, ~1.4% waiting on copies. The ~7x gap to Strata's 1,376 tok/s prompt rate is in those two attention kernels at 2,048-row passes, not in expert movement.
+That is the next thing to look at (see the DeltaNet "delta segment" and the sparse-indexer attention paths), as its own experiment.

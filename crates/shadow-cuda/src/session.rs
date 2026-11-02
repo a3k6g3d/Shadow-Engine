@@ -2678,8 +2678,11 @@ impl<'c, 'm> GpuSession<'c, 'm> {
         self.upload_to(self.bb.gtab.ptr, &plan.bytes);
         let t_plan = t_start.elapsed();
         self.routed_grouped(&plan, 0, 0, m, infos);
+        self.lt_point("staged: resident experts done");
         self.ctx.stream_wait_event(None, &self.sp.as_ref().unwrap().events[p]).unwrap();
+        self.lt_point("staged: GPU stalled on the copy");
         self.routed_grouped(&plan, 1, 0, m, infos);
+        self.lt_point("staged: copied experts done");
         let t_launch = t_start.elapsed();
         let bb = &self.bb;
         self.k2("moe_combine_qwen_rows", (h as u32).div_ceil(256), m as u32, 256, &[
