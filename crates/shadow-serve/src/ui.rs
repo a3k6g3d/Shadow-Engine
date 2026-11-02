@@ -871,6 +871,8 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
     .menu-pill-btn:hover { background: var(--surface-hover); color: var(--text); border-color: transparent; }
     .menu-pill-btn.active-state { border-color: transparent; }
     #queue-bar, #attach-tray { margin-bottom: 0.15rem; }
+    .retry-btn { margin-left: 0.6rem; background: var(--accent); color: #fff; border: none; border-radius: 0.4rem; padding: 0.15rem 0.7rem; cursor: pointer; font-size: 0.8rem; }
+    .retry-btn:hover { background: var(--accent-hover); }
     /* a reply (or a tool) in progress throbs: it has not hung; a stopped engine turns it red */
     @keyframes throb {
       0%, 100% { box-shadow: 0 0 0 0 rgba(99, 102, 241, 0); border-color: var(--border); }
@@ -1721,10 +1723,15 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
       return [`The server answered ${status}.`, msg];
     }
 
+    let resumeOnly = false;
+    let retryAction = null;
+    function retryFailed() { if (retryAction && !isGenerating) retryAction(); }
     async function sendMessage() {
-      const text = inputEl.value.trim();
-      if (!text && !attachments.length) return;
-      if (isGenerating) { enqueueMessage(text); return; } // a reply is being written: this message waits its turn
+      const resume = resumeOnly; // Retry: ask again from the conversation as it stands, with no new message
+      resumeOnly = false;
+      const text = resume ? '' : inputEl.value.trim();
+      if (!resume && !text && !attachments.length) return;
+      if (isGenerating) { if (!resume) enqueueMessage(text); return; } // a reply is being written: this message waits its turn
       if (modelState === 'loading') {
         timingInfo.textContent = 'The model is still loading - your message is still in the box.';
         return;
@@ -1737,6 +1744,8 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
       sendBtn.textContent = 'Queue';
       stopBtn.style.display = 'flex';
       currentAbortController = new AbortController();
+      const sentAtts = attachments.slice();
+      if (!resume) {
       inputEl.value = '';
       inputEl.style.height = 'auto';
 
@@ -1751,6 +1760,7 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
       userRow.className = 'msg-row user';
       userRow.innerHTML = `<div class="avatar">U</div><div class="bubble">${escapeHtml(text).replace(/\n/g, '<br>')}${sentFiles.length ? `<div class="att-note">${sentFiles.map(n => '📎 ' + escapeHtml(n)).join(' &nbsp; ')}</div>` : ''}</div>`;
       messagesEl.appendChild(userRow);
+      }
 
       const t0 = performance.now();
       let loopTurns = 0;
@@ -1824,7 +1834,8 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
 
           if (!response.ok) {
             const [head, detail] = friendlyError(response.status, await response.text());
-            msgContent.innerHTML = `<div class="msg-error">${escapeHtml(head)}<small>${escapeHtml(detail)}</small></div>`;
+            retryAction = () => { resumeOnly = true; sendMessage(); };
+            msgContent.innerHTML = `<div class="msg-error">${escapeHtml(head)}<small>${escapeHtml(detail)}</small> <button class="retry-btn" onclick="retryFailed()">Retry</button></div>`;
             failed = true;
             break;
           }
@@ -1893,9 +1904,16 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
 
           // the server's error mid-stream (e.g. a picture it could not encode): shown in place of the reply, the question taken back
           if (streamError) {
-            msgContent.innerHTML = `<div class="msg-error">${escapeHtml(streamError)}</div>`;
             thinkBlock.style.display = 'none';
-            history.pop();
+            if (loopTurns === 1 && !resume) {
+              // the question itself failed: take it back (it goes into the box again with Retry), as if it had not been sent
+              history.pop();
+              retryAction = () => { inputEl.value = text; attachments.push(...sentAtts); renderTray(); sendMessage(); };
+            } else {
+              // part-way through an agent turn: what was done stays in the conversation, and Retry asks for the next step again
+              retryAction = () => { resumeOnly = true; sendMessage(); };
+            }
+            msgContent.innerHTML = `<div class="msg-error">${escapeHtml(streamError)} <button class="retry-btn" onclick="retryFailed()">Retry</button></div>`;
             failed = true;
             break;
           }
@@ -1990,7 +2008,8 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
             history.push({ role: 'assistant', content: rawContent });
             break;
           }
-          msgContent.innerHTML = `<div class="msg-error">Lost the connection to the server.<small>${escapeHtml(err.message)} - is shadow serve still running?</small></div>`;
+          retryAction = () => { resumeOnly = true; sendMessage(); };
+          msgContent.innerHTML = `<div class="msg-error">Lost the connection to the server.<small>${escapeHtml(err.message)} - is shadow serve still running?</small> <button class="retry-btn" onclick="retryFailed()">Retry</button></div>`;
           failed = true;
           break;
         }
@@ -2557,12 +2576,12 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
         (sendQueue.length && queuePaused ? `<div class="q-note">Queue paused (the last reply was stopped or failed).<button onclick="resumeQueue()">Resume</button></div>` : '');
     }
     function dropQueued(i) { sendQueue.splice(i, 1); renderQueue(); }
-    function resumeQueue() { queuePaused = false; if (!isGenerating) runQueue(); else renderQueue(); }
+    function resumeQueue() { queuePaused = false; if (!isGenerating) runQueue(true); else renderQueue(); }
     // after a reply: the next queued message, unless the reply was stopped or failed (then the queue waits for Resume)
-    function runQueue() {
+    function runQueue(force) {
       if (!sendQueue.length || isGenerating) { renderQueue(); return; }
       const t = timingInfo.textContent || '';
-      if (queuePaused || t.startsWith('Generation stopped') || t.startsWith('Failed')) { queuePaused = true; renderQueue(); return; }
+      if (!force && (queuePaused || t.startsWith('Generation stopped') || t.startsWith('Failed'))) { queuePaused = true; renderQueue(); return; }
       const q = sendQueue.shift();
       renderQueue();
       attachments.splice(0, attachments.length, ...q.atts);

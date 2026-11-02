@@ -1363,3 +1363,12 @@ Single-prompt runs, "Write a Rust function that parses a comma separated list...
   64k: 695, 49.5 (-5.5%)**. Default is now **32,768**; `--ctx` (or the desktop app's extra flags) changes it. A 20,802-token prompt reads in 287 s at that window (~72 tok/s: reading, not the window, is the slow part).
 - The page now trims by itself: when the conversation reaches 85% of the window's room it cuts the oldest tool outputs (over 600 characters) to a one-line stub, newest kept, until it is at 60%; the chat goes on instead of stopping.
 - Not done: the window as a setting in the page (it is a start flag), 16-bit K/V (would halve the cost per token), K/V in host RAM (attention reads only 2,048 positions a token, so it could live there).
+
+## 2026-11-01: Resume and Retry; the staged-expert panic
+
+- **Resume did nothing** when a queued message waited after a failed reply: it cleared the pause, then the queue runner saw the status text "Failed ..." and paused it again. `resumeQueue()` now forces the send.
+  **Retry**: a failed reply (a server error in the stream, an HTTP error, a lost connection) shows a Retry button. If the question itself failed it is taken back and Retry sends it again with its attachments; if the failure came part-way
+  through an agent turn, what was done stays and Retry asks for the next step again (`resumeOnly`, no new user message). Tested: a simulated engine fault, Retry (answered), a paused queue with status "Failed", Resume (sent and answered).
+- The engine's net (the previous entry) caught another panic on a very long prompt (~18,600 new tokens): `a staged expert in neither the RAM tier nor the read-ahead` (`stage_copy`). Likely cause: the read-ahead buffers are sized at the start of a
+  long prompt for the file-only experts a layer has *then*, but the RAM tier changes while the prompt is read (promotions, evictions), so a layer can need more slots later and `stage_pipe_read` cut its list short.
+  Now the half being filled gets a bigger pinned buffer when a layer needs it. Not reproduced here (a 20,802-token prompt read fine before and after), so this is a fix for a probable cause, not a confirmed one; if it recurs the message tells.

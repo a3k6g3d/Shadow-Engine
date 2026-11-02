@@ -2551,7 +2551,15 @@ impl<'c, 'm> GpuSession<'c, 'm> {
             .filter(|&e| !self.cache.map.contains_key(&(l, e)) && !self.ram.at.contains_key(&(l, e))).collect();
         let sp = self.sp.as_mut().unwrap();
         let p = l & 1;
-        let want = &want[..want.len().min(sp.slots)];
+        // The buffers were sized for the file-only experts a layer had when the pipeline was set up; the RAM tier changes while a long prompt is read
+        // (promotions, evictions), so a layer can have more now.  This half gets a bigger buffer (it is free: what it held was copied out, `stage_pipe_wait`
+        // above); cutting `want` short would leave experts in neither place and `stage_copy` would panic.
+        if want.len() * stride > sp.bufs[p].len() {
+            if let Ok(r) = PinnedRegion::new(self.ctx, want.len() * stride) {
+                sp.bufs[p] = r;
+            }
+        }
+        let want = &want[..want.len().min(sp.bufs[p].len() / stride)];
         sp.layer[p] = l;
         sp.at[p] = want.iter().enumerate().map(|(s, &e)| (e, s)).collect();
         if want.is_empty() {
