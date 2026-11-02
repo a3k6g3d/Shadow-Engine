@@ -2614,7 +2614,18 @@ impl<'c, 'm> GpuSession<'c, 'm> {
             lens.push(total);
             n += 1;
         }
-        self.upload_batch(&mut dsts, &mut srcs, &host_srcs, &mut lens, stream);
+        // timing experiment only (`SHADOW_STAGE_COPY_EVERY=k`): every k-th expert is copied, the rest keep whatever the slot held, so the output is wrong
+        if let Some(k) = std::env::var("SHADOW_STAGE_COPY_EVERY").ok().and_then(|v| v.parse::<usize>().ok()).filter(|&k| k > 1) {
+            let keep = |i: usize| i % k == 0;
+            let mut i = 0;
+            dsts.retain(|_| { i += 1; keep(i - 1) });
+            i = 0; srcs.retain(|_| { i += 1; keep(i - 1) });
+            i = 0; lens.retain(|_| { i += 1; keep(i - 1) });
+            i = 0; let host_srcs: Vec<u64> = host_srcs.into_iter().filter(|_| { i += 1; keep(i - 1) }).collect();
+            self.upload_batch(&mut dsts, &mut srcs, &host_srcs, &mut lens, stream);
+        } else {
+            self.upload_batch(&mut dsts, &mut srcs, &host_srcs, &mut lens, stream);
+        }
         self.expert_uploads += 3 * n as usize;
         let sp = self.sp.as_mut().unwrap();
         sp.events[p].record(Some(&self.copy_stream)).unwrap();
