@@ -1372,3 +1372,21 @@ Single-prompt runs, "Write a Rust function that parses a comma separated list...
 - The engine's net (the previous entry) caught another panic on a very long prompt (~18,600 new tokens): `a staged expert in neither the RAM tier nor the read-ahead` (`stage_copy`). Likely cause: the read-ahead buffers are sized at the start of a
   long prompt for the file-only experts a layer has *then*, but the RAM tier changes while the prompt is read (promotions, evictions), so a layer can need more slots later and `stage_pipe_read` cut its list short.
   Now the half being filled gets a bigger pinned buffer when a layer needs it. Not reproduced here (a 20,802-token prompt read fine before and after), so this is a fix for a probable cause, not a confirmed one; if it recurs the message tells.
+
+## 2026-11-02: "move compute to the data" for the prompt path - not built; the premises were measured first, and they fail
+
+Spec: `docs/EXPERIMENT_SPEC_2026-11-01.json` (CPU computes 1-3 cache-miss experts a layer from the mapped file with the AVX-512 kernel; no host join; those experts leave the copy set; 4 arms x 3 interleaved fresh-launch runs, scored by total throughput).
+Nothing was built; the two numbers the idea rests on were measured instead (`cargo run --release -p shadow-model --example cpu_expert_tokens_bench`, AVX-512 kernel untouched, 14 threads, best of 12, one expert, T tokens through it):
+
+- **A prompt chunk sends many tokens to each expert** (2,048 tokens x 10 experts over ~400 per layer = ~32 tokens each, where decode has 1). The kernel streams the weights per (expert, token) pair, so the cost is linear in tokens:
+  layer 5, 32 tokens: **3.06 ms an expert (0.096 ms a token)**; layer 40, 32 tokens: **4.36 ms**. The PCIe copy it would replace is **0.13-0.18 ms**. A CPU expert is **~20-25x dearer than the copy** at prompt batch sizes
+  (at T=1, decode, it is as fast as the copy - which is why the decode hybrid wins and this does not).
+- **The page-cache premise** (a warm file cache serving the missing experts at DRAM speed): with the 36 GiB tier pinned and ~10 GiB free (63.8 GiB total; floor 3 GiB), most file-only experts are *not* in the page cache; they come from NVMe at ~3.5 GB/s.
+  Taking 1-3 of ~400 experts a layer off the copy set saves under 1% of a chunk even if the CPU work were perfectly hidden, and the CPU work (3-4 ms an expert, x1-3 a layer) is longer than the whole layer's copy time.
+- Verdict: as specced it cannot clear the 0.8% noise floor ("a tie is a loss"), so the 4-arm bench was **not run** and no code path was added (off by default would have been the only option anyway). The spec's own odds were ~40%; this lowers them.
+  The bench example stays in the tree as the measurement. Would change the answer: a prompt-batched CPU kernel (weights read once for all T tokens, so ~0.1 ms of weight traffic + T x compute) - that is a kernel change, which the spec rules out.
+
+**Found while setting the baseline: prompt reading is 3x slower today than on 2026-11-01.** The same ~3,000-token prompt reads at **65-74 tok/s** at every length from 3.0k to 20.8k tokens (3,001 tokens in 40.7 s = 73.8), against 186-229 tok/s measured earlier on Nov 1.
+The Oct 31 commit cd8be97 (built and run in a separate worktree) is just as slow now, so it is **not the code**, not `--ctx`, not the VRAM reserve, not MCP. During a read the GPU shows 100% utilisation but only 77-90 W of 250 W, clocks 2910 MHz, PCIe Gen4 x16,
+memory utilisation 6-10%, no other compute process. Changed on the machine meanwhile: a Windows Insider cumulative update (KB5127935, installed 2026-11-01; boot 10:23 that morning), nothing seen in the driver (617.42, 2026-09-29).
+Cause **not found**. Until a valid prompt baseline is re-established (a reboot, or finding what changed), no prompt-path A/B is trustworthy; decode (52 tok/s) was not re-measured.

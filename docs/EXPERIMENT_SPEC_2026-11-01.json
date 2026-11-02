@@ -1,0 +1,29 @@
+{
+  "project": "Shadow (Rust MoE inference engine, repo J:\\Shadow on this PC)",
+  "written": "2026-11-01, from the session that agreed to run it",
+  "task": "Port Avalon's 'move compute to the data' architecture onto Shadow's existing pipeline, then bench it.",
+  "machine_facts": {
+    "gpu": "RTX 5070 12.2 GB, expert cache 4.42 GiB (bigger caches measured as losses: 4.8 -5%, 5.0 -10%)",
+    "cpu": "i7-11700K, 8C/16T, HAS full AVX-512 (F/BW/VL/VNNI/VBMI/VBMI2) - verified via CPUID family 6 model 167 and IsProcessorFeaturePresent(0x21)=1",
+    "dram": "DDR4-2933 ~30 GB/s - this is the wall; copy engine achieves 13 GB/s, link can do 23-28",
+    "ram": "64 GB, 36 GiB pinned tier, 3 GiB pinned floor (machine froze hard at 0.4 GiB free), ~7 GiB free now",
+    "model": "89 GiB IQ3_S GGUF, served from disk via mmap; the OS file cache holds ~50 GiB of it and serves buffered reads at ~9.5 GB/s (memory speed); unbuffered reads cap at 3.5 GB/s (drive ceiling)"
+  },
+  "design_change": [
+    "1. CPU computes cache-miss experts straight from the mmap'd file (page cache -> CPU registers = ONE DRAM read), replacing the current path where bytes cross DRAM 3-4 times (page cache -> pinned read, -> write, pinned -> GPU).",
+    "2. The CPU kernel already exists and is fast enough: crates/shadow-model/src/cpu_expert_avx512.rs, 0.088-0.136 ms/expert, 17-21 GB/s on 14 threads, measured on this machine. Do NOT optimize the kernel; it is not the problem.",
+    "3. Output: CPU writes the expert's activation row into the pinned region; the copy path brings that small row up via its existing completion mechanism. NO host join - the previous attempts' fatal flaw.",
+    "4. Those experts are excluded from the copy set (the big weight copy is what disappears); only the small output row is copied.",
+    "5. The CPU job is submitted as soon as the router's tops are known (the 'pre' group's output), so CPU time hides under the GPU's resident-expert work."
+  ],
+  "why_the_previous_attempts_failed": "STATUS.md records three failed attempts (AVX2 hybrid, AVX-512 exact, CPU-in-verify). All three computed FROM THE PINNED BYTES - so they saved no DRAM traffic (the bytes had already crossed DRAM 3x to get there), and the host waited for the pool's completion before the combine (the join), which serialized exactly the overlap the design needed. The GPU-wait reduction was measured and came exactly as predicted (58 -> 46 -> 39 ms per pass) - the kernel did its job - but the pass stayed at 104 ms because the CPU time moved into the host's join. End-to-end losses: -2.5% to -13.5%. This new design fixes exactly those two structural problems: one DRAM read instead of three, and no host join.",
+  "net_dram_math_per_expert_moved_to_cpu": "old GPU path: 3 big DRAM passes (4.5 MB); new CPU path: 1 big read (1.5 MB) + 2 small passes for the 3 KB output row. ~3x traffic reduction for bytes moved to the CPU.",
+  "bench_protocol": "4 arms x 3 runs, interleaved, one fresh launch per run, warm turns only, scored by TOTAL throughput (not the median); noise floor 0.8% median / 2.0% p90 - anything under ~1% is a tie and a tie is a loss. Arms: baseline (no CPU experts), 1 expert/layer, 2 experts/layer, 3 experts/layer, all on the AVX-512 kernel, 14 threads.",
+  "expected_cost": "one full build + ~40 min per bench round + server restarts (36 s load, ~30 s tier refill)",
+  "honest_odds": "about 40% it wins. The architecture is right and the kernel is fast enough; the risks are this PC's DRAM (30 GB/s vs Avalon's 33-35), the cache (4.4 GiB vs Avalon's 9-14), and the 3 GiB pinned floor - the same three walls the notes kept hitting separately.",
+  "rules": [
+    "the tree's discipline: measure, and what loses stays opt-in (off by default); every experiment gets a dated STATUS.md entry with its measured numbers, wins and losses alike",
+    "do not change the kernel; do not change the pinned tier or the floor; do not touch the decode path (decode is already a win: 52.1 vs Strata's 47.7)",
+    "the target is the prompt path only (Shadow ~130-226 tok/s vs Strata 1,376 - the ~10x gap is why this experiment exists)"
+  ]
+}
