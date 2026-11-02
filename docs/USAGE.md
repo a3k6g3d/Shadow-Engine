@@ -57,7 +57,7 @@ Pictures: the chat page's 📎 button (or drop / paste) attaches a picture or a 
 encoder is `bin/strata-vision.exe` with `models/Qwen3.8-Flash-Next.mmproj-f16.gguf` (`SHADOW_VISION_EXE` / `SHADOW_MMPROJ` to point elsewhere); it needs ~1.8 GiB of
 free RAM above the floor while it runs (docs/STATUS.md, 2026-11-01).
 
-Open `http://127.0.0.1:8081/` for the chat UI and `/monitor` for the telemetry dashboard (CPU, GPU load, temperature,
+Open `http://127.0.0.1:8081/` for the chat UI and its Dashboard tab (`/#dash`; `/monitor` goes there) for the telemetry (CPU, GPU load, temperature,
 RAM, expert-cache hit rates, memory tiers).
 
 ## Flags

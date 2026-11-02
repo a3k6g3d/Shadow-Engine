@@ -788,105 +788,6 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
       color: #fff;
     }
 
-    /* Process Monitor View - Strictly separate tab */
-    #monitor-panel {
-      width: 100%;
-      height: 100%;
-      min-height: 0;
-      overflow-y: auto;
-      padding: 1.5rem;
-      gap: 1.25rem;
-    }
-    .monitor-grid {
-      max-width: 1200px;
-      width: 100%;
-      margin: 0 auto;
-      display: grid;
-      grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
-      gap: 1rem;
-    }
-    .mon-card {
-      background: var(--surface);
-      border: 1px solid var(--border);
-      border-radius: 12px;
-      padding: 1.15rem;
-      display: flex;
-      flex-direction: column;
-      gap: 0.85rem;
-      box-shadow: 0 4px 12px rgba(0, 0, 0, 0.25);
-    }
-    .mon-card-header {
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-    }
-    .mon-card-title {
-      font-size: 0.95rem;
-      font-weight: 700;
-      display: flex;
-      align-items: center;
-      gap: 0.5rem;
-      color: var(--text);
-    }
-    .mon-card-badge {
-      font-size: 0.72rem;
-      padding: 0.15rem 0.5rem;
-      border-radius: 9999px;
-      background: var(--surface-hover);
-      border: 1px solid var(--border);
-      color: var(--text-muted);
-    }
-    .mon-stat-big {
-      display: flex;
-      align-items: baseline;
-      gap: 0.4rem;
-    }
-    .mon-big-val {
-      font-size: 1.85rem;
-      font-weight: 800;
-      color: #fff;
-      font-variant-numeric: tabular-nums;
-    }
-    .mon-big-unit {
-      font-size: 0.9rem;
-      color: var(--text-muted);
-      font-weight: 500;
-    }
-    .progress-bar-wrap {
-      width: 100%;
-      height: 7px;
-      background: var(--bg);
-      border-radius: 9999px;
-      overflow: hidden;
-      border: 1px solid var(--border-subtle);
-    }
-    .progress-bar {
-      height: 100%;
-      background: var(--accent);
-      border-radius: 9999px;
-      transition: width 0.3s ease;
-    }
-    .progress-bar.cyan { background: var(--cyan); }
-    .progress-bar.warning { background: var(--warning); }
-    .progress-bar.success { background: var(--success); }
-
-    .stat-rows {
-      display: flex;
-      flex-direction: column;
-      gap: 0.45rem;
-      font-size: 0.8rem;
-    }
-    .stat-row {
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      color: var(--text-muted);
-    }
-    .stat-row strong {
-      color: var(--text);
-      font-variant-numeric: tabular-nums;
-    }
-
     /* MoE Memory Hierarchy Diagram */
     .tier-diagram-wrap {
       max-width: 1200px;
@@ -1000,9 +901,6 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
         <button class="nav-tab" id="tab-settings" onclick="switchView('settings')">
           <span>⚙</span> Settings
         </button>
-        <button class="nav-tab" id="tab-monitor" onclick="switchView('monitor')">
-          <span>📊</span> Process Monitor
-        </button>
       </div>
     </div>
     <div class="stats-bar">
@@ -1035,7 +933,6 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
           <button class="dash-btn" id="dash-last" onclick="openLastChat()">Resume last chat</button>
           <button class="dash-btn" onclick="switchView('settings')">Settings</button>
           <button class="dash-btn" id="dash-tools" onclick="toggleTools(); dashRefresh()">Windows tools</button>
-          <button class="dash-btn" onclick="switchView('monitor')">Process monitor</button>
         </div>
       </div>
       <div class="dash-grid">
@@ -1043,6 +940,7 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
           <h3>Engine <span class="tag" id="d-state">--</span></h3>
           <div class="big" id="d-model" style="font-size:1.05rem;word-break:break-all">--</div>
           <div class="kv"><span>Uptime</span><b id="d-uptime">--</b></div>
+          <div class="kv"><span>Process ID</span><b id="d-pid">--</b></div>
           <div class="kv"><span>Speculative decoding</span><b id="d-spec">--</b></div>
           <div class="kv"><span>Requests answered</span><b id="d-reqs">--</b></div>
           <div class="kv"><span>Context in use</span><b id="d-ctx">--</b></div>
@@ -1062,6 +960,8 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
           <div class="kv"><span>VRAM</span><b id="d-vram">--</b></div>
           <div class="bar"><i id="d-vrambar" style="width:0"></i></div>
           <div class="kv"><span>Temperature</span><b id="d-temp">--</b></div>
+          <div class="kv"><span>Memory controller busy</span><b id="d-memctl">--</b></div>
+          <div class="kv"><span>Free VRAM</span><b id="d-vramfree">--</b></div>
         </div>
         <div class="dcard">
           <h3>Expert tiers <span class="tag">where the model's experts live</span></h3>
@@ -1071,6 +971,8 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
           <div class="kv"><span>Misses served from RAM / drive</span><b id="d-served">--</b></div>
           <div class="bar"><i class="b" id="d-ramserved" style="width:0"></i><i class="c" id="d-fileserved" style="width:0"></i></div>
           <div class="kv"><span>Expert cache</span><b id="d-slots">--</b></div>
+          <div class="kv"><span>VRAM cache hits / misses</span><b id="d-hitmiss">--</b></div>
+          <div class="kv"><span>Misses read from RAM / drive</span><b id="d-servedn">--</b></div>
         </div>
         <div class="dcard">
           <h3>CPU <span class="tag" id="d-cputag">--</span></h3>
@@ -1088,6 +990,7 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
           <div class="big" id="d-ramfree">--<small>GiB free</small></div>
           <canvas class="spark" id="c-ram"></canvas>
           <div class="kv"><span>Shadow's working set</span><b id="d-ws">--</b></div>
+          <div class="kv"><span>RAM in use (whole PC)</span><b id="d-ramused">--</b></div>
         </div>
         <div class="dcard">
           <h3>Conversations <span class="tag" id="d-chatcount">--</span></h3>
@@ -1249,136 +1152,6 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
       <div class="bp-status" id="bp-status">Shadow's browser</div>
     </aside>
 
-    <!-- VIEW: PROCESS MONITOR (Separate Tab Only) -->
-    <div class="view-panel" id="monitor-panel">
-      <div class="monitor-grid">
-        <!-- CPU Card -->
-        <div class="mon-card">
-          <div class="mon-card-header">
-            <div class="mon-card-title"><span>⚡</span> CPU Usage</div>
-            <span class="mon-card-badge" id="cpu-cores-badge">-- Cores</span>
-          </div>
-          <div class="mon-stat-big">
-            <span class="mon-big-val" id="cpu-proc-val">0.0%</span>
-            <span class="mon-big-unit">Process (<span id="cpu-proc-cores">0.0</span> cores • Sys: <span id="cpu-sys-val">0.0%</span>)</span>
-          </div>
-          <div class="progress-bar-wrap">
-            <div class="progress-bar" id="cpu-bar" style="width: 0%;"></div>
-          </div>
-          <div class="stat-rows">
-            <div class="stat-row"><span>Shadow Process CPU</span><strong id="cpu-proc-txt">0.0%</strong></div>
-            <div class="stat-row"><span>Overall System CPU</span><strong id="cpu-sys-txt">0.0%</strong></div>
-            <div class="stat-row"><span>Active CPU Cores</span><strong id="cpu-cores-used-txt">0.0 / --</strong></div>
-            <div class="stat-row"><span>Logical Cores Total</span><strong id="cpu-cores-txt">--</strong></div>
-          </div>
-        </div>
-
-        <!-- GPU & VRAM Card (Real NVML Compute Usage + VRAM) -->
-        <div class="mon-card">
-          <div class="mon-card-header">
-            <div class="mon-card-title"><span>🎮</span> GPU Compute & VRAM</div>
-            <span class="mon-card-badge" id="gpu-device-badge">NVIDIA GPU</span>
-          </div>
-          <div class="mon-stat-big">
-            <span class="mon-big-val" id="gpu-util-val">0.0%</span>
-            <span class="mon-big-unit">Compute (VRAM: <span id="vram-used-val">--</span> / <span id="vram-total-val">-- GiB</span>)</span>
-          </div>
-          <div class="progress-bar-wrap">
-            <div class="progress-bar cyan" id="gpu-bar" style="width: 0%;"></div>
-          </div>
-          <div class="stat-rows">
-            <div class="stat-row"><span>GPU Compute Engine</span><strong id="gpu-util-txt">0.0%</strong></div>
-            <div class="stat-row"><span>VRAM Allocation</span><strong id="vram-used-total-txt">-- / -- GiB</strong></div>
-            <div class="stat-row"><span>GPU Temperature</span><strong id="gpu-temp-txt">-- °C</strong></div>
-            <div class="stat-row"><span>Memory Controller Activity</span><strong id="gpu-mem-txt">0.0%</strong></div>
-            <div class="stat-row"><span>Free VRAM</span><strong id="vram-free-txt">-- GiB</strong></div>
-            <div class="stat-row"><span>Expert VRAM Slots</span><strong id="vram-slots-txt">--</strong></div>
-            <div class="stat-row"><span>VRAM Cache Hit Rate</span><strong id="vram-hit-rate-txt">--%</strong></div>
-          </div>
-        </div>
-
-        <!-- RAM Card -->
-        <div class="mon-card">
-          <div class="mon-card-header">
-            <div class="mon-card-title"><span>🧠</span> System Memory (RAM)</div>
-            <span class="mon-card-badge" id="ram-load-badge">--% Load</span>
-          </div>
-          <div class="mon-stat-big">
-            <span class="mon-big-val" id="ram-used-val">--</span>
-            <span class="mon-big-unit">/ <span id="ram-total-val">-- GiB</span></span>
-          </div>
-          <div class="progress-bar-wrap">
-            <div class="progress-bar warning" id="ram-bar" style="width: 0%;"></div>
-          </div>
-          <div class="stat-rows">
-            <div class="stat-row"><span>Shadow Working Set</span><strong id="ram-proc-ws-txt">-- GiB</strong></div>
-            <div class="stat-row"><span>Pinned Tier (Hot Cache)</span><strong id="ram-pinned-txt">-- GiB</strong></div>
-            <div class="stat-row"><span>Available System RAM</span><strong id="ram-avail-txt">-- GiB</strong></div>
-          </div>
-        </div>
-
-        <!-- Engine & Process Card -->
-        <div class="mon-card">
-          <div class="mon-card-header">
-            <div class="mon-card-title"><span>⚙</span> Shadow Engine</div>
-            <span class="mon-card-badge" id="engine-pid-badge">PID: --</span>
-          </div>
-          <div class="mon-stat-big">
-            <span class="mon-big-val" id="engine-speed-val">0.0</span>
-            <span class="mon-big-unit">tok/s decode</span>
-          </div>
-          <div class="stat-rows">
-            <div class="stat-row"><span>Active Model</span><strong id="engine-model-txt" style="max-width: 170px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">--</strong></div>
-            <div class="stat-row"><span>Uptime</span><strong id="engine-uptime-txt">--</strong></div>
-            <div class="stat-row"><span>Total Requests</span><strong id="engine-requests-txt">0</strong></div>
-            <div class="stat-row"><span>Tokens Generated</span><strong id="engine-tokens-txt">0</strong></div>
-            <div class="stat-row"><span>Speculative Decoding</span><strong id="engine-mtp-txt">--</strong></div>
-            <div class="stat-row"><span>Queued Requests</span><strong id="engine-queue-txt">0</strong></div>
-          </div>
-        </div>
-      </div>
-
-      <!-- MoE Memory Hierarchy Diagram -->
-      <div class="tier-diagram-wrap">
-        <div class="tier-diagram-title"><span>⚡</span> MoE 3-Tier Memory Architecture</div>
-        <div class="tier-flow">
-          <div class="tier-box active-tier">
-            <div class="tier-header">
-              <span>Tier 1: VRAM Arena</span>
-              <span class="tag">Zero-Copy GPU</span>
-            </div>
-            <div class="stat-rows">
-              <div class="stat-row"><span>VRAM Slots:</span><strong id="tier1-slots">--</strong></div>
-              <div class="stat-row"><span>Cache Hits:</span><strong id="tier1-hits" style="color:var(--success);">--</strong></div>
-              <div class="stat-row"><span>Cache Misses:</span><strong id="tier1-misses">--</strong></div>
-            </div>
-          </div>
-
-          <div class="tier-box">
-            <div class="tier-header">
-              <span>Tier 2: Pinned RAM Tier</span>
-              <span class="tag">DMA Bus Speed</span>
-            </div>
-            <div class="stat-rows">
-              <div class="stat-row"><span>Pinned Capacity:</span><strong id="tier2-cap">30.0 GiB</strong></div>
-              <div class="stat-row"><span>Pinned Experts:</span><strong id="tier2-experts">--</strong></div>
-              <div class="stat-row"><span>RAM Tier Hits:</span><strong id="tier2-hits" style="color:var(--cyan);">--</strong></div>
-            </div>
-          </div>
-
-          <div class="tier-box">
-            <div class="tier-header">
-              <span>Tier 3: NVMe File Tier</span>
-              <span class="tag">Cold Shards</span>
-            </div>
-            <div class="stat-rows">
-              <div class="stat-row"><span>NVMe Reads:</span><strong id="tier3-reads">--</strong></div>
-              <div class="stat-row"><span>Status:</span><strong style="color:var(--text-muted);">Asynchronous Mmap</strong></div>
-            </div>
-          </div>
-        </div>
-      </div>
-    </div>
   </div>
 
   <!-- System Persona Customization Modal -->
@@ -1410,9 +1183,7 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
 
     // Elements
     const chatPanel = document.getElementById('chat-panel');
-    const monitorPanel = document.getElementById('monitor-panel');
     const tabChat = document.getElementById('tab-chat');
-    const tabMonitor = document.getElementById('tab-monitor');
     const messagesEl = document.getElementById('messages');
     const inputEl = document.getElementById('prompt-input');
     const sendBtn = document.getElementById('send-btn');
@@ -1503,27 +1274,23 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
     }
     updateToolsUI();
 
-    // View Switching: Chat and Process Monitor are completely separate tabs
+    // View switching: Chat, Dashboard and Settings are separate tabs
     function switchView(view) {
       currentView = view;
-      const panels = { chat: chatPanel, dash: document.getElementById('dash-panel'), settings: document.getElementById('settings-panel'), monitor: monitorPanel };
-      const tabs = { chat: tabChat, dash: document.getElementById('tab-dash'), settings: document.getElementById('tab-settings'), monitor: tabMonitor };
+      const panels = { chat: chatPanel, dash: document.getElementById('dash-panel'), settings: document.getElementById('settings-panel') };
+      const tabs = { chat: tabChat, dash: document.getElementById('tab-dash'), settings: document.getElementById('tab-settings') };
       for (const k of Object.keys(panels)) {
         panels[k].classList.toggle('active', k === view);
         tabs[k].classList.toggle('active', k === view);
       }
       document.body.classList.toggle('view-chat', view === 'chat');
       window.location.hash = view === 'chat' ? '' : '#' + view;
-      if (view === 'monitor') pollTelemetry();
       if (view === 'dash') dashRefresh();
       if (view === 'settings') settingsOpen();
     }
 
     document.getElementById('brand-logo').addEventListener('click', () => switchView('chat'));
 
-    if (window.location.hash === '#monitor') {
-      switchView('monitor');
-    }
 
     // Thinking Level Selection
     function toggleThinkingDropdown(e) {
@@ -2302,83 +2069,6 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
           gpuHeaderPill.innerHTML = `GPU: <strong>${d.gpu.utilization_percent.toFixed(0)}%</strong> • VRAM: <strong>${usedG}/${totalG} GiB</strong>`;
         }
 
-        // Process Monitor View - CPU
-        if (d.cpu) {
-          setTxt('cpu-proc-val', d.cpu.process_percent.toFixed(1) + '%');
-          setTxt('cpu-proc-cores', d.cpu.process_cores_used.toFixed(1));
-          setTxt('cpu-sys-val', d.cpu.system_percent.toFixed(1) + '%');
-          setTxt('cpu-proc-txt', d.cpu.process_percent.toFixed(1) + '%');
-          setTxt('cpu-sys-txt', d.cpu.system_percent.toFixed(1) + '%');
-          setTxt('cpu-cores-used-txt', `${d.cpu.process_cores_used.toFixed(1)} / ${d.cpu.logical_cores}`);
-          setTxt('cpu-cores-txt', d.cpu.logical_cores);
-          setTxt('cpu-cores-badge', d.cpu.logical_cores + ' Cores');
-          setWidth('cpu-bar', Math.min(d.cpu.process_percent * 2, 100) + '%');
-        }
-
-        // GPU & VRAM
-        if (d.gpu) {
-          const usedG = (d.gpu.vram_used_bytes / (1024**3)).toFixed(2);
-          const totalG = (d.gpu.vram_total_bytes / (1024**3)).toFixed(1);
-          const freeG = (d.gpu.vram_free_bytes / (1024**3)).toFixed(2);
-          setTxt('gpu-device-badge', d.gpu.name || 'NVIDIA GPU');
-          setTxt('gpu-util-val', d.gpu.utilization_percent.toFixed(1) + '%');
-          setTxt('gpu-util-txt', d.gpu.utilization_percent.toFixed(1) + '%');
-          setTxt('gpu-mem-txt', d.gpu.memory_controller_percent.toFixed(1) + '%');
-          setTxt('gpu-temp-txt', d.gpu.temperature_c > 0 ? `${d.gpu.temperature_c} °C` : 'N/A');
-          setTxt('vram-used-val', usedG);
-          setTxt('vram-total-val', totalG + ' GiB');
-          setTxt('vram-used-total-txt', `${usedG} / ${totalG} GiB`);
-          setTxt('vram-free-txt', freeG + ' GiB');
-          setTxt('vram-slots-txt', d.gpu.expert_cache_slots + ' slots');
-          setTxt('vram-hit-rate-txt', d.gpu.expert_cache_hit_rate.toFixed(1) + '%');
-          setWidth('gpu-bar', Math.min(d.gpu.utilization_percent, 100) + '%');
-
-          // Tier 1 stats
-          setTxt('tier1-slots', d.gpu.expert_cache_slots);
-          setTxt('tier1-hits', d.gpu.expert_cache_hits.toLocaleString());
-          setTxt('tier1-misses', d.gpu.expert_cache_misses.toLocaleString());
-        }
-
-        // RAM
-        if (d.ram) {
-          const usedG = (d.ram.system_used_bytes / (1024**3)).toFixed(1);
-          const totalG = (d.ram.system_total_bytes / (1024**3)).toFixed(1);
-          const availG = (d.ram.system_available_bytes / (1024**3)).toFixed(1);
-          setTxt('ram-used-val', usedG);
-          setTxt('ram-total-val', totalG + ' GiB');
-          setTxt('ram-avail-txt', availG + ' GiB');
-          setTxt('ram-load-badge', d.ram.system_load_percent + '% Load');
-          setTxt('ram-proc-ws-txt', formatBytes(d.ram.process_working_set_bytes));
-          setTxt('ram-pinned-txt', formatBytes(d.ram.pinned_tier_bytes));
-          const pct = d.ram.system_total_bytes > 0 ? (d.ram.system_used_bytes / d.ram.system_total_bytes) * 100 : 0;
-          setWidth('ram-bar', Math.min(pct, 100) + '%');
-
-          // Tier 2 stats
-          setTxt('tier2-cap', formatBytes(d.ram.pinned_tier_bytes));
-          setTxt('tier2-experts', d.ram.pinned_tier_experts);
-          setTxt('tier2-hits', d.ram.ram_served_hits.toLocaleString());
-          setTxt('tier3-reads', d.ram.file_served_misses.toLocaleString());
-        }
-
-        // Engine & Process
-        if (d.process) {
-          setTxt('engine-pid-badge', 'PID: ' + d.process.pid);
-          setTxt('engine-speed-val', d.process.tok_per_sec.toFixed(1));
-          if (d.process.model) {
-            const parts = d.process.model.split(/[\\/]/);
-            setTxt('engine-model-txt', parts[parts.length - 1]);
-            const mEl = document.getElementById('engine-model-txt');
-            if (mEl) mEl.title = d.process.model;
-          }
-          const up = d.process.uptime_s;
-          const mins = Math.floor(up / 60);
-          const secs = Math.floor(up % 60);
-          setTxt('engine-uptime-txt', `${mins}m ${secs}s`);
-          setTxt('engine-requests-txt', d.process.requests.toLocaleString());
-          setTxt('engine-tokens-txt', d.process.completion_tokens.toLocaleString());
-          setTxt('engine-mtp-txt', d.process.dflash_active ? 'On (DFlash drafter)' : d.process.mtp_active ? 'MTP head loaded (experimental)' : 'Off');
-          setTxt('engine-queue-txt', d.process.queued);
-        }
       } catch (err) {
         statusPill.textContent = 'Server offline';
         if (isGenerating && ++offlineCount >= 3) markStalled('Lost the connection to Shadow: is it still running?');
@@ -2593,6 +2283,12 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
       set('d-vram', gib(gpu.vram_used_bytes || 0) + ' / ' + gib(gpu.vram_total_bytes || 0) + ' GiB');
       wid('d-vrambar', gpu.vram_total_bytes ? 100 * gpu.vram_used_bytes / gpu.vram_total_bytes : 0);
       set('d-temp', gpu.temperature_c ? gpu.temperature_c + ' °C' : '--');
+      set('d-memctl', (gpu.memory_controller_percent || 0).toFixed(0) + '%');
+      set('d-vramfree', gib(gpu.vram_free_bytes || 0) + ' GiB');
+      set('d-hitmiss', (gpu.expert_cache_hits || 0).toLocaleString() + ' / ' + (gpu.expert_cache_misses || 0).toLocaleString());
+      set('d-servedn', (ram.ram_served_hits || 0).toLocaleString() + ' / ' + (ram.file_served_misses || 0).toLocaleString());
+      set('d-ramused', gib(ram.system_used_bytes || 0) + ' GiB (' + (ram.system_load_percent || 0) + '%)');
+      set('d-pid', p.pid || '--');
       set('d-hit', (gpu.expert_cache_hit_rate || 0).toFixed(1) + '%');
       wid('d-hitbar', gpu.expert_cache_hit_rate || 0);
       set('d-pin', gib(ram.pinned_tier_bytes || 0) + ' GiB (' + (ram.pinned_tier_experts || 0).toLocaleString() + ' experts)');
@@ -2845,7 +2541,8 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
     }
 
     document.body.classList.toggle('view-chat', currentView === 'chat');
-    if (['#dash', '#settings'].includes(window.location.hash)) switchView(window.location.hash.slice(1));
+    // (the old #monitor link: the Process Monitor became part of the Dashboard)
+    if (['#dash', '#settings', '#monitor'].includes(window.location.hash)) switchView(window.location.hash === '#settings' ? 'settings' : 'dash');
 
     pollTelemetry();
     setInterval(pollTelemetry, 1000);
@@ -2858,14 +2555,14 @@ const MONITOR_HTML: &str = r#"<!DOCTYPE html>
 <html lang="en" class="dark h-full">
 <head>
   <meta charset="UTF-8">
-  <meta http-equiv="refresh" content="0; url=/#monitor">
-  <title>Redirecting to Shadow Monitor...</title>
+  <meta http-equiv="refresh" content="0; url=/#dash">
+  <title>Redirecting to the Shadow Dashboard...</title>
   <script>
-    window.location.href = '/#monitor';
+    window.location.href = '/#dash';
   </script>
 </head>
 <body style="background:#090a0f; color:#8492a6; font-family:sans-serif; display:flex; align-items:center; justify-content:center; height:100vh;">
-  <p>Loading Shadow Process Monitor... <a href="/" style="color:#6366f1;">Return to Chat</a></p>
+  <p>Loading the Shadow Dashboard... <a href="/" style="color:#6366f1;">Return to Chat</a></p>
 </body>
 </html>
 "#;

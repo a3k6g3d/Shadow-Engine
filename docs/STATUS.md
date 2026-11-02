@@ -1341,3 +1341,9 @@ Single-prompt runs, "Write a Rust function that parses a comma separated list...
   message again"), the lent cache is restored and the session reset; a panic of the whole thread marks the engine `failed`; `shadow serve` sets `RUST_BACKTRACE=1` so the log shows where the next one comes from.
 - **The bubble throbs** (a glow in the accent colour, 1.8 s) while a reply is being written, and a tool card while its tool runs; it stops when the turn ends or is stopped. If the engine reports `failed`, or the telemetry
   poll fails three times while a reply is awaited, the bubble turns red with the reason instead of throbbing for ever.
+
+## 2026-11-01: the Process Monitor tab is gone; the Dashboard has what it had
+
+- The Process Monitor (CPU, GPU, RAM, engine and three tier cards) duplicated the Dashboard cards. The tab, its panel, styles and poller code are removed (~300 lines); `/monitor` and the old `#monitor` link go to the Dashboard.
+  What the monitor showed that the Dashboard did not moved into the Dashboard's cards: GPU: memory-controller activity and free VRAM; Expert tiers: VRAM cache hits / misses and misses read from RAM / drive (counts);
+  System memory: RAM in use with its load; Engine: process ID. The rest was already there (CPU usage and cores, GPU busy / VRAM / temperature, working set, pinned tier, uptime, requests, tokens, speculation, queue).
