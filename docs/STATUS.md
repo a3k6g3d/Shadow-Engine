@@ -1355,3 +1355,11 @@ Single-prompt runs, "Write a Rust function that parses a comma separated list...
 - Taking the limit off showed the opposite failure: an Extra-High question thought for **17,303 tokens**, until the context was full, and never answered (301 s). So there is a **thinking budget by effort** (`engine.rs`):
   Low 1,000, Medium 4,000, High 8,000, Extra-High 12,000 tokens, always leaving 1,200 for the answer (none for a small `max_tokens`); past it the engine feeds the model "That is enough thinking: the answer now. </think>" and it
   answers. Tested: the same question at Medium thought ~1,600 tokens by itself and answered; at Extra-High the budget closed it at ~12,000 and it answered (14,582 tokens in all, 268 s, finish "stop").
+
+## 2026-11-01: a 32,768-token window by default, and old tool outputs are trimmed
+
+- A long agent chat ended with "23724 prompt tokens + 0 max_tokens exceed the context of 17408": the window is `--ctx`, 16,384 by default, **not the model's limit** (`qwen4exp.context_length` = 262,144). It costs VRAM, not speed
+  directly: ~57 KB a token for the attention layers' K/V, taken from the expert cache. Measured (`serve --ctx N`, 4 chat prompts of 250 tokens, decode tok/s): **16k: 2,091 cache slots, 52.4; 32k: 1,621, 51.7 (-1.3%); 48k: 1,136, 49.7;
+  64k: 695, 49.5 (-5.5%)**. Default is now **32,768**; `--ctx` (or the desktop app's extra flags) changes it. A 20,802-token prompt reads in 287 s at that window (~72 tok/s: reading, not the window, is the slow part).
+- The page now trims by itself: when the conversation reaches 85% of the window's room it cuts the oldest tool outputs (over 600 characters) to a one-line stub, newest kept, until it is at 60%; the chat goes on instead of stopping.
+- Not done: the window as a setting in the page (it is a start flag), 16-bit K/V (would halve the cost per token), K/V in host RAM (attention reads only 2,048 positions a token, so it could live there).

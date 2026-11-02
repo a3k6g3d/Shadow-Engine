@@ -329,7 +329,8 @@ fn serve(path: &std::path::Path, rest: &[String]) -> ExitCode {
     let flag = |f: &str| rest.iter().position(|a| a == f).and_then(|i| rest.get(i + 1));
     let host = flag("--host").map(String::as_str).unwrap_or("127.0.0.1");
     let port: u16 = flag("--port").and_then(|v| v.parse().ok()).unwrap_or(8081);
-    let n_ctx: usize = flag("--ctx").and_then(|v| v.parse().ok()).unwrap_or(16384);
+    // 32,768 tokens: the window costs ~57 KB of VRAM a token (taken from the expert cache) and 32k costs 1.3% of decode speed (51.7 against 52.4 tok/s), 64k 5.5%
+    let n_ctx: usize = flag("--ctx").and_then(|v| v.parse().ok()).unwrap_or(32768);
     let addr = match format!("{host}:{port}").parse() {
         Ok(a) => a,
         Err(e) => {

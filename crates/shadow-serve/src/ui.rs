@@ -1798,6 +1798,7 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
         let thinkStart = performance.now();
         let isThinking = false;
 
+        trimHistory();
         const payloadMessages = [];
         const sys = systemPrompt();
         if (sys) payloadMessages.push({ role: 'system', content: sys });
@@ -2210,6 +2211,7 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
       keep(dashHist.cpu, d.cpu ? d.cpu.process_percent : 0);
       keep(dashHist.cpuSys, d.cpu ? d.cpu.system_percent : 0);
       lastTel = d;
+      if (d.process && d.process.n_ctx) serverCtx = d.process.n_ctx;
       if (currentView === 'dash') dashRender(d);
     }
     let offlineCount = 0;
@@ -2515,6 +2517,26 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
       browserPageInfo(output || '');
       browserRefresh();
       if (!browserTimer) browserTimer = setInterval(() => { if (isGenerating) browserRefresh(); }, 4000);
+    }
+
+    // ---- the context window: when the conversation nears it, the oldest tool outputs (pages, files, command results: most of an agent chat's tokens) are cut to
+    // a line, so the chat goes on instead of ending at "the conversation is full".  ~3 characters a token is assumed for such text.
+    let serverCtx = 16384;
+    function trimHistory() {
+      const size = m => Array.isArray(m.content) ? m.content.reduce((n, p) => n + (p.text ? p.text.length : 0), 0) : String(m.content || '').length;
+      const room = (serverCtx - 3500) * 3; // the system prompt and tools take ~3,000 tokens, and the reply needs some
+      let total = history.reduce((n, m) => n + size(m), 0);
+      if (total <= room * 0.85) return;
+      let cut = 0;
+      for (const m of history) {
+        if (total <= room * 0.6) break;
+        if (m.role !== 'tool' || typeof m.content !== 'string' || m.content.length < 600) continue;
+        const was = m.content.length;
+        m.content = `<tool_response>\n[older tool output removed to make room: ${was} characters]\n</tool_response>`;
+        total -= was - m.content.length;
+        cut++;
+      }
+      if (cut) timingInfo.textContent = `Made room: ${cut} older tool output${cut > 1 ? 's' : ''} shortened.`;
     }
 
     // ---- queued messages: typed while a reply is being written, sent in order when it ends (each one needs the one before it answered)
