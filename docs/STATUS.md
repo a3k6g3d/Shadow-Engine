@@ -1331,3 +1331,13 @@ Single-prompt runs, "Write a Rust function that parses a comma separated list...
 - A browser server's results are capped at 12,000 characters (`MAX_MCP_OUTPUT_CHARS`); the agent loop allows 14 tool turns (was 6); the tool clip no longer cuts inside a multi-byte character.
 - MCP servers' processes (npx, node, Chrome) are put in a Windows job object that kills them when Shadow ends, however it ends (tested: 16 processes while running, 0 after Shadow was killed).
 - Not done: the model cannot *see* the screenshot (it reads the text snapshot); feeding the picture back to it, now that Shadow reads pictures, is possible (~300-1000 tokens a picture, ~4-12 s to read).
+
+## 2026-11-01: an engine panic no longer hangs the chat; the bubble throbs while it works
+
+- The desktop app's log (`%APPDATA%\Shadow\shadow-console.log`) showed the engine thread dead with `session.rs:108: the cache has fewer slots than one token routes to` (`ExpertCache::victim`: every evictable slot of a
+  layer was in use by the current token) on a long agent conversation (a request reading ~5,000 new tokens after two large tool results, 2,091 cache slots). The thread died, `busy` stayed on, every later request
+  waited for ever and the page showed an empty bubble. Not reproduced since: a 13,451-token and a 15,136-token prompt read fine, alone and after other long prompts (one earlier run lost the server process at the second long prompt
+  with no panic text; it did not recur in two repeats). So the cause is **not found**; what is done: a panic inside one answer is caught (`engine::run` loop, `catch_unwind`): the request gets an error ("internal error: ... send the
+  message again"), the lent cache is restored and the session reset; a panic of the whole thread marks the engine `failed`; `shadow serve` sets `RUST_BACKTRACE=1` so the log shows where the next one comes from.
+- **The bubble throbs** (a glow in the accent colour, 1.8 s) while a reply is being written, and a tool card while its tool runs; it stops when the turn ends or is stopped. If the engine reports `failed`, or the telemetry
+  poll fails three times while a reply is awaited, the bubble turns red with the reason instead of throbbing for ever.

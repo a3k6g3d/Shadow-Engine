@@ -321,6 +321,10 @@ fn fastest_defaults(rest: &[String]) -> Vec<String> {
 /// `shadow serve MODEL [--host H] [--port P] [--ctx N] [tier flags]`: the HTTP server (shadow-serve) on the GPU
 /// session.  Port 8081 by default - 8080 is where the user's other server lives.
 fn serve(path: &std::path::Path, rest: &[String]) -> ExitCode {
+    // a panic in the engine says where in the log (the desktop app keeps it in shadow-console.log)
+    if std::env::var_os("RUST_BACKTRACE").is_none() {
+        std::env::set_var("RUST_BACKTRACE", "1");
+    }
     let rest = &fastest_defaults(rest);
     let flag = |f: &str| rest.iter().position(|a| a == f).and_then(|i| rest.get(i + 1));
     let host = flag("--host").map(String::as_str).unwrap_or("127.0.0.1");

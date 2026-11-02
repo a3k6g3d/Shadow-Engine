@@ -196,7 +196,9 @@ pub fn start(cfg: Config, status: Arc<Mutex<Status>>) -> std::sync::mpsc::Sender
     std::thread::Builder::new()
         .name("shadow-engine".into())
         .spawn(move || {
-            if let Err(e) = run(cfg, rx, &status) {
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run(cfg, rx, &status)))
+                .unwrap_or_else(|_| Err("the engine thread panicked (see the log above)".to_string()));
+            if let Err(e) = outcome {
                 eprintln!("shadow serve: engine failed: {e}");
                 let mut s = status.lock().unwrap();
                 s.state = "failed";
@@ -253,7 +255,23 @@ fn run(cfg: Config, rx: std::sync::mpsc::Receiver<Request>, status: &Mutex<Statu
     let mut pics = Pics { enc: None, cache: Default::default(), cur: vec![] };
     while let Ok(req) = rx.recv() {
         status.lock().unwrap().busy = true;
-        let r = answer(&arch, &req, &tok, &mut sess, &mut last_logits, &stops, think_end, &mut prefix, cfg.spec, &mut pics, &cfg.model);
+        // a panic inside one answer (an assumption of the cache broken by some state) must not kill the engine thread and leave every later request waiting
+        // for ever: it becomes that request's error, and the session starts clean
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            answer(&arch, &req, &tok, &mut sess, &mut last_logits, &stops, think_end, &mut prefix, cfg.spec, &mut pics, &cfg.model)
+        })).unwrap_or_else(|p| {
+            let msg = p.downcast_ref::<&str>().map(|s| s.to_string()).or_else(|| p.downcast_ref::<String>().cloned()).unwrap_or_default();
+            eprintln!("shadow serve: the engine hit an internal error ({msg}); the session was reset");
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                sess.restore_cache();
+                sess.reset();
+            }));
+            last_logits.clear();
+            prefix.snap = None;
+            prefix.prev.clear();
+            pics.cur.clear();
+            Err(format!("internal error: {msg}. The conversation's cache was reset: send the message again, or start a new chat."))
+        });
         let mut s = status.lock().unwrap();
         s.busy = false;
         s.finished += 1;

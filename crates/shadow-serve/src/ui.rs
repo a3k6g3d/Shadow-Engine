@@ -970,6 +970,14 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
     .menu-pill-btn:hover { background: var(--surface-hover); color: var(--text); border-color: transparent; }
     .menu-pill-btn.active-state { border-color: transparent; }
     #queue-bar, #attach-tray { margin-bottom: 0.15rem; }
+    /* a reply (or a tool) in progress throbs: it has not hung; a stopped engine turns it red */
+    @keyframes throb {
+      0%, 100% { box-shadow: 0 0 0 0 rgba(99, 102, 241, 0); border-color: var(--border); }
+      50% { box-shadow: 0 0 16px 2px rgba(99, 102, 241, 0.5); border-color: var(--accent); }
+    }
+    .msg-row.assistant.working > .bubble, .tool-call-block.running { animation: throb 1.8s ease-in-out infinite; }
+    .msg-row.assistant > .bubble { border: 1px solid var(--border); }
+    .msg-row.assistant.stalled > .bubble { animation: none; border-color: var(--danger); }
     /* the menus open above the whole bar, whatever its height (--bar-h follows the text box) */
     .dropdown-popup { bottom: calc(100% + 10px + var(--bar-h, 44px)); }
   </style>
@@ -1436,6 +1444,7 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
         currentAbortController = null;
       }
       isGenerating = false;
+      document.querySelectorAll('.msg-row.working, .tool-call-block.running').forEach(r => r.classList.remove('working', 'running'));
       sendBtn.textContent = 'Send';
       sendBtn.style.display = 'flex';
       stopBtn.style.display = 'none';
@@ -1985,7 +1994,8 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
 
         // Assistant Skeleton
         const asstRow = document.createElement('div');
-        asstRow.className = 'msg-row assistant';
+        document.querySelectorAll('.msg-row.working').forEach(r => r.classList.remove('working'));
+        asstRow.className = 'msg-row assistant working';
         asstRow.innerHTML = `
           <div class="avatar">S</div>
           <div class="bubble">
@@ -2152,7 +2162,7 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
 
             for (const tc of toolCalls) {
               const toolCard = document.createElement('div');
-              toolCard.className = 'tool-call-block';
+              toolCard.className = 'tool-call-block running';
               toolCard.innerHTML = `
                 <div class="tool-header">
                   <span>⚡ Windows Tool: <strong>${escapeHtml(tc.name)}</strong></span>
@@ -2165,6 +2175,7 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
               const result = await executeLocalTool(tc.name, tc.arguments);
               if (tc.name.startsWith('memory_')) loadMemory();
               if (tc.name.startsWith('mcp__browser__')) browserNote(result.output);
+              toolCard.classList.remove('running');
               const outputEl = toolCard.querySelector('.tool-output');
               toolCard.querySelector('.tool-header span:last-child').textContent = result.is_error ? 'Error' : 'Complete';
               outputEl.textContent = result.output;
@@ -2216,6 +2227,7 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
       }
       isGenerating = false;
       currentAbortController = null;
+      document.querySelectorAll('.msg-row.working, .tool-call-block.running').forEach(r => r.classList.remove('working', 'running'));
       saveCurrent();
       sendBtn.textContent = 'Send';
       sendBtn.style.display = 'flex';
@@ -2254,6 +2266,9 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
         if (!res.ok) return;
         const d = await res.json();
         dashPush(d);
+        offlineCount = 0;
+        // the engine is gone while a reply is awaited: say so instead of throbbing for ever
+        if (isGenerating && d.process && d.process.state === 'failed') markStalled("Shadow's engine stopped (it failed). Restart Shadow, then send the message again.");
 
         // Header pills
         if (d.process) {
@@ -2366,6 +2381,7 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
         }
       } catch (err) {
         statusPill.textContent = 'Server offline';
+        if (isGenerating && ++offlineCount >= 3) markStalled('Lost the connection to Shadow: is it still running?');
         statusPill.className = 'pill offline';
       }
     }
@@ -2496,6 +2512,18 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
       keep(dashHist.cpuSys, d.cpu ? d.cpu.system_percent : 0);
       lastTel = d;
       if (currentView === 'dash') dashRender(d);
+    }
+    let offlineCount = 0;
+    // the reply being awaited will never come: stop the throb, mark the bubble, say why
+    function markStalled(why) {
+      const row = document.querySelector('.msg-row.assistant.working');
+      if (!row) return;
+      row.classList.remove('working');
+      row.classList.add('stalled');
+      const c = row.querySelector('.msg-content');
+      if (c && !c.textContent.trim()) c.innerHTML = `<div class="msg-error">${escapeHtml(why)}</div>`;
+      else row.querySelector('.bubble').insertAdjacentHTML('beforeend', `<div class="msg-error">${escapeHtml(why)}</div>`);
+      timingInfo.textContent = why;
     }
     function dashRefresh() { if (lastTel) dashRender(lastTel); }
     function spark(id, vals, max, color, bars, overlay) {
