@@ -181,6 +181,19 @@ struct PrefixCache<'c> {
     convs: Vec<shadow_cuda::session::Snapshot<'c>>,
     /// the same snapshots as files (the model's drive): they outlive a restart and the RAM holds only their token lists; `convs` is then just the freshest few
     disk: Option<crate::convdisk::ConvDisk>,
+    /// the tokens of the freshest snapshot in `convs` that is not on disk yet: an agent chat takes one a tool call, so a snapshot is written when its conversation is left
+    /// (the next request does not start with these tokens) or after 30 s of quiet, not every turn
+    pending: Option<Vec<u32>>,
+}
+
+/// Write the pending snapshot (the freshest of `convs` with those tokens) to disk.
+fn spill(prefix: &mut PrefixCache<'_>) {
+    let Some(t) = prefix.pending.take() else { return };
+    let (Some(d), Some(s)) = (prefix.disk.as_ref(), prefix.convs.iter().find(|s| s.tokens() == &t[..])) else { return };
+    match s.to_bytes() {
+        Ok(b) => d.save(&t, b),
+        Err(e) => eprintln!("shadow serve: conversation snapshot not written ({e})"),
+    }
 }
 
 /// A conversation snapshot is taken after a prompt at least this long (reading ~1,000 tokens takes ~4 s; the snapshot ~0.1 s a 20k-token prompt) ...
@@ -265,9 +278,17 @@ fn run(cfg: Config, rx: std::sync::mpsc::Receiver<Request>, status: &Mutex<Statu
         eprintln!("shadow serve: ready in {:.1} s; {}", s.load_secs, s.report);
     }
     let mut last_logits: Vec<f32> = Vec::new();
-    let mut prefix = PrefixCache { snap: None, prev: vec![], convs: vec![], disk: crate::convdisk::ConvDisk::open(&cfg.model) };
+    let mut prefix = PrefixCache { snap: None, prev: vec![], convs: vec![], disk: crate::convdisk::ConvDisk::open(&cfg.model), pending: None };
     let mut pics = Pics { enc: None, cache: Default::default(), cur: vec![] };
-    while let Ok(req) = rx.recv() {
+    loop {
+        let req = match rx.recv_timeout(std::time::Duration::from_secs(30)) {
+            Ok(r) => r,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                spill(&mut prefix);
+                continue;
+            }
+            Err(_) => break,
+        };
         status.lock().unwrap().busy = true;
         // a panic inside one answer (an assumption of the cache broken by some state) must not kill the engine thread and leave every later request waiting
         // for ever: it becomes that request's error, and the session starts clean
@@ -420,6 +441,10 @@ fn answer<'c>(arch: &str, req: &Request, tok: &Tokenizer, sess: &mut GpuSession<
     let text = render_for_arch(arch, &req.messages, &req.opts)?;
     let ids = tok.encode(&text, true);
     let (ids, spans) = expand_pictures(tok, ids, &req.images, pics, model)?;
+    // leaving a conversation: its last snapshot goes to disk
+    if prefix.pending.as_ref().is_some_and(|t| !(ids.len() > t.len() && ids[..t.len()] == t[..])) {
+        spill(prefix);
+    }
     // no `max_tokens` given: as many as fit.  (It used to be 1,024, which a reasoning model can spend on thinking alone: the reply ended
     // mid-thought with no answer.)
     let max_tokens = if req.max_tokens == 0 { sess.capacity().saturating_sub(ids.len() + 8) } else { req.max_tokens };
@@ -525,7 +550,7 @@ fn answer<'c>(arch: &str, req: &Request, tok: &Tokenizer, sess: &mut GpuSession<
     // MAX_BATCH tokens at a time through the layers (`step_batch`), a chunk ending where the snapshot goes
     // a long prompt borrows the tail of the VRAM expert cache as staging and reads in big chunks; a short one, 64 at a time
     sess.hint_prompt(unread.len());
-    let lent = unread.len() >= 128 && !std::env::var("SHADOW_NO_LEND").is_ok_and(|v| v == "1") && sess.lend_cache(unread.len() >= shadow_cuda::session::LONG_PROMPT);
+    let mut lent = unread.len() >= 128 && !std::env::var("SHADOW_NO_LEND").is_ok_and(|v| v == "1") && sess.lend_cache(unread.len() >= shadow_cuda::session::LONG_PROMPT);
     let chunk = std::env::var("SHADOW_PREFILL_CHUNK").ok().and_then(|v| v.parse().ok())
         .unwrap_or(if lent { sess.batch_rows() } else { 64usize }).clamp(1, sess.batch_rows());
     let mut i = 0;
@@ -533,6 +558,13 @@ fn answer<'c>(arch: &str, req: &Request, tok: &Tokenizer, sess: &mut GpuSession<
         let mut end = (i + chunk).min(unread.len());
         if let Some(at) = snap_at.map(|s| s - cached).filter(|&at| i < at && at < end) {
             end = at;
+        }
+        // a few tokens (the tail of a prompt, or after a snapshot point) take the non-staged path, which needs slots of the cache in every layer: the lend is over
+        // (it would end here anyway: the evicted experts are read back either way).  With the lend at 99% of the arena most layers have no slot left, and the pass died with
+        // "the cache has fewer slots than one token routes to".
+        if lent && end - i <= shadow_cuda::session::MAX_VERIFY {
+            sess.restore_cache();
+            lent = false;
         }
         if end == unread.len() {
             *last_logits = sess.step_batch(&unread[i..end]).pop().unwrap();
@@ -567,14 +599,20 @@ fn answer<'c>(arch: &str, req: &Request, tok: &Tokenizer, sess: &mut GpuSession<
                 Ok(s) => {
                     eprintln!("shadow serve: conversation snapshot of {} tokens ({:.2} GiB) in {:.2} s; {} kept", ids.len(), s.host_bytes() as f64 / 1073741824.0,
                               t1.elapsed().as_secs_f64(), prefix.convs.len() + 1);
-                    if let Some(d) = prefix.disk.as_ref() {
+                    if s.host_bytes() <= budget {
+                        // an older snapshot of this conversation was pending: this one replaces it (one write a conversation episode)
+                        if prefix.pending.as_ref().is_some_and(|t| t.len() <= ids.len() && ids[..t.len()] == t[..]) {
+                            prefix.pending = None;
+                        }
+                        spill(prefix); // another conversation's, if any
+                        prefix.pending = prefix.disk.is_some().then(|| ids.clone());
+                        prefix.convs.push(s);
+                    } else if let Some(d) = prefix.disk.as_ref() {
+                        // too big for the RAM pool: straight to disk
                         match s.to_bytes() {
                             Ok(b) => d.save(&ids, b),
                             Err(e) => eprintln!("shadow serve: conversation snapshot not written ({e})"),
                         }
-                    }
-                    if s.host_bytes() <= budget {
-                        prefix.convs.push(s);
                     }
                 }
                 Err(e) => eprintln!("shadow serve: conversation snapshot failed ({e})"),
