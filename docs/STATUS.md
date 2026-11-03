@@ -1554,3 +1554,10 @@ The window (`--ctx`) takes VRAM from the expert cache, the cache is what a long 
 
 Each pass copies a layer's whole expert set whatever its token count, and now that the kernels are fast the copy is the limit: 704 rows copy 2.9x the bytes per prompt token of 2,048 rows. The 32k default costs **44% of the prompt speed** against 20k (decode: -1.3%, measured on 2026-11-01). There is no cheap way to give the 32k window the big batch:
 16-bit K/V (half the window's VRAM; touches the attention kernels of the decode path), lending the DFlash drafter's ~1.2 GB during a prompt, or staging halves sized to the experts a layer needs. A default of 24,576 keeps 86% of the 20k speed.
+
+## 2026-11-02: a long prompt lends 99% of the expert cache (was 96%): +15.4% at the 24,576 default
+
+`lend_cache` caps what a long prompt borrows at 99% of the arena (`SHADOW_LEND_PCT` sets it; at least 24 slots stay with the cache, the per-token path needs ~10). The staging halves take a fixed 2.5 GiB and the batch buffers the rest, so every percent is rows: ctx 24,576 goes from **1,472 to 1,600 rows**, ctx 32,768 from 704 to 768.
+3 interleaved pairs at ctx 24,576, 3,001-token prompt, 2 prompts each: 96% **75.7 s** (225 / 252 tok/s), 99% **65.6 s** for 18,006 tokens (**259 / 292 tok/s, +15.4%**). The 1,600-row pass is exactly two passes of the 3,001-token prompt (1,600 + 1,401) instead of three (1,472 + 1,472 + 57), which is where most of it comes from; the copy per pass is fixed.
+Checks: a 25,260-token prompt at the 32k window reads in 159.3 s (158.6 tok/s, no panic), 7-question check 6/7. An unrelated slow minute of the machine (190 / 203 at 99% in one earlier run) is why this was measured interleaved. Default now 99%.
+At 24,576 the 3k prompt now reads at 259 / 292 tok/s, level with the 20k window's 296; the 32k window is still 162 / 174 (768 rows). Desktop app: no rebuild needed (it starts `target/release/shadow.exe` with only `--port 8081`); restart it to pick up the build.

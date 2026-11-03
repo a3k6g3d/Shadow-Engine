@@ -2472,7 +2472,7 @@ impl<'c, 'm> GpuSession<'c, 'm> {
         let want = std::env::var("SHADOW_PREFILL_LEND_MIB").ok().and_then(|v| v.parse::<usize>().ok()).map(|m| m << 20)
             .unwrap_or((self.m.cfg.n_expert * if pipe { 2 } else { 1 } + if pipe { 2 } else { 0 }) * self.cache.slot_bytes
                        + if pipe && big { bb_row_floats(&self.m.cfg) * BIG_BATCH * 4 + (1 << 16) } else { 0 })
-            .min(self.cache.arena_bytes / 100 * 96);
+            .min((self.cache.arena_bytes / 100 * std::env::var("SHADOW_LEND_PCT").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(99)).min(self.cache.arena_bytes.saturating_sub(24 * self.cache.slot_bytes)));
         let target = self.cache.arena_bytes - want;
         let s0 = self.cache.slot_offset.partition_point(|&o| (o as usize) < target);
         if s0 >= self.cache.slots {
