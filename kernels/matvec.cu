@@ -1040,6 +1040,91 @@ extern "C" __global__ void mma_cols_iq3_xxs(const u8* w, const float* x, unsigne
 extern "C" __global__ void mma_grouped_iq3_xxs(const u64* wtab, const unsigned int* gtab, const float* x, unsigned int xs, float* y, unsigned int ys, unsigned int rows, unsigned int cols) { mma_grouped<IQ3XXS>(wtab, gtab, x, xs, y, ys, rows, cols); }
 extern "C" __global__ void mma_cols_q4_k(const u8* w, const float* x, unsigned int xs, float* y, unsigned int ys, unsigned int rows, unsigned int cols, unsigned int m) { mma_cols<Q4K>(w, x, xs, y, ys, rows, cols, m); }
 extern "C" __global__ void mma_cols_q5_k(const u8* w, const float* x, unsigned int xs, float* y, unsigned int ys, unsigned int rows, unsigned int cols, unsigned int m) { mma_cols<Q5K>(w, x, xs, y, ys, rows, cols, m); }
+// F32 weights (the MoE router and the shared expert's gate) on the tensor cores without giving up the bits that matter to the top-k: weight and activation are each split
+// into a bf16 high part and a bf16 low part (x = hi + lo, ~16 bits of mantissa together) and three bf16 products are accumulated in f32 (hi*hi + hi*lo + lo*hi), error ~2^-16
+// of the dot product against ~2^-11 for one half-precision product.  Same tile as mma_cols (64 rows x 32 tokens x 64 k, 128 threads).  cols a multiple of 64, rows any (guarded).
+static __device__ __forceinline__ unsigned int pack_bf16x2(float lo, float hi) {
+    unsigned int r;
+    asm("cvt.rn.bf16x2.f32 %0, %2, %1;" : "=r"(r) : "f"(lo), "f"(hi));
+    return r;
+}
+static __device__ __forceinline__ void split_bf16x2(float a, float b, unsigned int* hi, unsigned int* lo) {
+    unsigned int h = pack_bf16x2(a, b);
+    float ha = __uint_as_float(h << 16), hb = __uint_as_float(h & 0xffff0000u);
+    *hi = h;
+    *lo = pack_bf16x2(a - ha, b - hb);
+}
+extern "C" __global__ void mma_cols_f32x3(const u8* w, const float* x, unsigned int xs, float* y, unsigned int ys, unsigned int rows, unsigned int cols, unsigned int m) {
+    __shared__ __align__(16) unsigned short wh[MMA_ROWS][MMA_K + MMA_PAD], wl[MMA_ROWS][MMA_K + MMA_PAD];
+    __shared__ __align__(16) unsigned short xh[MMA_TOK][MMA_K + MMA_PAD], xl[MMA_TOK][MMA_K + MMA_PAD];
+    const unsigned int tid = threadIdx.x, warp = tid / 32, lane = tid % 32, grp = lane / 4, tig = lane % 4;
+    const unsigned int row_base = blockIdx.x * MMA_ROWS, tok_base = blockIdx.y * MMA_TOK;
+    const u64 rb = (u64) cols * 4;
+    float acc[4][4];
+#pragma unroll
+    for (unsigned int n = 0; n < 4; n++)
+#pragma unroll
+        for (unsigned int e = 0; e < 4; e++) acc[n][e] = 0.0f;
+    for (unsigned int kc = 0; kc < cols; kc += MMA_K) {
+#pragma unroll
+        for (unsigned int t = 0; t < 4; t++) {
+            unsigned int ch = tid + 128 * t, row = ch / 8, kk = (ch % 8) * 8;
+            float4 f0 = make_float4(0.f, 0.f, 0.f, 0.f), f1 = f0;
+            if (row_base + row < rows) {
+                const float4* p = (const float4*) (w + (u64) (row_base + row) * rb + (u64) (kc + kk) * 4);
+                f0 = p[0]; f1 = p[1];
+            }
+            uint4 ph, pl;
+            split_bf16x2(f0.x, f0.y, &ph.x, &pl.x); split_bf16x2(f0.z, f0.w, &ph.y, &pl.y);
+            split_bf16x2(f1.x, f1.y, &ph.z, &pl.z); split_bf16x2(f1.z, f1.w, &ph.w, &pl.w);
+            *(uint4*) &wh[row][kk] = ph;
+            *(uint4*) &wl[row][kk] = pl;
+        }
+#pragma unroll
+        for (unsigned int t = 0; t < 4; t++) {
+            unsigned int idx = tid + 128 * t, tok = idx / 16, kq = (idx % 16) * 4;
+            float4 f = make_float4(0.f, 0.f, 0.f, 0.f);
+            if (tok_base + tok < m) f = *(const float4*) (x + (u64) (tok_base + tok) * xs + kc + kq);
+            uint2 ph, pl;
+            split_bf16x2(f.x, f.y, &ph.x, &pl.x); split_bf16x2(f.z, f.w, &ph.y, &pl.y);
+            *(uint2*) &xh[tok][kq] = ph;
+            *(uint2*) &xl[tok][kq] = pl;
+        }
+        __syncthreads();
+#pragma unroll
+        for (unsigned int ks = 0; ks < MMA_K / 16; ks++) {
+            const unsigned int k0 = ks * 16 + tig * 2;
+            unsigned int ah[4], al[4];
+            ah[0] = *(const unsigned int*) &wh[warp * 16 + grp][k0];     al[0] = *(const unsigned int*) &wl[warp * 16 + grp][k0];
+            ah[1] = *(const unsigned int*) &wh[warp * 16 + grp + 8][k0]; al[1] = *(const unsigned int*) &wl[warp * 16 + grp + 8][k0];
+            ah[2] = *(const unsigned int*) &wh[warp * 16 + grp][k0 + 8]; al[2] = *(const unsigned int*) &wl[warp * 16 + grp][k0 + 8];
+            ah[3] = *(const unsigned int*) &wh[warp * 16 + grp + 8][k0 + 8]; al[3] = *(const unsigned int*) &wl[warp * 16 + grp + 8][k0 + 8];
+#pragma unroll
+            for (unsigned int n = 0; n < 4; n++) {
+                unsigned int bh0 = *(const unsigned int*) &xh[n * 8 + grp][k0], bh1 = *(const unsigned int*) &xh[n * 8 + grp][k0 + 8];
+                unsigned int bl0 = *(const unsigned int*) &xl[n * 8 + grp][k0], bl1 = *(const unsigned int*) &xl[n * 8 + grp][k0 + 8];
+                asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
+                             : "+f"(acc[n][0]), "+f"(acc[n][1]), "+f"(acc[n][2]), "+f"(acc[n][3])
+                             : "r"(al[0]), "r"(al[1]), "r"(al[2]), "r"(al[3]), "r"(bh0), "r"(bh1));
+                asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
+                             : "+f"(acc[n][0]), "+f"(acc[n][1]), "+f"(acc[n][2]), "+f"(acc[n][3])
+                             : "r"(ah[0]), "r"(ah[1]), "r"(ah[2]), "r"(ah[3]), "r"(bl0), "r"(bl1));
+                asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
+                             : "+f"(acc[n][0]), "+f"(acc[n][1]), "+f"(acc[n][2]), "+f"(acc[n][3])
+                             : "r"(ah[0]), "r"(ah[1]), "r"(ah[2]), "r"(ah[3]), "r"(bh0), "r"(bh1));
+            }
+        }
+        __syncthreads();
+    }
+#pragma unroll
+    for (unsigned int n = 0; n < 4; n++)
+#pragma unroll
+        for (unsigned int e = 0; e < 4; e++) {
+            unsigned int row = row_base + warp * 16 + grp + (e >= 2 ? 8 : 0), tok = tok_base + n * 8 + tig * 2 + (e & 1);
+            if (row < rows && tok < m) y[(u64) tok * ys + row] = acc[n][e];
+        }
+}
+
 extern "C" __global__ void mma_cols_bf16(const u8* w, const float* x, unsigned int xs, float* y, unsigned int ys, unsigned int rows, unsigned int cols, unsigned int m) { mma_cols<BF16>(w, x, xs, y, ys, rows, cols, m); }
 extern "C" __global__ void mma_cols_iq3_s(const u8* w, const float* x, unsigned int xs, float* y, unsigned int ys, unsigned int rows, unsigned int cols, unsigned int m) { mma_cols<IQ3S>(w, x, xs, y, ys, rows, cols, m); }
 extern "C" __global__ void mma_grouped_iq3_s(const u64* wtab, const unsigned int* gtab, const float* x, unsigned int xs, float* y, unsigned int ys, unsigned int rows, unsigned int cols) { mma_grouped<IQ3S>(wtab, gtab, x, xs, y, ys, rows, cols); }

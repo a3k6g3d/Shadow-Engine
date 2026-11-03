@@ -3514,8 +3514,22 @@ impl<'c, 'm> GpuSession<'c, 'm> {
             return;
         };
         let wptr = self.w.get(name).unwrap_or_else(|| panic!("{name} is not resident")).ptr;
+        if ty == "F32" && m >= 16 && std::env::var("SHADOW_STAGE_TIME").is_ok_and(|v| v == "1") {
+            eprintln!("F32 mv_cols {name} rows {rows} cols {} m {m}", t.dims[0]);
+        }
         static MMA_BF16: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         let mma_bf16 = ty == "BF16" && *MMA_BF16.get_or_init(|| !std::env::var("SHADOW_MMA_BF16").is_ok_and(|v| v == "0"));
+        static MMA_F32: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if ty == "F32" && !entry.starts_with("matvec_cols_ref_") && self.tensor_prompt && m >= 16 && t.dims[0].is_multiple_of(64) && *MMA_F32.get_or_init(|| !std::env::var("SHADOW_MMA_F32").is_ok_and(|v| v == "0")) {
+            // SAFETY: as the mma_cols launch below: `rows` rows of t.dims[0] f32 weights, m inputs of t.dims[0] floats at x + j * xs, m outputs of `rows` floats at y + j * ys.
+            unsafe {
+                self.mvp.launch("mma_cols_f32x3", ((rows as u32).div_ceil(64), (m as u32).div_ceil(32), 1), (128, 1, 1), 0,
+                                self.ls(), &[Arg::Ptr(wptr), Arg::Ptr(x), Arg::U32(xs as u32), Arg::Ptr(y), Arg::U32(ys as u32),
+                                             Arg::U32(rows as u32), Arg::U32(t.dims[0] as u32), Arg::U32(m as u32)])
+            }
+            .unwrap_or_else(|err| panic!("{name}: {err}"));
+            return;
+        }
         static MMA_QK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         let mma_qk = matches!(ty.as_str(), "Q4_K" | "Q5_K") && *MMA_QK.get_or_init(|| !std::env::var("SHADOW_MMA_QK").is_ok_and(|v| v == "0"));
         if self.tensor_prompt && m >= 16 && (matches!(ty.as_str(), "Q6_K" | "IQ4_XS") || mma_bf16 || mma_qk) && t.dims[0].is_multiple_of(64)
