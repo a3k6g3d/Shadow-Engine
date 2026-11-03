@@ -323,6 +323,9 @@ pub struct GpuSession<'c, 'm> {
     batch_scratch: Option<(DeviceBuffer<'c>, usize)>,
     ram: RamTier<'c>,
     copy_stream: Stream<'c>,
+    /// a second copy stream for the staged halves of a long prompt (`SHADOW_COPY_STREAMS=2`: the experts of a layer are split between the two)
+    copy_stream2: Stream<'c>,
+    copy_ev2: Event<'c>,
     copy_event: Event<'c>,
     staging: Option<PinnedRegion<'c>>,
     /// This layer's drive reads, put off until all its misses are known so `read_drive` can issue them together.
@@ -1258,6 +1261,8 @@ impl<'c, 'm> GpuSession<'c, 'm> {
             ctx.synchronize().map_err(e)?;
         }
         let copy_stream = ctx.stream().map_err(e)?;
+        let copy_stream2 = ctx.stream().map_err(e)?;
+        let copy_ev2 = ctx.event().map_err(e)?;
         let copy_event = ctx.event().map_err(e)?;
         let staging = if slot_bytes > 0 && c.n_expert_used > 0 {
             // four tokens' worth: a batched step may read up to 4 * n_expert_used of a layer's misses together
@@ -1267,7 +1272,7 @@ impl<'c, 'm> GpuSession<'c, 'm> {
         };
         let mut s = GpuSession {
             ctx, m, mvp, fw, w, v, b, bb, replay, dscr, batch_scratch, delta, attn, ple_state, tokens: vec![], pictures: vec![], rope_tab: None, rope_on: false, cap, trace: None, stop_after: None,
-            resident_bytes, expert_uploads: 0, cache, ram, copy_stream, copy_event, staging,
+            resident_bytes, expert_uploads: 0, cache, ram, copy_stream, copy_stream2, copy_ev2, copy_event, staging,
             pending: vec![], routing: RoutingCounts::new(c.n_layer, c.n_expert),
             prof: std::env::var("SHADOW_PROFILE").is_ok_and(|v| v == "1")
                 .then(|| Prof { last: std::time::Instant::now(), phases: vec![] }),
@@ -2617,15 +2622,16 @@ impl<'c, 'm> GpuSession<'c, 'm> {
             lens.push(total);
             n += 1;
         }
-        // timing experiment only (`SHADOW_STAGE_COPY_EVERY=k`): every k-th expert is copied, the rest keep whatever the slot held, so the output is wrong
-        if let Some(k) = std::env::var("SHADOW_STAGE_COPY_EVERY").ok().and_then(|v| v.parse::<usize>().ok()).filter(|&k| k > 1) {
-            let keep = |i: usize| i % k == 0;
-            let mut i = 0;
-            dsts.retain(|_| { i += 1; keep(i - 1) });
-            i = 0; srcs.retain(|_| { i += 1; keep(i - 1) });
-            i = 0; lens.retain(|_| { i += 1; keep(i - 1) });
-            i = 0; let host_srcs: Vec<u64> = host_srcs.into_iter().filter(|_| { i += 1; keep(i - 1) }).collect();
-            self.upload_batch(&mut dsts, &mut srcs, &host_srcs, &mut lens, stream);
+        static TWO: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if dsts.len() >= 2 && *TWO.get_or_init(|| std::env::var("SHADOW_COPY_STREAMS").is_ok_and(|v| v == "2")) {
+            // half of the layer's experts on each copy stream; stream 1 then waits for stream 2, so the half's event covers both
+            let h = dsts.len() / 2;
+            let (mut d2, mut s2, mut l2) = (dsts.split_off(h), srcs.split_off(h), lens.split_off(h));
+            let h2 = host_srcs[h..].to_vec();
+            self.upload_batch(&mut dsts, &mut srcs, &host_srcs[..h], &mut lens, stream);
+            self.upload_batch(&mut d2, &mut s2, &h2, &mut l2, self.copy_stream2.raw());
+            self.copy_ev2.record(Some(&self.copy_stream2)).unwrap();
+            self.ctx.stream_wait_event(Some(&self.copy_stream), &self.copy_ev2).unwrap();
         } else {
             self.upload_batch(&mut dsts, &mut srcs, &host_srcs, &mut lens, stream);
         }
