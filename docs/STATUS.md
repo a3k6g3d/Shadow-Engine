@@ -1540,3 +1540,17 @@ A fresh profile of the build after today's tensor-core kernels (`SHADOW_KTIME=1`
 `delta_steps128` 0.14. In the pass split the **GPU waiting for the expert copy is now ~677 ms a pass (it was 58 ms before the kernels got faster)**: of a ~3.2 s pass, resident experts 581, copied experts 277, attention 912, DeltaNet segment 394+305, stall 677 - roughly a fifth. The earlier conclusion "copies are not on the critical path" held for the slow kernels; it does not hold any more.
 Tried: the experts of a layer split between two copy streams (`SHADOW_COPY_STREAMS=2`; stream 1 waits for stream 2, so the half's event covers both). 3 interleaved pairs, 3,001-token prompt, ctx 16,384: one stream **65.0 s**, two **65.5 s** for 18,006 tokens: a tie, so it stays off. The copy is bound by the host memory / link, not by the number of streams.
 What is left for the copy: fewer bytes per token (a bigger batch: 2,048 rows at ctx 16k, 768 at the 32k default, so the 32k default copies ~2.7x as many bytes per prompt token; a lower `--ctx` or less VRAM per token buys rows), or experts that need no copy (a bigger resident set; the CPU-experts idea, whose premises were measured earlier as unfavourable).
+
+## 2026-11-02: what the context window costs the prompt path (all of today's kernels in; 3,001-token prompt, two prompts a launch)
+
+The window (`--ctx`) takes VRAM from the expert cache, the cache is what a long prompt lends for its staging halves and its batch buffers, so the window sets the prompt batch:
+
+| `--ctx` | expert cache | prompt batch rows | cold / warm tok/s |
+|---|---|---|---|
+| 16,384 | 2,065 slots | 2,048 | 260 / 294 |
+| 20,480 | 1,953 | 1,856 | 261 / 296 |
+| 24,576 | 1,837 | 1,472 | 227 / 253 |
+| **32,768 (default since 39db7c0)** | 1,595 | **704** | **144 / 165** |
+
+Each pass copies a layer's whole expert set whatever its token count, and now that the kernels are fast the copy is the limit: 704 rows copy 2.9x the bytes per prompt token of 2,048 rows. The 32k default costs **44% of the prompt speed** against 20k (decode: -1.3%, measured on 2026-11-01). There is no cheap way to give the 32k window the big batch:
+16-bit K/V (half the window's VRAM; touches the attention kernels of the decode path), lending the DFlash drafter's ~1.2 GB during a prompt, or staging halves sized to the experts a layer needs. A default of 24,576 keeps 86% of the 20k speed.
