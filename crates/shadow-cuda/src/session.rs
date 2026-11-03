@@ -3754,7 +3754,9 @@ impl<'c, 'm> GpuSession<'c, 'm> {
                     Arg::Ptr(bb.o.ptr), Arg::U32(vd as u32), Arg::U32(kh as u32), Arg::U32(m as u32), Arg::Ptr(bb.z.ptr),
                     Arg::Ptr(self.sv(&format!("{p}.ssm_norm.weight"))), Arg::F32(c.eps)]);
             } else {
-                self.k("delta_steps128", vh as u32, 128, &[
+                static DELTA_X8: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+                let x8 = m >= 16 && *DELTA_X8.get_or_init(|| std::env::var("SHADOW_DELTA_X8").is_ok_and(|v| v == "1"));
+                self.k(if x8 { "delta_steps128_x8" } else { "delta_steps128" }, vh as u32, if x8 { 1024 } else { 128 }, &[
                     Arg::Ptr(bb.x.ptr), Arg::Ptr(bb.x.ptr + (kd * 4) as u64), Arg::Ptr(bb.x.ptr + (2 * kd * 4) as u64),
                     Arg::U32(ch as u32), Arg::Ptr(beta_p), Arg::Ptr(alpha_p), Arg::U32(vh as u32),
                     Arg::Ptr(self.sv(&format!("{p}.ssm_a"))), Arg::Ptr(self.sv(&format!("{p}.ssm_dt.bias"))), Arg::Ptr(s.ptr),

@@ -1509,3 +1509,10 @@ Bench, ctx 16,384, the 3,001-token prompt, 7 interleaved pairs (2 prompts each, 
 
 Dropping the pair with the 18.8 s outlier: 247.3 -> 268.5 (**+8.6%**). New was faster in 6 of 7 pairs, a tie in the seventh (22.5 s vs 22.9 s). Warm second prompts: 10.1-11.1 s (new) vs 10.6-12.0 s (old).
 Correctness: the one-question sanity prompt answers "Open", the 7-question check is 6/7 (unchanged). Remaining in the profile: F32 dense (6%), the DeltaNet recurrence `delta_steps128` (17%), attention (8%).
+
+## 2026-11-02: the DeltaNet recurrence with 8 threads a column (`delta_steps128_x8`): -4.7%, stays opt-in (`SHADOW_DELTA_X8=1`)
+
+`delta_steps128` runs one 128-thread block per value head, a thread per column of the 128x128 state with its 128 rows in registers, 17% of the prompt's GPU time. `delta_steps128_x8` uses a 1,024-thread block (8 threads a column, 16 rows each; the 8 partial sums are added in the same order in double by every thread of the column), the same operations on the same values in the same order:
+an 80-token reply under `--exact` is byte-identical with and without it. Used for >= 16 tokens, 3,001-token prompt, ctx 16,384, 4 interleaved pairs (2 prompts each), total time for 24,004 tokens:
+**old 90.6 s (265 tok/s), x8 95.1 s (252 tok/s): x8 is 4.7% slower** (old faster in 4 of 4 pairs). The four extra `__syncthreads` per token (1,024 threads each) cost more than the shorter fma chains save; the recurrence is latency-bound on the token-after-token dependency, not on the chain length.
+So it is **off by default** (`SHADOW_DELTA_X8=1` turns it on). What would help is not more threads on the same loop but fewer sequential steps: a chunked scan (the WY / UT-transform form that handles 64 tokens per step with matrix products on tensor cores) - a different algorithm with different rounding, not bit-exact with the reference; not attempted.

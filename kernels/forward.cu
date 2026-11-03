@@ -351,6 +351,59 @@ extern "C" __global__ void delta_steps128(const float* q, const float* k, const 
     for (unsigned int i = 0; i < d; ++i) s[i * d + j] = col[i];
 }
 
+// delta_steps128 with 8 threads a column instead of 1: thread (c, j) of the 1024-thread block keeps rows 16c..16c+15 of column j of S (16 registers, not 128), so
+// the 16-term fma chains of one token run in parallel and the 8 partial sums are added in the same order (c = 0..7, in double) by every thread of the column:
+// the same operations on the same values in the same order, so the same bits as delta_steps128.  grid = value heads, block = 1024.
+extern "C" __global__ void delta_steps128_x8(const float* q, const float* k, const float* v, unsigned int xs, const float* b,
+                                             const float* a, unsigned int bs, const float* A, const float* dtb, float* S,
+                                             float* o, unsigned int os, unsigned int kh, unsigned int m) {
+    const unsigned int d = 128;
+    __shared__ float qs[128], ks[128], pm[8][128], pa[8][128];
+    const unsigned int h = blockIdx.x, c = threadIdx.x / 128, j = threadIdx.x % 128, kx = h % kh;
+    float* s = S + (u64) h * d * d;
+    float col[16];
+#pragma unroll
+    for (unsigned int r = 0; r < 16; ++r) col[r] = s[(16 * c + r) * d + j];
+    for (unsigned int t = 0; t < m; ++t) {
+        __syncthreads();
+        if (c == 0) {
+            qs[j] = q[(u64) t * xs + kx * d + j];
+            ks[j] = k[(u64) t * xs + kx * d + j];
+        }
+        __syncthreads();
+        const float beta = sigmoidf_ref(b[(u64) t * bs + h]);
+        const float decay = expf(A[h] * softplusf_ref(a[(u64) t * bs + h] + dtb[h]));
+        float part = 0.0f;
+#pragma unroll
+        for (unsigned int r = 0; r < 16; ++r) {
+            col[r] *= decay;
+            part = fmaf(col[r], ks[16 * c + r], part);
+        }
+        pm[c][j] = part;
+        __syncthreads();
+        double mem = 0.0;
+#pragma unroll
+        for (unsigned int cc = 0; cc < 8; ++cc) mem += (double) pm[cc][j];
+        const float delta = (float) (((double) v[(u64) t * xs + h * d + j] - mem) * (double) beta);
+        part = 0.0f;
+#pragma unroll
+        for (unsigned int r = 0; r < 16; ++r) {
+            col[r] += ks[16 * c + r] * delta;
+            part = fmaf(col[r], qs[16 * c + r], part);
+        }
+        pa[c][j] = part;
+        __syncthreads();
+        if (c == 0) {
+            double acc = 0.0;
+#pragma unroll
+            for (unsigned int cc = 0; cc < 8; ++cc) acc += (double) pa[cc][j];
+            o[(u64) t * os + h * d + j] = (float) acc;
+        }
+    }
+#pragma unroll
+    for (unsigned int r = 0; r < 16; ++r) s[(16 * c + r) * d + j] = col[r];
+}
+
 // delta_steps128 with gated_rmsnorm_heads folded in: after each token's recurrence the head's 128 outputs are
 // normalized and gated in the block (the same operations in the same order as gated_rmsnorm_heads, whose block is
 // these 128 threads too).  z rows os apart; o is written normalized.
