@@ -180,6 +180,8 @@ struct Bufs<'c> {
 pub const MAX_BATCH: usize = 256;
 /// Tokens a long prompt reads together in the lent cache (`big_batch_on`): per-token buffers carved from it, not kept.
 pub const BIG_BATCH: usize = 2048;
+/// Tokens a pass can take at most (`lend_kv` picks 2,048, 1,024 or 512 by the lent KV tail). 4,096 was tried (half the copying a token) but the drafter's feature buffers have to hold a whole pass: +150 MB of VRAM, -2 points of the 24k window's prompt speed, and the tail is only that big in a window band where the staging pipeline cannot start (STATUS.md 2026-11-03)
+pub const BIG_BATCH_MAX: usize = 2048;
 /// Unread prompt tokens from which the layer-ahead pipeline and the big batch are used.
 pub const LONG_PROMPT: usize = 1024;
 const COLS_MAX: usize = 8;
@@ -309,6 +311,10 @@ pub struct GpuSession<'c, 'm> {
     /// the address range `kv_extra` lives in: fixed, so the CUDA graphs captured over the big batch's buffers stay valid from one prompt to the next
     kv_extra_reg: Option<crate::kvvmm::VmmRegion<'c>>,
     prompt_hint: usize,
+    /// rows of the batch buffers `lend_kv` made room for (BIG_BATCH or BIG_BATCH_MAX)
+    kv_rows: usize,
+    /// `kv_extra` also holds the two staging halves (the cache arena is too small to lend them: windows past ~40k)
+    kv_halves: bool,
     /// `SHADOW_ROUTER_BIAS=x`: x is added to the router logits of the experts the VRAM cache holds when the top-k is chosen (not to their weights)
     router_bias: f32,
     delta: Vec<Option<(DeviceBuffer<'c>, DeviceBuffer<'c>)>>,
@@ -1034,7 +1040,7 @@ impl<'c, 'm> GpuSession<'c, 'm> {
         let dscr = a(BIG_BATCH.div_ceil(64) * c.ssm_v_heads * 8448)?;
         let kv_lend = !std::env::var("SHADOW_KV_LEND").is_ok_and(|v| v == "0");
         let mut kv_regions: Vec<crate::kvvmm::VmmRegion<'c>> = Vec::new();
-        let kv_extra_reg = if kv_lend { Some(crate::kvvmm::VmmRegion::new_empty(ctx, bb_row_floats(c) * BIG_BATCH * 4 + (1 << 16))?) } else { None };
+        let kv_extra_reg: Option<crate::kvvmm::VmmRegion<'c>> = None; // made at the first lend, when the slot size is known
         let mut delta = Vec::new();
         let mut attn = Vec::new();
         for l in 0..c.n_layer {
@@ -1295,7 +1301,7 @@ impl<'c, 'm> GpuSession<'c, 'm> {
             None
         };
         let mut s = GpuSession {
-            ctx, m, mvp, fw, w, v, b, bb, replay, dscr, kv_regions, kv_extra: None, kv_extra_reg, prompt_hint: 0, router_bias: std::env::var("SHADOW_ROUTER_BIAS").ok().and_then(|v| v.parse().ok()).unwrap_or(0.0), batch_scratch, delta, attn, ple_state, tokens: vec![], pictures: vec![], rope_tab: None, rope_on: false, cap, trace: None, stop_after: None,
+            ctx, m, mvp, fw, w, v, b, bb, replay, dscr, kv_regions, kv_extra: None, kv_extra_reg, prompt_hint: 0, kv_rows: 0, kv_halves: false, router_bias: std::env::var("SHADOW_ROUTER_BIAS").ok().and_then(|v| v.parse().ok()).unwrap_or(0.0), batch_scratch, delta, attn, ple_state, tokens: vec![], pictures: vec![], rope_tab: None, rope_on: false, cap, trace: None, stop_after: None,
             resident_bytes, expert_uploads: 0, cache, ram, copy_stream, copy_stream2, copy_ev2, copy_event, staging,
             pending: vec![], routing: RoutingCounts::new(c.n_layer, c.n_expert),
             prof: std::env::var("SHADOW_PROFILE").is_ok_and(|v| v == "1")
@@ -1319,7 +1325,7 @@ impl<'c, 'm> GpuSession<'c, 'm> {
             mapped_event2: ctx.event().map_err(e)?,
             group_event: ctx.event().map_err(e)?,
             ticket_stage: [usize::MAX; 2],
-            mapped: PinnedRegion::new(ctx, BIG_BATCH.max(2) * c.n_expert * 4)?,
+            mapped: PinnedRegion::new(ctx, BIG_BATCH_MAX.max(2) * c.n_expert * 4)?,
             mapped_event: ctx.event().map_err(e)?,
             waits: [0.0; 3],
             stage_ptr: std::ptr::null_mut(),
@@ -2492,19 +2498,33 @@ impl<'c, 'm> GpuSession<'c, 'm> {
 
     /// `SHADOW_KV_LEND=1`: hand the KV window's unfilled tail (past this prompt and 256 positions more) back to the driver and take it as one ordinary buffer for
     /// the prompt's batch buffers; true if there is such a buffer.  The device must be idle (it is: this runs before the prompt).
-    fn lend_kv(&mut self) -> bool {
+    fn lend_kv(&mut self, with_halves: bool) -> bool {
         if self.kv_regions.is_empty() || self.kv_extra.is_some() || self.prompt_hint == 0 {
             return false;
         }
         let _ = self.ctx.synchronize();
         let keep = self.tokens.len() + self.prompt_hint + 256;
         let freed: usize = self.kv_regions.iter_mut().map(|r| r.release_tail(keep)).sum();
-        let want = bb_row_floats(&self.m.cfg) * BIG_BATCH * 4 + (1 << 16);
-        if freed >= want + (8 << 20) {
+        let rb = bb_row_floats(&self.m.cfg) * 4;
+        // twice the rows when the tail is that big (a long window, a short prompt); the rows are one of two values, so the graphs captured per row count stay valid
+        let halves = if with_halves { 2 * self.m.cfg.n_expert * self.cache.slot_bytes } else { 0 };
+        let avail = freed.saturating_sub(halves + (1 << 16) + (8 << 20));
+        let cap = std::env::var("SHADOW_BIG_ROWS").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(BIG_BATCH_MAX);
+        // the rows are one of a few values, so the graphs captured per row count stay few
+        let rows = [BIG_BATCH_MAX, BIG_BATCH, 1024, 512].into_iter().find(|&r| r <= cap.max(512) && rb * r <= avail).unwrap_or(0);
+        // with the halves in the arena, a smaller batch than the arena itself can carve (1,600 rows at the 24k window) is no reason to take the KV tail
+        let rows = if !with_halves && rows < BIG_BATCH { 0 } else { rows };
+        let want = halves + rb * rows + (1 << 16);
+        if self.kv_extra_reg.is_none() {
+            let size = 2 * self.m.cfg.n_expert * self.cache.slot_bytes + rb * BIG_BATCH_MAX + (1 << 16);
+            self.kv_extra_reg = crate::kvvmm::VmmRegion::new_empty(self.ctx, size).ok();
+        }
+        if rows > 0 {
             if let Some(reg) = self.kv_extra_reg.as_mut() {
                 if reg.map_bytes(want).is_ok() {
                     // SAFETY: a view of the region's mapped range; the session owns the region.
                     self.kv_extra = Some(unsafe { DeviceBuffer::view(self.ctx, reg.base, want) });
+                    self.kv_rows = rows;
                     return true;
                 }
                 reg.release_tail(0);
@@ -2522,6 +2542,7 @@ impl<'c, 'm> GpuSession<'c, 'm> {
             return;
         }
         self.kv_extra = None;
+        self.kv_halves = false;
         if let Some(reg) = self.kv_extra_reg.as_mut() {
             reg.release_tail(0);
         }
@@ -2538,7 +2559,27 @@ impl<'c, 'm> GpuSession<'c, 'm> {
         }
         let pipe = long && !std::env::var("SHADOW_PREFILL_PIPE").is_ok_and(|v| v == "0");
         let big = !std::env::var("SHADOW_PREFILL_BIG").is_ok_and(|v| v == "0");
-        let kv_lent = pipe && big && self.lend_kv();
+        // the staging halves (two experts-sets of slots) are lent from the arena when it is big enough, else (a long window leaves a small cache) from the KV window's tail with the batch buffers
+        let (ne, sb) = (self.m.cfg.n_expert, self.cache.slot_bytes);
+        let pct = std::env::var("SHADOW_LEND_PCT").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(99);
+        let cap_bytes = (self.cache.arena_bytes / 100 * pct).min(self.cache.arena_bytes.saturating_sub(24 * sb));
+        let arena_hosts = cap_bytes >= (2 * ne + 6) * sb;
+        if pipe && big && !arena_hosts && self.lend_kv(true) {
+            let slots = std::env::var("SHADOW_PREFILL_STAGING").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(256);
+            let need = slots * sb;
+            if self.staging.as_ref().is_some_and(|s| s.len() < need) {
+                if let Ok(r) = PinnedRegion::new(self.ctx, need) {
+                    self.staging = Some(r);
+                }
+            }
+            let ptr = self.kv_extra.as_ref().unwrap().ptr;
+            self.kv_halves = true;
+            self.lent = Some(Lent { ptr, n: 0, saved: vec![], evict_saved: self.cache.evict_range.clone() });
+            self.stage_pipe_init(ptr);
+            self.big_batch_on();
+            return true;
+        }
+        let kv_lent = pipe && big && arena_hosts && self.lend_kv(false);
         let want = std::env::var("SHADOW_PREFILL_LEND_MIB").ok().and_then(|v| v.parse::<usize>().ok()).map(|m| m << 20)
             .unwrap_or((self.m.cfg.n_expert * if pipe { 2 } else { 1 } + if pipe { 2 } else { 0 }) * self.cache.slot_bytes
                        + if pipe && big && !kv_lent { bb_row_floats(&self.m.cfg) * BIG_BATCH * 4 + (1 << 16) } else { 0 })
@@ -2579,6 +2620,9 @@ impl<'c, 'm> GpuSession<'c, 'm> {
             if let Ok(r) = PinnedRegion::new(self.ctx, need) {
                 self.staging = Some(r);
             }
+        }
+        if std::env::var("SHADOW_STAGE_TIME").is_ok_and(|v| v == "1") {
+            eprintln!("LEND long {long} pipe {pipe} big {big} kv_lent {kv_lent}: {} of {} slots lent (n {n}, need {} for the pipeline), want {:.2} GiB", self.cache.slots - s0, self.cache.slots, 2 * self.m.cfg.n_expert, want as f64 / 1073741824.0);
         }
         let ptr = self.cache.arena.as_ref().unwrap().ptr + start as u64;
         self.lent = Some(Lent { ptr, n, saved, evict_saved });
@@ -2792,13 +2836,13 @@ impl<'c, 'm> GpuSession<'c, 'm> {
         let (Some(lent), true) = (self.lent.as_ref(), self.sp.is_some()) else { return false };
         let c = &self.m.cfg;
         let (start, end) = match self.kv_extra.as_ref() {
-            Some(x) => (x.ptr, x.ptr + x.bytes as u64),
+            Some(x) => (x.ptr + if self.kv_halves { (2 * c.n_expert * self.cache.slot_bytes) as u64 } else { 0 }, x.ptr + x.bytes as u64),
             None => (self.sp.as_ref().unwrap().base + (2 * c.n_expert * self.cache.slot_bytes) as u64, lent.ptr + (lent.n * self.cache.slot_bytes) as u64),
         };
         // As many rows as the lent room holds, up to BIG_BATCH: a longer `--ctx` leaves the expert cache (and so the room) smaller, and a prompt that
         // read 2,048 tokens at a time must not drop to 256 for want of a few MiB; each pass copies a layer's experts whatever its token count.
         let fit = (end.saturating_sub(start) as usize).saturating_sub(64 * 40) / (bb_row_floats(c) * 4);
-        let cap = std::env::var("SHADOW_BIG_ROWS").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(BIG_BATCH).min(BIG_BATCH);
+        let cap = if self.kv_extra.is_some() { self.kv_rows } else { std::env::var("SHADOW_BIG_ROWS").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(BIG_BATCH).min(BIG_BATCH) };
         let rows = fit.min(cap) / 64 * 64;
         let need = bb_row_floats(c) * rows * 4 + 64 * 40; // the 256-byte rounding of ~40 buffers
         if rows < 2 * MAX_BATCH {
@@ -3512,7 +3556,7 @@ impl<'c, 'm> GpuSession<'c, 'm> {
             if graphs && !c.is_attention(l) && l != c.ple_layer {
                 // a DeltaNet layer up to its router is the same launches for every batch of m: one graph
                 let on = self.replay.on.get();
-                self.batch_graph_segment((l, rn_ready, m, on, (self.rows > MAX_BATCH) as usize), |s| {
+                self.batch_graph_segment((l, rn_ready, m, on, self.rows), |s| {
                     s.hc_read_batch(&format!("blk.{l}.hc_attn"), true, rn_ready, m);
                     s.delta_batch(l, m);
                     s.hc_write_batch(Some(&format!("blk.{l}.hc_ffn_norm.weight")), m);
