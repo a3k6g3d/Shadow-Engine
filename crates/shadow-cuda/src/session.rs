@@ -529,6 +529,25 @@ impl Snapshot<'_> {
     pub fn tokens(&self) -> &[u32] {
         &self.tokens
     }
+
+    /// Bytes this snapshot holds in host memory (what a pool of them costs in RAM).
+    pub fn host_bytes(&self) -> usize {
+        let h = |s: &Saved| if let Saved::Host(v) = s { v.len() } else { 0 };
+        let mut n = h(&self.ple);
+        for d in self.delta.iter().flatten() {
+            n += h(&d.0) + h(&d.1);
+        }
+        for k in self.kv.iter().flatten() {
+            n += h(&k.k) + h(&k.v) + h(&k.raw) + h(&k.blocks);
+        }
+        if let Some((a, _, kv)) = &self.mtp {
+            n += h(a);
+            if let Some((b, c)) = kv {
+                n += h(b) + h(c);
+            }
+        }
+        n
+    }
 }
 
 /// An expert to read from the file into pinned memory and then copy to `dst`: into `RamTier`'s region at `off` when
