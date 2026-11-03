@@ -1082,6 +1082,17 @@ pub fn route(logits: &[f32], k: usize) -> Vec<(usize, f64)> {
     top.iter().map(|&e| (e, (ex[e] / z) / tz)).collect()
 }
 
+/// `route` with a bias added to the logits for the CHOICE only (`bias(e)` in logit units, e.g. towards the experts the cache already holds); the weights stay the
+/// unbiased router's, renormalized over the chosen experts, so the output mixes the chosen experts as the router itself weighs them.
+pub fn route_biased(logits: &[f32], bias: &dyn Fn(usize) -> f32, k: usize) -> Vec<(usize, f64)> {
+    let b: Vec<f32> = logits.iter().enumerate().map(|(i, &v)| v + bias(i)).collect();
+    let chosen = route(&b, k);
+    let mx = logits.iter().cloned().fold(f32::MIN, f32::max);
+    let ex: Vec<f64> = chosen.iter().map(|&(e, _)| ((logits[e] - mx) as f64).exp()).collect();
+    let z: f64 = ex.iter().sum();
+    chosen.iter().zip(&ex).map(|(&(e, _), &x)| (e, x / z)).collect()
+}
+
 /// Sigmoid top-k routing (`expert_gating_func = 2`, Flint): sigmoid(logits) in f32, top `k` chosen, renormalized by
 /// `sum(top) + 1e-20`.
 pub fn route_sigmoid(logits: &[f32], k: usize) -> Vec<(usize, f64)> {

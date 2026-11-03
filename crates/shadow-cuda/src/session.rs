@@ -15,7 +15,7 @@
 use crate::driver::{Context, DeviceBuffer, Event, Graph, Stream};
 use crate::kernels::{file, Arg, Program, FAST_KERNELS, PAIR2_KERNELS, PAIR_KERNELS, QUANT_KERNELS};
 use crate::pinned::PinnedRegion;
-use shadow_model::forward::{ple_rows, route, route_sigmoid, Model, Stepper};
+use shadow_model::forward::{ple_rows, route, route_biased, route_sigmoid, Model, Stepper};
 use shadow_model::gguf::TensorInfo;
 use shadow_model::placement::{uniform_order, RoutingCounts};
 use shadow_model::quant::dequantize;
@@ -303,6 +303,8 @@ pub struct GpuSession<'c, 'm> {
     replay: Replay<'c>,
     /// `delta_chunk_prep`'s output for up to BIG_BATCH tokens: 8,448 floats a (64-token chunk, value head)
     dscr: DeviceBuffer<'c>,
+    /// `SHADOW_ROUTER_BIAS=x`: x is added to the router logits of the experts the VRAM cache holds when the top-k is chosen (not to their weights)
+    router_bias: f32,
     delta: Vec<Option<(DeviceBuffer<'c>, DeviceBuffer<'c>)>>,
     attn: Vec<Option<Attn<'c>>>,
     ple_state: DeviceBuffer<'c>,
@@ -1271,7 +1273,7 @@ impl<'c, 'm> GpuSession<'c, 'm> {
             None
         };
         let mut s = GpuSession {
-            ctx, m, mvp, fw, w, v, b, bb, replay, dscr, batch_scratch, delta, attn, ple_state, tokens: vec![], pictures: vec![], rope_tab: None, rope_on: false, cap, trace: None, stop_after: None,
+            ctx, m, mvp, fw, w, v, b, bb, replay, dscr, router_bias: std::env::var("SHADOW_ROUTER_BIAS").ok().and_then(|v| v.parse().ok()).unwrap_or(0.0), batch_scratch, delta, attn, ple_state, tokens: vec![], pictures: vec![], rope_tab: None, rope_on: false, cap, trace: None, stop_after: None,
             resident_bytes, expert_uploads: 0, cache, ram, copy_stream, copy_stream2, copy_ev2, copy_event, staging,
             pending: vec![], routing: RoutingCounts::new(c.n_layer, c.n_expert),
             prof: std::env::var("SHADOW_PROFILE").is_ok_and(|v| v == "1")
@@ -2903,6 +2905,8 @@ impl<'c, 'm> GpuSession<'c, 'm> {
         }
         let top = if is_flint {
             route_sigmoid(&logits, c.n_expert_used)
+        } else if self.router_bias != 0.0 {
+            route_biased(&logits, &|e| if self.cache.map.contains_key(&(l, e)) { self.router_bias } else { 0.0 }, c.n_expert_used)
         } else {
             route(&logits, c.n_expert_used)
         };
@@ -3996,7 +4000,11 @@ impl<'c, 'm> GpuSession<'c, 'm> {
             self.k1("swiglu", m * sff, &[Arg::Ptr(bb.sg.ptr), Arg::Ptr(bb.su.ptr), Arg::Ptr(bb.sa.ptr), Arg::U32((m * sff) as u32)]);
             self.mv_cols(&format!("{p}.ffn_down_shexp.weight"), bb.sa.ptr, sff, bb.so.ptr, h, m);
         }
-        let mut tops: Vec<Vec<(usize, f64)>> = logits.iter().map(|lg| route(lg, k)).collect();
+        let mut tops: Vec<Vec<(usize, f64)>> = if self.router_bias != 0.0 {
+            logits.iter().map(|lg| route_biased(lg, &|e| if self.cache.map.contains_key(&(l, e)) { self.router_bias } else { 0.0 }, k)).collect()
+        } else {
+            logits.iter().map(|lg| route(lg, k)).collect()
+        };
         for (j, top) in tops.iter().enumerate() {
             for &(e, _) in top {
                 self.routing.add(l, e);
