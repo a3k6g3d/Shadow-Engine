@@ -260,6 +260,8 @@ pub const FILES: &[File] = &[
             e("l2norm_qk_heads", &[W, U, U, F]),
             e("delta_step", &[C, C, C, C, C, C, C, W, W, U, U]),
             e("delta_steps128", &[C, C, C, U, C, C, U, C, C, W, W, U, U, U]),
+            e("delta_chunk_prep", &[C, C, C, C, C, C, W, U, U, U, U, U]),
+            e("delta_chunk_run", &[C, C, C, C, W, W, U, U, U, U, U]),
             e("delta_steps128_x8", &[C, C, C, U, C, C, U, C, C, W, W, U, U, U]),
             e("delta_steps128_gn", &[C, C, C, U, C, C, U, C, C, W, W, U, U, U, C, C, F]),
             e("df_capture", &[C, W, U, U, U, U]),

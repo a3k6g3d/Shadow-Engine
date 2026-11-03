@@ -301,6 +301,8 @@ pub struct GpuSession<'c, 'm> {
     b: Bufs<'c>,
     bb: BatchBufs<'c>,
     replay: Replay<'c>,
+    /// `delta_chunk_prep`'s output for up to BIG_BATCH tokens: 8,448 floats a (64-token chunk, value head)
+    dscr: DeviceBuffer<'c>,
     delta: Vec<Option<(DeviceBuffer<'c>, DeviceBuffer<'c>)>>,
     attn: Vec<Option<Attn<'c>>>,
     ple_state: DeviceBuffer<'c>,
@@ -1018,6 +1020,7 @@ impl<'c, 'm> GpuSession<'c, 'm> {
             qkv: a(c.n_layer * MAX_VERIFY * (2 * kd + vd))?, ba: a(c.n_layer * MAX_VERIFY * 2 * c.ssm_v_heads)?,
             ple: a(MAX_VERIFY * ch)?, pass: None, on: std::cell::Cell::new(false),
         };
+        let dscr = a(BIG_BATCH.div_ceil(64) * c.ssm_v_heads * 8448)?;
         let mut delta = Vec::new();
         let mut attn = Vec::new();
         for l in 0..c.n_layer {
@@ -1263,7 +1266,7 @@ impl<'c, 'm> GpuSession<'c, 'm> {
             None
         };
         let mut s = GpuSession {
-            ctx, m, mvp, fw, w, v, b, bb, replay, batch_scratch, delta, attn, ple_state, tokens: vec![], pictures: vec![], rope_tab: None, rope_on: false, cap, trace: None, stop_after: None,
+            ctx, m, mvp, fw, w, v, b, bb, replay, dscr, batch_scratch, delta, attn, ple_state, tokens: vec![], pictures: vec![], rope_tab: None, rope_on: false, cap, trace: None, stop_after: None,
             resident_bytes, expert_uploads: 0, cache, ram, copy_stream, copy_event, staging,
             pending: vec![], routing: RoutingCounts::new(c.n_layer, c.n_expert),
             prof: std::env::var("SHADOW_PROFILE").is_ok_and(|v| v == "1")
@@ -3754,6 +3757,19 @@ impl<'c, 'm> GpuSession<'c, 'm> {
                     Arg::Ptr(bb.o.ptr), Arg::U32(vd as u32), Arg::U32(kh as u32), Arg::U32(m as u32), Arg::Ptr(bb.z.ptr),
                     Arg::Ptr(self.sv(&format!("{p}.ssm_norm.weight"))), Arg::F32(c.eps)]);
             } else {
+                static DELTA_CHUNK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+                if m >= 64 && m <= BIG_BATCH && *DELTA_CHUNK.get_or_init(|| std::env::var("SHADOW_DELTA_CHUNK").is_ok_and(|v| v == "1")) {
+                    let nch = m.div_ceil(64) as u32;
+                    self.k2("delta_chunk_prep", nch, vh as u32, 256, &[
+                        Arg::Ptr(bb.x.ptr), Arg::Ptr(bb.x.ptr + (kd * 4) as u64), Arg::Ptr(beta_p), Arg::Ptr(alpha_p),
+                        Arg::Ptr(self.sv(&format!("{p}.ssm_a"))), Arg::Ptr(self.sv(&format!("{p}.ssm_dt.bias"))), Arg::Ptr(self.dscr.ptr),
+                        Arg::U32(ch as u32), Arg::U32(vh as u32), Arg::U32(kh as u32), Arg::U32(vh as u32), Arg::U32(m as u32)]);
+                    self.k2("delta_chunk_run", vh as u32, (d / 16) as u32, 256, &[
+                        Arg::Ptr(bb.x.ptr), Arg::Ptr(bb.x.ptr + (kd * 4) as u64), Arg::Ptr(bb.x.ptr + (2 * kd * 4) as u64), Arg::Ptr(self.dscr.ptr),
+                        Arg::Ptr(s.ptr), Arg::Ptr(bb.o.ptr), Arg::U32(ch as u32), Arg::U32(vd as u32), Arg::U32(kh as u32), Arg::U32(vh as u32), Arg::U32(m as u32)]);
+                    self.k2("gated_rmsnorm_rows", vh as u32, m as u32, 128, &[Arg::Ptr(bb.o.ptr), Arg::Ptr(self.sv(&format!("{p}.ssm_norm.weight"))),
+                                                                             Arg::Ptr(bb.z.ptr), Arg::U32(d as u32), Arg::F32(c.eps), Arg::U32(vd as u32)]);
+                } else {
                 static DELTA_X8: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
                 let x8 = m >= 16 && *DELTA_X8.get_or_init(|| std::env::var("SHADOW_DELTA_X8").is_ok_and(|v| v == "1"));
                 self.k(if x8 { "delta_steps128_x8" } else { "delta_steps128" }, vh as u32, if x8 { 1024 } else { 128 }, &[
@@ -3764,6 +3780,7 @@ impl<'c, 'm> GpuSession<'c, 'm> {
                 self.k2("gated_rmsnorm_rows", vh as u32, m as u32, 128, &[Arg::Ptr(bb.o.ptr), Arg::Ptr(self.sv(&format!("{p}.ssm_norm.weight"))),
                                                                          Arg::Ptr(bb.z.ptr), Arg::U32(d as u32), Arg::F32(c.eps),
                                                                          Arg::U32(vd as u32)]);
+                }
             }
         } else {
             for j in 0..m {

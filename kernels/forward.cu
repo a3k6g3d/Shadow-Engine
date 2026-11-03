@@ -404,6 +404,142 @@ extern "C" __global__ void delta_steps128_x8(const float* q, const float* k, con
     for (unsigned int r = 0; r < 16; ++r) s[(16 * c + r) * d + j] = col[r];
 }
 
+// ---- the DeltaNet recurrence of a long prompt as a chunked scan (gated delta rule, WY form), 64 tokens a chunk.  Not bit-exact with delta_steps128 (other rounding), the same maths:
+//   S_t = g_t S_{t-1} + k_t u_t^T,  u_t = beta_t (v_t - g_t S_{t-1}^T k_t),  o_t = S_t^T q_t,  gamma_t = prod of the chunk's g up to t, ratio(t,s) = gamma_t / gamma_s
+//   (I + A) U = diag(beta) (V - diag(gamma) K S_0),  A[t][s] = beta_t ratio(t,s) (k_s . k_t) for s < t;  T = (I + A)^-1 diag(beta)
+//   O = diag(gamma) Q S_0 + Mo U,  Mo[t][s] = ratio(t,s) (k_s . q_t) for s <= t;  S_64 = gamma_64 S_0 + K^T diag(gamma_64 / gamma_s) U
+// delta_chunk_prep builds T, Mo, gamma, gamma_64/gamma_s for every (chunk, value head) at once (nothing in it depends on S); delta_chunk_run walks the chunks of a head in order,
+// 16 columns of S a block.  Tokens past m in the last chunk have beta = 0 and g = 1 (they change nothing).  Scratch per (chunk, head): DSCR floats.
+#define DSCR 8448
+extern "C" __global__ void delta_chunk_prep(const float* q, const float* k, const float* b, const float* a, const float* A, const float* dtb, float* scr,
+                                            unsigned int xs, unsigned int bs, unsigned int kh, unsigned int vh, unsigned int m) {
+    __shared__ float Ls[64], lgs[64], bt[64];
+    __shared__ float Am[64][65], T2[64][65];
+    const unsigned int n = blockIdx.x, h = blockIdx.y, kx = h % kh, tid = threadIdx.x, t0 = n * 64;
+    float* out = scr + ((u64) n * vh + h) * DSCR;
+    if (tid < 64) {
+        bool ok = t0 + tid < m;
+        bt[tid] = ok ? sigmoidf_ref(b[(u64) (t0 + tid) * bs + h]) : 0.0f;
+        lgs[tid] = ok ? A[h] * softplusf_ref(a[(u64) (t0 + tid) * bs + h] + dtb[h]) : 0.0f;
+    }
+    __syncthreads();
+    if (tid == 0) {
+        float acc = 0.0f;
+        for (unsigned int t = 0; t < 64; ++t) { acc += lgs[t]; Ls[t] = acc; }
+    }
+    __syncthreads();
+    {
+        const unsigned int t = tid / 4, s0 = (tid % 4) * 16;
+        const unsigned int tt = min(t0 + t, m - 1);
+        const float4* kt = (const float4*) (k + (u64) tt * xs + kx * 128);
+        const float4* qt = (const float4*) (q + (u64) tt * xs + kx * 128);
+        float kk[16], qk[16];
+#pragma unroll
+        for (unsigned int e = 0; e < 16; ++e) { kk[e] = 0.0f; qk[e] = 0.0f; }
+        for (unsigned int i4 = 0; i4 < 32; ++i4) {
+            float4 kv = kt[i4], qv = qt[i4];
+#pragma unroll
+            for (unsigned int e = 0; e < 16; ++e) {
+                const unsigned int ts = min(t0 + s0 + e, m - 1);
+                float4 sv = ((const float4*) (k + (u64) ts * xs + kx * 128))[i4];
+                kk[e] = fmaf(kv.x, sv.x, fmaf(kv.y, sv.y, fmaf(kv.z, sv.z, fmaf(kv.w, sv.w, kk[e]))));
+                qk[e] = fmaf(qv.x, sv.x, fmaf(qv.y, sv.y, fmaf(qv.z, sv.z, fmaf(qv.w, sv.w, qk[e]))));
+            }
+        }
+#pragma unroll
+        for (unsigned int e = 0; e < 16; ++e) {
+            const unsigned int s = s0 + e;
+            const float ratio = s <= t ? expf(Ls[t] - Ls[s]) : 0.0f;
+            Am[t][s] = s < t ? bt[t] * ratio * kk[e] : 0.0f;
+            out[4096 + t * 64 + s] = s <= t ? ratio * qk[e] : 0.0f;
+        }
+    }
+    __syncthreads();
+    if (tid < 64) {
+        const unsigned int c = tid;
+        for (unsigned int t = 0; t < 64; ++t) {
+            float x = 0.0f;
+            if (t >= c) {
+                x = t == c ? bt[t] : 0.0f;
+                for (unsigned int s = c; s < t; ++s) x -= Am[t][s] * T2[s][c];
+            }
+            T2[t][c] = x;
+        }
+    }
+    __syncthreads();
+    for (unsigned int e = tid; e < 4096; e += 256) out[e] = T2[e / 64][e % 64];
+    if (tid < 64) {
+        out[8192 + tid] = expf(Ls[tid]);
+        out[8256 + tid] = expf(Ls[63] - Ls[tid]);
+    }
+    if (tid == 0) out[8320] = expf(Ls[63]);
+}
+
+extern "C" __global__ void delta_chunk_run(const float* q, const float* k, const float* v, const float* scr, float* S, float* o,
+                                           unsigned int xs, unsigned int os, unsigned int kh, unsigned int vh, unsigned int m) {
+    __shared__ __align__(16) float Ss[128][16];
+    __shared__ __align__(16) float Rs[64][16], Us[64][16];
+    const unsigned int h = blockIdx.x, j0 = blockIdx.y * 16, kx = h % kh, tid = threadIdx.x;
+    const unsigned int t = tid / 4, g = tid % 4;
+    float* s = S + (u64) h * 128 * 128;
+    for (unsigned int e = tid; e < 128 * 16; e += 256) Ss[e / 16][e % 16] = s[(e / 16) * 128 + j0 + e % 16];
+    const unsigned int nch = (m + 63) / 64;
+    for (unsigned int n = 0; n < nch; ++n) {
+        const float* sc = scr + ((u64) n * vh + h) * DSCR;
+        const unsigned int t0 = n * 64, tt = min(t0 + t, m - 1);
+        const float4* kt = (const float4*) (k + (u64) tt * xs + kx * 128);
+        const float4* qt = (const float4*) (q + (u64) tt * xs + kx * 128);
+        __syncthreads();
+        float acc[4] = {0.f, 0.f, 0.f, 0.f}, accq[4] = {0.f, 0.f, 0.f, 0.f};
+        for (unsigned int i4 = 0; i4 < 32; ++i4) {
+            float4 kv = kt[i4], qv = qt[i4];
+            float ka[4] = {kv.x, kv.y, kv.z, kv.w}, qa[4] = {qv.x, qv.y, qv.z, qv.w};
+#pragma unroll
+            for (unsigned int ii = 0; ii < 4; ++ii) {
+                float4 sv = *(const float4*) &Ss[4 * i4 + ii][4 * g];
+                acc[0] = fmaf(ka[ii], sv.x, acc[0]); acc[1] = fmaf(ka[ii], sv.y, acc[1]); acc[2] = fmaf(ka[ii], sv.z, acc[2]); acc[3] = fmaf(ka[ii], sv.w, acc[3]);
+                accq[0] = fmaf(qa[ii], sv.x, accq[0]); accq[1] = fmaf(qa[ii], sv.y, accq[1]); accq[2] = fmaf(qa[ii], sv.z, accq[2]); accq[3] = fmaf(qa[ii], sv.w, accq[3]);
+            }
+        }
+        const float gam = sc[8192 + t];
+        float4 vv = *(const float4*) (v + (u64) tt * xs + h * 128 + j0 + 4 * g);
+        *(float4*) &Rs[t][4 * g] = make_float4(vv.x - gam * acc[0], vv.y - gam * acc[1], vv.z - gam * acc[2], vv.w - gam * acc[3]);
+        __syncthreads();
+        float u[4] = {0.f, 0.f, 0.f, 0.f};
+        for (unsigned int s2 = 0; s2 <= t; ++s2) {
+            const float w = sc[t * 64 + s2];
+            float4 r = *(const float4*) &Rs[s2][4 * g];
+            u[0] = fmaf(w, r.x, u[0]); u[1] = fmaf(w, r.y, u[1]); u[2] = fmaf(w, r.z, u[2]); u[3] = fmaf(w, r.w, u[3]);
+        }
+        *(float4*) &Us[t][4 * g] = make_float4(u[0], u[1], u[2], u[3]);
+        __syncthreads();
+        float oo[4] = {gam * accq[0], gam * accq[1], gam * accq[2], gam * accq[3]};
+        for (unsigned int s2 = 0; s2 <= t; ++s2) {
+            const float w = sc[4096 + t * 64 + s2];
+            float4 r = *(const float4*) &Us[s2][4 * g];
+            oo[0] = fmaf(w, r.x, oo[0]); oo[1] = fmaf(w, r.y, oo[1]); oo[2] = fmaf(w, r.z, oo[2]); oo[3] = fmaf(w, r.w, oo[3]);
+        }
+        if (t0 + t < m) *(float4*) (o + (u64) (t0 + t) * os + h * 128 + j0 + 4 * g) = make_float4(oo[0], oo[1], oo[2], oo[3]);
+        {
+            const unsigned int i = tid / 2, cb = (tid % 2) * 8;
+            const float gc = sc[8320];
+            float a8[8];
+#pragma unroll
+            for (unsigned int c = 0; c < 8; ++c) a8[c] = gc * Ss[i][cb + c];
+            for (unsigned int s2 = 0; s2 < 64; ++s2) {
+                const unsigned int ts = min(t0 + s2, m - 1);
+                const float kw = k[(u64) ts * xs + kx * 128 + i] * sc[8256 + s2];
+#pragma unroll
+                for (unsigned int c = 0; c < 8; ++c) a8[c] = fmaf(kw, Us[s2][cb + c], a8[c]);
+            }
+#pragma unroll
+            for (unsigned int c = 0; c < 8; ++c) Ss[i][cb + c] = a8[c];
+        }
+    }
+    __syncthreads();
+    for (unsigned int e = tid; e < 128 * 16; e += 256) s[(e / 16) * 128 + j0 + e % 16] = Ss[e / 16][e % 16];
+}
+
 // delta_steps128 with gated_rmsnorm_heads folded in: after each token's recurrence the head's 128 outputs are
 // normalized and gated in the block (the same operations in the same order as gated_rmsnorm_heads, whose block is
 // these 128 threads too).  z rows os apart; o is written normalized.
