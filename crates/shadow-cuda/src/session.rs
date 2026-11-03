@@ -530,6 +530,113 @@ impl Snapshot<'_> {
         &self.tokens
     }
 
+    /// The snapshot as bytes (a host snapshot only: `snapshot_to(_, true)`), for a file; `from_bytes` is the other way.
+    pub fn to_bytes(&self) -> Result<Vec<u8>, String> {
+        fn put_u64(o: &mut Vec<u8>, v: usize) {
+            o.extend_from_slice(&(v as u64).to_le_bytes());
+        }
+        fn put(o: &mut Vec<u8>, s: &Saved) -> Result<(), String> {
+            let Saved::Host(v) = s else { return Err("a snapshot kept on the device cannot be written to a file".into()) };
+            put_u64(o, v.len());
+            o.extend_from_slice(v);
+            Ok(())
+        }
+        let mut o = Vec::with_capacity(self.host_bytes() + (1 << 16));
+        put_u64(&mut o, self.tokens.len());
+        for t in &self.tokens {
+            o.extend_from_slice(&t.to_le_bytes());
+        }
+        put_u64(&mut o, self.delta.len());
+        for d in &self.delta {
+            match d {
+                Some((a, b)) => { o.push(1); put(&mut o, a)?; put(&mut o, b)?; }
+                None => o.push(0),
+            }
+        }
+        put(&mut o, &self.ple)?;
+        put_u64(&mut o, self.kv.len());
+        for k in &self.kv {
+            match k {
+                Some(k) => { o.push(1); put(&mut o, &k.k)?; put(&mut o, &k.v)?; put(&mut o, &k.raw)?; put(&mut o, &k.blocks)?; put_u64(&mut o, k.nblocks); }
+                None => o.push(0),
+            }
+        }
+        put_u64(&mut o, self.nblocks.len());
+        for &n in &self.nblocks {
+            put_u64(&mut o, n);
+        }
+        match &self.mtp {
+            Some((a, flag, kv)) => {
+                o.push(1);
+                put(&mut o, a)?;
+                o.push(*flag as u8);
+                match kv {
+                    Some((b, c)) => { o.push(1); put(&mut o, b)?; put(&mut o, c)?; }
+                    None => o.push(0),
+                }
+            }
+            None => o.push(0),
+        }
+        Ok(o)
+    }
+
+    pub fn from_bytes<'c>(b: &[u8]) -> Result<Snapshot<'c>, String> {
+        struct R<'a> { b: &'a [u8], at: usize }
+        impl R<'_> {
+            fn take(&mut self, n: usize) -> Result<&[u8], String> {
+                if self.at + n > self.b.len() {
+                    return Err("the snapshot file is cut short".into());
+                }
+                let s = &self.b[self.at..self.at + n];
+                self.at += n;
+                Ok(s)
+            }
+            fn u64(&mut self) -> Result<usize, String> {
+                Ok(u64::from_le_bytes(self.take(8)?.try_into().unwrap()) as usize)
+            }
+            fn u8(&mut self) -> Result<u8, String> {
+                Ok(self.take(1)?[0])
+            }
+            fn saved<'c>(&mut self) -> Result<Saved<'c>, String> {
+                let n = self.u64()?;
+                Ok(Saved::Host(self.take(n)?.to_vec()))
+            }
+        }
+        let mut r = R { b, at: 0 };
+        let nt = r.u64()?;
+        let tokens: Vec<u32> = r.take(nt * 4)?.chunks_exact(4).map(|c| u32::from_le_bytes(c.try_into().unwrap())).collect();
+        let nd = r.u64()?;
+        let mut delta = Vec::with_capacity(nd);
+        for _ in 0..nd {
+            delta.push(if r.u8()? == 1 { Some((r.saved()?, r.saved()?)) } else { None });
+        }
+        let ple = r.saved()?;
+        let nk = r.u64()?;
+        let mut kv = Vec::with_capacity(nk);
+        for _ in 0..nk {
+            kv.push(if r.u8()? == 1 {
+                let (k, v, raw, blocks) = (r.saved()?, r.saved()?, r.saved()?, r.saved()?);
+                Some(SnapKv { k, v, raw, blocks, nblocks: r.u64()? })
+            } else {
+                None
+            });
+        }
+        let nn = r.u64()?;
+        let mut nblocks = Vec::with_capacity(nn);
+        for _ in 0..nn {
+            nblocks.push(r.u64()?);
+        }
+        let mtp = if r.u8()? == 1 {
+            let a = r.saved()?;
+            let flag = r.u8()? == 1;
+            let kv = if r.u8()? == 1 { Some((r.saved()?, r.saved()?)) } else { None };
+            Some((a, flag, kv))
+        } else {
+            None
+        };
+        Ok(Snapshot { tokens, delta, ple, kv, nblocks, mtp })
+    }
+
     /// Bytes this snapshot holds in host memory (what a pool of them costs in RAM).
     pub fn host_bytes(&self) -> usize {
         let h = |s: &Saved| if let Saved::Host(v) = s { v.len() } else { 0 };

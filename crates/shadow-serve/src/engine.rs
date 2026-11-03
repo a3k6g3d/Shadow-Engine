@@ -179,14 +179,17 @@ struct PrefixCache<'c> {
     /// the sessions of the conversations read lately, one snapshot each (taken when a long prompt had just been read), in host memory: going back to one of them
     /// restores its snapshot (a second or less) instead of reading its whole history again.  Oldest first.
     convs: Vec<shadow_cuda::session::Snapshot<'c>>,
+    /// the same snapshots as files (the model's drive): they outlive a restart and the RAM holds only their token lists; `convs` is then just the freshest few
+    disk: Option<crate::convdisk::ConvDisk>,
 }
 
 /// A conversation snapshot is taken after a prompt at least this long (reading ~1,000 tokens takes ~4 s; the snapshot ~0.1 s a 20k-token prompt) ...
 const CONV_MIN: usize = 1024;
 /// ... at most this many are kept, and their host memory stays under this many bytes (`SHADOW_CONV_GIB`, default 4; 0 turns them off).
 const CONV_KEEP: usize = 4;
-fn conv_budget() -> usize {
-    (std::env::var("SHADOW_CONV_GIB").ok().and_then(|v| v.parse::<f64>().ok()).unwrap_or(4.0) * 1073741824.0) as usize
+/// With the disk copy the RAM pool is just the freshest (default 1 GiB); without it (`SHADOW_CONV_DISK_GIB=0`, or no writable drive) 4 GiB.
+fn conv_budget(disk: bool) -> usize {
+    (std::env::var("SHADOW_CONV_GIB").ok().and_then(|v| v.parse::<f64>().ok()).unwrap_or(if disk { 1.0 } else { 4.0 }) * 1073741824.0) as usize
 }
 
 /// The shortest shared start worth a snapshot (~0.06 s a token to read; a restore is ~10-20 ms).
@@ -262,7 +265,7 @@ fn run(cfg: Config, rx: std::sync::mpsc::Receiver<Request>, status: &Mutex<Statu
         eprintln!("shadow serve: ready in {:.1} s; {}", s.load_secs, s.report);
     }
     let mut last_logits: Vec<f32> = Vec::new();
-    let mut prefix = PrefixCache { snap: None, prev: vec![], convs: vec![] };
+    let mut prefix = PrefixCache { snap: None, prev: vec![], convs: vec![], disk: crate::convdisk::ConvDisk::open(&cfg.model) };
     let mut pics = Pics { enc: None, cache: Default::default(), cur: vec![] };
     while let Ok(req) = rx.recv() {
         status.lock().unwrap().busy = true;
@@ -458,7 +461,23 @@ fn answer<'c>(arch: &str, req: &Request, tok: &Tokenizer, sess: &mut GpuSession<
         let best = prefix.convs.iter().enumerate()
             .filter(|(_, s)| s.tokens().len() > cached && s.tokens().len() < ids.len() && ids[..s.tokens().len()] == *s.tokens())
             .max_by_key(|(_, s)| s.tokens().len()).map(|(i, _)| i);
-        if let Some(i) = best {
+        let on_disk = prefix.disk.as_ref().and_then(|d| d.best(&ids, cached)).filter(|(n, _)| best.is_none_or(|i| *n > prefix.convs[i].tokens().len()));
+        if let Some((n, path)) = on_disk {
+            let t1 = Instant::now();
+            let snap = prefix.disk.as_ref().unwrap().load(&path).and_then(|b| shadow_cuda::session::Snapshot::from_bytes(&b));
+            match snap.and_then(|s| sess.restore(&s)) {
+                Ok(()) => {
+                    cached = n;
+                    sess.dflash_break();
+                    eprintln!("shadow serve: restored a conversation snapshot of {cached} tokens from disk in {:.2} s", t1.elapsed().as_secs_f64());
+                }
+                Err(e) => {
+                    eprintln!("shadow serve: conversation restore from disk failed ({e}); reading the prompt");
+                    sess.reset();
+                    cached = 0;
+                }
+            }
+        } else if let Some(i) = best {
             let t1 = Instant::now();
             match sess.restore(&prefix.convs[i]) {
                 Ok(()) => {
@@ -532,22 +551,31 @@ fn answer<'c>(arch: &str, req: &Request, tok: &Tokenizer, sess: &mut GpuSession<
     if lent {
         sess.restore_cache();
     }
-    if spans.is_empty() && ids.len() >= CONV_MIN && conv_budget() > 0 && sess.tokens().len() == ids.len() {
+    let budget = conv_budget(prefix.disk.is_some());
+    if spans.is_empty() && ids.len() >= CONV_MIN && budget > 0 && sess.tokens().len() == ids.len() {
         // the conversation's state as of this prompt (before the reply): a later request that starts with these tokens restores it.  An older snapshot of the same
         // conversation (its tokens a start of these) is replaced.
         let est = ids.len() * 65536 + (256 << 20);
         prefix.convs.retain(|s| !(s.tokens().len() <= ids.len() && ids[..s.tokens().len()] == *s.tokens()));
-        while !prefix.convs.is_empty() && (prefix.convs.len() >= CONV_KEEP || prefix.convs.iter().map(|s| s.host_bytes()).sum::<usize>() + est > conv_budget()) {
+        while !prefix.convs.is_empty() && (prefix.convs.len() >= CONV_KEEP || prefix.convs.iter().map(|s| s.host_bytes()).sum::<usize>() + est > budget) {
             prefix.convs.remove(0);
         }
         let floor = shadow_cuda::pinned::RAM_FLOOR + (3 << 30);
-        if est <= conv_budget() && shadow_cuda::pinned::available_ram() > floor + est as u64 {
+        if (est <= budget || prefix.disk.is_some()) && shadow_cuda::pinned::available_ram() > floor + est as u64 {
             let t1 = Instant::now();
             match sess.snapshot_to(true, true) {
                 Ok(s) => {
                     eprintln!("shadow serve: conversation snapshot of {} tokens ({:.2} GiB) in {:.2} s; {} kept", ids.len(), s.host_bytes() as f64 / 1073741824.0,
                               t1.elapsed().as_secs_f64(), prefix.convs.len() + 1);
-                    prefix.convs.push(s);
+                    if let Some(d) = prefix.disk.as_ref() {
+                        match s.to_bytes() {
+                            Ok(b) => d.save(&ids, b),
+                            Err(e) => eprintln!("shadow serve: conversation snapshot not written ({e})"),
+                        }
+                    }
+                    if s.host_bytes() <= budget {
+                        prefix.convs.push(s);
+                    }
                 }
                 Err(e) => eprintln!("shadow serve: conversation snapshot failed ({e})"),
             }

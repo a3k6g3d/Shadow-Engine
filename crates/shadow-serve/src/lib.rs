@@ -5,6 +5,7 @@
 //! Not yet: sampling (greedy only), images.
 
 pub mod cpuinfo;
+pub mod convdisk;
 pub mod engine;
 pub mod mcp;
 pub mod memory;
