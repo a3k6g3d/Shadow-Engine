@@ -1495,3 +1495,17 @@ Bench, ctx 16,384, the 3,001-token prompt, 3 interleaved pairs (new first), 2 pr
 
 Every pair favoured the new kernels (cold launch 236-239 -> 250-253, warm 266-277 -> 294-296). Correctness: the 7-question check is 6/7, the same as before; the one-question sanity prompt (a near tie that the fast modes already decide differently from `--exact` at some cache sizes) now answers "Fast" instead of "Open" at ctx 16k -
 the weights go through half precision as in the other `mma_cols_*` kernels, which changes the last digits. On by default. Since the session began the 3k prompt has gone 70 -> ~272 tok/s (the batch fix, BF16, Q4_K/Q5_K). Remaining in the profile: `hc_down_inject_cols_fast_bf16` (14%), F32 dense (6%), the DeltaNet recurrence (17%).
+
+## 2026-11-02: tensor-core hyper-connection down/inject projection (`mma_hc_down_inject_bf16`): +8.6% to +11.2% at ctx 16k
+
+The fused `hc_down_inject_cols_fast_bf16` (320 "down" rows + 4 "inject" rows over the 10,240-wide stream, <= 8 tokens a launch, 14% of the prompt's GPU time) has a tensor-core twin for a long prompt: one launch for all of a pass's tokens (grid ((324 rows)/64, tokens/32), 128 threads), BF16 weights and activations as half, f32 accumulate,
+then the same `hc_epilogue` (down: v*sigmoid(v), inject: 2*sigmoid(v)). Used by `hc_read_batch` under `--tensor-prompt` for >= 16 tokens; `SHADOW_MMA_HC=0` turns it off. On by default.
+Bench, ctx 16,384, the 3,001-token prompt, 7 interleaved pairs (2 prompts each, total throughput; the first three pairs ran new-first, the last four old-first):
+
+| arm | total time for 42,014 tokens | tok/s |
+|---|---|---|
+| `SHADOW_MMA_HC=0` | 175.5 s (one pair had an 18.8 s cold launch) | **239.4** |
+| `mma_hc_down_inject_bf16` | 157.8 s | **266.2 (+11.2%)** |
+
+Dropping the pair with the 18.8 s outlier: 247.3 -> 268.5 (**+8.6%**). New was faster in 6 of 7 pairs, a tie in the seventh (22.5 s vs 22.9 s). Warm second prompts: 10.1-11.1 s (new) vs 10.6-12.0 s (old).
+Correctness: the one-question sanity prompt answers "Open", the 7-question check is 6/7 (unchanged). Remaining in the profile: F32 dense (6%), the DeltaNet recurrence `delta_steps128` (17%), attention (8%).

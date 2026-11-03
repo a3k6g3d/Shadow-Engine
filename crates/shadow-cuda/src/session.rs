@@ -3665,7 +3665,19 @@ impl<'c, 'm> GpuSession<'c, 'm> {
             }
         }
         let (w_inj, r_inj) = if inject { (self.w[&format!("{p}_inject.weight")].ptr, cs as u32) } else { (0, 0) };
-        for j0 in (0..m).step_by(COLS_MAX) {
+        static MMA_HC: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let mma_hc = self.tensor_prompt && self.fast_order && m >= 16 && ch.is_multiple_of(64) && *MMA_HC.get_or_init(|| !std::env::var("SHADOW_MMA_HC").is_ok_and(|v| v == "0"));
+        if mma_hc {
+            // SAFETY: as the launch below, for all m inputs at once; the kernel guards the last row and token tiles.
+            unsafe {
+                self.mvp.launch("mma_hc_down_inject_bf16", ((rank as u32 + r_inj).div_ceil(64), (m as u32).div_ceil(32), 1), (128, 1, 1), 0, self.ls(), &[
+                    Arg::Ptr(self.w[&format!("{p}_down.weight")].ptr), Arg::Ptr(bb.down.ptr), Arg::U32(rank as u32),
+                    Arg::U32(rank as u32), Arg::Ptr(w_inj), Arg::Ptr(bb.g.ptr), Arg::U32(r_inj), Arg::U32(cs as u32),
+                    Arg::Ptr(bb.rn.ptr), Arg::U32(ch as u32), Arg::U32(ch as u32), Arg::F32(cs as f32), Arg::U32(m as u32),
+                ]).unwrap_or_else(|err| panic!("mma_hc_down_inject_bf16: {err}"));
+            }
+        }
+        for j0 in (0..m).step_by(COLS_MAX).filter(|_| !mma_hc) {
             // SAFETY: rank + r_inj rows of ch BF16 weights; n inputs of ch floats in rn, n outputs of rank (down) and
             // cs (g) floats, from row j0.
             unsafe {

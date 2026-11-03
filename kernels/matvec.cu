@@ -1320,6 +1320,77 @@ extern "C" __global__ void hc_down_inject_cols_fast_bf16(const u8* w_down, float
     }
 }
 
+// The tensor-core form of hc_down_inject_cols_fast_bf16 for a long prompt (same arguments): rows 0..r_down of the output come from w_down and go through the
+// "down" epilogue into down[j * ds + row], rows r_down.. from w_inj through the "inject" epilogue into g[j * gs + row - r_down]; x_j = rn + j * rs.
+// Grid ((r_down + r_inj) / 64 rounded up, m / 32 rounded up), 128 threads; the tile loop is `mma_core`'s with BF16 weights.
+extern "C" __global__ void mma_hc_down_inject_bf16(const u8* w_down, float* down, unsigned int r_down, unsigned int ds,
+                                                  const u8* w_inj, float* g, unsigned int r_inj, unsigned int gs,
+                                                  const float* rn, unsigned int rs, unsigned int cols, float div, unsigned int m) {
+    __shared__ __align__(16) unsigned short ws[MMA_ROWS][MMA_K + MMA_PAD];
+    __shared__ __align__(16) unsigned short xt[MMA_TOK][MMA_K + MMA_PAD];
+    const unsigned int tid = threadIdx.x, warp = tid / 32, lane = tid % 32, grp = lane / 4, tig = lane % 4;
+    const unsigned int row_base = blockIdx.x * MMA_ROWS, tok_base = blockIdx.y * MMA_TOK, rows = r_down + r_inj;
+    float acc[4][4];
+#pragma unroll
+    for (unsigned int n = 0; n < 4; n++)
+#pragma unroll
+        for (unsigned int e = 0; e < 4; e++) acc[n][e] = 0.0f;
+    for (unsigned int kc = 0; kc < cols; kc += MMA_K) {
+#pragma unroll
+        for (unsigned int t = 0; t < 4; t++) {
+            unsigned int ch = tid + 128 * t, row = ch / 8, kk = (ch % 8) * 8, R = row_base + row;
+            float v[8];
+            if (R < rows) {
+                const u8* rw = R < r_down ? w_down + (u64) R * cols * 2 : w_inj + (u64) (R - r_down) * cols * 2;
+                Dec8<BF16>::dec8(rw, kc + kk, v);
+            } else {
+#pragma unroll
+                for (unsigned int e = 0; e < 8; e++) v[e] = 0.0f;
+            }
+            uint4 p;
+            p.x = pack_half2(v[0], v[1]); p.y = pack_half2(v[2], v[3]); p.z = pack_half2(v[4], v[5]); p.w = pack_half2(v[6], v[7]);
+            *(uint4*) &ws[row][kk] = p;
+        }
+#pragma unroll
+        for (unsigned int t = 0; t < 4; t++) {
+            unsigned int idx = tid + 128 * t, tok = idx / 16, kq = (idx % 16) * 4;
+            float4 f = make_float4(0.f, 0.f, 0.f, 0.f);
+            if (tok_base + tok < m) f = *(const float4*) (rn + (u64) (tok_base + tok) * rs + kc + kq);
+            uint2 p;
+            p.x = pack_half2(f.x, f.y); p.y = pack_half2(f.z, f.w);
+            *(uint2*) &xt[tok][kq] = p;
+        }
+        __syncthreads();
+#pragma unroll
+        for (unsigned int ks = 0; ks < MMA_K / 16; ks++) {
+            const unsigned int k0 = ks * 16 + tig * 2;
+            unsigned int a0 = *(const unsigned int*) &ws[warp * 16 + grp][k0];
+            unsigned int a1 = *(const unsigned int*) &ws[warp * 16 + grp + 8][k0];
+            unsigned int a2 = *(const unsigned int*) &ws[warp * 16 + grp][k0 + 8];
+            unsigned int a3 = *(const unsigned int*) &ws[warp * 16 + grp + 8][k0 + 8];
+#pragma unroll
+            for (unsigned int n = 0; n < 4; n++) {
+                unsigned int b0 = *(const unsigned int*) &xt[n * 8 + grp][k0];
+                unsigned int b1 = *(const unsigned int*) &xt[n * 8 + grp][k0 + 8];
+                asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
+                             : "+f"(acc[n][0]), "+f"(acc[n][1]), "+f"(acc[n][2]), "+f"(acc[n][3])
+                             : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+            }
+        }
+        __syncthreads();
+    }
+#pragma unroll
+    for (unsigned int n = 0; n < 4; n++)
+#pragma unroll
+        for (unsigned int e = 0; e < 4; e++) {
+            unsigned int R = row_base + warp * 16 + grp + (e >= 2 ? 8 : 0), tok = tok_base + n * 8 + tig * 2 + (e & 1);
+            if (R < rows && tok < m) {
+                if (R < r_down) down[(u64) tok * ds + R] = hc_epilogue(acc[n][e], div, false);
+                else g[(u64) tok * gs + (R - r_down)] = hc_epilogue(acc[n][e], div, true);
+            }
+        }
+}
+
 // matvec_fast_rows over the rows ids[i] of a matrix (the draft head: 106k of the 248k vocabulary rows): y[i] = W[ids[i]] x.
 template <typename Q>
 static __device__ __forceinline__ void matvec_ids_rows(const u8* w, const unsigned int* ids, const float* x, float* y,
