@@ -67,7 +67,7 @@ RAM, expert-cache hit rates, memory tiers).
 | flag | default | meaning |
 |---|---|---|
 | `--host H`, `--port P` | `127.0.0.1`, `8081` | where to listen |
-| `--ctx N` | 16384 | positions the session is built for (KV and drafter rings scale with it) |
+| `--ctx N` | 24576 | positions the session is built for (KV and drafter rings scale with it) |
 | `--exact` | off | no speculation, no inexact modes, none of the defaults above |
 | `--ram-tier-gib G` or `auto` | 36 (30 when under 49 GiB of RAM is available) | pinned host memory for the expert tier; `auto` sizes it from the RAM available now less 10 GiB |
 | `--ram-floor-gib N` | 4 | RAM that must stay available after pinning (0: no check); see "The RAM rule" |

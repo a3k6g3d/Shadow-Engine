@@ -329,8 +329,9 @@ fn serve(path: &std::path::Path, rest: &[String]) -> ExitCode {
     let flag = |f: &str| rest.iter().position(|a| a == f).and_then(|i| rest.get(i + 1));
     let host = flag("--host").map(String::as_str).unwrap_or("127.0.0.1");
     let port: u16 = flag("--port").and_then(|v| v.parse().ok()).unwrap_or(8081);
-    // 32,768 tokens: the window costs ~57 KB of VRAM a token (taken from the expert cache) and 32k costs 1.3% of decode speed (51.7 against 52.4 tok/s), 64k 5.5%
-    let n_ctx: usize = flag("--ctx").and_then(|v| v.parse().ok()).unwrap_or(32768);
+    // 24,576 tokens: the window costs ~57 KB of VRAM a token (taken from the expert cache), 1.3% of decode speed at 32k (51.7 against 52.4 tok/s), and it sets the prompt batch: a 3,001-token prompt
+    // reads at 253 tok/s at 24k (1,472 rows a pass) against 165 at 32k (704 rows) and 296 at 20k (STATUS.md 2026-11-02)
+    let n_ctx: usize = flag("--ctx").and_then(|v| v.parse().ok()).unwrap_or(24576);
     let addr = match format!("{host}:{port}").parse() {
         Ok(a) => a,
         Err(e) => {
