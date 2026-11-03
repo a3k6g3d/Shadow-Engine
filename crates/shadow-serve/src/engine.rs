@@ -470,6 +470,7 @@ fn answer<'c>(arch: &str, req: &Request, tok: &Tokenizer, sess: &mut GpuSession<
     PREFILL.1.store(unread.len(), Relaxed);
     // MAX_BATCH tokens at a time through the layers (`step_batch`), a chunk ending where the snapshot goes
     // a long prompt borrows the tail of the VRAM expert cache as staging and reads in big chunks; a short one, 64 at a time
+    sess.hint_prompt(unread.len());
     let lent = unread.len() >= 128 && !std::env::var("SHADOW_NO_LEND").is_ok_and(|v| v == "1") && sess.lend_cache(unread.len() >= shadow_cuda::session::LONG_PROMPT);
     let chunk = std::env::var("SHADOW_PREFILL_CHUNK").ok().and_then(|v| v.parse().ok())
         .unwrap_or(if lent { sess.batch_rows() } else { 64usize }).clamp(1, sess.batch_rows());

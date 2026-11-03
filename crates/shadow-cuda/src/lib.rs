@@ -7,6 +7,7 @@ pub mod dflash;
 pub mod driver;
 pub mod dylib;
 pub mod kernels;
+pub mod kvvmm;
 pub mod mtp;
 pub mod nvrtc;
 pub mod pinned;

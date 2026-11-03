@@ -303,6 +303,12 @@ pub struct GpuSession<'c, 'm> {
     replay: Replay<'c>,
     /// `delta_chunk_prep`'s output for up to BIG_BATCH tokens: 8,448 floats a (64-token chunk, value head)
     dscr: DeviceBuffer<'c>,
+    /// `SHADOW_KV_LEND=1`: the KV window's buffers are virtual-memory regions, and a long prompt borrows the unfilled tail of them (`lend_kv`) for its batch buffers
+    kv_regions: Vec<crate::kvvmm::VmmRegion<'c>>,
+    kv_extra: Option<DeviceBuffer<'c>>,
+    /// the address range `kv_extra` lives in: fixed, so the CUDA graphs captured over the big batch's buffers stay valid from one prompt to the next
+    kv_extra_reg: Option<crate::kvvmm::VmmRegion<'c>>,
+    prompt_hint: usize,
     /// `SHADOW_ROUTER_BIAS=x`: x is added to the router logits of the experts the VRAM cache holds when the top-k is chosen (not to their weights)
     router_bias: f32,
     delta: Vec<Option<(DeviceBuffer<'c>, DeviceBuffer<'c>)>>,
@@ -1026,15 +1032,31 @@ impl<'c, 'm> GpuSession<'c, 'm> {
             ple: a(MAX_VERIFY * ch)?, pass: None, on: std::cell::Cell::new(false),
         };
         let dscr = a(BIG_BATCH.div_ceil(64) * c.ssm_v_heads * 8448)?;
+        let kv_lend = !std::env::var("SHADOW_KV_LEND").is_ok_and(|v| v == "0");
+        let mut kv_regions: Vec<crate::kvvmm::VmmRegion<'c>> = Vec::new();
+        let kv_extra_reg = if kv_lend { Some(crate::kvvmm::VmmRegion::new_empty(ctx, bb_row_floats(c) * BIG_BATCH * 4 + (1 << 16))?) } else { None };
         let mut delta = Vec::new();
         let mut attn = Vec::new();
         for l in 0..c.n_layer {
             if c.is_attention(l) {
                 delta.push(None);
                 let blocks = if id > 0 { cap / c.compress[l].max(1) + 1 } else { 0 };
-                let mut at = Attn { k: a(cap * kvd)?, v: a(cap * kvd)?, raw: a(cap * id)?, blocks: a(blocks * id)?, nblocks: 0 };
-                at.k.zero().map_err(e)?;
-                at.v.zero().map_err(e)?;
+                let mut at = if kv_lend {
+                    let mk = |per_pos: usize, regs: &mut Vec<crate::kvvmm::VmmRegion<'c>>| -> Result<DeviceBuffer<'c>, String> {
+                        let r = crate::kvvmm::VmmRegion::new(ctx, per_pos, cap)?;
+                        // SAFETY: a view of the region's address range; the session owns the region for as long as the view lives.
+                        let v = unsafe { DeviceBuffer::view(ctx, r.base, cap * per_pos) };
+                        regs.push(r);
+                        Ok(v)
+                    };
+                    let (k, v, raw) = (mk(kvd * 4, &mut kv_regions)?, mk(kvd * 4, &mut kv_regions)?, mk(id * 4, &mut kv_regions)?);
+                    Attn { k, v, raw, blocks: a(blocks * id)?, nblocks: 0 }
+                } else {
+                    let mut at = Attn { k: a(cap * kvd)?, v: a(cap * kvd)?, raw: a(cap * id)?, blocks: a(blocks * id)?, nblocks: 0 };
+                    at.k.zero().map_err(e)?;
+                    at.v.zero().map_err(e)?;
+                    at
+                };
                 attn.push(Some(at));
             } else {
                 let mut s = a(c.ssm_v_heads * c.ssm_head_dim * c.ssm_head_dim)?;
@@ -1273,7 +1295,7 @@ impl<'c, 'm> GpuSession<'c, 'm> {
             None
         };
         let mut s = GpuSession {
-            ctx, m, mvp, fw, w, v, b, bb, replay, dscr, router_bias: std::env::var("SHADOW_ROUTER_BIAS").ok().and_then(|v| v.parse().ok()).unwrap_or(0.0), batch_scratch, delta, attn, ple_state, tokens: vec![], pictures: vec![], rope_tab: None, rope_on: false, cap, trace: None, stop_after: None,
+            ctx, m, mvp, fw, w, v, b, bb, replay, dscr, kv_regions, kv_extra: None, kv_extra_reg, prompt_hint: 0, router_bias: std::env::var("SHADOW_ROUTER_BIAS").ok().and_then(|v| v.parse().ok()).unwrap_or(0.0), batch_scratch, delta, attn, ple_state, tokens: vec![], pictures: vec![], rope_tab: None, rope_on: false, cap, trace: None, stop_after: None,
             resident_bytes, expert_uploads: 0, cache, ram, copy_stream, copy_stream2, copy_ev2, copy_event, staging,
             pending: vec![], routing: RoutingCounts::new(c.n_layer, c.n_expert),
             prof: std::env::var("SHADOW_PROFILE").is_ok_and(|v| v == "1")
@@ -2463,6 +2485,51 @@ impl<'c, 'm> GpuSession<'c, 'm> {
         self.rows
     }
 
+    /// The engine tells the session how many tokens the next long prompt reads (so `lend_kv` knows how much of the window it will fill).
+    pub fn hint_prompt(&mut self, n: usize) {
+        self.prompt_hint = n;
+    }
+
+    /// `SHADOW_KV_LEND=1`: hand the KV window's unfilled tail (past this prompt and 256 positions more) back to the driver and take it as one ordinary buffer for
+    /// the prompt's batch buffers; true if there is such a buffer.  The device must be idle (it is: this runs before the prompt).
+    fn lend_kv(&mut self) -> bool {
+        if self.kv_regions.is_empty() || self.kv_extra.is_some() || self.prompt_hint == 0 {
+            return false;
+        }
+        let _ = self.ctx.synchronize();
+        let keep = self.tokens.len() + self.prompt_hint + 256;
+        let freed: usize = self.kv_regions.iter_mut().map(|r| r.release_tail(keep)).sum();
+        let want = bb_row_floats(&self.m.cfg) * BIG_BATCH * 4 + (1 << 16);
+        if freed >= want + (8 << 20) {
+            if let Some(reg) = self.kv_extra_reg.as_mut() {
+                if reg.map_bytes(want).is_ok() {
+                    // SAFETY: a view of the region's mapped range; the session owns the region.
+                    self.kv_extra = Some(unsafe { DeviceBuffer::view(self.ctx, reg.base, want) });
+                    return true;
+                }
+                reg.release_tail(0);
+            }
+        }
+        for r in &mut self.kv_regions {
+            let _ = r.remap_tail();
+        }
+        false
+    }
+
+    /// Give the borrowed memory back: free the buffer, map the window's tail again (a failure here is fatal: the window would be missing memory).
+    fn unlend_kv(&mut self) {
+        if self.kv_regions.is_empty() || (self.kv_extra.is_none() && self.kv_regions.iter().all(|r| r.is_full())) {
+            return;
+        }
+        self.kv_extra = None;
+        if let Some(reg) = self.kv_extra_reg.as_mut() {
+            reg.release_tail(0);
+        }
+        for r in &mut self.kv_regions {
+            r.remap_tail().unwrap_or_else(|err| panic!("KV window: {err}"));
+        }
+    }
+
     /// `long`: a prompt long enough (`LONG_PROMPT` tokens) to pay for the layer-ahead pipeline and the big batch (which allocate pinned
     /// buffers and read the evicted experts back from the file afterwards); a shorter one lends the tail only.
     pub fn lend_cache(&mut self, long: bool) -> bool {
@@ -2471,18 +2538,21 @@ impl<'c, 'm> GpuSession<'c, 'm> {
         }
         let pipe = long && !std::env::var("SHADOW_PREFILL_PIPE").is_ok_and(|v| v == "0");
         let big = !std::env::var("SHADOW_PREFILL_BIG").is_ok_and(|v| v == "0");
+        let kv_lent = pipe && big && self.lend_kv();
         let want = std::env::var("SHADOW_PREFILL_LEND_MIB").ok().and_then(|v| v.parse::<usize>().ok()).map(|m| m << 20)
             .unwrap_or((self.m.cfg.n_expert * if pipe { 2 } else { 1 } + if pipe { 2 } else { 0 }) * self.cache.slot_bytes
-                       + if pipe && big { bb_row_floats(&self.m.cfg) * BIG_BATCH * 4 + (1 << 16) } else { 0 })
+                       + if pipe && big && !kv_lent { bb_row_floats(&self.m.cfg) * BIG_BATCH * 4 + (1 << 16) } else { 0 })
             .min((self.cache.arena_bytes / 100 * std::env::var("SHADOW_LEND_PCT").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(99)).min(self.cache.arena_bytes.saturating_sub(24 * self.cache.slot_bytes)));
         let target = self.cache.arena_bytes - want;
         let s0 = self.cache.slot_offset.partition_point(|&o| (o as usize) < target);
         if s0 >= self.cache.slots {
+            self.unlend_kv();
             return false;
         }
         let start = self.cache.slot_offset[s0] as usize;
         let n = (self.cache.arena_bytes - start) / self.cache.slot_bytes.max(1);
         if n < 2 {
+            self.unlend_kv();
             return false;
         }
         self.ctx.synchronize().unwrap(); // nothing is still reading the entries about to go
@@ -2721,8 +2791,10 @@ impl<'c, 'm> GpuSession<'c, 'm> {
     fn big_batch_on(&mut self) -> bool {
         let (Some(lent), true) = (self.lent.as_ref(), self.sp.is_some()) else { return false };
         let c = &self.m.cfg;
-        let start = self.sp.as_ref().unwrap().base + (2 * c.n_expert * self.cache.slot_bytes) as u64;
-        let end = lent.ptr + (lent.n * self.cache.slot_bytes) as u64;
+        let (start, end) = match self.kv_extra.as_ref() {
+            Some(x) => (x.ptr, x.ptr + x.bytes as u64),
+            None => (self.sp.as_ref().unwrap().base + (2 * c.n_expert * self.cache.slot_bytes) as u64, lent.ptr + (lent.n * self.cache.slot_bytes) as u64),
+        };
         // As many rows as the lent room holds, up to BIG_BATCH: a longer `--ctx` leaves the expert cache (and so the room) smaller, and a prompt that
         // read 2,048 tokens at a time must not drop to 256 for want of a few MiB; each pass copies a layer's experts whatever its token count.
         let fit = (end.saturating_sub(start) as usize).saturating_sub(64 * 40) / (bb_row_floats(c) * 4);
@@ -2787,6 +2859,7 @@ impl<'c, 'm> GpuSession<'c, 'm> {
         self.stage_pipe_wait();
         self.ctx.synchronize().unwrap();
         self.big_batch_off();
+        self.unlend_kv();
         self.cache.evict_range = lent.evict_saved;
         let arena = self.cache.arena.as_ref().unwrap().ptr;
         let stream = self.copy_stream.raw();

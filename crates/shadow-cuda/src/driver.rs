@@ -82,6 +82,15 @@ table! {
     cuMemcpyDtoD: fn(CuDevicePtr, CuDevicePtr, usize) = ["cuMemcpyDtoD_v2"];
     cuMemcpyDtoHAsync: fn(*mut c_void, CuDevicePtr, usize, H) = ["cuMemcpyDtoHAsync_v2"];
     cuMemsetD8: fn(CuDevicePtr, u8, usize) = ["cuMemsetD8_v2"];
+    // the virtual memory API (physical chunks mapped into a reserved address range), for lending the unfilled part of the KV window
+    cuMemGetAllocationGranularity: fn(*mut usize, *const c_void, c_uint) = ["cuMemGetAllocationGranularity"];
+    cuMemCreate: fn(*mut u64, usize, *const c_void, u64) = ["cuMemCreate"];
+    cuMemAddressReserve: fn(*mut CuDevicePtr, usize, usize, CuDevicePtr, u64) = ["cuMemAddressReserve"];
+    cuMemAddressFree: fn(CuDevicePtr, usize) = ["cuMemAddressFree"];
+    cuMemMap: fn(CuDevicePtr, usize, usize, u64, u64) = ["cuMemMap"];
+    cuMemUnmap: fn(CuDevicePtr, usize) = ["cuMemUnmap"];
+    cuMemSetAccess: fn(CuDevicePtr, usize, *const c_void, usize) = ["cuMemSetAccess"];
+    cuMemRelease: fn(u64) = ["cuMemRelease"];
     cuMemHostRegister: fn(*mut c_void, usize, c_uint) = ["cuMemHostRegister_v2"];
     cuMemHostUnregister: fn(*mut c_void) = ["cuMemHostUnregister"];
     cuMemHostGetDevicePointer: fn(*mut CuDevicePtr, *mut c_void, c_uint) = ["cuMemHostGetDevicePointer_v2", "cuMemHostGetDevicePointer"];
