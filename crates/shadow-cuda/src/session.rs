@@ -290,7 +290,7 @@ fn bb_row_floats(c: &shadow_model::forward::Config) -> usize {
         + c.idx_heads * c.idx_dim + c.n_expert + 1 + 3 * c.shared_ff + h + 64 * k + 2 * k * c.expert_ff + k * c.expert_ff + k * h
 }
 
-/// Whether the per-row buffers of the two layer kinds (and `up` / `eg`) share memory: opt-in (`SHADOW_ALIAS_ROWS=on|sets|up`): +9-12% on 9-15k prompts, `--exact` byte-identical, but the fast modes agree less with `--exact` (0.219 against 0.339, docs/STATUS.md 2026-11-04); a pipelined session never.
+/// Whether the per-row buffers of the two layer kinds (and `up` / `eg`) share memory: on by default (`SHADOW_ALIAS_ROWS=0` off, `sets` / `up` one of the two): +9-12% on 9-15k prompts, `--exact` byte-identical, but the fast modes agree less with `--exact` (0.219 against 0.339, docs/STATUS.md 2026-11-04); a pipelined session never.
 static ALIAS_ROWS: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(3);
 fn alias_sets() -> bool {
     ALIAS_ROWS.load(std::sync::atomic::Ordering::Relaxed) & 1 != 0
@@ -1211,7 +1211,7 @@ impl<'c, 'm> GpuSession<'c, 'm> {
             sel_toks: a(SEL_ROWS * (c.idx_budget + ratio) + SEL_ROWS)?,
             logits: a(COLS_MAX * c.vocab)?,
         };
-        ALIAS_ROWS.store(if tiers.pipeline { 0 } else { match std::env::var("SHADOW_ALIAS_ROWS").as_deref() { Ok("sets") => 1, Ok("up") => 2, Ok("on") | Ok("1") => 3, _ => 0 } }, std::sync::atomic::Ordering::Relaxed);
+        ALIAS_ROWS.store(if tiers.pipeline { 0 } else { match std::env::var("SHADOW_ALIAS_ROWS").as_deref() { Ok("sets") => 1, Ok("up") => 2, Ok("0") | Ok("off") => 0, _ => 3 } }, std::sync::atomic::Ordering::Relaxed);
         let bb = make_bb(c, MAX_BATCH, &mut |n| a(n), fixed)?;
         let replay = Replay {
             qkv: a(c.n_layer * MAX_VERIFY * (2 * kd + vd))?, ba: a(c.n_layer * MAX_VERIFY * 2 * c.ssm_v_heads)?,
