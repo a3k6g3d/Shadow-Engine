@@ -3024,7 +3024,7 @@ impl<'c, 'm> GpuSession<'c, 'm> {
         // As many rows as the lent room holds, up to BIG_BATCH: a longer `--ctx` leaves the expert cache (and so the room) smaller, and a prompt that
         // read 2,048 tokens at a time must not drop to 256 for want of a few MiB; each pass copies a layer's experts whatever its token count.
         let fit = (end.saturating_sub(start) as usize).saturating_sub(64 * 40) / (bb_row_floats(c) * 4);
-        let cap = if self.kv_extra.is_some() { self.kv_rows } else { std::env::var("SHADOW_BIG_ROWS").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(BIG_BATCH).min(BIG_BATCH) };
+        let cap = if self.kv_extra.is_some() { self.kv_rows } else { std::env::var("SHADOW_BIG_ROWS").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(BIG_BATCH).min(BIG_BATCH_MAX) };
         let rows = fit.min(cap) / 64 * 64;
         let need = bb_row_floats(c) * rows * 4 + 64 * 40; // the 256-byte rounding of ~40 buffers
         if rows < 2 * MAX_BATCH {
