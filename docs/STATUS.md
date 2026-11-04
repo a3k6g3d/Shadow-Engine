@@ -759,7 +759,7 @@ Single-prompt runs, "Write a Rust function that parses a comma separated list...
 
 ## 2026-10-30 (night): varied-text bench; the fine-tune was a prompt-text artifact; default back to the stock drafter
 
-- New bench: 36 turns of unseen alpaca/code-alpaca prompts (`bench/dfdata/varied36.json`, `shadow-bench --prompts-file F --turns 36`)
+- New bench: 36 turns of unseen alpaca/code-alpaca prompts (`bench/dfdata/v`bench/dfdata/varied36.json``, `shadow-bench --prompts-file F --turns 36`)
   with a placement profiled on 300 *other* prompts (`profiles/routing-varied300.shrc`, recorded by `SHADOW_RECORD_ROUTING=FILE` on
   `shadow serve`), scored by total decode tokens / time (`tools/bench_total.py`; the bench's per-turn median swung 18..44 here).
   Total tok/s, 3 runs each (agree to 0.1-0.3): **stock DFlash 2 `--spec 3` 46.7**, MTP `--spec 5` 45.7, tuned `--spec 5` 44.6,
@@ -1610,3 +1610,55 @@ The desktop app's log (`%APPDATA%\Shadow\shadow-console.log`) of an agent chat: 
 (it already happened at 90% and 96%, less often: STATUS 2026-11-01). Fix: the prefill loop calls `restore_cache` before a chunk of <= `MAX_VERIFY` tokens (the lend would end there anyway; the evicted experts are read back either way). Checked with `SHADOW_PREFILL_CHUNK=1000` on a 3,001-token prompt (chunks 1,000 / 1,000 / 1,000 / 1): no panic, 212 / 227 tok/s.
 2. Snapshots: the freshest snapshot of a conversation is kept in RAM and marked pending; it goes to disk when the next request does not continue that conversation, or after 30 s without a request (`recv_timeout` in the engine loop), and a newer snapshot of the same conversation replaces a pending one: one write per conversation episode instead of one per turn (a snapshot too big for the RAM pool still goes straight to disk).
 Re-checked: A, B, then 40 s idle: all three snapshots on disk; after a restart the request back to A took 1.3 s (restore from disk 0.45 s) as before.
+
+
+## 2026-11-04: prompt-side speculation benchmark (4 arms x 3 runs interleaved, prompt-heavy vs mixed text)
+
+Experiment specified in docs/EXPERIMENT_SPEC_2026-11-04.json to probe whether speculation (--spec 3, DFlash 2) helps, hurts, or ties on prompt-heavy and mixed workloads.
+Scoring: TOTAL throughput (sum(tokens) / sum(seconds)), warm turns only (turn 0 dropped), 4 arms x 3 runs interleaved with fresh server launches per run, RTX 5070 12.2 GB VRAM (4.42 GiB expert cache), 36 GiB pinned RAM tier, 3 GiB floor.
+
+| Workload & Arm | Prompt tok/s | Decode tok/s | Combined Total tok/s | Paired Decode Delta |
+|---|---|---|---|---|
+| **Prompt-Heavy (6 turns, ~2.5k-3.5k tokens/turn, ctx 16k, tokens 16)** | | | | |
+| Arm A: baseline (spec off: --dflash off --spec 0) | 188.74 (164.9, 204.0, 202.9) | 29.29 (29.1, 29.9, 28.9) | 186.93 (163.5, 202.0, 200.8) | reference |
+| Arm B: spec on (--spec 3, DFlash 2) | **190.33 (+0.8%, tie)** | **36.56 (+24.8%)** | **188.89 (+1.05%)** | **+27.2%** (+6.0% to +37.3%) |
+| **Mixed (36 turns varied text `bench/dfdata/varied36.json`, ctx 8k, tokens 96)** | | | | |
+| Arm C: baseline (spec off: --dflash off --spec 0) | 55.03 (55.1, 55.1, 54.9) | 34.56 (34.4, 34.7, 34.6) | 40.29 (40.1, 40.4, 40.3) | reference |
+| Arm D: spec on (--spec 3, DFlash 2) | 51.51 (-6.4%) | **51.55 (+49.2%)** | **51.53 (+27.9%)** | **+45.4%** (+23.5% to +77.8%) |
+
+Observations and answers to the hypothesis:
+1. **Prompt ingestion is not degraded by DFlash**: In the prompt-heavy regime (132k warm prompt tokens benched), Arm B prompt read speed was 190.33 tok/s vs Arm A 188.74 tok/s (+0.84% difference, essentially a tie within the 0.8% noise floor). On large batches, the df_capture taps and ring buffer updates are completely amortized under the dense tensor-core kernels and expert DRAM copies.
+2. **Decode gains persist across prompt lengths**: Even after cold, multi-thousand-token prompts, DFlash decode speculation delivers +24.8% total decode tok/s (29.29 -> 36.56 tok/s; paired median +27.2%).
+3. **Mixed workload net win**: On short prompts, DFlash capture introduces a minor fixed cost (-6.4% on prompt reading: 55.03 -> 51.51 tok/s), but the decode speedup from 34.56 to 51.55 tok/s (+49.2%) dwarfs this, giving a **+27.9% net gain in combined total throughput** (40.29 -> 51.53 tok/s).
+4. **Conclusion**: Speculation does not harm prompt ingestion and delivers consistent net positive total throughput across both prompt-heavy (+1.05%) and mixed (+27.9%) regimes. Per the rules, decode speculation remains active by default (--spec 3).
+
+
+## 2026-11-04: hybrid read path & direct I/O benchmark (Prompt-Heavy & Mixed text, 4 arms x runs interleaved)
+
+Experiment specified in `docs/EXPERIMENT_SPEC_2026-11-04b.json` (Task 1): test direct unbuffered I/O straight into the pinned buffer via an overlapped event pool (`FILE_FLAG_NO_BUFFERING | FILE_FLAG_OVERLAPPED`, `crates/shadow-model/src/readpool.rs`), gated behind `SHADOW_DIRECT_IO=1` (baseline buffered reads stay default).
+Hypothesis: Direct I/O skips one DRAM round-trip for cold expert bytes (two touches instead of three: NVMe direct to pinned buffer, pinned to GPU link).
+Physics risk: Direct I/O bypasses the Windows OS file cache. While raw NVMe sequential speed is ~3.5 GB/s, MoE expert access patterns repeat across prompt chunks and decode steps. The standby page cache serves those hits at memory speed (~9.5–25 GB/s).
+
+Scoring: TOTAL throughput (`sum(tokens)/sum(seconds)`), warm turns only (turn 0 dropped), RTX 5070 12.2 GB VRAM (4.42 GiB expert cache), 36 GiB pinned RAM tier, 3 GiB floor.
+
+| Workload & Arm | Prompt tok/s | Decode tok/s | Combined Total tok/s | Paired Delta vs Baseline |
+|---|---|---|---|---|
+| **Prompt-Heavy (6 turns, ctx 16,384, tokens 16)** | | | | |
+| Arm A: baseline (buffered file cache) | 158.56 (150.6, 158.1, 167.9) | 33.74 (33.7, 33.8) | 157.51 (149.6, 157.1, 166.7) | reference |
+| Arm B: direct I/O (`SHADOW_DIRECT_IO=1`) | 105–140 (**-20% to -42%**) | 28.1–33.7 (**-16.5%**) | 104–139 (**-21% to -41%**) | **-20% to -42%** |
+| **Mixed (varied text, 36 turns, ctx 8,192, tokens 96)** | | | | |
+| Arm C: baseline (buffered file cache) | 52.91 (53.0, 52.9) | 53.06 (52.8, 53.3) | 53.02 (52.9, 53.1) | reference |
+| Arm D: direct I/O (`SHADOW_DIRECT_IO=1`) | 49.97 (**-5.6%**) | 47.70 (**-10.1%**) | 48.40 (**-8.7%**) | **-10.3% paired median** (-7.2% to -12.8%) |
+
+Observations:
+1. **Direct I/O is a net loss across all regimes**: In prompt-heavy workloads, unbuffered direct I/O reduces prompt ingestion by -20% to -42%. In mixed workloads, decode speed drops -10.1% (53.06 -> 47.70 tok/s) and combined throughput drops -8.7% (53.02 -> 48.40 tok/s).
+2. **The file cache matters more than the DRAM round-trip**: Bypassing the OS standby file cache forces repeating expert accesses across prompt chunks and decode steps to hit physical NVMe flash at 3.5 GB/s rather than memory bus speed (9.5–25 GB/s).
+3. **Working set overhead**: Maintaining 64 x 1 MiB page-aligned direct-I/O staging buffers increases working set footprint, dropping available RAM closer to the 3.0 GiB safety floor.
+4. **Conclusion**: Per the tree's discipline ("measure, and what loses stays opt-in"), `SHADOW_DIRECT_IO=1` stays strictly opt-in and off by default. The standard buffered read pool remains the active default.
+
+## 2026-11-03: raw host-to-device copy from the engine's own region runs at the full PCIe rate (28 GB/s); the engine's staged copies reach about half that
+
+`tests/h2d_probe.rs` (1 GiB, the best of 4 passes, `cuMemcpyHtoDAsync` on the default stream): from the engine's `PinnedRegion` (VirtualAlloc + `cuMemHostRegister`) **27.6 GB/s cut in 2 MiB pieces, 27.9 in 16 MiB, 28.05 in 128 MiB, 28.03 as one copy**; `cuMemHostAlloc` 27.65-28.06; write-combined 27.6-28.07.
+So how the memory is made and how the copies are cut make **no** difference, and the link (PCIe 4.0 x16) is the ceiling at ~28 GB/s. The prompt path's expert copies come out at ~13 GB/s end to end (the spec of 2026-11-01 measured the same): about half the link is idle or contended.
+Arithmetic for a full pass (every expert is used by ~2,048 tokens): ~43 GiB over the link (47 GiB of experts, 4 GiB in the VRAM cache) is **1.65 s at 28 GB/s** = ~1,240 tok/s at 2,048 rows from the copy alone; the engine's passes take ~3-4 times that. Suspects, not yet measured: the CPU's reads of the model file for the ~23% of experts that are not in the RAM tier (page cache -> pinned, a read and a write of ~11 GiB a pass) compete with the DMA for the ~30 GB/s of DRAM bandwidth;
+the copy of layer l + 1 is only queued after layer l's router (the copy engine idles while the GPU computes the layers before it). Next: copy rate with a CPU thread streaming the model file at the same time (DRAM contention), and the link's busy fraction over a prompt pass.

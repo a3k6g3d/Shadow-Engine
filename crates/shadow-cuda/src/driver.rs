@@ -92,6 +92,8 @@ table! {
     cuMemSetAccess: fn(CuDevicePtr, usize, *const c_void, usize) = ["cuMemSetAccess"];
     cuMemRelease: fn(u64) = ["cuMemRelease"];
     cuMemHostRegister: fn(*mut c_void, usize, c_uint) = ["cuMemHostRegister_v2"];
+    cuMemHostAlloc: fn(*mut *mut c_void, usize, c_uint) = ["cuMemHostAlloc"];
+    cuMemFreeHost: fn(*mut c_void) = ["cuMemFreeHost"];
     cuMemHostUnregister: fn(*mut c_void) = ["cuMemHostUnregister"];
     cuMemHostGetDevicePointer: fn(*mut CuDevicePtr, *mut c_void, c_uint) = ["cuMemHostGetDevicePointer_v2", "cuMemHostGetDevicePointer"];
     cuModuleLoadData: fn(*mut H, *const c_void) = ["cuModuleLoadData"];
