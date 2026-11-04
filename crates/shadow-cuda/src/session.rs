@@ -2904,6 +2904,13 @@ impl<'c, 'm> GpuSession<'c, 'm> {
             jobs.push((&names[0], e, gate));
             jobs.push((&names[1], e, up));
         }
+        if std::env::var("SHADOW_STAGE_NOREAD").is_ok_and(|v| v == "1") {
+            // timing experiment only (the output is wrong): the file-only experts are zeros, not read - no file or page-cache traffic beside the copies
+            for (_, _, s) in jobs.iter_mut() {
+                s.fill(0);
+            }
+            return;
+        }
         // SAFETY: buffer p is not touched again until `stage_pipe_wait` (the next `stage_pipe_read`, the copies out of it in
         // `stage_copy`, `restore_cache`); its previous contents (layer l - 2's) were copied out by a transfer the caller has seen finish.
         unsafe { self.m.experts_submit(&mut jobs) };
