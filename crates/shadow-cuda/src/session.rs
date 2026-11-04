@@ -2762,9 +2762,14 @@ impl<'c, 'm> GpuSession<'c, 'm> {
             return true;
         }
         let kv_lent = pipe && big && arena_hosts && self.lend_kv(false);
+        // more rows than the KV tail holds (`SHADOW_BIG_ROWS`): the rest of their buffers from the arena, past the halves (256 MiB more for the carving's gaps)
+        let extra = if kv_lent {
+            let cap = std::env::var("SHADOW_BIG_ROWS").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(BIG_BATCH).min(BIG_BATCH_MAX);
+            (bb_row_floats(&self.m.cfg) * 4 * cap + (256 << 20)).saturating_sub(self.kv_extra.as_ref().map_or(0, |x| x.bytes))
+        } else { 0 };
         let want = std::env::var("SHADOW_PREFILL_LEND_MIB").ok().and_then(|v| v.parse::<usize>().ok()).map(|m| m << 20)
             .unwrap_or((self.m.cfg.n_expert * if pipe { 2 } else { 1 } + if pipe { 2 } else { 0 }) * self.cache.slot_bytes
-                       + if pipe && big && !kv_lent { bb_row_floats(&self.m.cfg) * BIG_BATCH * 4 + (1 << 16) } else { 0 })
+                       + if pipe && big && !kv_lent { bb_row_floats(&self.m.cfg) * BIG_BATCH * 4 + (1 << 16) } else { extra })
             .min((self.cache.arena_bytes / 100 * std::env::var("SHADOW_LEND_PCT").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(99)).min(self.cache.arena_bytes.saturating_sub(24 * self.cache.slot_bytes)));
         let target = self.cache.arena_bytes - want;
         let s0 = self.cache.slot_offset.partition_point(|&o| (o as usize) < target);
@@ -3017,44 +3022,66 @@ impl<'c, 'm> GpuSession<'c, 'm> {
     fn big_batch_on(&mut self) -> bool {
         let (Some(lent), true) = (self.lent.as_ref(), self.sp.is_some()) else { return false };
         let c = &self.m.cfg;
-        let (start, end) = match self.kv_extra.as_ref() {
-            Some(x) => (x.ptr + if self.kv_halves { (2 * c.n_expert * self.cache.slot_bytes) as u64 } else { 0 }, x.ptr + x.bytes as u64),
-            None => (self.sp.as_ref().unwrap().base + (2 * c.n_expert * self.cache.slot_bytes) as u64, lent.ptr + (lent.n * self.cache.slot_bytes) as u64),
+        let halves = (2 * c.n_expert * self.cache.slot_bytes) as u64;
+        // where the buffers can go: the KV window's lent tail, and the lent part of the arena past the stage halves (both, when the lend took both)
+        let ranges: Vec<(u64, u64)> = match self.kv_extra.as_ref() {
+            Some(x) => {
+                let mut v = vec![(x.ptr + if self.kv_halves { halves } else { 0 }, x.ptr + x.bytes as u64)];
+                let (a0, a1) = (self.sp.as_ref().unwrap().base + halves, lent.ptr + (lent.n * self.cache.slot_bytes) as u64);
+                if !self.kv_halves && a1 > a0 + (1 << 20) {
+                    // the arena's part first: the first buffers carved are the biggest
+                    v.insert(0, (a0, a1));
+                }
+                v
+            }
+            None => vec![(self.sp.as_ref().unwrap().base + halves, lent.ptr + (lent.n * self.cache.slot_bytes) as u64)],
         };
         // As many rows as the lent room holds, up to BIG_BATCH: a longer `--ctx` leaves the expert cache (and so the room) smaller, and a prompt that
         // read 2,048 tokens at a time must not drop to 256 for want of a few MiB; each pass copies a layer's experts whatever its token count.
-        let fit = (end.saturating_sub(start) as usize).saturating_sub(64 * 40) / (bb_row_floats(c) * 4);
-        let cap = if self.kv_extra.is_some() { self.kv_rows } else { std::env::var("SHADOW_BIG_ROWS").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(BIG_BATCH).min(BIG_BATCH_MAX) };
-        let rows = fit.min(cap) / 64 * 64;
-        let need = bb_row_floats(c) * rows * 4 + 64 * 40; // the 256-byte rounding of ~40 buffers
+        let env_cap = std::env::var("SHADOW_BIG_ROWS").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(BIG_BATCH).min(BIG_BATCH_MAX);
+        let cap = if self.kv_halves { env_cap.min(self.kv_rows) } else { env_cap };
+        let ctx = self.ctx;
+        let dummy = |ctx: &'c Context| unsafe { DeviceBuffer::view(ctx, 0, 0) };
+        // the carving is first-fit over the ranges, so the rows are found by carving: the most rows (a multiple of 64) whose buffers all fit
+        let fits = |rows: usize| -> bool {
+            let mut cur: Vec<u64> = ranges.iter().map(|r| r.0).collect();
+            let mut take = |floats: usize| -> Result<DeviceBuffer<'c>, String> {
+                let bytes = (floats.max(1) * 4).next_multiple_of(256) as u64;
+                let k = ranges.iter().zip(cur.iter()).position(|(r, &a)| a + bytes <= r.1).ok_or_else(|| "no room".to_string())?;
+                cur[k] += bytes;
+                Ok(unsafe { DeviceBuffer::view(ctx, 0, 0) })
+            };
+            let fixed = FixedBufs { att: dummy(ctx), sel_iqn: dummy(ctx), sel_scores: dummy(ctx), sel_toks: dummy(ctx), logits: dummy(ctx) };
+            make_bb(c, rows, &mut take, fixed).is_ok()
+        };
+        let mut rows = cap / 64 * 64;
+        while rows >= 2 * MAX_BATCH && !fits(rows) {
+            rows -= 64;
+        }
         if rows < 2 * MAX_BATCH {
             return false;
         }
         if std::env::var("SHADOW_STAGE_TIME").is_ok_and(|v| v == "1") {
-            eprintln!("BIGBATCH lent {} slots ({:.2} GiB), halves {:.2} GiB, big rows need {:.2} GiB, room after halves {:.2} GiB",
-                      lent.n, (lent.n * self.cache.slot_bytes) as f64 / 1073741824.0, (2 * c.n_expert * self.cache.slot_bytes) as f64 / 1073741824.0,
-                      need as f64 / 1073741824.0, (end - start) as f64 / 1073741824.0);
+            eprintln!("BIGBATCH lent {} slots ({:.2} GiB), halves {:.2} GiB, ranges {} ({:.2} GiB), rows {rows} of cap {cap}",
+                      lent.n, (lent.n * self.cache.slot_bytes) as f64 / 1073741824.0, halves as f64 / 1073741824.0,
+                      ranges.len(), ranges.iter().map(|r| r.1 - r.0).sum::<u64>() as f64 / 1073741824.0);
         }
-        if start + need as u64 > end {
-            return false;
-        }
-        let ctx = self.ctx;
-        let mut at = start;
+        let mut cur: Vec<u64> = ranges.iter().map(|r| r.0).collect();
         let mut take = |floats: usize| -> Result<DeviceBuffer<'c>, String> {
             let bytes = floats.max(1) * 4;
-            let p = at;
-            at += bytes.next_multiple_of(256) as u64;
-            // SAFETY: inside the lent cache, past the stage halves: nothing else uses it until `big_batch_off`, which swaps these away.
+            let aligned = bytes.next_multiple_of(256) as u64;
+            let k = ranges.iter().zip(cur.iter()).position(|(r, &a)| a + aligned <= r.1).ok_or_else(|| "no room".to_string())?;
+            let p = cur[k];
+            cur[k] += aligned;
+            // SAFETY: inside the lent cache or KV tail, past the stage halves: nothing else uses it until `big_batch_off`, which swaps these away.
             Ok(unsafe { DeviceBuffer::view(ctx, p, bytes) })
         };
-        let dummy = |ctx: &'c Context| unsafe { DeviceBuffer::view(ctx, 0, 0) };
         let fixed = FixedBufs {
             att: std::mem::replace(&mut self.bb.att, dummy(ctx)), sel_iqn: std::mem::replace(&mut self.bb.sel_iqn, dummy(ctx)),
             sel_scores: std::mem::replace(&mut self.bb.sel_scores, dummy(ctx)), sel_toks: std::mem::replace(&mut self.bb.sel_toks, dummy(ctx)),
             logits: std::mem::replace(&mut self.bb.logits, dummy(ctx)),
         };
         let built = make_bb(c, rows, &mut take, fixed);
-        assert!(at <= end, "big batch buffers: {} bytes carved of {} lent", at - start, end - start);
         match built {
             Ok(big) => {
                 self.small_bb = Some(std::mem::replace(&mut self.bb, big));
