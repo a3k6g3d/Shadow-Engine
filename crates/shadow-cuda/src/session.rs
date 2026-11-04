@@ -56,10 +56,14 @@ struct StagePipe<'c> {
     /// recorded on the compute stream after layer l's combine (half l & 1 is read by its experts until then): the copy two layers on waits for it
     done: [Event<'c>; 2],
     ready: [usize; 2],
-    bufs: [PinnedRegion<'c>; 2],
+    /// three read-ahead buffers, layer l's in `l % 3`: the one the next layer's read fills was last used two layers back, whose copy is long done, so the host
+    /// need not wait for the copy it just queued (with two, the host blocked on every layer's copy before it could queue the next layer's compute)
+    bufs: [PinnedRegion<'c>; 3],
+    /// recorded on the copy stream after the copy out of buffer b
+    buf_done: [Event<'c>; 3],
     /// the layer whose file-only experts buffer p holds, and expert -> slot in it
-    layer: [usize; 2],
-    at: [HashMap<usize, usize>; 2],
+    layer: [usize; 3],
+    at: [HashMap<usize, usize>; 3],
     slots: usize,
     pending: bool,
 }
@@ -364,6 +368,14 @@ pub struct GpuSession<'c, 'm> {
     replay: Replay<'c>,
     /// `delta_chunk_prep`'s output for up to BIG_BATCH tokens: 8,448 floats a (64-token chunk, value head)
     dscr: DeviceBuffer<'c>,
+    /// with `--tensor-prompt` (`SHADOW_PREFILL_DEVPLAN=0` off): a long prompt's MoE is routed and planned on the device (`dev_plan`); these are its scratch buffers:
+    /// each token's chosen experts, the users of each expert, each expert's first group, and the host's per-layer expert tables (copied flags, addresses)
+    devplan: bool,
+    dp_tidx: DeviceBuffer<'c>,
+    dp_cnt: DeviceBuffer<'c>,
+    dp_gstart: DeviceBuffer<'c>,
+    dp_copied: DeviceBuffer<'c>,
+    dp_eaddr: DeviceBuffer<'c>,
     /// `SHADOW_KV_LEND=1`: the KV window's buffers are virtual-memory regions, and a long prompt borrows the unfilled tail of them (`lend_kv`) for its batch buffers
     kv_regions: Vec<crate::kvvmm::VmmRegion<'c>>,
     kv_extra: Option<DeviceBuffer<'c>>,
@@ -1265,6 +1277,7 @@ impl<'c, 'm> GpuSession<'c, 'm> {
             ple: a(MAX_VERIFY * ch)?, pass: None, on: std::cell::Cell::new(false),
         };
         let dscr = a(BIG_BATCH.div_ceil(64) * c.ssm_v_heads * 8448)?;
+        let (dp_tidx, dp_cnt, dp_gstart, dp_copied, dp_eaddr) = (a(BIG_BATCH_MAX * 16)?, a(1024)?, a(1024)?, a(256)?, a(6144)?);
         let kv_lend = !std::env::var("SHADOW_KV_LEND").is_ok_and(|v| v == "0");
         let mut kv_regions: Vec<crate::kvvmm::VmmRegion<'c>> = Vec::new();
         let kv_extra_reg: Option<crate::kvvmm::VmmRegion<'c>> = None; // made at the first lend, when the slot size is known
@@ -1528,7 +1541,8 @@ impl<'c, 'm> GpuSession<'c, 'm> {
             None
         };
         let mut s = GpuSession {
-            ctx, m, mvp, fw, w, v, b, bb, replay, dscr, kv_regions, kv_extra: None, kv_extra_reg, prompt_hint: 0, kv_rows: 0, kv_halves: false, router_bias: std::env::var("SHADOW_ROUTER_BIAS").ok().and_then(|v| v.parse().ok()).unwrap_or(0.0), batch_scratch, delta, attn, ple_state, tokens: vec![], pictures: vec![], rope_tab: None, rope_on: false, cap, trace: None, stop_after: None,
+            ctx, m, mvp, fw, w, v, b, bb, replay, dscr,
+            devplan: tiers.tensor_prompt && !std::env::var("SHADOW_PREFILL_DEVPLAN").is_ok_and(|v| v == "0"), dp_tidx, dp_cnt, dp_gstart, dp_copied, dp_eaddr, kv_regions, kv_extra: None, kv_extra_reg, prompt_hint: 0, kv_rows: 0, kv_halves: false, router_bias: std::env::var("SHADOW_ROUTER_BIAS").ok().and_then(|v| v.parse().ok()).unwrap_or(0.0), batch_scratch, delta, attn, ple_state, tokens: vec![], pictures: vec![], rope_tab: None, rope_on: false, cap, trace: None, stop_after: None,
             resident_bytes, expert_uploads: 0, cache, ram, copy_stream, copy_stream2, copy_ev2, copy_event, staging,
             pending: vec![], routing: RoutingCounts::new(c.n_layer, c.n_expert),
             prof: std::env::var("SHADOW_PROFILE").is_ok_and(|v| v == "1")
@@ -2883,11 +2897,11 @@ impl<'c, 'm> GpuSession<'c, 'm> {
         }
         let slots = per_layer.iter().map(|&n| ne.saturating_sub(n)).max().unwrap_or(ne).max(1);
         let bytes = slots * self.cache.slot_bytes;
-        let (Ok(a), Ok(b), Ok(e0), Ok(e1)) =
-            (PinnedRegion::new(self.ctx, bytes), PinnedRegion::new(self.ctx, bytes), self.ctx.event(), self.ctx.event()) else { return };
-        let (Ok(d0), Ok(d1)) = (self.ctx.event(), self.ctx.event()) else { return };
-        self.sp = Some(StagePipe { base, events: [e0, e1], done: [d0, d1], ready: [usize::MAX; 2], bufs: [a, b], layer: [usize::MAX; 2],
-                                   at: [HashMap::new(), HashMap::new()], slots, pending: false });
+        let (Ok(a), Ok(b), Ok(c3), Ok(e0), Ok(e1)) =
+            (PinnedRegion::new(self.ctx, bytes), PinnedRegion::new(self.ctx, bytes), PinnedRegion::new(self.ctx, bytes), self.ctx.event(), self.ctx.event()) else { return };
+        let (Ok(d0), Ok(d1), Ok(b0), Ok(b1), Ok(b2)) = (self.ctx.event(), self.ctx.event(), self.ctx.event(), self.ctx.event(), self.ctx.event()) else { return };
+        self.sp = Some(StagePipe { base, events: [e0, e1], done: [d0, d1], ready: [usize::MAX; 2], bufs: [a, b, c3], buf_done: [b0, b1, b2], layer: [usize::MAX; 3],
+                                   at: [HashMap::new(), HashMap::new(), HashMap::new()], slots, pending: false });
     }
 
     /// Waits for the read-ahead's file reads.
@@ -2911,8 +2925,8 @@ impl<'c, 'm> GpuSession<'c, 'm> {
         if self.fv_on {
             // the file-only experts are copied from file views by `stage_copy`: no read-ahead
             let sp = self.sp.as_mut().unwrap();
-            sp.layer[l & 1] = l;
-            sp.at[l & 1].clear();
+            sp.layer[l % 3] = l;
+            sp.at[l % 3].clear();
             return;
         }
         let names = ["gate", "up", "down"].map(|p| format!("blk.{l}.ffn_{p}_exps.weight"));
@@ -2922,7 +2936,7 @@ impl<'c, 'm> GpuSession<'c, 'm> {
         let want: Vec<usize> = (0..self.m.cfg.n_expert)
             .filter(|&e| !self.cache.map.contains_key(&(l, e)) && !self.ram.at.contains_key(&(l, e))).collect();
         let sp = self.sp.as_mut().unwrap();
-        let p = l & 1;
+        let p = l % 3;
         // The buffers were sized for the file-only experts a layer had when the pipeline was set up; the RAM tier changes while a long prompt is read
         // (promotions, evictions), so a layer can have more now.  This half gets a bigger buffer (it is free: what it held was copied out, `stage_pipe_wait`
         // above); cutting `want` short would leave experts in neither place and `stage_copy` would panic.
@@ -2966,6 +2980,7 @@ impl<'c, 'm> GpuSession<'c, 'm> {
         let total: usize = names.iter().map(|n| self.m.expert_bytes(n)).sum();
         let stream = self.copy_stream.raw();
         let p = l & 1;
+        let rb = l % 3;
         let half = self.sp.as_ref().unwrap().base + (p * self.m.cfg.n_expert * self.cache.slot_bytes) as u64;
         let mut n = 0u64;
         let (mut dsts, mut srcs, mut host_srcs, mut lens): (Vec<u64>, Vec<u64>, Vec<u64>, Vec<usize>) = (vec![], vec![], vec![], vec![]);
@@ -3022,11 +3037,11 @@ impl<'c, 'm> GpuSession<'c, 'm> {
                 self.ram.served += 1;
             } else {
                 let sp = self.sp.as_ref().unwrap();
-                let slot = *sp.at[p].get(&e).expect("a staged expert in neither the RAM tier nor the read-ahead");
-                debug_assert_eq!(sp.layer[p], l);
+                let slot = *sp.at[rb].get(&e).expect("a staged expert in neither the RAM tier nor the read-ahead");
+                debug_assert_eq!(sp.layer[rb], l);
                 let at = slot * self.cache.slot_bytes;
-                srcs.push(sp.bufs[p].dev_ptr + at as u64);
-                host_srcs.push(sp.bufs[p].as_slice()[at..at + total].as_ptr() as u64);
+                srcs.push(sp.bufs[rb].dev_ptr + at as u64);
+                host_srcs.push(sp.bufs[rb].as_slice()[at..at + total].as_ptr() as u64);
                 self.ram.drive += 1;
             }
             dsts.push(dst);
@@ -3049,13 +3064,14 @@ impl<'c, 'm> GpuSession<'c, 'm> {
         self.expert_uploads += 3 * n as usize;
         let sp = self.sp.as_mut().unwrap();
         sp.events[p].record(Some(&self.copy_stream)).unwrap();
+        sp.buf_done[rb].record(Some(&self.copy_stream)).unwrap();
         sp.ready[p] = l;
     }
 
     /// Layer `l`'s routed experts for a long prompt's m tokens, all in one group: the resident ones from the cache, the rest from stage
     /// half l & 1, which the previous layer's `moe_staged` has been copying in while it ran (the first layer of a pass fills it here);
     /// then layer l + 1's copy is queued behind the resident experts' launches and layer l + 2's file reads started.
-    fn moe_staged(&mut self, l: usize, m: usize, tops: &[Vec<(usize, f64)>], infos: &[TensorInfo], sizes: &[usize], _names: &[String; 3]) {
+    fn moe_staged(&mut self, l: usize, m: usize, tops: Option<&[Vec<(usize, f64)>]>, infos: &[TensorInfo], sizes: &[usize], _names: &[String; 3]) {
         let c = &self.m.cfg;
         let (h, k, ne) = (c.hidden, c.n_expert_used, c.n_expert);
         let p = l & 1;
@@ -3074,35 +3090,41 @@ impl<'c, 'm> GpuSession<'c, 'm> {
                 self.stage_copy(l + 1);
             }
         }
-        let mut seen = vec![false; ne];
-        let mut set: Vec<usize> = Vec::new();
-        for top in tops {
-            for &(e, _) in top {
-                if !seen[e] {
-                    seen[e] = true;
-                    set.push(e);
+        let (plan, n_set) = if let Some(tops) = tops {
+            let mut seen = vec![false; ne];
+            let mut set: Vec<usize> = Vec::new();
+            for top in tops {
+                for &(e, _) in top {
+                    if !seen[e] {
+                        seen[e] = true;
+                        set.push(e);
+                    }
                 }
             }
-        }
-        let arena = self.cache.arena.as_ref().unwrap().ptr;
-        let half = self.sp.as_ref().unwrap().base + (p * ne * self.cache.slot_bytes) as u64;
-        for &e in &set {
-            if self.cache.touch((l, e)).is_some() {
-                self.cache.hits += 1;
-            } else {
-                self.cache.misses += 1;
+            let arena = self.cache.arena.as_ref().unwrap().ptr;
+            let half = self.sp.as_ref().unwrap().base + (p * ne * self.cache.slot_bytes) as u64;
+            for &e in &set {
+                if self.cache.touch((l, e)).is_some() {
+                    self.cache.hits += 1;
+                } else {
+                    self.cache.misses += 1;
+                }
             }
-        }
-        let part = [0u64, sizes[0] as u64, (sizes[0] + sizes[1]) as u64];
-        let addr = |e: usize| match self.cache.map.get(&(l, e)) {
-            Some(&s) => arena + self.cache.slot_offset[s],
-            None => half + (e * self.cache.slot_bytes) as u64,
+            let part = [0u64, sizes[0] as u64, (sizes[0] + sizes[1]) as u64];
+            let addr = |e: usize| match self.cache.map.get(&(l, e)) {
+                Some(&s) => arena + self.cache.slot_offset[s],
+                None => half + (e * self.cache.slot_bytes) as u64,
+            };
+            let copied = |e: usize| !self.cache.map.contains_key(&(l, e));
+            let chunk_n = if self.mma_experts_ok(infos) { 32 } else { 8 };
+            let plan = grouped_plan(tops, 0, m, &set, k, self.rows * k, addr, copied, part, chunk_n);
+            assert!(plan.bytes.len() <= self.bb.gtab.bytes, "grouped experts: {} bytes of tables", plan.bytes.len());
+            self.upload_to(self.bb.gtab.ptr, &plan.bytes);
+            (plan, set.len())
+        } else {
+            // routed and planned on the device: nothing the host decided depends on the tokens' routing
+            (self.dev_plan(l, m, sizes), 0)
         };
-        let copied = |e: usize| !self.cache.map.contains_key(&(l, e));
-        let chunk_n = if self.mma_experts_ok(infos) { 32 } else { 8 };
-        let plan = grouped_plan(tops, 0, m, &set, k, self.rows * k, addr, copied, part, chunk_n);
-        assert!(plan.bytes.len() <= self.bb.gtab.bytes, "grouped experts: {} bytes of tables", plan.bytes.len());
-        self.upload_to(self.bb.gtab.ptr, &plan.bytes);
         let t_plan = t_start.elapsed();
         self.routed_grouped(&plan, 0, 0, m, infos);
         self.lt_point("staged: resident experts done");
@@ -3116,14 +3138,17 @@ impl<'c, 'm> GpuSession<'c, 'm> {
             Arg::Ptr(row(&bb.y, h, 0)), Arg::Ptr(row(&bb.eo, k * h, 0)), Arg::Ptr(bb.gtab.ptr + plan.weights),
             Arg::Ptr(row(&bb.so, h, 0)), Arg::Ptr(row(&bb.sgl, 1, 0)), Arg::Ptr(bb.gtab.ptr + plan.counts),
             Arg::U32(h as u32), Arg::U32(k as u32)]);
+        if !lead2 {
+            self.sp.as_ref().unwrap().done[p].record(None).unwrap();
+        }
         // now the next layer's copy and the one after's reads, behind this layer's launches: the GPU runs this layer while the host queues them
         if lead2 {
             let n_layer = self.m.cfg.n_layer;
             self.sp.as_ref().unwrap().done[p].record(None).unwrap();
             if l + 2 < n_layer {
-                if self.sp.as_ref().unwrap().layer[p] != l + 2 {
-                    // buffer p held layer l's file-only experts: their copy is done before the buffer is read into again
-                    self.sp.as_ref().unwrap().events[p].synchronize().unwrap();
+                if self.sp.as_ref().unwrap().layer[(l + 2) % 3] != l + 2 {
+                    // the buffer held layer l - 1's file-only experts: their copy is done before the buffer is read into again
+                    self.sp.as_ref().unwrap().buf_done[(l + 2) % 3].synchronize().unwrap();
                     self.stage_pipe_read(l + 2);
                 }
                 // the half it fills is the one this layer's experts read: wait for their combine
@@ -3131,20 +3156,23 @@ impl<'c, 'm> GpuSession<'c, 'm> {
                 self.stage_copy(l + 2);
             }
             if l + 3 < n_layer {
-                // buffer (l + 1) & 1 held layer l + 1's file-only experts: their copy, queued a layer ago, has finished
-                self.sp.as_ref().unwrap().events[(l + 1) & 1].synchronize().unwrap();
+                // the buffer layer l + 3 reads into held layer l's file-only experts: their copy has finished
+                self.sp.as_ref().unwrap().buf_done[(l + 3) % 3].synchronize().unwrap();
                 self.stage_pipe_read(l + 3);
             }
         } else if l + 1 < self.m.cfg.n_layer {
+            // layer l + 1's copy fills the half layer l - 1's experts read: with the host running ahead of the GPU (the device planner: no wait for the router's logits) they may
+            // not be done, so the copy stream waits for the event recorded after layer l - 1's combine
+            self.ctx.stream_wait_event(Some(&self.copy_stream), &self.sp.as_ref().unwrap().done[(l + 1) & 1]).unwrap();
             self.stage_copy(l + 1);
             let t_copyq = t_start.elapsed();
-            // buffer l & 1 held layer l's file-only experts: its copy (queued before the previous layer's compute) has finished
-            self.sp.as_ref().unwrap().events[p].synchronize().unwrap();
+            // the buffer layer l + 2 reads into held layer l - 1's file-only experts: their copy was queued two layers ago, and is done (or soon)
+            self.sp.as_ref().unwrap().buf_done[(l + 2) % 3].synchronize().unwrap();
             let t_sync = t_start.elapsed();
             self.stage_pipe_read(l + 2);
             if stage_time {
                 eprintln!("STAGE L{l} m={m} experts={} plan {:.1} launch {:.1} copy_queued {:.1} event_sync {:.1} read_started {:.1} ms (file waits so far {:.2} s)",
-                          set.len(), t_plan.as_secs_f64() * 1e3, t_launch.as_secs_f64() * 1e3, t_copyq.as_secs_f64() * 1e3, t_sync.as_secs_f64() * 1e3,
+                          n_set, t_plan.as_secs_f64() * 1e3, t_launch.as_secs_f64() * 1e3, t_copyq.as_secs_f64() * 1e3, t_sync.as_secs_f64() * 1e3,
                           t_start.elapsed().as_secs_f64() * 1e3, self.waits[2]);
             }
         }
@@ -4456,6 +4484,91 @@ impl<'c, 'm> GpuSession<'c, 'm> {
         self.multi_cols(l, 1, false, m);
     }
 
+    /// Whether this pass's MoE is routed and planned on the device (`SHADOW_PREFILL_DEVPLAN=1`): a long prompt's staged pass, plain routing, the tensor-core expert kernels.
+    fn dev_plan_ok(&self, m: usize, infos: &[TensorInfo]) -> bool {
+        if std::env::var("SHADOW_STAGE_TIME").is_ok_and(|v| v == "2") {
+            eprintln!("DEVPLAN? devplan {} sp {} m {} bias {} cpu {} pipe {} accept {} vres {} replay {} rlog {} mma {}", self.devplan, self.sp.is_some(), m, self.router_bias, self.cpu.is_some(),
+                      self.pipe_active, self.accept_moe, self.verify_resident, self.replay.on.get(), self.route_log.is_some(), self.mma_experts_ok(infos));
+        }
+        self.devplan && self.sp.is_some() && m > MAX_VERIFY && m <= BIG_BATCH_MAX && self.router_bias == 0.0 && self.cpu.is_none() && !self.pipe_active
+            && !self.replay.on.get() && self.route_log.is_none() && self.mma_experts_ok(infos)
+            && self.m.cfg.n_expert <= 512 && self.m.cfg.n_expert_used <= 16
+    }
+
+    /// Routes (`route_topk_rows`) and plans (`plan_scan`, `plan_fill`) layer l's m tokens on the device, into `bb.gtab` in the layout `routed_grouped` reads, with room
+    /// for the most groups a phase can have; the host sends only the per-expert tables (where each expert is, and whether it is resident), which do not depend on the routing.
+    fn dev_plan(&mut self, l: usize, m: usize, sizes: &[usize]) -> GroupedPlan {
+        let c = &self.m.cfg;
+        let (k, ne) = (c.n_expert_used, c.n_expert);
+        let chunk_n = 32usize;
+        let g = ne + (m * k).div_ceil(chunk_n);
+        let rec = 4 * (1 + 2 * chunk_n);
+        let (a0, a1) = (0usize, 3 * g * 8);
+        let (r0, r1) = (a1 + 3 * g * 8, a1 + 3 * g * 8 + 3 * g * rec);
+        let w = r1 + 3 * g * rec;
+        let counts = w + m * k * 4;
+        assert!(counts + m * 4 <= self.bb.gtab.bytes, "device plan: {} bytes of tables", counts + m * 4);
+        let p = l & 1;
+        let arena = self.cache.arena.as_ref().unwrap().ptr;
+        let half = self.sp.as_ref().unwrap().base + (p * ne * self.cache.slot_bytes) as u64;
+        let part = [0u64, sizes[0] as u64, (sizes[0] + sizes[1]) as u64];
+        let mut eaddr: Vec<u8> = Vec::with_capacity(3 * ne * 8);
+        let mut copied = vec![0u8; ne.next_multiple_of(4)];
+        for pt in 0..3 {
+            for e in 0..ne {
+                let base = match self.cache.map.get(&(l, e)) {
+                    Some(&s) => arena + self.cache.slot_offset[s],
+                    None => half + (e * self.cache.slot_bytes) as u64,
+                };
+                eaddr.extend_from_slice(&(base + part[pt]).to_le_bytes());
+            }
+        }
+        for e in 0..ne {
+            copied[e] = !self.cache.map.contains_key(&(l, e)) as u8;
+        }
+        self.upload_to(self.dp_eaddr.ptr, &eaddr);
+        self.upload_to(self.dp_copied.ptr, &copied);
+        let (gt, rl) = (self.bb.gtab.ptr, self.bb.rl.ptr);
+        let nrec = 2 * 3 * g * (1 + 2 * chunk_n);
+        self.k1("zero_words", ne, &[Arg::Ptr(self.dp_cnt.ptr), Arg::U32(ne as u32)]);
+        self.k1("zero_words", nrec, &[Arg::Ptr(gt + r0 as u64), Arg::U32(nrec as u32)]);
+        self.k1("route_topk_rows", m, &[Arg::Ptr(rl), Arg::Ptr(self.dp_tidx.ptr), Arg::Ptr(gt + w as u64), Arg::Ptr(self.dp_cnt.ptr), Arg::U32(ne as u32), Arg::U32(k as u32), Arg::U32(m as u32)]);
+        self.k("plan_scan", 1, 1024, &[Arg::Ptr(self.dp_cnt.ptr), Arg::Ptr(self.dp_copied.ptr), Arg::Ptr(self.dp_gstart.ptr), Arg::U32(ne as u32)]);
+        self.k("plan_fill", ne as u32, 256, &[Arg::Ptr(self.dp_tidx.ptr), Arg::Ptr(self.dp_cnt.ptr), Arg::Ptr(self.dp_gstart.ptr), Arg::Ptr(self.dp_copied.ptr), Arg::Ptr(self.dp_eaddr.ptr),
+                                              Arg::Ptr(gt), Arg::U32(ne as u32), Arg::U32(k as u32), Arg::U32(m as u32), Arg::U32(g as u32), Arg::U32((self.rows * k) as u32),
+                                              Arg::U32(a0 as u32), Arg::U32(a1 as u32), Arg::U32(r0 as u32), Arg::U32(r1 as u32)]);
+        if std::env::var("SHADOW_DEVPLAN_CHECK").is_ok_and(|v| v == "1") {
+            // debugging: the host's routing of the same logits against the device's
+            self.ctx.synchronize().unwrap();
+            let mut lb = vec![0u8; m * ne * 4];
+            self.download(rl, &mut lb);
+            let logits = floats(&lb);
+            let mut tb = vec![0u8; m * k * 4];
+            self.download(self.dp_tidx.ptr, &mut tb);
+            let mut wb = vec![0u8; m * k * 4];
+            self.download(gt + w as u64, &mut wb);
+            let (dw, mut bad_e, mut bad_w) = (floats(&wb), 0usize, 0usize);
+            let mut hist = vec![0u32; ne];
+            for j in 0..m {
+                let top = route(&logits[j * ne..(j + 1) * ne], k);
+                for (i, &(e, wt)) in top.iter().enumerate() {
+                    let de = u32::from_le_bytes(tb[(j * k + i) * 4..(j * k + i) * 4 + 4].try_into().unwrap()) as usize;
+                    hist[e] += 1;
+                    bad_e += (de != e) as usize;
+                    bad_w += (dw[j * k + i] != wt as f32) as usize;
+                }
+            }
+            let mut cb = vec![0u8; ne * 4];
+            self.download(self.dp_cnt.ptr, &mut cb);
+            let bad_c = (0..ne).filter(|&e| u32::from_le_bytes(cb[e * 4..e * 4 + 4].try_into().unwrap()) != hist[e]).count();
+            eprintln!("DEVPLAN-CHECK L{l} m={m}: experts differing {bad_e}, weights differing {bad_w} of {}, histogram entries differing {bad_c} of {ne}", m * k);
+        }
+        // the combine's per-token expert counts: all k
+        let nc = m;
+        self.k1("fill_words", nc, &[Arg::Ptr(gt + counts as u64), Arg::U32(nc as u32), Arg::U32(k as u32)]);
+        GroupedPlan { bytes: vec![], phase: [(g, a0 as u64, r0 as u64), (g, a1 as u64, r1 as u64)], weights: w as u64, counts: counts as u64, chunk_n }
+    }
+
     /// `router_done`: `moe_router_batch` already ran (in a graph).
     fn moe_batch(&mut self, l: usize, m: usize, logs: &mut [Vec<u16>], router_done: bool, ticket: Option<usize>) {
         let c = &self.m.cfg;
@@ -4463,6 +4576,23 @@ impl<'c, 'm> GpuSession<'c, 'm> {
         let (h, sff, k, ne) = (c.hidden, c.shared_ff, c.n_expert_used, c.n_expert);
         if !router_done {
             self.moe_router_batch(l, m);
+        }
+        if self.devplan && self.sp.is_some() && m > MAX_VERIFY {
+            let names = [format!("{p}.ffn_gate_exps.weight"), format!("{p}.ffn_up_exps.weight"), format!("{p}.ffn_down_exps.weight")];
+            let infos: Vec<TensorInfo> = names.iter().map(|n| self.expert_info(n)).collect();
+            if self.dev_plan_ok(m, &infos) {
+                let sizes: Vec<usize> = names.iter().map(|n| self.m.expert_bytes(n)).collect();
+                {
+                    // the shared expert
+                    let bb = &self.bb;
+                    self.multi_cols(l, 2, false, m);
+                    self.k1("swiglu", m * sff, &[Arg::Ptr(bb.sg.ptr), Arg::Ptr(bb.su.ptr), Arg::Ptr(bb.sa.ptr), Arg::U32((m * sff) as u32)]);
+                    self.mv_cols(&format!("{p}.ffn_down_shexp.weight"), bb.sa.ptr, sff, bb.so.ptr, h, m);
+                }
+                self.moe_staged(l, m, None, &infos, &sizes, &names);
+                let _ = (logs, ticket, k, ne);
+                return;
+            }
         }
         let t_wait = std::time::Instant::now();
         // SHADOW_TIMING_NO_SYNC=1 (timing only, wrong output): last time's router logits, no wait for the GPU
@@ -4616,7 +4746,7 @@ impl<'c, 'm> GpuSession<'c, 'm> {
         }
         if self.sp.is_some() && m > MAX_VERIFY && !cpu_pending {
             let t_pre = t_woke.elapsed();
-            self.moe_staged(l, m, &tops, &infos, &sizes, &names);
+            self.moe_staged(l, m, Some(&tops), &infos, &sizes, &names);
             if m >= 2048 && std::env::var("SHADOW_STAGE_TIME").is_ok_and(|v| v == "1") {
                 eprintln!("HOST L{l} m={m}: after the logits arrived: conversion {:.1} ms, route+bookkeeping+plan prep {:.1} ms, moe_staged {:.1} ms (GPU has only the shared expert meanwhile)",
                           t_routed0.as_secs_f64() * 1e3, (t_pre - t_routed0).as_secs_f64() * 1e3, (t_woke.elapsed() - t_pre).as_secs_f64() * 1e3);

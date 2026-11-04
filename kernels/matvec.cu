@@ -1024,6 +1024,7 @@ template <typename Q>
 static __device__ __forceinline__ void mma_grouped(const u64* wtab, const unsigned int* gtab, const float* x, unsigned int xs, float* y,
                                                    unsigned int ys, unsigned int rows, unsigned int cols) {
     const unsigned int* gi = gtab + (u64) blockIdx.y * 65;
+    if (gi[0] == 0) return; // an empty group (the device planner's table has room for more groups than there are)
     mma_core<Q>((const u8*) wtab[blockIdx.y], x, xs, y, ys, rows, cols, gi[0], 0, gi + 1, gi + 33);
 }
 extern "C" __global__ void mma_cols_q6_k(const u8* w, const float* x, unsigned int xs, float* y, unsigned int ys, unsigned int rows, unsigned int cols, unsigned int m) { mma_cols<Q6K>(w, x, xs, y, ys, rows, cols, m); }

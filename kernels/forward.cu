@@ -1675,3 +1675,121 @@ extern "C" __global__ void index_scores_rows_f32(const float* iq, const float* b
     }
     scores[r * sc_rs + b] = s / sqrtf((float) id);
 }
+
+// ---------------------------------------------------------------------------------------------------------------------------------
+// Device-side routing and planning of a long prompt's MoE (docs/PREFILL2_SPEC.md, stage 1): what the host did between the router's logits arriving and the
+// grouped expert kernels launching, so the host need not wait for the logits and can queue a whole pass ahead.
+
+extern "C" __global__ void zero_words(unsigned int* p, unsigned int n) {
+    for (unsigned int i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += gridDim.x * blockDim.x) p[i] = 0u;
+}
+
+extern "C" __global__ void fill_words(unsigned int* p, unsigned int n, unsigned int v) {
+    for (unsigned int i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += gridDim.x * blockDim.x) p[i] = v;
+}
+
+// `shadow_model::forward::route` for token j = one thread: the f64 exponentials of (logit - max), their sum in index order, the top k by (score descending, index
+// ascending) kept by insertion, the weights (ex / z) / (sum of the top k's ex / z).  Writes the k expert numbers (tidx) and weights (as f32, the form the combine
+// reads) of token j and counts the token among each chosen expert's users (cnt).  The CUDA exp() is not the host library's: weights can differ in the last bit of
+// a double, which is below an f32's rounding except by chance, so this is a fast-mode kernel, not an `--exact` one.
+extern "C" __global__ void route_topk_rows(const float* logits, unsigned int* tidx, float* weights, unsigned int* cnt, unsigned int ne, unsigned int k,
+                                           unsigned int m) {
+    const unsigned int j = blockIdx.x * blockDim.x + threadIdx.x;
+    if (j >= m) return;
+    const float* lg = logits + (u64) j * ne;
+    float mx = -3.402823466e+38f;
+    for (unsigned int i = 0; i < ne; ++i) mx = fmaxf(mx, lg[i]);
+    double ex[512];
+    double z = 0.0;
+    for (unsigned int i = 0; i < ne; ++i) {
+        ex[i] = exp((double) (lg[i] - mx));
+        z += ex[i];
+    }
+    unsigned int top[16];
+    unsigned int n = 0;
+    for (unsigned int i = 0; i < ne; ++i) {
+        // before(a, b): a ranks ahead of b
+        if (n == k && !(ex[i] > ex[top[k - 1]] || (ex[i] == ex[top[k - 1]] && i < top[k - 1]))) continue;
+        unsigned int at = 0;
+        while (at < n && (ex[top[at]] > ex[i] || (ex[top[at]] == ex[i] && top[at] < i))) ++at;
+        if (n < k) ++n;
+        for (unsigned int t = n - 1; t > at; --t) top[t] = top[t - 1];
+        top[at] = i;
+    }
+    double tz = 0.0;
+    for (unsigned int t = 0; t < n; ++t) tz += ex[top[t]] / z;
+    for (unsigned int t = 0; t < n; ++t) {
+        tidx[(u64) j * k + t] = top[t];
+        weights[(u64) j * k + t] = (float) ((ex[top[t]] / z) / tz);
+        atomicAdd(&cnt[top[t]], 1u);
+    }
+}
+
+// One block (ne <= 1024 threads): the first group of each expert within its phase.  An expert's cnt tokens make ceil(cnt / 32) groups; phase 0 holds the experts
+// with copied[e] == 0 (resident in the VRAM cache), phase 1 the others, each in expert order.
+extern "C" __global__ void plan_scan(const unsigned int* cnt, const unsigned char* copied, unsigned int* gstart, unsigned int ne) {
+    __shared__ unsigned int s0[1024], s1[1024];
+    const unsigned int e = threadIdx.x;
+    unsigned int g = e < ne ? (cnt[e] + 31u) / 32u : 0u;
+    const unsigned int c = e < ne ? copied[e] : 0u;
+    s0[e] = c ? 0u : g;
+    s1[e] = c ? g : 0u;
+    __syncthreads();
+    for (unsigned int off = 1; off < 1024; off <<= 1) {
+        const unsigned int a = e >= off ? s0[e - off] : 0u, b = e >= off ? s1[e - off] : 0u;
+        __syncthreads();
+        s0[e] += a;
+        s1[e] += b;
+        __syncthreads();
+    }
+    if (e < ne) gstart[e] = c ? s1[e] - g : s0[e] - g;
+}
+
+// One block (256 threads) an expert: its tokens in token order, 32 a group, written as the records and matrix addresses `mma_grouped_*` read (65 u32 a record:
+// count, 32 input rows, 32 output rows; part 0 = gate: in row j, out row pair; part 1 = up: in j, out up_off + pair; part 2 = down: in pair, out pair;
+// pair = j * k + the expert's rank in token j's list).  `base` + a0 / a1 the addresses of phase 0 / 1 (3 parts x G entries of 8 bytes), + r0 / r1 the records.
+// The records' counts were zeroed, so groups past the last one are empty and the kernels skip them.
+extern "C" __global__ void plan_fill(const unsigned int* tidx, const unsigned int* cnt, const unsigned int* gstart, const unsigned char* copied,
+                                     const u64* eaddr, unsigned char* base, unsigned int ne, unsigned int k, unsigned int m, unsigned int G,
+                                     unsigned int up_off, unsigned int a0, unsigned int a1, unsigned int r0, unsigned int r1) {
+    __shared__ unsigned int scan[256];
+    const unsigned int e = blockIdx.x, tid = threadIdx.x;
+    const unsigned int total = cnt[e];
+    if (total == 0) return;
+    const unsigned int ph = copied[e];
+    u64* addr = (u64*) (base + (ph ? a1 : a0));
+    unsigned int* rec = (unsigned int*) (base + (ph ? r1 : r0));
+    const unsigned int g0 = gstart[e];
+    unsigned int seen = 0;
+    for (unsigned int t0 = 0; t0 < m; t0 += 256) {
+        const unsigned int j = t0 + tid;
+        int rank = -1;
+        if (j < m) {
+            for (unsigned int i = 0; i < k; ++i) if (tidx[(u64) j * k + i] == e) { rank = (int) i; break; }
+        }
+        scan[tid] = rank >= 0 ? 1u : 0u;
+        __syncthreads();
+        for (unsigned int off = 1; off < 256; off <<= 1) {
+            const unsigned int v = tid >= off ? scan[tid - off] : 0u;
+            __syncthreads();
+            scan[tid] += v;
+            __syncthreads();
+        }
+        const unsigned int incl = scan[tid], chunk_total = scan[255];
+        if (rank >= 0) {
+            const unsigned int p = seen + incl - 1, g = g0 + p / 32, s = p % 32;
+            const unsigned int pair = j * k + (unsigned int) rank;
+            for (unsigned int part = 0; part < 3; ++part) {
+                unsigned int* r = rec + ((u64) part * G + g) * 65;
+                r[1 + s] = part == 2 ? pair : j;
+                r[33 + s] = part == 1 ? up_off + pair : pair;
+                if (s == 0) {
+                    r[0] = min(32u, total - 32u * (p / 32));
+                    addr[(u64) part * G + g] = eaddr[(u64) part * ne + e];
+                }
+            }
+        }
+        seen += chunk_total;
+        __syncthreads();
+    }
+}
