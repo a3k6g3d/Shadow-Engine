@@ -53,6 +53,8 @@ struct StagePipe<'c> {
     base: u64,
     /// the copy of the layer in `ready[p]` into half p is queued (and done when `events[p]` is)
     events: [Event<'c>; 2],
+    /// recorded on the compute stream after layer l's combine (half l & 1 is read by its experts until then): the copy two layers on waits for it
+    done: [Event<'c>; 2],
     ready: [usize; 2],
     bufs: [PinnedRegion<'c>; 2],
     /// the layer whose file-only experts buffer p holds, and expert -> slot in it
@@ -2849,7 +2851,8 @@ impl<'c, 'm> GpuSession<'c, 'm> {
         let bytes = slots * self.cache.slot_bytes;
         let (Ok(a), Ok(b), Ok(e0), Ok(e1)) =
             (PinnedRegion::new(self.ctx, bytes), PinnedRegion::new(self.ctx, bytes), self.ctx.event(), self.ctx.event()) else { return };
-        self.sp = Some(StagePipe { base, events: [e0, e1], ready: [usize::MAX; 2], bufs: [a, b], layer: [usize::MAX; 2],
+        let (Ok(d0), Ok(d1)) = (self.ctx.event(), self.ctx.event()) else { return };
+        self.sp = Some(StagePipe { base, events: [e0, e1], done: [d0, d1], ready: [usize::MAX; 2], bufs: [a, b], layer: [usize::MAX; 2],
                                    at: [HashMap::new(), HashMap::new()], slots, pending: false });
     }
 
@@ -2969,11 +2972,18 @@ impl<'c, 'm> GpuSession<'c, 'm> {
         let p = l & 1;
         let stage_time = std::env::var("SHADOW_STAGE_TIME").is_ok_and(|v| v == "1");
         let t_start = std::time::Instant::now();
+        // the copy of layer l + 1 is queued behind layer l's experts (it overlaps them); `SHADOW_STAGE_LEAD=2`: layer l + 2's is queued there instead and waits
+        // for layer l's combine, so each copy overlaps a whole layer ahead of its use - a tie at 4,096 rows (docs/STATUS.md 2026-11-04), so opt-in
+        let lead2 = std::env::var("SHADOW_STAGE_LEAD").is_ok_and(|v| v == "2");
         if self.sp.as_ref().unwrap().ready[p] != l {
             // the first layer of a pass: read and copy it here, and start layer l + 1's reads
             self.stage_pipe_read(l);
             self.stage_copy(l);
             self.stage_pipe_read(l + 1);
+            if lead2 && l + 1 < c.n_layer {
+                // two layers in flight: layer l + 1's copy too (half (l + 1) & 1 is free at the start of a pass)
+                self.stage_copy(l + 1);
+            }
         }
         let mut seen = vec![false; ne];
         let mut set: Vec<usize> = Vec::new();
@@ -3018,7 +3028,25 @@ impl<'c, 'm> GpuSession<'c, 'm> {
             Arg::Ptr(row(&bb.so, h, 0)), Arg::Ptr(row(&bb.sgl, 1, 0)), Arg::Ptr(bb.gtab.ptr + plan.counts),
             Arg::U32(h as u32), Arg::U32(k as u32)]);
         // now the next layer's copy and the one after's reads, behind this layer's launches: the GPU runs this layer while the host queues them
-        if l + 1 < self.m.cfg.n_layer {
+        if lead2 {
+            let n_layer = self.m.cfg.n_layer;
+            self.sp.as_ref().unwrap().done[p].record(None).unwrap();
+            if l + 2 < n_layer {
+                if self.sp.as_ref().unwrap().layer[p] != l + 2 {
+                    // buffer p held layer l's file-only experts: their copy is done before the buffer is read into again
+                    self.sp.as_ref().unwrap().events[p].synchronize().unwrap();
+                    self.stage_pipe_read(l + 2);
+                }
+                // the half it fills is the one this layer's experts read: wait for their combine
+                self.ctx.stream_wait_event(Some(&self.copy_stream), &self.sp.as_ref().unwrap().done[p]).unwrap();
+                self.stage_copy(l + 2);
+            }
+            if l + 3 < n_layer {
+                // buffer (l + 1) & 1 held layer l + 1's file-only experts: their copy, queued a layer ago, has finished
+                self.sp.as_ref().unwrap().events[(l + 1) & 1].synchronize().unwrap();
+                self.stage_pipe_read(l + 3);
+            }
+        } else if l + 1 < self.m.cfg.n_layer {
             self.stage_copy(l + 1);
             let t_copyq = t_start.elapsed();
             // buffer l & 1 held layer l's file-only experts: its copy (queued before the previous layer's compute) has finished
