@@ -465,6 +465,11 @@ pub struct GpuSession<'c, 'm> {
     graphs: HashMap<(usize, bool), Graph<'c>>,
     /// The same for the batched step: (layer, fused norm, tokens, keeping the rollback's inputs).
     batch_graphs: HashMap<(usize, bool, usize, bool, usize, u64), Graph<'c>>,
+    /// `SHADOW_FILE_VIEWS=1`: a long prompt's file-only experts are copied to the GPU straight from the OS file cache (read-only views of the model files, registered
+    /// for a layer at a time) instead of being read into pinned buffers by the CPU first
+    fv_on: bool,
+    fv: Option<crate::fileview::FileMaps>,
+    fv_regs: [crate::fileview::RangeSet; 2],
     graphs_on: bool,
     /// `matvec_cols_multi`'s job tables, by (layer, group, rollback inputs): built before a graph is captured.
     multi: HashMap<(usize, u8, bool), DeviceBuffer<'c>>,
@@ -1550,6 +1555,9 @@ impl<'c, 'm> GpuSession<'c, 'm> {
             stale_logits: HashMap::new(),
             zero_copy: std::env::var("SHADOW_ZERO_COPY").is_ok_and(|v| v == "1"),
             batch_graphs: HashMap::new(),
+            fv_on: std::env::var("SHADOW_FILE_VIEWS").is_ok_and(|v| v == "1"),
+            fv: None,
+            fv_regs: Default::default(),
             fast_order: !std::env::var("SHADOW_REF_ORDER").is_ok_and(|v| v == "1"),
             verify_stats: [0.0; 7],
             tail_skip: tiers.tail_skip,
@@ -2874,6 +2882,13 @@ impl<'c, 'm> GpuSession<'c, 'm> {
             return;
         }
         self.stage_pipe_wait();
+        if self.fv_on {
+            // the file-only experts are copied from file views by `stage_copy`: no read-ahead
+            let sp = self.sp.as_mut().unwrap();
+            sp.layer[l & 1] = l;
+            sp.at[l & 1].clear();
+            return;
+        }
         let names = ["gate", "up", "down"].map(|p| format!("blk.{l}.ffn_{p}_exps.weight"));
         let sizes: Vec<usize> = names.iter().map(|n| self.m.expert_bytes(n)).collect();
         let total: usize = sizes.iter().sum();
@@ -2928,11 +2943,52 @@ impl<'c, 'm> GpuSession<'c, 'm> {
         let half = self.sp.as_ref().unwrap().base + (p * self.m.cfg.n_expert * self.cache.slot_bytes) as u64;
         let mut n = 0u64;
         let (mut dsts, mut srcs, mut host_srcs, mut lens): (Vec<u64>, Vec<u64>, Vec<u64>, Vec<usize>) = (vec![], vec![], vec![], vec![]);
+        if self.fv_on {
+            // the registrations of the copy two layers back are done with (its event was waited for): release them, then register this layer's file-only pieces
+            let t_fv = std::time::Instant::now();
+            self.sp.as_ref().unwrap().events[p].synchronize().unwrap();
+            let t_sync = t_fv.elapsed();
+            self.fv_regs[p].release(self.ctx);
+            let t_rel = t_fv.elapsed();
+            if self.fv.is_none() {
+                self.fv = Some(crate::fileview::FileMaps::open(&self.m.shard_paths()).unwrap_or_else(|e| panic!("file views: {e}")));
+            }
+            let mut pieces: Vec<(usize, u64, usize)> = vec![];
+            for e in 0..self.m.cfg.n_expert {
+                if self.cache.map.contains_key(&(l, e)) || self.ram.at.contains_key(&(l, e)) {
+                    continue;
+                }
+                for nm in &names {
+                    pieces.push(self.m.expert_file_range(nm, e));
+                }
+            }
+            self.fv_regs[p].register(self.ctx, self.fv.as_ref().unwrap(), &pieces).unwrap_or_else(|e| panic!("file views: {e}"));
+            if std::env::var("SHADOW_STAGE_TIME").is_ok_and(|v| v == "1") {
+                eprintln!("FV L{l}: {} pieces, event wait {:.1} ms, release {:.1} ms, map+register {:.1} ms ({} ranges)", pieces.len(), t_sync.as_secs_f64() * 1e3,
+                          (t_rel - t_sync).as_secs_f64() * 1e3, (t_fv.elapsed() - t_rel).as_secs_f64() * 1e3, self.fv_regs[p].len());
+            }
+        }
         for e in 0..self.m.cfg.n_expert {
             if self.cache.map.contains_key(&(l, e)) {
                 continue;
             }
             let dst = half + (e * self.cache.slot_bytes) as u64;
+            if self.fv_on && !self.ram.at.contains_key(&(l, e)) {
+                // a file-only expert: its gate, up and down pieces straight from the registered file view into the slot
+                let mut o = 0u64;
+                for nm in &names {
+                    let (sh, off, len) = self.m.expert_file_range(nm, e);
+                    let (dev, host) = self.fv_regs[p].locate(sh, off);
+                    dsts.push(dst + o);
+                    srcs.push(dev);
+                    host_srcs.push(host as u64);
+                    lens.push(len);
+                    o += len as u64;
+                }
+                self.ram.drive += 1;
+                n += 1;
+                continue;
+            }
             if let Some(&off) = self.ram.at.get(&(l, e)) {
                 let region = self.ram.region.as_ref().unwrap();
                 srcs.push(region.dev_ptr + off as u64);
@@ -3162,6 +3218,9 @@ impl<'c, 'm> GpuSession<'c, 'm> {
         let Some(lent) = self.lent.take() else { return };
         self.stage_pipe_wait();
         self.ctx.synchronize().unwrap();
+        for r in self.fv_regs.iter_mut() {
+            r.release(self.ctx);
+        }
         self.big_batch_off();
         self.unlend_kv();
         self.cache.evict_range = lent.evict_saved;

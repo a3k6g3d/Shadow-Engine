@@ -434,6 +434,18 @@ impl Model {
         (t.nbytes() / t.dims[2]) as usize
     }
 
+    /// Where one expert's slice of a fused expert tensor lies in the model's files: (shard, byte offset in the file, length).
+    pub fn expert_file_range(&self, name: &str, e: usize) -> (usize, u64, usize) {
+        let t = self.g.tensor(name).unwrap_or_else(|| panic!("no tensor {name}"));
+        let per = (t.nbytes() / t.dims[2]) as usize;
+        (t.shard, t.offset + (e * per) as u64, per)
+    }
+
+    /// The paths of the model's files, in shard order.
+    pub fn shard_paths(&self) -> Vec<std::path::PathBuf> {
+        self.g.shards.iter().map(|s| s.path.clone()).collect()
+    }
+
     /// One expert's slice read straight into `out` (exactly `expert_bytes(name)` long), e.g. a pinned tier's slot.
     pub fn expert_into(&self, name: &str, e: usize, out: &mut [u8]) {
         let t = self.g.tensor(name).unwrap_or_else(|| panic!("no tensor {name}"));

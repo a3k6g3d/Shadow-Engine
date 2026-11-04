@@ -6,6 +6,7 @@ pub mod backend;
 pub mod dflash;
 pub mod driver;
 pub mod dylib;
+pub mod fileview;
 pub mod kernels;
 pub mod kvvmm;
 pub mod mtp;
