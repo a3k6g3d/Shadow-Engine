@@ -986,9 +986,9 @@ extern "C" __global__ void attention_sinks_heads(const float* q, const float* kc
 
 // The indexer's key for complete block b: the mean of its `ratio` raw keys (summed in order, then divided), RMSNorm
 // with w, RoPE at the block's first position.  One block of 128 threads.
-extern "C" __global__ void pool_block(const float* raw, float* blocks, const float* w, unsigned int b,
-                                      unsigned int ratio, unsigned int id, float eps, unsigned int rope_dims,
-                                      float theta) {
+static __device__ __forceinline__ void pool_block_one(const float* raw, float* blocks, const float* w, unsigned int b,
+                                                      unsigned int ratio, unsigned int id, float eps, unsigned int rope_dims,
+                                                      float theta) {
     __shared__ float pooled[256];
     for (unsigned int i = threadIdx.x; i < id; i += blockDim.x) {
         float acc = 0.0f;
@@ -1000,6 +1000,19 @@ extern "C" __global__ void pool_block(const float* raw, float* blocks, const flo
     rmsnorm_one(pooled, w, out, id, eps);
     __syncthreads();
     rope_one(out, b * ratio, rope_dims, theta);
+}
+
+extern "C" __global__ void pool_block(const float* raw, float* blocks, const float* w, unsigned int b,
+                                      unsigned int ratio, unsigned int id, float eps, unsigned int rope_dims,
+                                      float theta) {
+    pool_block_one(raw, blocks, w, b, ratio, id, eps, rope_dims, theta);
+}
+
+// `pool_block` for the blocks b0 .. b0 + gridDim.x - 1 in one launch (a prompt pass completes hundreds a layer, which took one launch each): the same numbers a block.
+extern "C" __global__ void pool_blocks(const float* raw, float* blocks, const float* w, unsigned int b0,
+                                       unsigned int ratio, unsigned int id, float eps, unsigned int rope_dims,
+                                       float theta) {
+    pool_block_one(raw, blocks, w, b0 + blockIdx.x, ratio, id, eps, rope_dims, theta);
 }
 
 // score[b] = (sum over heads of max(0, q_h . key_b)) / sqrt(id); the dots in double, rounded to float, as the reference.

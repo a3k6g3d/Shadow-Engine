@@ -282,6 +282,7 @@ pub const FILES: &[File] = &[
             e("attention_heads", &[C, C, C, C, U, C, W, W, U, U, U, U]),
             e("attention_sinks_heads", &[C, C, C, C, U, U, W, W, U, U, U, U]),
             e("pool_block", &[C, W, C, U, U, U, F, U, F]),
+            e("pool_blocks", &[C, W, C, U, U, U, F, U, F]),
             e("index_scores", &[C, C, W, U, U, U]),
             e("swiglu", &[C, C, W, U]),
             e("swiglu_scaled", &[C, C, C, C, W, U, U]),

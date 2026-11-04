@@ -268,8 +268,33 @@ fn bb_row_floats(c: &shadow_model::forward::Config) -> usize {
     let kd = c.ssm_k_heads * c.ssm_head_dim;
     let vd = c.ssm_v_heads * c.ssm_head_dim;
     let (qd, kvd) = (c.n_head * c.head_dim, c.n_kv_head * c.head_dim);
-    3 * ch + 2 * h + cs + c.hc_rank + 2 * (2 * kd + vd) + 2 * vd + 2 * c.ssm_v_heads + 2 * qd + qd + qd + qd + kvd
+    if std::env::var("SHADOW_ROW_INVENTORY").is_ok_and(|v| v == "1") {
+        let parts = [("r,rn,up (3 x ch)", 3 * ch), ("u + y (2 x h)", 2 * h), ("g", cs), ("down (hc_rank)", c.hc_rank), ("qkv + x (2 x (2kd+vd))", 2 * (2 * kd + vd)), ("z + o (2 x vd)", 2 * vd),
+                     ("beta + alpha", 2 * c.ssm_v_heads), ("qg + q + gate + ao", 2 * qd + qd + qd + qd), ("kk (kvd)", kvd), ("iq (idx_heads*idx_dim)", c.idx_heads * c.idx_dim),
+                     ("rl + sgl (n_expert + 1)", c.n_expert + 1), ("sg + su + sa (3 x shared_ff)", 3 * c.shared_ff), ("so (h)", h), ("gtab (64 k)", 64 * k),
+                     ("eg (2 k ff)", 2 * k * c.expert_ff), ("act (k ff)", k * c.expert_ff), ("eo (k h)", k * h)];
+        let total: usize = parts.iter().map(|p| p.1).sum();
+        eprintln!("ROWS: hidden {h} streams {cs} k {k} expert_ff {} shared_ff {} qd {qd} kvd {kvd} kd {kd} vd {vd}: {total} floats = {:.0} KB a row", c.expert_ff, c.shared_ff, total as f64 * 4.0 / 1024.0);
+        for (n, f) in parts {
+            eprintln!("ROWS   {n:<34} {f:>7} floats {:>5.1}%", 100.0 * f as f64 / total as f64);
+        }
+    }
+    let (delta_set, attn_set) = (2 * (2 * kd + vd) + 2 * vd, 2 * qd + qd + qd + qd);
+    // a layer is DeltaNet or attention, never both: the two sets of per-row buffers share one region (`alias_rows`), and `up`, which lives only inside a hyper-connection
+    // read, shares `eg`'s, which lives only inside the experts
+    let sets = if alias_sets() { delta_set.max(attn_set) } else { delta_set + attn_set };
+    let up = if alias_up() { 0 } else { ch };
+    2 * ch + up + 2 * h + cs + c.hc_rank + sets + 2 * c.ssm_v_heads + kvd
         + c.idx_heads * c.idx_dim + c.n_expert + 1 + 3 * c.shared_ff + h + 64 * k + 2 * k * c.expert_ff + k * c.expert_ff + k * h
+}
+
+/// Whether the per-row buffers of the two layer kinds (and `up` / `eg`) share memory: opt-in (`SHADOW_ALIAS_ROWS=on|sets|up`) - it broke the fast modes (fidelity 0.001, replies of a few tokens) for a reason not found, while `--exact` output stayed byte-identical; a pipelined session never.
+static ALIAS_ROWS: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(3);
+fn alias_sets() -> bool {
+    ALIAS_ROWS.load(std::sync::atomic::Ordering::Relaxed) & 1 != 0
+}
+fn alias_up() -> bool {
+    ALIAS_ROWS.load(std::sync::atomic::Ordering::Relaxed) & 2 != 0
 }
 
 /// `BatchBufs` for `rows` tokens, each buffer from `take(floats)`, with the buffers that do not grow with the batch given.
@@ -282,14 +307,38 @@ fn make_bb<'c>(c: &shadow_model::forward::Config, rows: usize,
     let (qd, kvd) = (c.n_head * c.head_dim, c.n_kv_head * c.head_dim);
     let id = c.idx_dim;
     let mut ab = |n: usize| take(rows * n);
+    let (delta_set, attn_set) = (2 * (2 * kd + vd) + 2 * vd, 2 * qd + qd + qd + qd);
+    let (alias, alias_up) = (alias_sets(), alias_up());
+    // the two sets from one region when aliased: each buffer is its own rows x n array, laid end to end from the region's start
+    let region = if alias { Some(ab(delta_set.max(attn_set))?) } else { None };
+    let carve = |off: &mut usize, n: usize, region: &Option<DeviceBuffer<'c>>, ab: &mut dyn FnMut(usize) -> Result<DeviceBuffer<'c>, String>| -> Result<DeviceBuffer<'c>, String> {
+        match region {
+            // SAFETY: inside the region, which the BatchBufs keeps for as long as these views live; the two sets are never in use at once (`alias_rows`)
+            Some(r) => { let b = unsafe { r.subview(*off * 4, rows * n * 4) }; *off += rows * n; Ok(b) }
+            None => ab(n),
+        }
+    };
+    let mut off = 0usize;
+    let qkv = carve(&mut off, 2 * kd + vd, &region, &mut ab)?;
+    let x = carve(&mut off, 2 * kd + vd, &region, &mut ab)?;
+    let z = carve(&mut off, vd, &region, &mut ab)?;
+    let o = carve(&mut off, vd, &region, &mut ab)?;
+    let mut off = 0usize;
+    let qg = carve(&mut off, 2 * qd, &region, &mut ab)?;
+    let q = carve(&mut off, qd, &region, &mut ab)?;
+    let gate = carve(&mut off, qd, &region, &mut ab)?;
+    let ao = carve(&mut off, qd, &region, &mut ab)?;
+    let eg = ab(2 * k * c.expert_ff)?;
+    // SAFETY: `up` is read and written only between a hyper-connection's down projection and its mix, `eg` only inside the experts: never at once (`alias_rows`)
+    let up = if alias_up { unsafe { eg.subview(0, rows * ch * 4) } } else { ab(ch)? };
     Ok(BatchBufs {
-        r: ab(ch)?, rn: ab(ch)?, u: ab(h)?, g: ab(cs)?, y: ab(h)?, down: ab(c.hc_rank)?, up: ab(ch)?,
-        qkv: ab(2 * kd + vd)?, x: ab(2 * kd + vd)?, z: ab(vd)?, beta: ab(c.ssm_v_heads)?, alpha: ab(c.ssm_v_heads)?, o: ab(vd)?,
-        qg: ab(2 * qd)?, q: ab(qd)?, gate: ab(qd)?, att: fixed.att, kk: ab(kvd)?, iq: ab(c.idx_heads * id)?, ao: ab(qd)?,
+        r: ab(ch)?, rn: ab(ch)?, u: ab(h)?, g: ab(cs)?, y: ab(h)?, down: ab(c.hc_rank)?, up,
+        qkv, x, z, beta: ab(c.ssm_v_heads)?, alpha: ab(c.ssm_v_heads)?, o,
+        qg, q, gate, att: fixed.att, kk: ab(kvd)?, iq: ab(c.idx_heads * id)?, ao,
         rl: ab(c.n_expert)?, sgl: ab(1)?,
         sel_iqn: fixed.sel_iqn, sel_scores: fixed.sel_scores, sel_toks: fixed.sel_toks,
         sg: ab(c.shared_ff)?, su: ab(c.shared_ff)?, sa: ab(c.shared_ff)?, so: ab(h)?, logits: fixed.logits,
-        gtab: ab(64 * k)?, eg: ab(2 * k * c.expert_ff)?, act: ab(k * c.expert_ff)?, eo: ab(k * h)?,
+        gtab: ab(64 * k)?, eg, act: ab(k * c.expert_ff)?, eo: ab(k * h)?,
     })
 }
 
@@ -1158,6 +1207,7 @@ impl<'c, 'm> GpuSession<'c, 'm> {
             sel_toks: a(SEL_ROWS * (c.idx_budget + ratio) + SEL_ROWS)?,
             logits: a(COLS_MAX * c.vocab)?,
         };
+        ALIAS_ROWS.store(if tiers.pipeline { 0 } else { match std::env::var("SHADOW_ALIAS_ROWS").as_deref() { Ok("sets") => 1, Ok("up") => 2, Ok("on") | Ok("1") => 3, _ => 0 } }, std::sync::atomic::Ordering::Relaxed);
         let bb = make_bb(c, MAX_BATCH, &mut |n| a(n), fixed)?;
         let replay = Replay {
             qkv: a(c.n_layer * MAX_VERIFY * (2 * kd + vd))?, ba: a(c.n_layer * MAX_VERIFY * 2 * c.ssm_v_heads)?,
@@ -3783,9 +3833,11 @@ impl<'c, 'm> GpuSession<'c, 'm> {
             .unwrap_or_else(|err| panic!("{name}: {err}"));
             return;
         }
+        static MMA_NL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let mma_nl = ty == "IQ4_NL" && *MMA_NL.get_or_init(|| std::env::var("SHADOW_MMA_NL").is_ok_and(|v| v == "1"));
         static MMA_QK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         let mma_qk = matches!(ty.as_str(), "Q4_K" | "Q5_K") && *MMA_QK.get_or_init(|| !std::env::var("SHADOW_MMA_QK").is_ok_and(|v| v == "0"));
-        if self.tensor_prompt && m >= 16 && (matches!(ty.as_str(), "Q6_K" | "IQ4_XS") || mma_bf16 || mma_qk) && t.dims[0].is_multiple_of(64)
+        if self.tensor_prompt && m >= 16 && (matches!(ty.as_str(), "Q6_K" | "IQ4_XS") || mma_bf16 || mma_qk || mma_nl) && t.dims[0].is_multiple_of(64)
             && entry.starts_with("matvec_cols_") && !entry.starts_with("matvec_cols_ref_") {
             // SAFETY: as the launches below: `rows` rows of t.dims[0] weights, m inputs of t.dims[0] floats at x + j * xs, m outputs of `rows`
             // floats at y + j * ys; the kernel reads 16-byte groups of the inputs (x and xs checked above) and guards the last tiles.
@@ -4082,11 +4134,21 @@ impl<'c, 'm> GpuSession<'c, 'm> {
             let (nh, nkv, hd) = (c.n_head, c.n_kv_head, c.head_dim);
             let (rd, th, eps) = (c.rope_dims as u32, c.rope_theta as f32, c.eps);
             let done = self.attn[l].as_ref().unwrap().nblocks;
-            for blk in done..(p0 + m) / ratio {
+            static ONE_LAUNCH: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            let one = *ONE_LAUNCH.get_or_init(|| !std::env::var("SHADOW_POOL_BATCH").is_ok_and(|v| v == "0"));
+            if !one {
+                for blk in done..(p0 + m) / ratio {
+                    let at = self.attn[l].as_ref().unwrap();
+                    self.k("pool_block", 1, 128, &[
+                        Arg::Ptr(at.raw.ptr), Arg::Ptr(at.blocks.ptr), Arg::Ptr(self.sv(&format!("{p}.indexer.k_norm.weight"))),
+                        Arg::U32(blk as u32), Arg::U32(ratio as u32), Arg::U32(id as u32), Arg::F32(eps), Arg::U32(rd), Arg::F32(th)]);
+                }
+            } else if (p0 + m) / ratio > done {
+                // one launch for all the blocks this pass completes (it was one each)
                 let at = self.attn[l].as_ref().unwrap();
-                self.k("pool_block", 1, 128, &[
+                self.k("pool_blocks", ((p0 + m) / ratio - done) as u32, 128, &[
                     Arg::Ptr(at.raw.ptr), Arg::Ptr(at.blocks.ptr), Arg::Ptr(self.sv(&format!("{p}.indexer.k_norm.weight"))),
-                    Arg::U32(blk as u32), Arg::U32(ratio as u32), Arg::U32(id as u32), Arg::F32(eps), Arg::U32(rd), Arg::F32(th)]);
+                    Arg::U32(done as u32), Arg::U32(ratio as u32), Arg::U32(id as u32), Arg::F32(eps), Arg::U32(rd), Arg::F32(th)]);
             }
             self.attn[l].as_mut().unwrap().nblocks = (p0 + m) / ratio;
             let bb = &self.bb;

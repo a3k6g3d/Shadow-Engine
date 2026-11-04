@@ -296,6 +296,14 @@ impl<'c> DeviceBuffer<'c> {
     pub unsafe fn view(ctx: &'c Context, ptr: CuDevicePtr, bytes: usize) -> DeviceBuffer<'c> {
         DeviceBuffer { ctx, ptr, bytes, owned: false }
     }
+
+    /// A view of `bytes` at `off` bytes into this buffer.
+    ///
+    /// # Safety
+    /// As `view`: the part must lie inside this buffer, which must outlive the view, and the part's bytes must not be used through two views at the same time.
+    pub unsafe fn subview(&self, off: usize, bytes: usize) -> DeviceBuffer<'c> {
+        DeviceBuffer { ctx: self.ctx, ptr: self.ptr + off as u64, bytes, owned: false }
+    }
 }
 
 impl DeviceBuffer<'_> {
