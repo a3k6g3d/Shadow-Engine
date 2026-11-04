@@ -1068,6 +1068,32 @@ struct GroupedPlan {
 }
 
 #[allow(clippy::too_many_arguments)]
+/// `route` (or `route_biased`) for every token's logits, spread over the CPU's threads when there are many (a long prompt's pass: 4,000+ tokens x 512 f64 exponentials
+/// was ~27 ms of one thread a layer with the GPU idle); each token is routed by the same code on one thread, so the result is bit for bit the sequential one.
+fn route_all(logits: &[Vec<f32>], k: usize, bias: Option<(&HashMap<(usize, usize), usize>, usize, f32)>) -> Vec<Vec<(usize, f64)>> {
+    let one = |lg: &Vec<f32>| match bias {
+        Some((map, l, b)) => route_biased(lg, &|e| if map.contains_key(&(l, e)) { b } else { 0.0 }, k),
+        None => route(lg, k),
+    };
+    if logits.len() < 256 {
+        return logits.iter().map(one).collect();
+    }
+    let threads = std::thread::available_parallelism().map_or(4, |n| n.get()).min(16);
+    let chunk = logits.len().div_ceil(threads);
+    let mut out: Vec<Vec<(usize, f64)>> = vec![vec![]; logits.len()];
+    std::thread::scope(|s| {
+        for (lc, oc) in logits.chunks(chunk).zip(out.chunks_mut(chunk)) {
+            let one = &one;
+            s.spawn(move || {
+                for (lg, o) in lc.iter().zip(oc.iter_mut()) {
+                    *o = one(lg);
+                }
+            });
+        }
+    });
+    out
+}
+
 fn grouped_plan(tops: &[Vec<(usize, f64)>], start: usize, end: usize, set: &[usize], k: usize, up: usize,
                 addr: impl Fn(usize) -> u64, copied: impl Fn(usize) -> bool, part: [u64; 3], chunk_n: usize) -> GroupedPlan {
     // (expert, [(token, rank)]) per phase, at most `chunk_n` (8, or 32 for the tensor-core kernels) tokens a group
@@ -4480,11 +4506,8 @@ impl<'c, 'm> GpuSession<'c, 'm> {
             self.k1("swiglu", m * sff, &[Arg::Ptr(bb.sg.ptr), Arg::Ptr(bb.su.ptr), Arg::Ptr(bb.sa.ptr), Arg::U32((m * sff) as u32)]);
             self.mv_cols(&format!("{p}.ffn_down_shexp.weight"), bb.sa.ptr, sff, bb.so.ptr, h, m);
         }
-        let mut tops: Vec<Vec<(usize, f64)>> = if self.router_bias != 0.0 {
-            logits.iter().map(|lg| route_biased(lg, &|e| if self.cache.map.contains_key(&(l, e)) { self.router_bias } else { 0.0 }, k)).collect()
-        } else {
-            logits.iter().map(|lg| route(lg, k)).collect()
-        };
+        let t_routed0 = t_woke.elapsed();
+        let mut tops: Vec<Vec<(usize, f64)>> = route_all(&logits, k, if self.router_bias != 0.0 { Some((&self.cache.map, l, self.router_bias)) } else { None });
         for (j, top) in tops.iter().enumerate() {
             for &(e, _) in top {
                 self.routing.add(l, e);
@@ -4592,7 +4615,12 @@ impl<'c, 'm> GpuSession<'c, 'm> {
             self.cpu_host.0 += t_plan.elapsed().as_secs_f64();
         }
         if self.sp.is_some() && m > MAX_VERIFY && !cpu_pending {
+            let t_pre = t_woke.elapsed();
             self.moe_staged(l, m, &tops, &infos, &sizes, &names);
+            if m >= 2048 && std::env::var("SHADOW_STAGE_TIME").is_ok_and(|v| v == "1") {
+                eprintln!("HOST L{l} m={m}: after the logits arrived: conversion {:.1} ms, route+bookkeeping+plan prep {:.1} ms, moe_staged {:.1} ms (GPU has only the shared expert meanwhile)",
+                          t_routed0.as_secs_f64() * 1e3, (t_pre - t_routed0).as_secs_f64() * 1e3, (t_woke.elapsed() - t_pre).as_secs_f64() * 1e3);
+            }
             return;
         }
         // misses read from the file may wait in the staging buffer, a slot each
