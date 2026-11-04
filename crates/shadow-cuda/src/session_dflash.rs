@@ -37,6 +37,10 @@ impl<'c, 'm> GpuSession<'c, 'm> {
         let c = &self.m.cfg;
         // a pipelined group writes its rows of the feature buffer, not the first ones
         let feat = self.dflash.as_ref().unwrap().bufs.feat.ptr + (self.row_shift * NFEAT * 4) as u64;
+        // a pass of more rows than the buffers hold: the last ones (the drafter looks back WINDOW positions, `dflash_observe` takes the same)
+        let skip = m.saturating_sub(DF_ROWS);
+        let r = r + (skip * c.streams * c.hidden * 4) as u64;
+        let m = m - skip;
         self.k2("df_capture", (c.hidden as u32).div_ceil(256), m as u32, 256,
                 &[Arg::Ptr(r), Arg::Ptr(feat), Arg::U32(slot as u32), Arg::U32(c.hidden as u32), Arg::U32(c.streams as u32),
                   Arg::U32(NFEAT as u32)]);
@@ -71,6 +75,9 @@ impl<'c, 'm> GpuSession<'c, 'm> {
     /// The main model has read positions p0 .. p0 + m, their features in the feature rows (`df_capture`): the drafter's
     /// context K/V for them.
     pub(super) fn dflash_observe(&mut self, m: usize, p0: usize) {
+        // only the last DF_ROWS rows of a long pass have features (`df_capture`)
+        let (valid, skip) = (p0 + m, m.saturating_sub(DF_ROWS));
+        let (m, p0) = (m - skip, p0 + skip);
         let (feat, ctxh) = {
             let df = self.dflash.as_ref().unwrap();
             (df.bufs.feat.ptr, df.bufs.ctxh.ptr)
@@ -95,7 +102,7 @@ impl<'c, 'm> GpuSession<'c, 'm> {
             f.write_all(&bytes).unwrap();
         }
         let df = self.dflash.as_mut().unwrap();
-        df.valid = p0 + m;
+        df.valid = valid;
         if p0 == 0 {
             df.broken = false;
         }

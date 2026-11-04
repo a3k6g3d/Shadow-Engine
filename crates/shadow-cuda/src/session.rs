@@ -181,7 +181,7 @@ pub const MAX_BATCH: usize = 256;
 /// Tokens a long prompt reads together in the lent cache (`big_batch_on`): per-token buffers carved from it, not kept.
 pub const BIG_BATCH: usize = 2048;
 /// Tokens a pass can take at most (`lend_kv` picks 2,048, 1,024 or 512 by the lent KV tail). 4,096 was tried (half the copying a token) but the drafter's feature buffers have to hold a whole pass: +150 MB of VRAM, -2 points of the 24k window's prompt speed, and the tail is only that big in a window band where the staging pipeline cannot start (STATUS.md 2026-11-03)
-pub const BIG_BATCH_MAX: usize = 2048;
+pub const BIG_BATCH_MAX: usize = 8192;
 /// Unread prompt tokens from which the layer-ahead pipeline and the big batch are used.
 pub const LONG_PROMPT: usize = 1024;
 const COLS_MAX: usize = 8;
@@ -2691,9 +2691,9 @@ impl<'c, 'm> GpuSession<'c, 'm> {
         // twice the rows when the tail is that big (a long window, a short prompt); the rows are one of two values, so the graphs captured per row count stay valid
         let halves = if with_halves { 2 * self.m.cfg.n_expert * self.cache.slot_bytes } else { 0 };
         let avail = freed.saturating_sub(halves + (1 << 16) + (8 << 20));
-        let cap = std::env::var("SHADOW_BIG_ROWS").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(BIG_BATCH_MAX);
+        let cap = std::env::var("SHADOW_BIG_ROWS").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(BIG_BATCH);
         // the rows are one of a few values, so the graphs captured per row count stay few
-        let rows = [BIG_BATCH_MAX, BIG_BATCH, 1024, 512].into_iter().find(|&r| r <= cap.max(512) && rb * r <= avail).unwrap_or(0);
+        let rows = [BIG_BATCH_MAX, 4096, BIG_BATCH, 1024, 512].into_iter().find(|&r| r <= cap.max(512) && rb * r <= avail).unwrap_or(0);
         // with the halves in the arena, a smaller batch than the arena itself can carve (1,600 rows at the 24k window) is no reason to take the KV tail
         let rows = if !with_halves && rows < BIG_BATCH { 0 } else { rows };
         let want = halves + rb * rows + (1 << 16);

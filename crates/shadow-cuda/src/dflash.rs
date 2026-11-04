@@ -26,6 +26,8 @@ pub const N_GROUPS: usize = HIDDEN / CONV_GROUP;
 pub const RANK: usize = 256;
 pub const TOP_K: usize = 16;
 pub const WINDOW: usize = 2048;
+/// rows of the drafter's feature and context buffers: a long pass's last WINDOW positions
+pub const DF_ROWS: usize = WINDOW;
 /// K/V slots kept per layer (a position p lives in slot p % RING): the window and a block.
 pub const RING: usize = WINDOW + 2 * BLOCK;
 pub const MASK_TOKEN: u32 = 248077;
@@ -280,7 +282,8 @@ impl<'c> DflashModel<'c> {
             }
         }
         let a = |n: usize| ctx.alloc(n.max(1) * 4).map_err(e);
-        let fr = crate::session::BIG_BATCH_MAX;
+        // the drafter looks back WINDOW positions: a pass of more rows than that gives it the last DF_ROWS only (`df_capture`), whatever the pass's size
+        let fr = DF_ROWS;
         let bufs = DflashBufs {
             feat: a(fr * NFEAT)?,
             feat_rows: fr,
