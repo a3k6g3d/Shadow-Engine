@@ -4252,8 +4252,14 @@ impl<'c, 'm> GpuSession<'c, 'm> {
             let sstride = self.cap / ratio + 1;
             let tstride = c.idx_budget + ratio;
             let idx_heads = c.idx_heads;
+            let sel_time = std::env::var("SHADOW_SEL_TIME").is_ok_and(|v| v == "1");
+            // `SHADOW_SEL_CPU=1`: the host selects (download, select_nth, upload per group), as before
+            let sel_cpu = std::env::var("SHADOW_SEL_CPU").is_ok_and(|v| v == "1");
+            let (mut t_launch, mut t_down, mut t_cpu, mut t_up, mut groups) = (0f64, 0f64, 0f64, 0f64, 0usize);
+            let t_all = std::time::Instant::now();
             let mut j = jt;
             while j < m {
+                let tg = std::time::Instant::now();
                 let e = (j + SEL_ROWS).min(m);
                 // the group's rows in two launches: the indexer queries, then every row's block scores
                 self.k2("head_norm_rope_rows", idx_heads as u32, (e - j) as u32, 128, &[
@@ -4265,8 +4271,19 @@ impl<'c, 'm> GpuSession<'c, 'm> {
                     Arg::Ptr(bb.sel_iqn.ptr), Arg::Ptr(at.blocks.ptr), Arg::Ptr(bb.sel_scores.ptr), Arg::U32((p0 + j + 1) as u32),
                     Arg::U32(ratio as u32), Arg::U32(idx_heads as u32), Arg::U32(id as u32), Arg::U32(iqd as u32),
                     Arg::U32(sstride as u32)]);
+                let lens = bb.sel_toks.ptr + (SEL_ROWS * tstride * 4) as u64;
+                if !sel_cpu {
+                    // the selection on the GPU (the same choice as the host's below): no download, no host work, the group's launches queue behind each other
+                    self.k2("select_blocks_rows", (e - j) as u32, 1, 256, &[
+                        Arg::Ptr(bb.sel_scores.ptr), Arg::Ptr(bb.sel_toks.ptr), Arg::Ptr(lens), Arg::U32(sstride as u32), Arg::U32(tstride as u32),
+                        Arg::U32((p0 + j + 1) as u32), Arg::U32(ratio as u32), Arg::U32(keep as u32)]);
+                } else {
                 let mut sb = vec![0u8; (e - j) * sstride * 4];
+                t_launch += tg.elapsed().as_secs_f64();
+                let td = std::time::Instant::now();
                 self.download(bb.sel_scores.ptr, &mut sb);
+                t_down += td.elapsed().as_secs_f64();
+                let tc = std::time::Instant::now();
                 let all = floats(&sb);
                 let mut toks_host = vec![0u32; (e - j) * tstride];
                 let mut ntoks = Vec::with_capacity(e - j);
@@ -4285,12 +4302,16 @@ impl<'c, 'm> GpuSession<'c, 'm> {
                     ntoks.push(toks.len());
                 }
                 // the selections, then their lengths (one word each) after the SEL_ROWS rows
+                t_cpu += tc.elapsed().as_secs_f64();
+                let tu = std::time::Instant::now();
                 toks_host.resize(SEL_ROWS * tstride + SEL_ROWS, 0);
                 for (r, &n) in ntoks.iter().enumerate() {
                     toks_host[SEL_ROWS * tstride + r] = n as u32;
                 }
                 self.upload_to(bb.sel_toks.ptr, &toks_host.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>());
-                let lens = bb.sel_toks.ptr + (SEL_ROWS * tstride * 4) as u64;
+                t_up += tu.elapsed().as_secs_f64();
+                }
+                groups += 1;
                 // a row needs only its selection's length of scratch (tstride), not the context's (cap): more rows a launch
                 let per_launch = (ATT_ROWS * self.cap / tstride).clamp(1, SEL_ROWS);
                 for r0 in (0..e - j).step_by(per_launch) {
@@ -4312,6 +4333,10 @@ impl<'c, 'm> GpuSession<'c, 'm> {
                     }
                 }
                 j = e;
+            }
+            if sel_time {
+                eprintln!("SEL L{l} m={m} groups {groups}: total {:.1} ms = launch {:.1} + download(wait) {:.1} + cpu select {:.1} + upload {:.1} (rest = attention launches)",
+                          t_all.elapsed().as_secs_f64() * 1e3, t_launch * 1e3, t_down * 1e3, t_cpu * 1e3, t_up * 1e3);
             }
         } else {
             for j in 0..m {

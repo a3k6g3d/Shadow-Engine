@@ -1469,3 +1469,81 @@ extern "C" __global__ void df_walk(const unsigned int* cand, const float* unary,
         __syncthreads();
     }
 }
+
+// The top `keep` blocks of each row's index scores, as the token lists `attention_*_sel_rows` read: what the host did after a download of the
+// scores (select_nth by score, best first, then lower block first; the chosen blocks' tokens in ascending order, then the tokens of the
+// incomplete block).  Row r = blockIdx.x has n = n0 + r tokens, nb = n / ratio complete blocks (nb >= keep).  toks rows `tstride` words apart,
+// lens[r] = the row's token count.  Scores are not NaN.  block = 256 threads.
+extern "C" __global__ void select_blocks_rows(const float* scores, unsigned int* toks, unsigned int* lens, unsigned int sc_rs,
+                                              unsigned int tstride, unsigned int n0, unsigned int ratio, unsigned int keep) {
+    __shared__ unsigned int cnt;
+    __shared__ unsigned int scan[256];
+    const u64 r = blockIdx.x;
+    const unsigned int tid = threadIdx.x;
+    const unsigned int n = n0 + (unsigned int) r;
+    const unsigned int nb = n / ratio;
+    const float* sc = scores + r * sc_rs;
+    unsigned int* out = toks + r * tstride;
+    // smaller key = better (higher score); -0.0 is 0.0 as in the host's comparison
+    #define SEL_KEY(b, d) { float v_ = sc[b]; if (v_ == 0.0f) v_ = 0.0f; unsigned int u_ = __float_as_uint(v_); u_ = (u_ & 0x80000000u) ? ~u_ : (u_ | 0x80000000u); d = ~u_; }
+    // the keep-th smallest key by radix selection: `prefix` ends as its value, k as how many of the keys equal to it are taken (lowest blocks first)
+    unsigned int prefix = 0, k = keep;
+    for (int bit = 31; bit >= 0; --bit) {
+        if (tid == 0) cnt = 0;
+        __syncthreads();
+        const unsigned int hi = bit == 31 ? 0u : (0xFFFFFFFFu << (bit + 1));
+        unsigned int local = 0;
+        for (unsigned int b = tid; b < nb; b += 256) {
+            unsigned int d;
+            SEL_KEY(b, d);
+            if ((d & hi) == prefix && !((d >> bit) & 1u)) ++local;
+        }
+        atomicAdd(&cnt, local);
+        __syncthreads();
+        const unsigned int c = cnt;
+        __syncthreads();
+        if (c < k) {
+            k -= c;
+            prefix |= 1u << bit;
+        }
+    }
+    unsigned int eq_before = 0, ch_before = 0;
+    for (unsigned int c0 = 0; c0 < nb; c0 += 256) {
+        const unsigned int b = c0 + tid;
+        unsigned int d = 0;
+        if (b < nb) { SEL_KEY(b, d); }
+        const unsigned int lt = b < nb && d < prefix;
+        const unsigned int eq = b < nb && d == prefix;
+        scan[tid] = eq;
+        __syncthreads();
+        for (unsigned int off = 1; off < 256; off <<= 1) {
+            const unsigned int v = tid >= off ? scan[tid - off] : 0u;
+            __syncthreads();
+            scan[tid] += v;
+            __syncthreads();
+        }
+        const unsigned int eq_incl = scan[tid], eq_total = scan[255];
+        __syncthreads();
+        const unsigned int chosen = lt || (eq && eq_before + eq_incl - eq < k);
+        scan[tid] = chosen;
+        __syncthreads();
+        for (unsigned int off = 1; off < 256; off <<= 1) {
+            const unsigned int v = tid >= off ? scan[tid - off] : 0u;
+            __syncthreads();
+            scan[tid] += v;
+            __syncthreads();
+        }
+        const unsigned int ch_incl = scan[tid], ch_total = scan[255];
+        if (chosen) {
+            const unsigned int q = ch_before + ch_incl - 1;
+            for (unsigned int i = 0; i < ratio; ++i) out[q * ratio + i] = b * ratio + i;
+        }
+        eq_before += eq_total;
+        ch_before += ch_total;
+        __syncthreads();
+    }
+    #undef SEL_KEY
+    const unsigned int tn = n - nb * ratio;
+    for (unsigned int t = tid; t < tn; t += 256) out[keep * ratio + t] = nb * ratio + t;
+    if (tid == 0) lens[r] = keep * ratio + tn;
+}
