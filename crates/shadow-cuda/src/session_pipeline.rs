@@ -181,7 +181,7 @@ impl<'c, 'm> GpuSession<'c, 'm> {
         self.with_rows(j0, |s| {
             let on = s.replay.on.get();
             if graphs && !attention && l != ple {
-                s.batch_graph_segment((l, rn_ready, mc, on, j0), |s| {
+                s.batch_graph_segment((l, rn_ready, mc, on, j0, s.bb.r.ptr), |s| {
                     s.hc_read_batch(&format!("blk.{l}.hc_attn"), true, rn_ready, mc);
                     s.delta_batch(l, mc);
                     s.hc_write_batch(Some(&format!("blk.{l}.hc_ffn_norm.weight")), mc);

@@ -211,6 +211,8 @@ const BATCH_SCRATCH_SLOTS: usize = 32;
 /// `step_batch`'s per-token intermediates, MAX_BATCH rows each, row j of a buffer at ptr + j * its stride: what goes
 /// into or comes out of a projection all m tokens share (the rest stay in `Bufs`, used one token at a time).
 struct BatchBufs<'c> {
+    /// the allocation `qkv`..`ao` are views into when the two layer kinds share their buffers (`alias_sets`): it must live as long as they do
+    _region: Option<DeviceBuffer<'c>>,
     r: DeviceBuffer<'c>,
     rn: DeviceBuffer<'c>,
     u: DeviceBuffer<'c>,
@@ -288,7 +290,7 @@ fn bb_row_floats(c: &shadow_model::forward::Config) -> usize {
         + c.idx_heads * c.idx_dim + c.n_expert + 1 + 3 * c.shared_ff + h + 64 * k + 2 * k * c.expert_ff + k * c.expert_ff + k * h
 }
 
-/// Whether the per-row buffers of the two layer kinds (and `up` / `eg`) share memory: opt-in (`SHADOW_ALIAS_ROWS=on|sets|up`) - it broke the fast modes (fidelity 0.001, replies of a few tokens) for a reason not found, while `--exact` output stayed byte-identical; a pipelined session never.
+/// Whether the per-row buffers of the two layer kinds (and `up` / `eg`) share memory: opt-in (`SHADOW_ALIAS_ROWS=on|sets|up`): +9-12% on 9-15k prompts, `--exact` byte-identical, but the fast modes agree less with `--exact` (0.219 against 0.339, docs/STATUS.md 2026-11-04); a pipelined session never.
 static ALIAS_ROWS: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(3);
 fn alias_sets() -> bool {
     ALIAS_ROWS.load(std::sync::atomic::Ordering::Relaxed) & 1 != 0
@@ -310,11 +312,12 @@ fn make_bb<'c>(c: &shadow_model::forward::Config, rows: usize,
     let (delta_set, attn_set) = (2 * (2 * kd + vd) + 2 * vd, 2 * qd + qd + qd + qd);
     let (alias, alias_up) = (alias_sets(), alias_up());
     // the two sets from one region when aliased: each buffer is its own rows x n array, laid end to end from the region's start
-    let region = if alias { Some(ab(delta_set.max(attn_set))?) } else { None };
+    // each carved buffer starts on a 256-byte boundary, as the separate allocations do (the tensor-core and vector loads need it; a row count that is no multiple of 64 breaks it otherwise), so the region has up to 4 x 63 floats of padding
+    let region = if alias { Some(ab(delta_set.max(attn_set) + 256usize.div_ceil(rows))?) } else { None };
     let carve = |off: &mut usize, n: usize, region: &Option<DeviceBuffer<'c>>, ab: &mut dyn FnMut(usize) -> Result<DeviceBuffer<'c>, String>| -> Result<DeviceBuffer<'c>, String> {
         match region {
             // SAFETY: inside the region, which the BatchBufs keeps for as long as these views live; the two sets are never in use at once (`alias_rows`)
-            Some(r) => { let b = unsafe { r.subview(*off * 4, rows * n * 4) }; *off += rows * n; Ok(b) }
+            Some(r) => { let b = unsafe { r.subview(*off * 4, rows * n * 4) }; *off += (rows * n).next_multiple_of(64); Ok(b) }
             None => ab(n),
         }
     };
@@ -332,6 +335,7 @@ fn make_bb<'c>(c: &shadow_model::forward::Config, rows: usize,
     // SAFETY: `up` is read and written only between a hyper-connection's down projection and its mix, `eg` only inside the experts: never at once (`alias_rows`)
     let up = if alias_up { unsafe { eg.subview(0, rows * ch * 4) } } else { ab(ch)? };
     Ok(BatchBufs {
+        _region: region,
         r: ab(ch)?, rn: ab(ch)?, u: ab(h)?, g: ab(cs)?, y: ab(h)?, down: ab(c.hc_rank)?, up,
         qkv, x, z, beta: ab(c.ssm_v_heads)?, alpha: ab(c.ssm_v_heads)?, o,
         qg, q, gate, att: fixed.att, kk: ab(kvd)?, iq: ab(c.idx_heads * id)?, ao,
@@ -454,7 +458,7 @@ pub struct GpuSession<'c, 'm> {
     /// on first use on `gstream`, which orders with the default stream.  `SHADOW_GRAPHS=0`: none.
     graphs: HashMap<(usize, bool), Graph<'c>>,
     /// The same for the batched step: (layer, fused norm, tokens, keeping the rollback's inputs).
-    batch_graphs: HashMap<(usize, bool, usize, bool, usize), Graph<'c>>,
+    batch_graphs: HashMap<(usize, bool, usize, bool, usize, u64), Graph<'c>>,
     graphs_on: bool,
     /// `matvec_cols_multi`'s job tables, by (layer, group, rollback inputs): built before a graph is captured.
     multi: HashMap<(usize, u8, bool), DeviceBuffer<'c>>,
@@ -1809,7 +1813,7 @@ impl<'c, 'm> GpuSession<'c, 'm> {
     /// Runs `f`'s launches as the graph `key`: captured from `f` the first time, replayed after.  `f` must launch the
     /// same kernels with the same arguments every time (no host decisions, uploads or reads inside).
     /// `graph_segment` for the batched step's segments.
-    fn batch_graph_segment(&mut self, key: (usize, bool, usize, bool, usize), f: impl FnOnce(&Self)) {
+    fn batch_graph_segment(&mut self, key: (usize, bool, usize, bool, usize, u64), f: impl FnOnce(&Self)) {
         if !self.batch_graphs.contains_key(&key) {
             self.gstream.begin_capture().unwrap();
             self.capturing.set(true);
@@ -1818,7 +1822,9 @@ impl<'c, 'm> GpuSession<'c, 'm> {
             let g = self.gstream.end_capture().unwrap_or_else(|e| panic!("graph capture of layer {} x {}: {e}", key.0, key.2));
             self.batch_graphs.insert(key, g);
         }
-        self.batch_graphs[&key].launch(&self.gstream).unwrap();
+        if let Err(e) = self.batch_graphs[&key].launch(&self.gstream) {
+            panic!("batch graph (layer {}, rn_ready {}, m {}, on {}, rows {}): {e}", key.0, key.1, key.2, key.3, key.4);
+        }
     }
 
     fn graph_segment(&mut self, key: (usize, bool), f: impl FnOnce(&Self)) {
@@ -3732,7 +3738,8 @@ impl<'c, 'm> GpuSession<'c, 'm> {
             if graphs && !c.is_attention(l) && l != c.ple_layer {
                 // a DeltaNet layer up to its router is the same launches for every batch of m: one graph
                 let on = self.replay.on.get();
-                self.batch_graph_segment((l, rn_ready, m, on, self.rows), |s| {
+                // the key holds where the batch buffers are (the graph's launches carry their addresses): the same row count at another address - a prompt that lent another stretch of the KV window - is another graph
+                self.batch_graph_segment((l, rn_ready, m, on, self.rows, self.bb.r.ptr), |s| {
                     s.hc_read_batch(&format!("blk.{l}.hc_attn"), true, rn_ready, m);
                     s.delta_batch(l, m);
                     s.hc_write_batch(Some(&format!("blk.{l}.hc_ffn_norm.weight")), m);
