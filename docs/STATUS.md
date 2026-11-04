@@ -1662,3 +1662,23 @@ Observations:
 So how the memory is made and how the copies are cut make **no** difference, and the link (PCIe 4.0 x16) is the ceiling at ~28 GB/s. The prompt path's expert copies come out at ~13 GB/s end to end (the spec of 2026-11-01 measured the same): about half the link is idle or contended.
 Arithmetic for a full pass (every expert is used by ~2,048 tokens): ~43 GiB over the link (47 GiB of experts, 4 GiB in the VRAM cache) is **1.65 s at 28 GB/s** = ~1,240 tok/s at 2,048 rows from the copy alone; the engine's passes take ~3-4 times that. Suspects, not yet measured: the CPU's reads of the model file for the ~23% of experts that are not in the RAM tier (page cache -> pinned, a read and a write of ~11 GiB a pass) compete with the DMA for the ~30 GB/s of DRAM bandwidth;
 the copy of layer l + 1 is only queued after layer l's router (the copy engine idles while the GPU computes the layers before it). Next: copy rate with a CPU thread streaming the model file at the same time (DRAM contention), and the link's busy fraction over a prompt pass.
+
+## 2026-11-03 (night): the prompt gap to Strata measured on this PC, and why - DRAM is shared between the link and the CPU, and Strata's passes hold the whole prompt
+
+**Head to head, same machine, same prompts (STATUS.md excerpts; Strata = `build-upstream-029` with the 2026-10-28 bench config at `--max-context 24576`, `--prefill auto`; Shadow = defaults, ctx 24,576; Strata alone on the GPU, then Shadow alone):**
+
+| prompt | Strata | Shadow |
+|---|---|---|
+| 3,043 / 3,001 tokens | 4.2 s = **733 tok/s** | **194 (cold) / 210 tok/s** |
+| 9,578 / 9,536 tokens | 10.3 s = **934 tok/s** | 45.5 s = **209 tok/s** |
+| 15,178 / 15,136 tokens | 10.7 s = **1,422 tok/s** | 72.9 s = **208 tok/s** |
+
+(the Shadow 3k figure was 258 / 291 earlier today with a warm file cache; Strata's run had just used 40 GiB of RAM, so this one started cold). The "1,376 tok/s" in the old notes is a real figure for long prompts on this PC. **Strata's speed rises with the prompt (733 -> 934 -> 1,422); Shadow's is flat at ~210.**
+Model that fits the three Strata points: a fixed ~3.2 s a pass (the expert copy, ~43 GiB) plus ~0.5 ms a token (compute), with the whole prompt in one pass (rows >= 15k). Shadow: a pass is capped at 2,048 rows by VRAM (590 KB a row: ~30 per-row buffers, among them the 41k-float expert intermediates eg / act / eo and three 10k-float hyper-connection streams),
+so the fixed copy cost is paid every 2,048 tokens (1.6 ms a token), and Shadow's compute is ~1.7 ms a token against Strata's ~0.5.
+
+**Why the copy is slow: DRAM is shared.** `tests/h2d_probe.rs`: a DMA from the engine's pinned region alone runs at **28 GB/s** (the PCIe 4.0 x16 rate, whatever the allocation or chunking); with **one** CPU thread copying memory beside it the DMA falls to **15.2 GB/s**, with two **14.5**, with four **13.9** - the engine's ~13 GB/s. Non-temporal stores for the CPU copy change nothing (12.6 GB/s beside one thread of either kind): the ~30 GB/s of DRAM is the budget, the DMA alone takes all of it.
+The CPU's share in a pass is the read pool's file-cache -> staging copies for the ~23% of experts outside the RAM tier (~11 GiB, read + write).
+**New fact:** `cuMemHostRegister(view, size, CU_MEMHOSTREGISTER_READ_ONLY = 8)` works on a `MapViewOfFile` view of the model file: registration 56 us, the DMA reads **the file's exact bytes** (checked, MATCH) at 28 GB/s once the pages are in, and for pages nobody has touched the first DMA pages them in from the NVMe (118 ms for 256 MiB = 2.3 GB/s) - the GPU can pull straight from the file cache with no CPU copy. Cost: pinning the pages on the first DMA after a registration (~50 ms per 256 MiB, ~5 GB/s), so views would be registered once and kept, not per pass.
+**So the levers, in the order the numbers give them:** (1) rows a pass: 2,048 -> 8,192+ cuts the copy a token 4x (VRAM per row has to fall ~4x: build the expert intermediates per expert group instead of per (token, expert); keep the hyper-connection streams in half precision or recompute them); (2) compute a token 1.7 -> ~0.5 ms (attention 0.6 and the DeltaNet / dense projections: the profile of 2026-11-02); (3) CPU DRAM traffic out of the pass: file-backed experts as registered file views (no staging copy), the RAM tier left alone.
+Not needed to start: a new engine. The passes, the per-row buffers and the attention kernels are what to change; each step above can be measured against this table. Strata's source is in `J:\Strata-work\Strata-up029\src` for the layout of its prefill.
