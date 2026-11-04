@@ -1547,3 +1547,22 @@ extern "C" __global__ void select_blocks_rows(const float* scores, unsigned int*
     for (unsigned int t = tid; t < tn; t += 256) out[keep * ratio + t] = nb * ratio + t;
     if (tid == 0) lens[r] = keep * ratio + tn;
 }
+
+// `index_scores_rows` with the dot products in float (`--tensor-prompt`'s inexact family): the double version is limited by the card's FP64 rate (1/64 of FP32).
+extern "C" __global__ void index_scores_rows_f32(const float* iq, const float* blocks, float* scores, unsigned int n0,
+                                                 unsigned int ratio, unsigned int heads, unsigned int id,
+                                                 unsigned int iq_rs, unsigned int sc_rs) {
+    const u64 r = blockIdx.y;
+    unsigned int nb = (n0 + (unsigned int) r) / ratio;
+    unsigned int b = blockIdx.x * blockDim.x + threadIdx.x;
+    if (b >= nb) return;
+    const float* q = iq + r * iq_rs;
+    const float* kb = blocks + (u64) b * id;
+    float s = 0.0f;
+    for (unsigned int h = 0; h < heads; ++h) {
+        float d = 0.0f;
+        for (unsigned int i = 0; i < id; ++i) d = fmaf(q[h * id + i], kb[i], d);
+        s += fmaxf(d, 0.0f);
+    }
+    scores[r * sc_rs + b] = s / sqrtf((float) id);
+}

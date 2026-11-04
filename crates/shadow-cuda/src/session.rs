@@ -4267,7 +4267,10 @@ impl<'c, 'm> GpuSession<'c, 'm> {
                     Arg::U32(iqd as u32), Arg::Ptr(self.sv(&format!("{p}.indexer.q_norm.weight"))), Arg::U32(id as u32), Arg::F32(eps),
                     Arg::U32((p0 + j) as u32), Arg::U32(rd), Arg::F32(th)]);
                 let max_nb = (p0 + e) / ratio;
-                self.k2("index_scores_rows", (max_nb as u32).div_ceil(256), (e - j) as u32, 256, &[
+                // `SHADOW_IDX_F32=1` (with `--tensor-prompt`): float dot products, not the double ones that the card's FP64 rate bounds - +1.3% and a different reply
+                // (docs/STATUS.md 2026-11-04), so opt-in
+                let idx_kernel = if self.tensor_prompt && std::env::var("SHADOW_IDX_F32").is_ok_and(|v| v == "1") { "index_scores_rows_f32" } else { "index_scores_rows" };
+                self.k2(idx_kernel, (max_nb as u32).div_ceil(256), (e - j) as u32, 256, &[
                     Arg::Ptr(bb.sel_iqn.ptr), Arg::Ptr(at.blocks.ptr), Arg::Ptr(bb.sel_scores.ptr), Arg::U32((p0 + j + 1) as u32),
                     Arg::U32(ratio as u32), Arg::U32(idx_heads as u32), Arg::U32(id as u32), Arg::U32(iqd as u32),
                     Arg::U32(sstride as u32)]);

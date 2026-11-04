@@ -246,6 +246,7 @@ pub const FILES: &[File] = &[
             e("attention_heads_sel_rows", &[C, C, C, C, U, C, C, W, W, U, U, U, U, U]),
             e("attention_group_sel_rows", &[C, C, C, C, U, C, C, W, W, U, U, U, U, U, U]),
             e("index_scores_rows", &[C, C, W, U, U, U, U, U, U]),
+            e("index_scores_rows_f32", &[C, C, W, U, U, U, U, U, U]),
             e("select_blocks_rows", &[C, W, W, U, U, U, U, U]),
             e("head_norm_rope_rows", &[C, U, U, W, U, U, C, U, F, U, U, F]),
             e("moe_combine_qwen_rows", &[W, C, C, C, C, C, U, U]),
