@@ -4330,7 +4330,10 @@ impl<'c, 'm> GpuSession<'c, 'm> {
                         let hb = std::env::var("SHADOW_ATT_HB").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(4).clamp(1, 8).min(group);
                         let mut a = args.to_vec();
                         a.push(Arg::U32(hb as u32));
-                        self.k2("attention_group_sel_rows", (nkv * group.div_ceil(hb)) as u32, n as u32, 256, &a);
+                        // `SHADOW_ATT_F32=1` (with `--tensor-prompt`): float scores, softmax and weighted sum - the double kernel is FP64-bound (74% of the pipe) but the float one
+                        // is a tie on prompts (docs/STATUS.md 2026-11-04), so opt-in
+                        let kernel = if self.tensor_prompt && std::env::var("SHADOW_ATT_F32").is_ok_and(|v| v == "1") { "attention_group_sel_rows_f32" } else { "attention_group_sel_rows" };
+                        self.k2(kernel, (nkv * group.div_ceil(hb)) as u32, n as u32, 256, &a);
                     } else {
                         self.k2("attention_heads_sel_rows", nh as u32, n as u32, 256, &args);
                     }
