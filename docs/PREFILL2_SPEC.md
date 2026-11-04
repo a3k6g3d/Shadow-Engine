@@ -56,3 +56,10 @@ Rust for everything except the CUDA kernels (NVRTC compiles CUDA C; nothing else
 scripts in %TEMP% (ab.sh, qt.sh, hash9k.py, p9k.py, p15k.py - recreate from STATUS if gone).  Rules: every model load under `tools/run_capped.ps1` (floor 3 GiB with the 36 GiB tier);
 commit only files you changed (Gemini edits the same tree, uncommitted: CHANGELOG.md, Cargo.toml, README.md, shadow-bench, readpool.rs, real_model.rs, shadow-serve engine.rs / ui.rs,
 shadow main.rs, USAGE.md); DRAM is at its stable maximum; a tie is a loss and what loses stays opt-in.
+
+
+## Status (2026-11-04, end of the day)
+
+- **Stage 1 (1a-1c) done and on by default** (`SHADOW_PREFILL_DEVPLAN=0` off): routing and planning on the device, host runs ahead, three read-ahead buffers, copy waits for the layer reading its half. 9.5k 446-456 -> 490 tok/s, 15k 461-465 -> 514-517 (+9-11%), all exact/fidelity checks unchanged. Timeline after it (`bench/nsys-stage1-2026-11-04`, 9.65 s window): kernels busy 60.6%, copies busy 64.6% (15.5 GB/s while active), both 34.1%, **neither 9.0%, copy with no kernel 30.5%**; the 10-50 ms gaps left are the GPU waiting on a layer's copy.
+- Rows past ~4k still do not help (drafter off: 4,096 vs 6,400 real rows 519/497 and 428/427 vs 495/481 and 506/484, noisy).
+- **Next**: the copy engine is idle 35% of the time and the GPU waits on it 30%: the copy of layer l + 1 starts only after the previous copy ends and the layer before the last has combined (two halves), so a finer pipeline (the ring: stage 4) or a copy that does not need the whole layer first is where the overlap is; kernel time is ~0.75 ms a token (Strata's whole cost per token is ~0.7 ms), so the kernels need to shrink too to pass ~800 tok/s.
