@@ -182,6 +182,10 @@ pub const MAX_BATCH: usize = 256;
 pub const BIG_BATCH: usize = 2048;
 /// Tokens a pass can take at most (`lend_kv` picks 2,048, 1,024 or 512 by the lent KV tail). 4,096 was tried (half the copying a token) but the drafter's feature buffers have to hold a whole pass: +150 MB of VRAM, -2 points of the 24k window's prompt speed, and the tail is only that big in a window band where the staging pipeline cannot start (STATUS.md 2026-11-03)
 pub const BIG_BATCH_MAX: usize = 8192;
+/// Rows a pass takes when the lent room allows (`SHADOW_BIG_ROWS` sets it): 4,096 read 9.5k and 15k prompts 14% and 23% faster than 2,048 (docs/STATUS.md 2026-11-04), at some cost to the first reply's decode speed (the cache is emptier)
+fn big_rows_cap() -> usize {
+    std::env::var("SHADOW_BIG_ROWS").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(4096).min(BIG_BATCH_MAX)
+}
 /// Unread prompt tokens from which the layer-ahead pipeline and the big batch are used.
 pub const LONG_PROMPT: usize = 1024;
 const COLS_MAX: usize = 8;
@@ -1061,10 +1065,20 @@ fn grouped_plan(tops: &[Vec<(usize, f64)>], start: usize, end: usize, set: &[usi
                 addr: impl Fn(usize) -> u64, copied: impl Fn(usize) -> bool, part: [u64; 3], chunk_n: usize) -> GroupedPlan {
     // (expert, [(token, rank)]) per phase, at most `chunk_n` (8, or 32 for the tensor-core kernels) tokens a group
     let mut groups: [Vec<(usize, Vec<(usize, usize)>)>; 2] = [vec![], vec![]];
+    // each expert's (token, rank) pairs in token order, from one walk over the tokens (it was a search of every token for every expert)
+    let mut by_expert: Vec<Vec<(usize, usize)>> = vec![vec![]; set.iter().copied().max().map_or(0, |e| e + 1)];
+    for j in start..end {
+        for (i, &(x, _)) in tops[j].iter().enumerate() {
+            if let Some(u) = by_expert.get_mut(x) {
+                // the first rank an expert has in a token's list (a list names an expert once)
+                if u.last().is_none_or(|l| l.0 != j) {
+                    u.push((j, i));
+                }
+            }
+        }
+    }
     for &e in set {
-        let users: Vec<(usize, usize)> = (start..end)
-            .filter_map(|j| tops[j].iter().position(|&(x, _)| x == e).map(|i| (j, i)))
-            .collect();
+        let users = &by_expert[e];
         for chunk in users.chunks(chunk_n) {
             groups[copied(e) as usize].push((e, chunk.to_vec()));
         }
@@ -2695,7 +2709,8 @@ impl<'c, 'm> GpuSession<'c, 'm> {
         // the rows are one of a few values, so the graphs captured per row count stay few
         let rows = [BIG_BATCH_MAX, 4096, BIG_BATCH, 1024, 512].into_iter().find(|&r| r <= cap.max(512) && rb * r <= avail).unwrap_or(0);
         // with the halves in the arena, a smaller batch than the arena itself can carve (1,600 rows at the 24k window) is no reason to take the KV tail
-        let rows = if !with_halves && rows < BIG_BATCH { 0 } else { rows };
+        // a tail too small for a pass alone still adds to the arena's part (`lend_cache` lends the rest of the rows' buffers from the arena)
+        let rows = if !with_halves && rows < 512 { 0 } else { rows };
         let want = halves + rb * rows + (1 << 16);
         if self.kv_extra_reg.is_none() {
             let size = 2 * self.m.cfg.n_expert * self.cache.slot_bytes + rb * BIG_BATCH_MAX + (1 << 16);
@@ -2762,14 +2777,15 @@ impl<'c, 'm> GpuSession<'c, 'm> {
             return true;
         }
         let kv_lent = pipe && big && arena_hosts && self.lend_kv(false);
+        let big_cap = big_rows_cap();
         // more rows than the KV tail holds (`SHADOW_BIG_ROWS`): the rest of their buffers from the arena, past the halves (256 MiB more for the carving's gaps)
         let extra = if kv_lent {
-            let cap = std::env::var("SHADOW_BIG_ROWS").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(BIG_BATCH).min(BIG_BATCH_MAX);
+            let cap = big_rows_cap();
             (bb_row_floats(&self.m.cfg) * 4 * cap + (256 << 20)).saturating_sub(self.kv_extra.as_ref().map_or(0, |x| x.bytes))
         } else { 0 };
         let want = std::env::var("SHADOW_PREFILL_LEND_MIB").ok().and_then(|v| v.parse::<usize>().ok()).map(|m| m << 20)
             .unwrap_or((self.m.cfg.n_expert * if pipe { 2 } else { 1 } + if pipe { 2 } else { 0 }) * self.cache.slot_bytes
-                       + if pipe && big && !kv_lent { bb_row_floats(&self.m.cfg) * BIG_BATCH * 4 + (1 << 16) } else { extra })
+                       + if pipe && big && !kv_lent { bb_row_floats(&self.m.cfg) * big_cap * 4 + (1 << 16) } else { extra })
             .min((self.cache.arena_bytes / 100 * std::env::var("SHADOW_LEND_PCT").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(99)).min(self.cache.arena_bytes.saturating_sub(24 * self.cache.slot_bytes)));
         let target = self.cache.arena_bytes - want;
         let s0 = self.cache.slot_offset.partition_point(|&o| (o as usize) < target);
@@ -3038,7 +3054,7 @@ impl<'c, 'm> GpuSession<'c, 'm> {
         };
         // As many rows as the lent room holds, up to BIG_BATCH: a longer `--ctx` leaves the expert cache (and so the room) smaller, and a prompt that
         // read 2,048 tokens at a time must not drop to 256 for want of a few MiB; each pass copies a layer's experts whatever its token count.
-        let env_cap = std::env::var("SHADOW_BIG_ROWS").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(BIG_BATCH).min(BIG_BATCH_MAX);
+        let env_cap = big_rows_cap();
         let cap = if self.kv_halves { env_cap.min(self.kv_rows) } else { env_cap };
         let ctx = self.ctx;
         let dummy = |ctx: &'c Context| unsafe { DeviceBuffer::view(ctx, 0, 0) };
