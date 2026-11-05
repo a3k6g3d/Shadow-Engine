@@ -201,7 +201,7 @@ fn sub_rows_cap() -> usize {
 /// Bytes the big batch's buffers take for `total` rows a pass: the temporaries for the sub-chunk and the residual streams of every row.
 fn big_batch_bytes(c: &shadow_model::forward::Config, total: usize) -> usize {
     let sub = sub_rows_cap().min(total);
-    bb_row_floats(c) * 4 * sub + if total > sub { 2 * c.streams * c.hidden * 4 * total } else { 0 }
+    bb_row_floats(c) * 4 * sub + if total > sub { c.streams * c.hidden * 4 * total.next_multiple_of(sub) } else { 0 }
 }
 /// Unread prompt tokens from which the layer-ahead pipeline and the big batch are used.
 pub const LONG_PROMPT: usize = 1024;
@@ -381,10 +381,9 @@ pub struct GpuSession<'c, 'm> {
     dscr: DeviceBuffer<'c>,
     /// with `--tensor-prompt` (`SHADOW_PREFILL_DEVPLAN=0` off): a long prompt's MoE is routed and planned on the device (`dev_plan`); these are its scratch buffers:
     /// each token's chosen experts, the users of each expert, each expert's first group, and the host's per-layer expert tables (copied flags, addresses)
-    /// the residual streams of every row of a pass bigger than `rows` (see `sub_rows_cap`); `bb.r` is then a view of the sub-chunk being run
-    rbig: Option<DeviceBuffer<'c>>,
-    /// the same for each row's normalized input to the next layer (`bb.rn`), so the batched fused write + norm keeps running between sub-chunks
-    rnbig: Option<DeviceBuffer<'c>>,
+    /// the residual streams of every row of a pass bigger than `rows` (see `sub_rows_cap`), one buffer of `rows` rows a part (carved wherever the lent ranges have room:
+    /// a part is a sub-chunk's storage; the first sub-chunk, the remainder, sits at the end of part 0); `bb.r` is then a view of the sub-chunk being run
+    rparts: Vec<DeviceBuffer<'c>>,
     /// whether the sub-chunk being run is the pass's last (the layer's copy pipeline advances once a layer, after it)
     sub_last: bool,
     sub_first: bool,
@@ -1586,7 +1585,7 @@ impl<'c, 'm> GpuSession<'c, 'm> {
         };
         let mut s = GpuSession {
             ctx, m, mvp, fw, w, v, b, bb, replay, dscr,
-            rbig: None, rnbig: None, sub_last: true, sub_first: true,
+            rparts: Vec::new(), sub_last: true, sub_first: true,
             devplan: tiers.tensor_prompt && !std::env::var("SHADOW_PREFILL_DEVPLAN").is_ok_and(|v| v == "0"), dp_tidx, dp_cnt, dp_gstart, dp_copied, dp_eaddr, kv_regions, kv_extra: None, kv_extra_reg, prompt_hint: 0, kv_rows: 0, kv_halves: false, router_bias: std::env::var("SHADOW_ROUTER_BIAS").ok().and_then(|v| v.parse().ok()).unwrap_or(0.0), batch_scratch, delta, attn, ple_state, tokens: vec![], pictures: vec![], rope_tab: None, rope_on: false, cap, trace: None, stop_after: None,
             resident_bytes, expert_uploads: 0, cache, ram, copy_stream, copy_stream2, copy_ev2, copy_event, staging,
             pending: vec![], routing: RoutingCounts::new(c.n_layer, c.n_expert),
@@ -3309,7 +3308,7 @@ impl<'c, 'm> GpuSession<'c, 'm> {
             if make_bb(c, rows, &mut take, fixed).is_err() {
                 return false;
             }
-            total <= rows || (take(total * ch).is_ok() && take(total * ch).is_ok())
+            total <= rows || (0..total.div_ceil(rows)).all(|_| take(rows * ch).is_ok())
         };
         let sub = sub_rows_cap().min(cap);
         let mut rows = sub / 64 * 64;
@@ -3329,6 +3328,9 @@ impl<'c, 'm> GpuSession<'c, 'm> {
             eprintln!("BIGBATCH lent {} slots ({:.2} GiB), halves {:.2} GiB, ranges {} ({:.2} GiB), rows {rows} of cap {cap}, pass {total} rows",
                       lent.n, (lent.n * self.cache.slot_bytes) as f64 / 1073741824.0, halves as f64 / 1073741824.0,
                       ranges.len(), ranges.iter().map(|r| r.1 - r.0).sum::<u64>() as f64 / 1073741824.0);
+            for r in &ranges {
+                eprintln!("BIGBATCH range {:.3} GiB", (r.1 - r.0) as f64 / 1073741824.0);
+            }
         }
         let mut cur: Vec<u64> = ranges.iter().map(|r| r.0).collect();
         let mut take = |floats: usize| -> Result<DeviceBuffer<'c>, String> {
@@ -3346,14 +3348,13 @@ impl<'c, 'm> GpuSession<'c, 'm> {
             logits: std::mem::replace(&mut self.bb.logits, dummy(ctx)),
         };
         let built = make_bb(c, rows, &mut take, fixed);
-        let (rbig, rnbig) = if total > rows { (take(total * ch).ok(), take(total * ch).ok()) } else { (None, None) };
+        let rparts: Vec<DeviceBuffer<'c>> = if total > rows { (0..total.div_ceil(rows)).map_while(|_| take(rows * ch).ok()).collect() } else { Vec::new() };
         match built {
             Ok(big) => {
                 self.small_bb = Some(std::mem::replace(&mut self.bb, big));
                 self.rows = rows;
-                self.batch_max = if rbig.is_some() && rnbig.is_some() { total } else { rows };
-                self.rbig = rbig;
-                self.rnbig = rnbig;
+                self.batch_max = if !rparts.is_empty() && rparts.len() == total.div_ceil(rows) { total } else { rows };
+                self.rparts = rparts;
                 true
             }
             Err(_) => false, // cannot happen: `take` does not fail; the fixed buffers are dropped views
@@ -3368,8 +3369,7 @@ impl<'c, 'm> GpuSession<'c, 'm> {
             std::mem::swap(a, b);
         }
         self.bb = small;
-        self.rbig = None;
-        self.rnbig = None;
+        self.rparts = Vec::new();
         self.rows = MAX_BATCH;
         self.batch_max = MAX_BATCH;
     }
@@ -3966,6 +3966,20 @@ impl<'c, 'm> GpuSession<'c, 'm> {
     }
 
     fn batch(&mut self, toks: &[u32], with_logits: bool) -> Vec<Vec<f32>> {
+        #[cfg(windows)]
+        {
+            // `SHADOW_MAIN_PRIO=N`: the thread that queues a long prompt's kernels runs at THREAD_PRIORITY N (1 above normal, 2 highest), so the read workers' memcpys do not
+            // keep it waiting for a core (a launch is 5 us, but 1,000 a prompt took one scheduler quantum, ~16 ms)
+            extern "system" {
+                fn GetCurrentThread() -> isize;
+                fn SetThreadPriority(h: isize, p: i32) -> i32;
+            }
+            static PRIO: std::sync::OnceLock<Option<i32>> = std::sync::OnceLock::new();
+            if let Some(p) = *PRIO.get_or_init(|| std::env::var("SHADOW_MAIN_PRIO").ok().and_then(|v| v.parse::<i32>().ok())) {
+                // SAFETY: the pseudo-handle of this thread; a priority between -2 and 2.
+                unsafe { SetThreadPriority(GetCurrentThread(), p.clamp(-2, 2)) };
+            }
+        }
         let m = toks.len();
         let p0 = self.tokens.len();
         assert!(p0 + m <= self.cap, "this session was made for {} positions", self.cap);
@@ -3976,7 +3990,7 @@ impl<'c, 'm> GpuSession<'c, 'm> {
         let ch = h * cs;
         // a pass bigger than the temporaries' rows runs layer by layer in sub-chunks (the first takes the remainder, so the last is a full one), the residual streams
         // of every row in `rbig`; `bb.r` is a view of the sub-chunk being run
-        let sub_mode = m > self.rows && self.rbig.is_some() && self.rnbig.is_some() && !self.pipeline_ok(m);
+        let sub_mode = m > self.rows && !self.rparts.is_empty() && !self.pipeline_ok(m);
         let subs: Vec<(usize, usize)> = if sub_mode {
             let s = self.rows;
             let first = m % s;
@@ -3990,7 +4004,11 @@ impl<'c, 'm> GpuSession<'c, 'm> {
             vec![(0, m)]
         };
         assert!(sub_mode || m <= self.rows, "a pass of {m} rows with temporaries for {}", self.rows);
-        let r_all = if sub_mode { self.rbig.as_ref().unwrap().ptr } else { self.bb.r.ptr };
+        // row j's residual streams are at storage row j + pad (the first sub-chunk, the remainder, ends part 0): a sub-chunk is inside one part
+        let pad = if sub_mode { (self.rows - m % self.rows) % self.rows } else { 0 };
+        let row_ptr = |j: usize| -> u64 {
+            if sub_mode { self.rparts[(j + pad) / self.rows].ptr + (((j + pad) % self.rows) * ch * 4) as u64 } else { self.bb.r.ptr + (j * ch * 4) as u64 }
+        };
         {
             let (t, bytes) = self.m.dense("token_embd.weight");
             let (qk, qb) = t.ty.block().unwrap();
@@ -4002,7 +4020,7 @@ impl<'c, 'm> GpuSession<'c, 'm> {
                     None => dequantize(t.ty, &bytes[tok as usize * rb..(tok as usize + 1) * rb], &mut x).unwrap(),
                 }
                 self.upload_to(self.b.e.ptr, &f32s(&x));
-                self.k1("broadcast", ch, &[Arg::Ptr(self.b.e.ptr), Arg::Ptr(r_all + (j * ch * 4) as u64), Arg::U32(h as u32),
+                self.k1("broadcast", ch, &[Arg::Ptr(self.b.e.ptr), Arg::Ptr(row_ptr(j)), Arg::U32(h as u32),
                                            Arg::U32(cs as u32)]);
             }
         }
@@ -4015,21 +4033,16 @@ impl<'c, 'm> GpuSession<'c, 'm> {
         if piped {
             rn_ready = self.layers_pipelined(m, p0, &mut logs, graphs);
         }
-        let saved_r = if sub_mode {
-            let rn = std::mem::replace(&mut self.bb.rn, unsafe { self.rnbig.as_ref().unwrap().subview(0, 0) });
-            Some((std::mem::replace(&mut self.bb.r, unsafe { self.rbig.as_ref().unwrap().subview(0, 0) }), rn))
-        } else {
-            None
-        };
-        // whether each row's normalized input to the layer is in `rn`: one answer for all of a layer's sub-chunks (each made it for itself at the end of the layer before)
+        let saved_r = if sub_mode { Some(std::mem::replace(&mut self.bb.r, unsafe { self.rparts[0].subview(0, 0) })) } else { None };
+        // whether each row's normalized input to the layer is in `rn`; a sub-chunked pass keeps only the residual streams between sub-chunks, so each sub-chunk
+        // normalizes its own at the start (`rmsnorm_groups_rows`, 0.2 ms) and `rn` is the sub-chunk's scratch
         let mut rn_layer = rn_ready;
         for l in 0..(if piped { 0 } else { c.n_layer }) {
             for (si, &(s0, ms)) in subs.iter().enumerate() {
-                rn_ready = rn_layer;
+                rn_ready = rn_layer && !sub_mode;
                 if sub_mode {
                     // SAFETY: rows s0 .. s0 + ms of the residual streams, used by this sub-chunk only until the next view
-                    self.bb.r = unsafe { self.rbig.as_ref().unwrap().subview(s0 * ch * 4, ms * ch * 4) };
-                    self.bb.rn = unsafe { self.rnbig.as_ref().unwrap().subview(s0 * ch * 4, ms * ch * 4) };
+                    self.bb.r = unsafe { self.rparts[(s0 + pad) / self.rows].subview(((s0 + pad) % self.rows) * ch * 4, ms * ch * 4) };
                     self.sub_last = si + 1 == subs.len();
                     self.sub_first = si == 0;
                 }
@@ -4125,10 +4138,9 @@ impl<'c, 'm> GpuSession<'c, 'm> {
             // the last sub-chunk's output rows (a sub-chunked pass gives logits for its last rows only; the rows before come back empty)
             self.hc_read_batch("output_hc", false, rn_ready, m_obs);
         }
-        if let Some((r, rn)) = saved_r {
-            // the views of the last sub-chunk go with the buffers: the saved ones are `bb.r` and `bb.rn` again
+        if let Some(r) = saved_r {
+            // the view of the last sub-chunk goes with the buffers: the saved one is `bb.r` again
             let _ = std::mem::replace(&mut self.bb.r, r);
-            let _ = std::mem::replace(&mut self.bb.rn, rn);
         }
         self.sub_last = true;
         self.sub_first = true;
@@ -4344,7 +4356,11 @@ impl<'c, 'm> GpuSession<'c, 'm> {
         let (h, cs, rank) = (c.hidden, c.streams, c.hc_rank);
         let ch = h * cs;
         let bb = &self.bb;
-        if !skip_norm {
+        if !skip_norm && m >= 2 {
+            // one launch for all rows (the same arithmetic as a launch a row)
+            self.k2("rmsnorm_groups_rows", cs as u32, m as u32, 256, &[Arg::Ptr(bb.r.ptr), Arg::Ptr(self.sv(&format!("{p}_norm.weight"))), Arg::Ptr(bb.rn.ptr),
+                                                                       Arg::U32(h as u32), Arg::F32(c.eps), Arg::U32(cs as u32)]);
+        } else if !skip_norm {
             for j in 0..m {
                 self.hc_norm(p, row(&bb.r, ch, j), row(&bb.rn, ch, j));
             }

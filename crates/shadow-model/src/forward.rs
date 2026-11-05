@@ -19,7 +19,7 @@ use std::fs::File;
 pub const MAX_POSITIONS: usize = 32768;
 
 /// Threads behind `Model::experts_into_many`, each with its own file handles.
-pub const READ_WORKERS: usize = 8;
+pub const READ_WORKERS: usize = 16;
 
 /// The shapes, from the file's key-values (ARCH.md, "Shapes").
 #[derive(Debug, Clone)]
@@ -370,7 +370,8 @@ impl Model {
             dense.insert(t.name.clone(), b);
         }
         let paths: Vec<_> = g.shards.iter().map(|s| s.path.clone()).collect();
-        let pool = ReadPool::new(&paths, READ_WORKERS)?;
+        let workers = std::env::var("SHADOW_READ_WORKERS").ok().and_then(|v| v.parse::<usize>().ok()).filter(|&n| n >= 1).unwrap_or(READ_WORKERS);
+        let pool = ReadPool::new(&paths, workers)?;
         Ok(Model { g, cfg, files, pool, dense, ple_cache: std::sync::RwLock::new(HashMap::new()) })
     }
 

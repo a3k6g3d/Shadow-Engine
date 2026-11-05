@@ -232,6 +232,7 @@ pub const FILES: &[File] = &[
         headers: &[],
         entries: &[
             e("rmsnorm_groups", &[C, C, W, U, F]),
+            e("rmsnorm_groups_rows", &[C, C, W, U, F, U]),
             e("add_rmsnorm1", &[W, C, C, W, U, F]),
             e("silu_div", &[W, U, F]),
             e("sigmoid_div", &[C, W, U, F, F]),

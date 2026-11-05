@@ -15,7 +15,9 @@ starts = [0]
 for i in range(1, len(sel)):
     if sel[i][0] - sel[i - 1][1] > 1e9:
         starts.append(i)
-last = sel[starts[-1]:]
+groups = [sel[a:b] for a, b in zip(starts, starts[1:] + [len(sel)])]
+big = [g for g in groups if len(g) >= 100]   # a prompt's window; a few launches are a decode step or a short request
+last = (big or groups)[-1]
 t0, t1 = last[0][0], last[-1][1]
 
 

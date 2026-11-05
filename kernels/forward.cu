@@ -77,6 +77,13 @@ extern "C" __global__ void rmsnorm_groups(const float* x, const float* w, float*
     rmsnorm_one(x + (u64) g * group, w + (u64) g * group, y + (u64) g * group, group, eps);
 }
 
+// `rmsnorm_groups` for many rows: grid (groups, rows), a row `groups * group` floats (the same arithmetic as one launch a row).
+extern "C" __global__ void rmsnorm_groups_rows(const float* x, const float* w, float* y, unsigned int group, float eps, unsigned int groups) {
+    const unsigned int g = blockIdx.x;
+    const u64 off = (u64) blockIdx.y * groups * group + (u64) g * group;
+    rmsnorm_one(x + off, w + (u64) g * group, y + off, group, eps);
+}
+
 // r[i] += y[i], then u = rmsnorm(r, w, eps) in one block of 256 threads
 extern "C" __global__ void add_rmsnorm1(float* r, const float* y, const float* w, float* u, unsigned int n, float eps) {
     double ss = 0.0;
