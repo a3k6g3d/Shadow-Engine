@@ -4433,9 +4433,9 @@ impl<'c, 'm> GpuSession<'c, 'm> {
                     Arg::U32(iqd as u32), Arg::Ptr(self.sv(&format!("{p}.indexer.q_norm.weight"))), Arg::U32(id as u32), Arg::F32(eps),
                     Arg::U32((p0 + j) as u32), Arg::U32(rd), Arg::F32(th)]);
                 let max_nb = (p0 + e) / ratio;
-                // `SHADOW_IDX_F32=1` (with `--tensor-prompt`): float dot products, not the double ones that the card's FP64 rate bounds - +1.3% and a different reply
-                // (docs/STATUS.md 2026-11-04), so opt-in
-                let idx_kernel = if self.tensor_prompt && std::env::var("SHADOW_IDX_F32").is_ok_and(|v| v == "1") { "index_scores_rows_f32" } else { "index_scores_rows" };
+                // float dot products (with `--tensor-prompt`; `SHADOW_IDX_F32=0` keeps the double ones that the card's FP64 rate bounds): a tie while the copies paced the
+                // pass, +2-7% with the device planner (docs/STATUS.md 2026-11-04), at the cost of a different (not a worse) reply
+                let idx_kernel = if self.tensor_prompt && !std::env::var("SHADOW_IDX_F32").is_ok_and(|v| v == "0") { "index_scores_rows_f32" } else { "index_scores_rows" };
                 self.k2(idx_kernel, (max_nb as u32).div_ceil(256), (e - j) as u32, 256, &[
                     Arg::Ptr(bb.sel_iqn.ptr), Arg::Ptr(at.blocks.ptr), Arg::Ptr(bb.sel_scores.ptr), Arg::U32((p0 + j + 1) as u32),
                     Arg::U32(ratio as u32), Arg::U32(idx_heads as u32), Arg::U32(id as u32), Arg::U32(iqd as u32),
@@ -4496,9 +4496,9 @@ impl<'c, 'm> GpuSession<'c, 'm> {
                         let hb = std::env::var("SHADOW_ATT_HB").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(4).clamp(1, 8).min(group);
                         let mut a = args.to_vec();
                         a.push(Arg::U32(hb as u32));
-                        // `SHADOW_ATT_F32=1` (with `--tensor-prompt`): float scores, softmax and weighted sum - the double kernel is FP64-bound (74% of the pipe) but the float one
-                        // is a tie on prompts (docs/STATUS.md 2026-11-04), so opt-in
-                        let kernel = if self.tensor_prompt && std::env::var("SHADOW_ATT_F32").is_ok_and(|v| v == "1") { "attention_group_sel_rows_f32" } else { "attention_group_sel_rows" };
+                        // float scores, softmax and weighted sum (with `--tensor-prompt`; `SHADOW_ATT_F32=0` keeps the double kernel, FP64-bound at 74% of the pipe): a tie while the
+                        // copies paced the pass, +2-7% with the device planner (docs/STATUS.md 2026-11-04)
+                        let kernel = if self.tensor_prompt && !std::env::var("SHADOW_ATT_F32").is_ok_and(|v| v == "0") { "attention_group_sel_rows_f32" } else { "attention_group_sel_rows" };
                         self.k2(kernel, (nkv * group.div_ceil(hb)) as u32, n as u32, 256, &a);
                     } else {
                         self.k2("attention_heads_sel_rows", nh as u32, n as u32, 256, &args);

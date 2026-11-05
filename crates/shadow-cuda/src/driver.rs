@@ -80,6 +80,7 @@ table! {
     cuMemcpyDtoH: fn(*mut c_void, CuDevicePtr, usize) = ["cuMemcpyDtoH_v2"];
     cuMemcpyHtoDAsync: fn(CuDevicePtr, *const c_void, usize, H) = ["cuMemcpyHtoDAsync_v2"];
     cuMemcpyDtoD: fn(CuDevicePtr, CuDevicePtr, usize) = ["cuMemcpyDtoD_v2"];
+    cuMemcpyDtoDAsync: fn(CuDevicePtr, CuDevicePtr, usize, H) = ["cuMemcpyDtoDAsync_v2"];
     cuMemcpyDtoHAsync: fn(*mut c_void, CuDevicePtr, usize, H) = ["cuMemcpyDtoHAsync_v2"];
     cuMemsetD8: fn(CuDevicePtr, u8, usize) = ["cuMemsetD8_v2"];
     // the virtual memory API (physical chunks mapped into a reserved address range), for lending the unfilled part of the KV window
