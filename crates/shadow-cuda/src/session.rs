@@ -4181,7 +4181,8 @@ impl<'c, 'm> GpuSession<'c, 'm> {
             return;
         }
         static MMA_NL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        let mma_nl = ty == "IQ4_NL" && *MMA_NL.get_or_init(|| std::env::var("SHADOW_MMA_NL").is_ok_and(|v| v == "1"));
+        // on since the device planner (the pass is no longer paced by the copies: the shared experts' IQ4_NL down projection took 331 ms of a 3.5 s kernel window as 8-column launches); `SHADOW_MMA_NL=0` off
+        let mma_nl = ty == "IQ4_NL" && *MMA_NL.get_or_init(|| !std::env::var("SHADOW_MMA_NL").is_ok_and(|v| v == "0"));
         static MMA_QK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         let mma_qk = matches!(ty.as_str(), "Q4_K" | "Q5_K") && *MMA_QK.get_or_init(|| !std::env::var("SHADOW_MMA_QK").is_ok_and(|v| v == "0"));
         if self.tensor_prompt && m >= 16 && (matches!(ty.as_str(), "Q6_K" | "IQ4_XS") || mma_bf16 || mma_qk || mma_nl) && t.dims[0].is_multiple_of(64)
