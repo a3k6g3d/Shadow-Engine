@@ -281,6 +281,150 @@ extern "C" __global__ void __launch_bounds__(128) gated_rmsnorm_rows_w(float* o,
     }
 }
 
+// ---- Float versions of the prompt path's norm / recurrence kernels, for `--tensor-prompt` (the inexact family, like the float attention): the card does FP64 at 1/64 of FP32
+// and these kernels sat on the FP64 pipe (Nsight Compute: `gated_rmsnorm_rows` 86% of the pipe, `delta_steps128` 46% at 8% occupancy).  Sums by warp shuffles, no double anywhere.
+// Relative differences from the double kernels ~1e-7; `--exact` and decode keep the double ones.
+static __device__ __forceinline__ float block_sum_f(float v) {
+    __shared__ float wb[32];
+    const unsigned int lane = threadIdx.x & 31, w = threadIdx.x >> 5, nw = (blockDim.x + 31) >> 5;
+    #pragma unroll
+    for (unsigned int o = 16; o > 0; o >>= 1) v += __shfl_xor_sync(0xffffffffu, v, o);
+    if (lane == 0) wb[w] = v;
+    __syncthreads();
+    float r = lane < nw ? wb[lane] : 0.0f;
+    #pragma unroll
+    for (unsigned int o = 16; o > 0; o >>= 1) r += __shfl_xor_sync(0xffffffffu, r, o);
+    __syncthreads();
+    return r;
+}
+
+static __device__ void rmsnorm_one_f(const float* x, const float* w, float* y, unsigned int n, float eps) {
+    float ss = 0.0f;
+    for (unsigned int i = threadIdx.x; i < n; i += blockDim.x) ss = fmaf(x[i], x[i], ss);
+    const float r = 1.0f / sqrtf(block_sum_f(ss) / (float) n + eps);
+    for (unsigned int i = threadIdx.x; i < n; i += blockDim.x) y[i] = (x[i] * r) * w[i];
+}
+
+extern "C" __global__ void rmsnorm_groups_rows_f(const float* x, const float* w, float* y, unsigned int group, float eps, unsigned int groups) {
+    const unsigned int g = blockIdx.x;
+    const u64 off = (u64) blockIdx.y * groups * group + (u64) g * group;
+    rmsnorm_one_f(x + off, w + (u64) g * group, y + off, group, eps);
+}
+
+static __device__ __forceinline__ void hc_write_rmsnorm_one_f(float* r, const float* g, const float* y, const float* w,
+                                                              float* rn, unsigned int group, float eps, unsigned int s) {
+    const float gs = g[s];
+    float* rs = r + (u64) s * group;
+    const float* ws = w + (u64) s * group;
+    float* ys = rn + (u64) s * group;
+    float ss = 0.0f;
+    for (unsigned int i = threadIdx.x; i < group; i += blockDim.x) {
+        const float v = rs[i] + gs * y[i];
+        rs[i] = v;
+        ss = fmaf(v, v, ss);
+    }
+    const float scale = 1.0f / sqrtf(block_sum_f(ss) / (float) group + eps);
+    for (unsigned int i = threadIdx.x; i < group; i += blockDim.x) ys[i] = (rs[i] * scale) * ws[i];
+}
+
+extern "C" __global__ void hc_write_rmsnorm_rows_f(float* r, const float* g, const float* y, const float* w, float* rn,
+                                                   unsigned int group, float eps, unsigned int streams) {
+    const u64 j = blockIdx.y, rs = (u64) streams * group;
+    hc_write_rmsnorm_one_f(r + j * rs, g + j * streams, y + j * group, w, rn + j * rs, group, eps, blockIdx.x);
+}
+
+extern "C" __global__ void l2norm_qk_rows_f(float* x, unsigned int kh, unsigned int d, float q_div, unsigned int xs) {
+    float* h = x + (u64) blockIdx.y * xs + (u64) blockIdx.x * d;
+    const float div = blockIdx.x < kh ? q_div : 1.0f;
+    float ss = 0.0f;
+    for (unsigned int i = threadIdx.x; i < d; i += blockDim.x) ss = fmaf(h[i], h[i], ss);
+    const float n = 1.0f / sqrtf(block_sum_f(ss) + 1e-6f);
+    for (unsigned int i = threadIdx.x; i < d; i += blockDim.x) {
+        const float v = h[i] * n;
+        h[i] = div == 1.0f ? v : v / div;
+    }
+}
+
+extern "C" __global__ void __launch_bounds__(128) gated_rmsnorm_rows_wf(float* o, const float* w, const float* z, unsigned int d, float eps, unsigned int os,
+                                                                          unsigned int heads) {
+    const unsigned int lane = threadIdx.x & 31, head = blockIdx.x * 4 + (threadIdx.x >> 5);
+    if (head >= heads) return;
+    float* h = o + (u64) blockIdx.y * os + (u64) head * d;
+    const float* zh = z + (u64) blockIdx.y * os + (u64) head * d;
+    float e[4];
+    float ss = 0.0f;
+    #pragma unroll
+    for (unsigned int q = 0; q < 4; ++q) { e[q] = h[lane + 32 * q]; ss = fmaf(e[q], e[q], ss); }
+    #pragma unroll
+    for (unsigned int s = 16; s > 0; s >>= 1) ss += __shfl_xor_sync(0xffffffffu, ss, s);
+    const float r = 1.0f / sqrtf(ss / (float) d + eps);
+    #pragma unroll
+    for (unsigned int q = 0; q < 4; ++q) {
+        const unsigned int i = lane + 32 * q;
+        h[i] = (e[q] * r) * w[i] * sigmoidf_ref(zh[i]);
+    }
+}
+
+extern "C" __global__ void conv_silu_steps_par_f(const float* x, const float* state, const float* w, float* out, unsigned int ch, unsigned int k, unsigned int m) {
+    const unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
+    const unsigned int j = blockIdx.y;
+    if (i >= ch) return;
+    float acc = w[i * k + (k - 1)] * x[(u64) j * ch + i];
+    for (unsigned int t = 0; t + 1 < k; ++t) {
+        const int n = (int) j - (int) (k - 1) + (int) t;
+        const float v = n >= 0 ? x[(u64) n * ch + i] : state[(u64) (n + (int) k - 1) * ch + i];
+        acc = fmaf(w[i * k + t], v, acc);
+    }
+    out[(u64) j * ch + i] = siluf_ref(acc);
+}
+
+// `delta_steps128` with the two sums over the 128 rows in float (8 partials of 16 each, as before, added in float): no FP64 on the token loop's critical path.
+extern "C" __global__ void delta_steps128_f(const float* q, const float* k, const float* v, unsigned int xs, const float* b,
+                                            const float* a, unsigned int bs, const float* A, const float* dtb, float* S,
+                                            float* o, unsigned int os, unsigned int kh, unsigned int m) {
+    const unsigned int d = 128;
+    __shared__ float qs[128], ks[128];
+    unsigned int h = blockIdx.x, j = threadIdx.x, kx = h % kh;
+    float* s = S + (u64) h * d * d;
+    float col[128];
+#pragma unroll
+    for (unsigned int i = 0; i < d; ++i) col[i] = s[i * d + j];
+    for (unsigned int t = 0; t < m; ++t) {
+        __syncthreads();
+        qs[j] = q[(u64) t * xs + kx * d + j];
+        ks[j] = k[(u64) t * xs + kx * d + j];
+        __syncthreads();
+        const float beta = sigmoidf_ref(b[(u64) t * bs + h]);
+        const float decay = expf(A[h] * softplusf_ref(a[(u64) t * bs + h] + dtb[h]));
+        float mem = 0.0f;
+#pragma unroll
+        for (unsigned int i0 = 0; i0 < d; i0 += 16) {
+            float part = 0.0f;
+#pragma unroll
+            for (unsigned int i = i0; i < i0 + 16; ++i) {
+                col[i] *= decay;
+                part = fmaf(col[i], ks[i], part);
+            }
+            mem += part;
+        }
+        const float delta = (v[(u64) t * xs + h * d + j] - mem) * beta;
+        float acc = 0.0f;
+#pragma unroll
+        for (unsigned int i0 = 0; i0 < d; i0 += 16) {
+            float part = 0.0f;
+#pragma unroll
+            for (unsigned int i = i0; i < i0 + 16; ++i) {
+                col[i] += ks[i] * delta;
+                part = fmaf(col[i], qs[i], part);
+            }
+            acc += part;
+        }
+        o[(u64) t * os + h * d + j] = acc;
+    }
+#pragma unroll
+    for (unsigned int i = 0; i < d; ++i) s[i * d + j] = col[i];
+}
+
 // Each `d`-wide head: x = x / sqrt(sum x^2 + 1e-6), then x /= div.  grid = heads, block = 128.
 extern "C" __global__ void l2norm_heads(float* x, unsigned int d, float div) {
     float* h = x + (u64) blockIdx.x * d;

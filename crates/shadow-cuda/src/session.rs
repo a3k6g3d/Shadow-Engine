@@ -2450,12 +2450,18 @@ impl<'c, 'm> GpuSession<'c, 'm> {
         let bb = &self.bb;
         let eps = self.m.cfg.eps;
         if d == 128 && !std::env::var("SHADOW_GN_W").is_ok_and(|v| v == "0") {
-            self.k2("gated_rmsnorm_rows_w", (vh as u32).div_ceil(4), m as u32, 128, &[Arg::Ptr(bb.o.ptr), Arg::Ptr(self.sv(weight)), Arg::Ptr(bb.z.ptr),
+            self.k2(self.nk("gated_rmsnorm_rows_w", "gated_rmsnorm_rows_wf"), (vh as u32).div_ceil(4), m as u32, 128, &[Arg::Ptr(bb.o.ptr), Arg::Ptr(self.sv(weight)), Arg::Ptr(bb.z.ptr),
                                                                                     Arg::U32(d as u32), Arg::F32(eps), Arg::U32(vd as u32), Arg::U32(vh as u32)]);
         } else {
             self.k2("gated_rmsnorm_rows", vh as u32, m as u32, 128, &[Arg::Ptr(bb.o.ptr), Arg::Ptr(self.sv(weight)), Arg::Ptr(bb.z.ptr),
                                                                      Arg::U32(d as u32), Arg::F32(eps), Arg::U32(vd as u32)]);
         }
+    }
+
+    /// `name_f` (the float kernel, no FP64: docs/STATUS.md 2026-11-05 (37)) with `--tensor-prompt`, unless `SHADOW_NORM_F32=0`; `name` otherwise.
+    fn nk(&self, name: &'static str, f32name: &'static str) -> &'static str {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if self.tensor_prompt && *ON.get_or_init(|| !std::env::var("SHADOW_NORM_F32").is_ok_and(|v| v == "0")) { f32name } else { name }
     }
 
     fn hc_norm(&self, p: &str, r: u64, rn: u64) {
@@ -4417,7 +4423,7 @@ impl<'c, 'm> GpuSession<'c, 'm> {
         let bb = &self.bb;
         if !skip_norm && m >= 2 {
             // one launch for all rows (the same arithmetic as a launch a row)
-            self.k2("rmsnorm_groups_rows", cs as u32, m as u32, 256, &[Arg::Ptr(bb.r.ptr), Arg::Ptr(self.sv(&format!("{p}_norm.weight"))), Arg::Ptr(bb.rn.ptr),
+            self.k2(self.nk("rmsnorm_groups_rows", "rmsnorm_groups_rows_f"), cs as u32, m as u32, 256, &[Arg::Ptr(bb.r.ptr), Arg::Ptr(self.sv(&format!("{p}_norm.weight"))), Arg::Ptr(bb.rn.ptr),
                                                                        Arg::U32(h as u32), Arg::F32(c.eps), Arg::U32(cs as u32)]);
         } else if !skip_norm {
             for j in 0..m {
@@ -4469,7 +4475,7 @@ impl<'c, 'm> GpuSession<'c, 'm> {
         let (h, cs) = (c.hidden, c.streams);
         let bb = &self.bb;
         if let Some(n) = next_norm {
-            self.k2("hc_write_rmsnorm_rows", cs as u32, m as u32, 256, &[
+            self.k2(self.nk("hc_write_rmsnorm_rows", "hc_write_rmsnorm_rows_f"), cs as u32, m as u32, 256, &[
                 Arg::Ptr(bb.r.ptr), Arg::Ptr(bb.g.ptr), Arg::Ptr(bb.y.ptr), Arg::Ptr(self.sv(n)), Arg::Ptr(bb.rn.ptr),
                 Arg::U32(h as u32), Arg::F32(c.eps), Arg::U32(cs as u32)]);
             return;
@@ -4502,7 +4508,7 @@ impl<'c, 'm> GpuSession<'c, 'm> {
             let kh = c.ssm_k_heads;
             // every (token, channel) its own thread, the same sums in the same order (`SHADOW_CONV_PAR=0`: one thread a channel walking the tokens)
             if m >= 8 && !std::env::var("SHADOW_CONV_PAR").is_ok_and(|v| v == "0") {
-                self.k2("conv_silu_steps_par", (ch as u32).div_ceil(256), m as u32, 256, &[Arg::Ptr(qkv_p), Arg::Ptr(conv.ptr),
+                self.k2(self.nk("conv_silu_steps_par", "conv_silu_steps_par_f"), (ch as u32).div_ceil(256), m as u32, 256, &[Arg::Ptr(qkv_p), Arg::Ptr(conv.ptr),
                                             Arg::Ptr(self.sv(&format!("{p}.ssm_conv1d.weight"))), Arg::Ptr(bb.x.ptr),
                                             Arg::U32(ch as u32), Arg::U32(c.conv_k as u32), Arg::U32(m as u32)]);
                 self.k1("conv_state_update", ch, &[Arg::Ptr(qkv_p), Arg::Ptr(conv.ptr), Arg::U32(ch as u32), Arg::U32(c.conv_k as u32), Arg::U32(m as u32)]);
@@ -4511,7 +4517,7 @@ impl<'c, 'm> GpuSession<'c, 'm> {
                                             Arg::Ptr(self.sv(&format!("{p}.ssm_conv1d.weight"))), Arg::Ptr(bb.x.ptr),
                                             Arg::U32(ch as u32), Arg::U32(c.conv_k as u32), Arg::U32(m as u32)]);
             }
-            self.k2("l2norm_qk_rows", (2 * kh) as u32, m as u32, 128, &[Arg::Ptr(bb.x.ptr), Arg::U32(kh as u32), Arg::U32(d as u32),
+            self.k2(self.nk("l2norm_qk_rows", "l2norm_qk_rows_f"), (2 * kh) as u32, m as u32, 128, &[Arg::Ptr(bb.x.ptr), Arg::U32(kh as u32), Arg::U32(d as u32),
                                                                        Arg::F32((d as f32).sqrt()), Arg::U32(ch as u32)]);
             if self.fuse & 4 != 0 {
                 // the recurrence and the head's gated RMSNorm in one kernel
@@ -4536,7 +4542,7 @@ impl<'c, 'm> GpuSession<'c, 'm> {
                 } else {
                 static DELTA_X8: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
                 let x8 = m >= 16 && *DELTA_X8.get_or_init(|| std::env::var("SHADOW_DELTA_X8").is_ok_and(|v| v == "1"));
-                self.k(if x8 { "delta_steps128_x8" } else { "delta_steps128" }, vh as u32, if x8 { 1024 } else { 128 }, &[
+                self.k(if x8 { "delta_steps128_x8" } else if std::env::var("SHADOW_DELTA_F32").is_ok_and(|v| v == "0") { "delta_steps128" } else { self.nk("delta_steps128", "delta_steps128_f") }, vh as u32, if x8 { 1024 } else { 128 }, &[
                     Arg::Ptr(bb.x.ptr), Arg::Ptr(bb.x.ptr + (kd * 4) as u64), Arg::Ptr(bb.x.ptr + (2 * kd * 4) as u64),
                     Arg::U32(ch as u32), Arg::Ptr(beta_p), Arg::Ptr(alpha_p), Arg::U32(vh as u32),
                     Arg::Ptr(self.sv(&format!("{p}.ssm_a"))), Arg::Ptr(self.sv(&format!("{p}.ssm_dt.bias"))), Arg::Ptr(s.ptr),
