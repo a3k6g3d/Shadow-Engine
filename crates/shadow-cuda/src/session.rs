@@ -196,7 +196,7 @@ fn big_rows_cap() -> usize {
 /// Rows of the layer's temporary buffers when a pass is bigger (`SHADOW_SUB_ROWS`): the pass is run layer by layer in sub-chunks of this many rows, so only the residual
 /// streams (4 x hidden floats a row) are kept for the whole pass and a pass of 8,192 rows takes less VRAM than 4,096 rows used to.
 fn sub_rows_cap() -> usize {
-    std::env::var("SHADOW_SUB_ROWS").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(1024).max(256)
+    std::env::var("SHADOW_SUB_ROWS").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(2048).max(256)
 }
 /// Bytes the big batch's buffers take for `total` rows a pass: the temporaries for the sub-chunk and the residual streams of every row.
 fn big_batch_bytes(c: &shadow_model::forward::Config, total: usize) -> usize {
