@@ -4508,8 +4508,22 @@ impl<'c, 'm> GpuSession<'c, 'm> {
             let keep = c.idx_budget / ratio;
             // the first token with more complete blocks than the budget keeps
             let jt = (0..m).find(|&j| (p0 + j + 1) / ratio > keep).unwrap_or(m);
-            for j0 in (0..jt).step_by(ATT_ROWS) {
-                let n = (jt - j0).min(ATT_ROWS);
+            // the first positions attend every earlier token: float scores and sums with the key loads shared over `hb` heads a block (`SHADOW_ATT_F32=0`: the double kernel,
+            // a block a head); the float scratch holds twice the rows
+            let dense_f32 = self.tensor_prompt && !std::env::var("SHADOW_ATT_F32").is_ok_and(|v| v == "0");
+            let dense_rows = if dense_f32 { 2 * ATT_ROWS } else { ATT_ROWS };
+            for j0 in (0..jt).step_by(dense_rows) {
+                let n = (jt - j0).min(dense_rows);
+                if dense_f32 {
+                    let group = nh / nkv;
+                    let hb = std::env::var("SHADOW_ATT_HB").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(4).clamp(1, 8).min(group);
+                    self.k2("attention_group_dense_rows_f32", (nkv * group.div_ceil(hb)) as u32, n as u32, 256, &[
+                        Arg::Ptr(row(&bb.q, qd, j0)), Arg::Ptr(at.k.ptr), Arg::Ptr(at.v.ptr), Arg::U32((p0 + j0 + 1) as u32),
+                        Arg::Ptr(row(&bb.gate, qd, j0)), Arg::Ptr(row(&bb.ao, qd, j0)), Arg::Ptr(bb.att.ptr),
+                        Arg::U32(self.cap as u32), Arg::U32(nkv as u32), Arg::U32(hd as u32), Arg::U32(group as u32),
+                        Arg::U32(nh as u32), Arg::U32(hb as u32)]);
+                    continue;
+                }
                 self.k2("attention_heads_rows", nh as u32, n as u32, 256, &[
                     Arg::Ptr(row(&bb.q, qd, j0)), Arg::Ptr(at.k.ptr), Arg::Ptr(at.v.ptr), Arg::U32((p0 + j0 + 1) as u32),
                     Arg::Ptr(row(&bb.gate, qd, j0)), Arg::Ptr(row(&bb.ao, qd, j0)), Arg::Ptr(bb.att.ptr),
