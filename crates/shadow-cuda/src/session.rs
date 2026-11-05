@@ -3803,6 +3803,15 @@ impl<'c, 'm> GpuSession<'c, 'm> {
         self.step_batch_opt(tokens, true)
     }
 
+    /// `step_batch` for a caller that uses only the last row's logits (the end of a prompt): the output projection of the rows before it is skipped (they come back empty;
+    /// `SHADOW_LOGITS_LAST=0` computes them).  The 1,024 rows of a last sub-chunk were 130 launches of 2.7 ms, 352 ms of a 15k prompt.
+    pub fn step_batch_last(&mut self, tokens: &[u32]) -> Vec<Vec<f32>> {
+        self.logits_last = !std::env::var("SHADOW_LOGITS_LAST").is_ok_and(|v| v == "0");
+        let out = self.step_batch(tokens);
+        self.logits_last = false;
+        out
+    }
+
     /// `step_batch` without the logits (reading a prompt).
     pub fn prefill_batch(&mut self, tokens: &[u32]) {
         self.step_batch_opt(tokens, false);
@@ -5426,8 +5435,7 @@ impl Stepper for GpuSession<'_, '_> {
         GpuSession::step_prefill(self, token);
     }
     fn prefill(&mut self, tokens: &[u32]) -> Vec<f32> {
-        // a tie (docs/STATUS.md 2026-11-05 (31)): opt-in
-        self.logits_last = std::env::var("SHADOW_LOGITS_LAST").is_ok_and(|v| v == "1");
+        self.logits_last = !std::env::var("SHADOW_LOGITS_LAST").is_ok_and(|v| v == "0");
         let out = self.step_batch(tokens).pop().unwrap_or_default();
         self.logits_last = false;
         out

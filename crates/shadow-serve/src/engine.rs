@@ -767,7 +767,7 @@ fn answer<'c>(arch: &str, req: &Request, tok: &Tokenizer, sess: &mut GpuSession<
             lent = false;
         }
         if end == unread.len() {
-            *last_logits = sess.step_batch(&unread[i..end]).pop().unwrap();
+            *last_logits = sess.step_batch_last(&unread[i..end]).pop().unwrap();
         } else {
             sess.prefill_batch(&unread[i..end]);
         }
