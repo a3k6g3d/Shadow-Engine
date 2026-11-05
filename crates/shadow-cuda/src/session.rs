@@ -188,9 +188,20 @@ pub const MAX_BATCH: usize = 256;
 pub const BIG_BATCH: usize = 2048;
 /// Tokens a pass can take at most (`lend_kv` picks 2,048, 1,024 or 512 by the lent KV tail). 4,096 was tried (half the copying a token) but the drafter's feature buffers have to hold a whole pass: +150 MB of VRAM, -2 points of the 24k window's prompt speed, and the tail is only that big in a window band where the staging pipeline cannot start (STATUS.md 2026-11-03)
 pub const BIG_BATCH_MAX: usize = 8192;
-/// Rows a pass takes when the lent room allows (`SHADOW_BIG_ROWS` sets it): 4,096 read 9.5k and 15k prompts 14% and 23% faster than 2,048 (docs/STATUS.md 2026-11-04), at some cost to the first reply's decode speed (the cache is emptier)
+/// Rows a pass takes when the lent room allows (`SHADOW_BIG_ROWS` sets it): 4,096 read 9.5k and 15k prompts 14% and 23% faster than 2,048, 8,192 (run in sub-chunks, `sub_rows_cap`) 5-8% faster again
+/// (docs/STATUS.md 2026-11-04), at some cost to the first reply's decode speed (the cache is emptier)
 fn big_rows_cap() -> usize {
-    std::env::var("SHADOW_BIG_ROWS").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(4096).min(BIG_BATCH_MAX)
+    std::env::var("SHADOW_BIG_ROWS").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(8192).min(BIG_BATCH_MAX)
+}
+/// Rows of the layer's temporary buffers when a pass is bigger (`SHADOW_SUB_ROWS`): the pass is run layer by layer in sub-chunks of this many rows, so only the residual
+/// streams (4 x hidden floats a row) are kept for the whole pass and a pass of 8,192 rows takes less VRAM than 4,096 rows used to.
+fn sub_rows_cap() -> usize {
+    std::env::var("SHADOW_SUB_ROWS").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(2048).max(256)
+}
+/// Bytes the big batch's buffers take for `total` rows a pass: the temporaries for the sub-chunk and the residual streams of every row.
+fn big_batch_bytes(c: &shadow_model::forward::Config, total: usize) -> usize {
+    let sub = sub_rows_cap().min(total);
+    bb_row_floats(c) * 4 * sub + if total > sub { 2 * c.streams * c.hidden * 4 * total } else { 0 }
 }
 /// Unread prompt tokens from which the layer-ahead pipeline and the big batch are used.
 pub const LONG_PROMPT: usize = 1024;
@@ -370,6 +381,13 @@ pub struct GpuSession<'c, 'm> {
     dscr: DeviceBuffer<'c>,
     /// with `--tensor-prompt` (`SHADOW_PREFILL_DEVPLAN=0` off): a long prompt's MoE is routed and planned on the device (`dev_plan`); these are its scratch buffers:
     /// each token's chosen experts, the users of each expert, each expert's first group, and the host's per-layer expert tables (copied flags, addresses)
+    /// the residual streams of every row of a pass bigger than `rows` (see `sub_rows_cap`); `bb.r` is then a view of the sub-chunk being run
+    rbig: Option<DeviceBuffer<'c>>,
+    /// the same for each row's normalized input to the next layer (`bb.rn`), so the batched fused write + norm keeps running between sub-chunks
+    rnbig: Option<DeviceBuffer<'c>>,
+    /// whether the sub-chunk being run is the pass's last (the layer's copy pipeline advances once a layer, after it)
+    sub_last: bool,
+    sub_first: bool,
     devplan: bool,
     dp_tidx: DeviceBuffer<'c>,
     dp_cnt: DeviceBuffer<'c>,
@@ -1568,6 +1586,7 @@ impl<'c, 'm> GpuSession<'c, 'm> {
         };
         let mut s = GpuSession {
             ctx, m, mvp, fw, w, v, b, bb, replay, dscr,
+            rbig: None, rnbig: None, sub_last: true, sub_first: true,
             devplan: tiers.tensor_prompt && !std::env::var("SHADOW_PREFILL_DEVPLAN").is_ok_and(|v| v == "0"), dp_tidx, dp_cnt, dp_gstart, dp_copied, dp_eaddr, kv_regions, kv_extra: None, kv_extra_reg, prompt_hint: 0, kv_rows: 0, kv_halves: false, router_bias: std::env::var("SHADOW_ROUTER_BIAS").ok().and_then(|v| v.parse().ok()).unwrap_or(0.0), batch_scratch, delta, attn, ple_state, tokens: vec![], pictures: vec![], rope_tab: None, rope_on: false, cap, trace: None, stop_after: None,
             resident_bytes, expert_uploads: 0, cache, ram, copy_stream, copy_stream2, copy_ev2, copy_event, staging,
             pending: vec![], routing: RoutingCounts::new(c.n_layer, c.n_expert),
@@ -2760,7 +2779,7 @@ impl<'c, 'm> GpuSession<'c, 'm> {
     /// there is nothing to lend (no cache, a pinned placement).
     /// Tokens a pass can take now: `MAX_BATCH`, more while a long prompt has the cache lent.
     pub fn batch_rows(&self) -> usize {
-        self.rows
+        self.batch_max
     }
 
     /// The engine tells the session how many tokens the next long prompt reads (so `lend_kv` knows how much of the window it will fill).
@@ -2857,11 +2876,11 @@ impl<'c, 'm> GpuSession<'c, 'm> {
         // more rows than the KV tail holds (`SHADOW_BIG_ROWS`): the rest of their buffers from the arena, past the halves (256 MiB more for the carving's gaps)
         let extra = if kv_lent {
             let cap = big_rows_cap();
-            (bb_row_floats(&self.m.cfg) * 4 * cap + (256 << 20)).saturating_sub(self.kv_extra.as_ref().map_or(0, |x| x.bytes))
+            (big_batch_bytes(&self.m.cfg, cap) + (256 << 20)).saturating_sub(self.kv_extra.as_ref().map_or(0, |x| x.bytes))
         } else { 0 };
         let want = std::env::var("SHADOW_PREFILL_LEND_MIB").ok().and_then(|v| v.parse::<usize>().ok()).map(|m| m << 20)
             .unwrap_or((self.m.cfg.n_expert * if pipe { 2 } else { 1 } + if pipe { 2 } else { 0 }) * self.cache.slot_bytes
-                       + if pipe && big && !kv_lent { bb_row_floats(&self.m.cfg) * big_cap * 4 + (1 << 16) } else { extra })
+                       + if pipe && big && !kv_lent { big_batch_bytes(&self.m.cfg, big_cap) + (1 << 16) } else { extra })
             .min((self.cache.arena_bytes / 100 * std::env::var("SHADOW_LEND_PCT").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(99)).min(self.cache.arena_bytes.saturating_sub(24 * self.cache.slot_bytes)));
         let target = self.cache.arena_bytes - want;
         let s0 = self.cache.slot_offset.partition_point(|&o| (o as usize) < target);
@@ -3129,6 +3148,16 @@ impl<'c, 'm> GpuSession<'c, 'm> {
                 self.stage_copy(l + 1);
             }
         }
+        // the next layer's copy and the read-ahead after it are queued at the start of the layer (its first sub-chunk), not behind its last experts: the half the copy fills
+        // was read by layer l - 1, whose combine the copy stream waits for, so the copy runs behind the whole layer's mixers and experts
+        // (`SHADOW_STAGE_EARLY=0`: after the layer, as before)
+        let early = !lead2 && !std::env::var("SHADOW_STAGE_EARLY").is_ok_and(|v| v == "0");
+        if early && self.sub_first && l + 1 < c.n_layer {
+            self.ctx.stream_wait_event(Some(&self.copy_stream), &self.sp.as_ref().unwrap().done[(l + 1) & 1]).unwrap();
+            self.stage_copy(l + 1);
+            self.sp.as_ref().unwrap().buf_done[(l + 2) % 3].synchronize().unwrap();
+            self.stage_pipe_read(l + 2);
+        }
         let (plan, n_set) = if let Some(tops) = tops {
             let mut seen = vec![false; ne];
             let mut set: Vec<usize> = Vec::new();
@@ -3178,8 +3207,15 @@ impl<'c, 'm> GpuSession<'c, 'm> {
             Arg::Ptr(row(&bb.y, h, 0)), Arg::Ptr(row(&bb.eo, k * h, 0)), Arg::Ptr(bb.gtab.ptr + plan.weights),
             Arg::Ptr(row(&bb.so, h, 0)), Arg::Ptr(row(&bb.sgl, 1, 0)), Arg::Ptr(bb.gtab.ptr + plan.counts),
             Arg::U32(h as u32), Arg::U32(k as u32)]);
+        if !self.sub_last {
+            // not the layer's last sub-chunk: the copy pipeline moves on once, after the last one
+            return;
+        }
         if !lead2 {
             self.sp.as_ref().unwrap().done[p].record(None).unwrap();
+        }
+        if early {
+            return;
         }
         // now the next layer's copy and the one after's reads, behind this layer's launches: the GPU runs this layer while the host queues them
         if lead2 {
@@ -3241,10 +3277,12 @@ impl<'c, 'm> GpuSession<'c, 'm> {
         // read 2,048 tokens at a time must not drop to 256 for want of a few MiB; each pass copies a layer's experts whatever its token count.
         let env_cap = big_rows_cap();
         let cap = if self.kv_halves { env_cap.min(self.kv_rows) } else { env_cap };
+        let ch = c.streams * c.hidden;
         let ctx = self.ctx;
         let dummy = |ctx: &'c Context| unsafe { DeviceBuffer::view(ctx, 0, 0) };
         // the carving is first-fit over the ranges, so the rows are found by carving: the most rows (a multiple of 64) whose buffers all fit
-        let fits = |rows: usize| -> bool {
+        // `total` rows a pass: the temporaries are for `rows`, the residual streams for `total` (when that is more)
+        let fits = |rows: usize, total: usize| -> bool {
             let mut cur: Vec<u64> = ranges.iter().map(|r| r.0).collect();
             let mut take = |floats: usize| -> Result<DeviceBuffer<'c>, String> {
                 let bytes = (floats.max(1) * 4).next_multiple_of(256) as u64;
@@ -3253,17 +3291,27 @@ impl<'c, 'm> GpuSession<'c, 'm> {
                 Ok(unsafe { DeviceBuffer::view(ctx, 0, 0) })
             };
             let fixed = FixedBufs { att: dummy(ctx), sel_iqn: dummy(ctx), sel_scores: dummy(ctx), sel_toks: dummy(ctx), logits: dummy(ctx) };
-            make_bb(c, rows, &mut take, fixed).is_ok()
+            if make_bb(c, rows, &mut take, fixed).is_err() {
+                return false;
+            }
+            total <= rows || (take(total * ch).is_ok() && take(total * ch).is_ok())
         };
-        let mut rows = cap / 64 * 64;
-        while rows >= 2 * MAX_BATCH && !fits(rows) {
+        let sub = sub_rows_cap().min(cap);
+        let mut rows = sub / 64 * 64;
+        while rows >= 2 * MAX_BATCH && !fits(rows, rows) {
             rows -= 64;
         }
         if rows < 2 * MAX_BATCH {
             return false;
         }
+        // the most rows a pass can have with those temporaries (a multiple of 64, at most the cap)
+        let mut total = cap / 64 * 64;
+        while total > rows && !fits(rows, total) {
+            total -= 64;
+        }
+        let total = total.max(rows);
         if std::env::var("SHADOW_STAGE_TIME").is_ok_and(|v| v == "1") {
-            eprintln!("BIGBATCH lent {} slots ({:.2} GiB), halves {:.2} GiB, ranges {} ({:.2} GiB), rows {rows} of cap {cap}",
+            eprintln!("BIGBATCH lent {} slots ({:.2} GiB), halves {:.2} GiB, ranges {} ({:.2} GiB), rows {rows} of cap {cap}, pass {total} rows",
                       lent.n, (lent.n * self.cache.slot_bytes) as f64 / 1073741824.0, halves as f64 / 1073741824.0,
                       ranges.len(), ranges.iter().map(|r| r.1 - r.0).sum::<u64>() as f64 / 1073741824.0);
         }
@@ -3283,11 +3331,14 @@ impl<'c, 'm> GpuSession<'c, 'm> {
             logits: std::mem::replace(&mut self.bb.logits, dummy(ctx)),
         };
         let built = make_bb(c, rows, &mut take, fixed);
+        let (rbig, rnbig) = if total > rows { (take(total * ch).ok(), take(total * ch).ok()) } else { (None, None) };
         match built {
             Ok(big) => {
                 self.small_bb = Some(std::mem::replace(&mut self.bb, big));
                 self.rows = rows;
-                self.batch_max = rows;
+                self.batch_max = if rbig.is_some() && rnbig.is_some() { total } else { rows };
+                self.rbig = rbig;
+                self.rnbig = rnbig;
                 true
             }
             Err(_) => false, // cannot happen: `take` does not fail; the fixed buffers are dropped views
@@ -3302,6 +3353,8 @@ impl<'c, 'm> GpuSession<'c, 'm> {
             std::mem::swap(a, b);
         }
         self.bb = small;
+        self.rbig = None;
+        self.rnbig = None;
         self.rows = MAX_BATCH;
         self.batch_max = MAX_BATCH;
     }
@@ -3906,6 +3959,23 @@ impl<'c, 'm> GpuSession<'c, 'm> {
         let c = &self.m.cfg;
         let (h, cs) = (c.hidden, c.streams);
         let ch = h * cs;
+        // a pass bigger than the temporaries' rows runs layer by layer in sub-chunks (the first takes the remainder, so the last is a full one), the residual streams
+        // of every row in `rbig`; `bb.r` is a view of the sub-chunk being run
+        let sub_mode = m > self.rows && self.rbig.is_some() && self.rnbig.is_some() && !self.pipeline_ok(m);
+        let subs: Vec<(usize, usize)> = if sub_mode {
+            let s = self.rows;
+            let first = m % s;
+            let mut v = vec![];
+            if first > 0 {
+                v.push((0, first));
+            }
+            v.extend((first..m).step_by(s).map(|s0| (s0, s)));
+            v
+        } else {
+            vec![(0, m)]
+        };
+        assert!(sub_mode || m <= self.rows, "a pass of {m} rows with temporaries for {}", self.rows);
+        let r_all = if sub_mode { self.rbig.as_ref().unwrap().ptr } else { self.bb.r.ptr };
         {
             let (t, bytes) = self.m.dense("token_embd.weight");
             let (qk, qb) = t.ty.block().unwrap();
@@ -3917,7 +3987,7 @@ impl<'c, 'm> GpuSession<'c, 'm> {
                     None => dequantize(t.ty, &bytes[tok as usize * rb..(tok as usize + 1) * rb], &mut x).unwrap(),
                 }
                 self.upload_to(self.b.e.ptr, &f32s(&x));
-                self.k1("broadcast", ch, &[Arg::Ptr(self.b.e.ptr), Arg::Ptr(row(&self.bb.r, ch, j)), Arg::U32(h as u32),
+                self.k1("broadcast", ch, &[Arg::Ptr(self.b.e.ptr), Arg::Ptr(r_all + (j * ch * 4) as u64), Arg::U32(h as u32),
                                            Arg::U32(cs as u32)]);
             }
         }
@@ -3930,90 +4000,123 @@ impl<'c, 'm> GpuSession<'c, 'm> {
         if piped {
             rn_ready = self.layers_pipelined(m, p0, &mut logs, graphs);
         }
+        let saved_r = if sub_mode {
+            let rn = std::mem::replace(&mut self.bb.rn, unsafe { self.rnbig.as_ref().unwrap().subview(0, 0) });
+            Some((std::mem::replace(&mut self.bb.r, unsafe { self.rbig.as_ref().unwrap().subview(0, 0) }), rn))
+        } else {
+            None
+        };
+        // whether each row's normalized input to the layer is in `rn`: one answer for all of a layer's sub-chunks (each made it for itself at the end of the layer before)
+        let mut rn_layer = rn_ready;
         for l in 0..(if piped { 0 } else { c.n_layer }) {
-            if l == c.ple_layer {
-                // every position's rows at once, in parallel
-                let ple_probe = std::env::var("SHADOW_PLE_TIME").is_ok_and(|v| v == "1");
-                if ple_probe {
-                    self.ctx.synchronize().unwrap();
+            for (si, &(s0, ms)) in subs.iter().enumerate() {
+                rn_ready = rn_layer;
+                if sub_mode {
+                    // SAFETY: rows s0 .. s0 + ms of the residual streams, used by this sub-chunk only until the next view
+                    self.bb.r = unsafe { self.rbig.as_ref().unwrap().subview(s0 * ch * 4, ms * ch * 4) };
+                    self.bb.rn = unsafe { self.rnbig.as_ref().unwrap().subview(s0 * ch * 4, ms * ch * 4) };
+                    self.sub_last = si + 1 == subs.len();
+                    self.sub_first = si == 0;
                 }
-                let t_ple_block = std::time::Instant::now();
-                let all: Vec<i64> = (0..m).flat_map(|j| ple_rows(c, &self.tokens[..p0 + j + 1])).collect();
-                self.m.ple_prefetch(&all);
-                let t_pref = t_ple_block.elapsed().as_secs_f64();
-                for j in 0..m {
-                    let r = row(&self.bb.r, ch, j);
-                    self.ple_at(l, p0 + j + 1, r);
-                    if self.replay.on.get() {
-                        self.k1("copy", ch, &[Arg::Ptr(self.replay.ple.ptr + (j * ch * 4) as u64), Arg::Ptr(self.b.gvn.ptr),
-                                              Arg::U32(ch as u32)]);
+                let (m, p0) = (ms, p0 + s0);
+                if l == c.ple_layer {
+                    // every position's rows at once, in parallel
+                    let ple_probe = std::env::var("SHADOW_PLE_TIME").is_ok_and(|v| v == "1");
+                    if ple_probe {
+                        self.ctx.synchronize().unwrap();
                     }
-                    self.k1("add", ch, &[Arg::Ptr(r), Arg::Ptr(self.b.gv.ptr), Arg::U32(ch as u32)]);
+                    let t_ple_block = std::time::Instant::now();
+                    let all: Vec<i64> = (0..m).flat_map(|j| ple_rows(c, &self.tokens[..p0 + j + 1])).collect();
+                    self.m.ple_prefetch(&all);
+                    let t_pref = t_ple_block.elapsed().as_secs_f64();
+                    for j in 0..m {
+                        let r = row(&self.bb.r, ch, j);
+                        self.ple_at(l, p0 + j + 1, r);
+                        if self.replay.on.get() {
+                            self.k1("copy", ch, &[Arg::Ptr(self.replay.ple.ptr + (j * ch * 4) as u64), Arg::Ptr(self.b.gvn.ptr),
+                                                  Arg::U32(ch as u32)]);
+                        }
+                        self.k1("add", ch, &[Arg::Ptr(r), Arg::Ptr(self.b.gv.ptr), Arg::U32(ch as u32)]);
+                    }
+                    rn_ready = false;
+                    if ple_probe {
+                        let t_host = t_ple_block.elapsed().as_secs_f64();
+                        self.ctx.synchronize().unwrap();
+                        eprintln!("SHADOW_PLE_TIME m={m}: prefetch {:.2} ms, host to queued {:.2} ms, with the GPU done {:.2} ms",
+                                  1e3 * t_pref, 1e3 * t_host, 1e3 * t_ple_block.elapsed().as_secs_f64());
+                    }
                 }
-                rn_ready = false;
-                if ple_probe {
-                    let t_host = t_ple_block.elapsed().as_secs_f64();
-                    self.ctx.synchronize().unwrap();
-                    eprintln!("SHADOW_PLE_TIME m={m}: prefetch {:.2} ms, host to queued {:.2} ms, with the GPU done {:.2} ms",
-                              1e3 * t_pref, 1e3 * t_host, 1e3 * t_ple_block.elapsed().as_secs_f64());
+                {
+                    let on = self.replay.on.get();
+                    if !c.is_attention(l) {
+                        self.ensure_multi(l, 0, on);
+                    }
+                    self.ensure_multi(l, 1, false);
+                    self.ensure_multi(l, 2, false);
                 }
-            }
-            {
-                let on = self.replay.on.get();
-                if !c.is_attention(l) {
-                    self.ensure_multi(l, 0, on);
-                }
-                self.ensure_multi(l, 1, false);
-                self.ensure_multi(l, 2, false);
-            }
-            heap_check("layer loop top");
-            if graphs && !c.is_attention(l) && l != c.ple_layer {
-                // a DeltaNet layer up to its router is the same launches for every batch of m: one graph
-                let on = self.replay.on.get();
-                // the key holds where the batch buffers are (the graph's launches carry their addresses): the same row count at another address - a prompt that lent another stretch of the KV window - is another graph
-                self.batch_graph_segment((l, rn_ready, m, on, self.rows, self.bb.r.ptr), |s| {
-                    s.hc_read_batch(&format!("blk.{l}.hc_attn"), true, rn_ready, m);
-                    s.delta_batch(l, m);
-                    s.hc_write_batch(Some(&format!("blk.{l}.hc_ffn_norm.weight")), m);
-                    s.hc_read_batch(&format!("blk.{l}.hc_ffn"), true, true, m);
-                    s.moe_router_batch(l, m);
-                });
-                self.lt_point(if graphs { "delta segment (graph)" } else { "delta segment" });
-                heap_check("delta segment (graph) queued");
-                self.moe_batch(l, m, &mut logs, true, None);
-                heap_check("moe_batch after a graph segment");
-                self.lt_point("moe (router wait, fetch, experts)");
-            } else {
-                heap_check("layer start (eager)");
-                self.hc_read_batch(&format!("blk.{l}.hc_attn"), true, rn_ready, m);
-                if c.is_attention(l) {
-                    self.attention_batch(l, p0, m);
+                heap_check("layer loop top");
+                if graphs && !c.is_attention(l) && l != c.ple_layer {
+                    // a DeltaNet layer up to its router is the same launches for every batch of m: one graph
+                    let on = self.replay.on.get();
+                    // the key holds where the batch buffers are (the graph's launches carry their addresses): the same row count at another address - a prompt that lent another stretch of the KV window - is another graph
+                    self.batch_graph_segment((l, rn_ready, m, on, self.rows, self.bb.r.ptr), |s| {
+                        s.hc_read_batch(&format!("blk.{l}.hc_attn"), true, rn_ready, m);
+                        s.delta_batch(l, m);
+                        s.hc_write_batch(Some(&format!("blk.{l}.hc_ffn_norm.weight")), m);
+                        s.hc_read_batch(&format!("blk.{l}.hc_ffn"), true, true, m);
+                        s.moe_router_batch(l, m);
+                    });
+                    self.lt_point(if graphs { "delta segment (graph)" } else { "delta segment" });
+                    heap_check("delta segment (graph) queued");
+                    self.moe_batch(l, m, &mut logs[s0..s0 + m], true, None);
+                    heap_check("moe_batch after a graph segment");
+                    self.lt_point("moe (router wait, fetch, experts)");
                 } else {
-                    self.delta_batch(l, m);
+                    heap_check("layer start (eager)");
+                    self.hc_read_batch(&format!("blk.{l}.hc_attn"), true, rn_ready, m);
+                    if c.is_attention(l) {
+                        self.attention_batch(l, p0, m);
+                    } else {
+                        self.delta_batch(l, m);
+                    }
+                    self.hc_write_batch(Some(&format!("blk.{l}.hc_ffn_norm.weight")), m);
+                    self.hc_read_batch(&format!("blk.{l}.hc_ffn"), true, true, m);
+                    self.mark("batch: mixers, norms, hc glue");
+                    self.lt_point(if c.is_attention(l) { "attention layer" } else { "delta segment" });
+                    heap_check(if c.is_attention(l) { "attention layer queued" } else { "delta segment queued" });
+                    self.moe_batch(l, m, &mut logs[s0..s0 + m], false, None);
+                    heap_check("moe_batch (eager)");
+                    self.lt_point("moe (router wait, fetch, experts)");
                 }
-                self.hc_write_batch(Some(&format!("blk.{l}.hc_ffn_norm.weight")), m);
-                self.hc_read_batch(&format!("blk.{l}.hc_ffn"), true, true, m);
-                self.mark("batch: mixers, norms, hc glue");
-                self.lt_point(if c.is_attention(l) { "attention layer" } else { "delta segment" });
-                heap_check(if c.is_attention(l) { "attention layer queued" } else { "delta segment queued" });
-                self.moe_batch(l, m, &mut logs, false, None);
-                heap_check("moe_batch (eager)");
-                self.lt_point("moe (router wait, fetch, experts)");
+                self.mark("batch: routed experts + combine");
+                let next = if l + 1 == c.ple_layer {
+                    None
+                } else if l + 1 < c.n_layer {
+                    Some(format!("blk.{}.hc_attn_norm.weight", l + 1))
+                } else {
+                    Some("output_hc_norm.weight".to_string())
+                };
+                self.hc_write_batch(next.as_deref(), m);
+                rn_ready = next.is_some();
+                if self.dflash.is_some() && (!sub_mode || si + 1 == subs.len()) {
+                    // the drafter looks back 2,048 positions: the last sub-chunk's features are the ones kept
+                    self.df_capture(l, self.bb.r.ptr, m);
+                }
             }
-            self.mark("batch: routed experts + combine");
-            let next = if l + 1 == c.ple_layer {
-                None
-            } else if l + 1 < c.n_layer {
-                Some(format!("blk.{}.hc_attn_norm.weight", l + 1))
-            } else {
-                Some("output_hc_norm.weight".to_string())
-            };
-            self.hc_write_batch(next.as_deref(), m);
-            rn_ready = next.is_some();
-            if self.dflash.is_some() {
-                self.df_capture(l, self.bb.r.ptr, m);
-            }
+            rn_layer = rn_ready;
         }
+        let (m_obs, p0_obs) = { let &(s0, ms) = subs.last().unwrap(); (ms, p0 + s0) };
+        if with_logits {
+            // the last sub-chunk's output rows (a sub-chunked pass gives logits for its last rows only; the rows before come back empty)
+            self.hc_read_batch("output_hc", false, rn_ready, m_obs);
+        }
+        if let Some((r, rn)) = saved_r {
+            // the views of the last sub-chunk go with the buffers: the saved ones are `bb.r` and `bb.rn` again
+            let _ = std::mem::replace(&mut self.bb.r, r);
+            let _ = std::mem::replace(&mut self.bb.rn, rn);
+        }
+        self.sub_last = true;
+        self.sub_first = true;
         if let Some((_, log)) = self.route_log.as_mut() {
             log.extend(logs.into_iter().flatten());
         }
@@ -4021,15 +4124,15 @@ impl<'c, 'm> GpuSession<'c, 'm> {
             self.mtp_observe(self.bb.r.ptr, toks, p0);
         }
         if self.dflash.is_some() {
-            self.dflash_observe(m, p0);
+            self.dflash_observe(m_obs, p0_obs);
         }
         if !with_logits {
             return vec![];
         }
-        self.hc_read_batch("output_hc", false, rn_ready, m);
         let mut logits = Vec::with_capacity(m);
-        for j0 in (0..m).step_by(COLS_MAX) {
-            let n = (m - j0).min(COLS_MAX);
+        logits.resize(m - m_obs, vec![]);
+        for j0 in (0..m_obs).step_by(COLS_MAX) {
+            let n = (m_obs - j0).min(COLS_MAX);
             self.mv_cols("output.weight", row(&self.bb.u, h, j0), h, self.bb.logits.ptr, c.vocab, n);
             let mut out = vec![0u8; n * c.vocab * 4];
             self.download(self.bb.logits.ptr, &mut out);
