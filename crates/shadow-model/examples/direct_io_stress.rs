@@ -24,8 +24,12 @@ fn main() {
         seed ^= seed << 17;
         seed
     };
+    let random = args.iter().any(|a| a == "--random");
     for b in 0..batches {
-        let mut bufs: Vec<Vec<u8>> = (0..pieces).map(|_| vec![0u8; piece - (next() % 4096) as usize]).collect();
+        // --random: batches of 1..pieces pieces of 0.4 .. 1.3 x piece bytes, as the layers' varying numbers of file-only experts give
+        let tiny = args.iter().any(|a| a == "--tiny");
+        let n = if random { 1 + (next() % pieces as u64) as usize } else { pieces };
+        let mut bufs: Vec<Vec<u8>> = (0..n).map(|_| if tiny { vec![0u8; 100 + (next() % 8000) as usize] } else if random { vec![0u8; (piece as u64 * (40 + next() % 90) / 100) as usize] } else { vec![0u8; piece - (next() % 4096) as usize] }).collect();
         let offs: Vec<u64> = bufs.iter().map(|v| next() % (file_len - v.len() as u64)).collect();
         {
             let mut jobs: Vec<(usize, u64, &mut [u8])> = bufs.iter_mut().zip(&offs).map(|(v, &o)| (0usize, o, v.as_mut_slice())).collect();
@@ -41,7 +45,7 @@ fn main() {
             f.read_exact(&mut want).unwrap();
             bad += (want != *v) as usize;
         }
-        println!("batch {b}: {pieces} pieces of ~{piece} bytes, {bad} differ");
+        println!("batch {b}: {} pieces, {bad} differ", bufs.len());
     }
     println!("done");
 }

@@ -1106,6 +1106,32 @@ fn route_all(logits: &[Vec<f32>], k: usize, bias: Option<(&HashMap<(usize, usize
     out
 }
 
+/// `SHADOW_HEAPCHECK=1` (debugging a heap-corruption crash): validates the process heap and reports the first `what` after which it is corrupt.
+#[cfg(windows)]
+fn heap_check(what: &str) {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    static BAD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    static VERBOSE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var("SHADOW_HEAPCHECK").is_ok_and(|v| v == "1" || v == "2")) || BAD.load(std::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
+    if *VERBOSE.get_or_init(|| std::env::var("SHADOW_HEAPCHECK").is_ok_and(|v| v == "2")) {
+        eprintln!("HEAPCHECK ok before: {what}");
+    }
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetProcessHeap() -> *mut std::ffi::c_void;
+        fn HeapValidate(heap: *mut std::ffi::c_void, flags: u32, mem: *const std::ffi::c_void) -> i32;
+    }
+    // SAFETY: plain Win32 calls on the process heap.
+    if unsafe { HeapValidate(GetProcessHeap(), 0, std::ptr::null()) } == 0 {
+        BAD.store(true, std::sync::atomic::Ordering::Relaxed);
+        eprintln!("HEAPCHECK: the process heap is CORRUPT after: {what}");
+    }
+}
+#[cfg(not(windows))]
+fn heap_check(_what: &str) {}
+
 fn grouped_plan(tops: &[Vec<(usize, f64)>], start: usize, end: usize, set: &[usize], k: usize, up: usize,
                 addr: impl Fn(usize) -> u64, copied: impl Fn(usize) -> bool, part: [u64; 3], chunk_n: usize) -> GroupedPlan {
     // (expert, [(token, rank)]) per phase, at most `chunk_n` (8, or 32 for the tensor-core kernels) tokens a group
@@ -2895,7 +2921,11 @@ impl<'c, 'm> GpuSession<'c, 'm> {
         for &(l, _) in self.ram.at.keys() {
             per_layer[l] += 1;
         }
-        let slots = per_layer.iter().map(|&n| ne.saturating_sub(n)).max().unwrap_or(ne).max(1);
+        let mut slots = per_layer.iter().map(|&n| ne.saturating_sub(n)).max().unwrap_or(ne).max(1);
+        // debugging a direct-I/O crash: `SHADOW_STAGE_SLOTS=n` sizes the read-ahead buffers for n experts (512 = every expert of a layer, so no buffer is ever replaced)
+        if let Some(n) = std::env::var("SHADOW_STAGE_SLOTS").ok().and_then(|v| v.parse::<usize>().ok()) {
+            slots = n.max(1);
+        }
         let bytes = slots * self.cache.slot_bytes;
         let (Ok(a), Ok(b), Ok(c3), Ok(e0), Ok(e1)) =
             (PinnedRegion::new(self.ctx, bytes), PinnedRegion::new(self.ctx, bytes), PinnedRegion::new(self.ctx, bytes), self.ctx.event(), self.ctx.event()) else { return };
@@ -2910,6 +2940,7 @@ impl<'c, 'm> GpuSession<'c, 'm> {
             if sp.pending {
                 let t0 = std::time::Instant::now();
                 self.m.experts_wait();
+                heap_check("experts_wait (read-ahead complete)");
                 self.waits[2] += t0.elapsed().as_secs_f64();
                 sp.pending = false;
             }
@@ -2969,7 +3000,13 @@ impl<'c, 'm> GpuSession<'c, 'm> {
         // SAFETY: buffer p is not touched again until `stage_pipe_wait` (the next `stage_pipe_read`, the copies out of it in
         // `stage_copy`, `restore_cache`); its previous contents (layer l - 2's) were copied out by a transfer the caller has seen finish.
         unsafe { self.m.experts_submit(&mut jobs) };
+        heap_check("experts_submit");
         sp.pending = true;
+        if std::env::var("SHADOW_READ_SYNC").is_ok_and(|v| v == "1") {
+            // debugging a direct-I/O crash: no read in flight while other work goes on
+            self.m.experts_wait();
+            sp.pending = false;
+        }
     }
 
     /// Queues the copy of all of layer `l`'s experts that the VRAM cache does not hold into stage half l & 1 (slot = expert number), from the
@@ -3066,6 +3103,7 @@ impl<'c, 'm> GpuSession<'c, 'm> {
         sp.events[p].record(Some(&self.copy_stream)).unwrap();
         sp.buf_done[rb].record(Some(&self.copy_stream)).unwrap();
         sp.ready[p] = l;
+        heap_check("stage_copy");
     }
 
     /// Layer `l`'s routed experts for a long prompt's m tokens, all in one group: the resident ones from the cache, the rest from stage
@@ -3076,6 +3114,7 @@ impl<'c, 'm> GpuSession<'c, 'm> {
         let (h, k, ne) = (c.hidden, c.n_expert_used, c.n_expert);
         let p = l & 1;
         let stage_time = std::env::var("SHADOW_STAGE_TIME").is_ok_and(|v| v == "1");
+        heap_check("moe_staged start");
         let t_start = std::time::Instant::now();
         // the copy of layer l + 1 is queued behind layer l's experts (it overlaps them); `SHADOW_STAGE_LEAD=2`: layer l + 2's is queued there instead and waits
         // for layer l's combine, so each copy overlaps a whole layer ahead of its use - a tie at 4,096 rows (docs/STATUS.md 2026-11-04), so opt-in
@@ -3133,6 +3172,7 @@ impl<'c, 'm> GpuSession<'c, 'm> {
         self.routed_grouped(&plan, 1, 0, m, infos);
         self.lt_point("staged: copied experts done");
         let t_launch = t_start.elapsed();
+        heap_check("moe_staged experts launched");
         let bb = &self.bb;
         self.k2("moe_combine_qwen_rows", (h as u32).div_ceil(256), m as u32, 256, &[
             Arg::Ptr(row(&bb.y, h, 0)), Arg::Ptr(row(&bb.eo, k * h, 0)), Arg::Ptr(bb.gtab.ptr + plan.weights),
@@ -3926,6 +3966,7 @@ impl<'c, 'm> GpuSession<'c, 'm> {
                 self.ensure_multi(l, 1, false);
                 self.ensure_multi(l, 2, false);
             }
+            heap_check("layer loop top");
             if graphs && !c.is_attention(l) && l != c.ple_layer {
                 // a DeltaNet layer up to its router is the same launches for every batch of m: one graph
                 let on = self.replay.on.get();
@@ -3938,9 +3979,12 @@ impl<'c, 'm> GpuSession<'c, 'm> {
                     s.moe_router_batch(l, m);
                 });
                 self.lt_point(if graphs { "delta segment (graph)" } else { "delta segment" });
+                heap_check("delta segment (graph) queued");
                 self.moe_batch(l, m, &mut logs, true, None);
+                heap_check("moe_batch after a graph segment");
                 self.lt_point("moe (router wait, fetch, experts)");
             } else {
+                heap_check("layer start (eager)");
                 self.hc_read_batch(&format!("blk.{l}.hc_attn"), true, rn_ready, m);
                 if c.is_attention(l) {
                     self.attention_batch(l, p0, m);
@@ -3951,7 +3995,9 @@ impl<'c, 'm> GpuSession<'c, 'm> {
                 self.hc_read_batch(&format!("blk.{l}.hc_ffn"), true, true, m);
                 self.mark("batch: mixers, norms, hc glue");
                 self.lt_point(if c.is_attention(l) { "attention layer" } else { "delta segment" });
+                heap_check(if c.is_attention(l) { "attention layer queued" } else { "delta segment queued" });
                 self.moe_batch(l, m, &mut logs, false, None);
+                heap_check("moe_batch (eager)");
                 self.lt_point("moe (router wait, fetch, experts)");
             }
             self.mark("batch: routed experts + combine");
