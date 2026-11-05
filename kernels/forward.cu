@@ -228,6 +228,59 @@ extern "C" __global__ void conv_silu_steps(const float* x, float* state, const f
     }
 }
 
+// `conv_silu_steps` with every (token, channel) an independent thread: the window of token j is the k - 1 inputs before it (the carried state for tokens before this batch's
+// first), taps summed in the same order in double, so the outputs are bit for bit `conv_silu_steps`' (one thread a channel walking all m tokens: 32 blocks of 256 on the
+// whole GPU).  Launch (ceil(ch / 256), m); `conv_state_update` then moves the window on (each channel one thread, so the in-place shift is ordered).
+extern "C" __global__ void conv_silu_steps_par(const float* x, const float* state, const float* w, float* out, unsigned int ch, unsigned int k, unsigned int m) {
+    const unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
+    const unsigned int j = blockIdx.y;
+    if (i >= ch) return;
+    const float xi = x[(u64) j * ch + i];
+    double acc = (double) w[i * k + (k - 1)] * (double) xi;
+    for (unsigned int t = 0; t + 1 < k; ++t) {
+        const int n = (int) j - (int) (k - 1) + (int) t;                  // the token this tap reads
+        const float v = n >= 0 ? x[(u64) n * ch + i] : state[(u64) (n + (int) k - 1) * ch + i];
+        acc += (double) w[i * k + t] * (double) v;
+    }
+    out[(u64) j * ch + i] = siluf_ref((float) acc);
+}
+
+extern "C" __global__ void conv_state_update(const float* x, float* state, unsigned int ch, unsigned int k, unsigned int m) {
+    const unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= ch) return;
+    for (unsigned int t = 0; t + 1 < k; ++t) {
+        const int n = (int) m - (int) (k - 1) + (int) t;
+        // n < 0: the old window's entry n + k - 1 = m + t, past t, not yet overwritten (t ascends)
+        state[(u64) t * ch + i] = n >= 0 ? x[(u64) n * ch + i] : state[(u64) (n + (int) k - 1) * ch + i];
+    }
+}
+
+// `gated_rmsnorm_rows` for d = 128 with a warp a (head, row): the lane holds elements l, l + 32, l + 64, l + 96 and sums them as the 128-thread block tree did
+// ((e_l + e_l+64) + (e_l+32 + e_l+96), then halving with shuffles), so the sum of squares, and every output, is bit for bit the same.  Launch (ceil(heads / 4), m) blocks of 128.
+extern "C" __global__ void __launch_bounds__(128) gated_rmsnorm_rows_w(float* o, const float* w, const float* z, unsigned int d, float eps, unsigned int os,
+                                                                         unsigned int heads) {
+    const unsigned int lane = threadIdx.x & 31, head = blockIdx.x * 4 + (threadIdx.x >> 5);
+    if (head >= heads) return;
+    float* h = o + (u64) blockIdx.y * os + (u64) head * d;
+    const float* zh = z + (u64) blockIdx.y * os + (u64) head * d;
+    float e[4];
+    #pragma unroll
+    for (unsigned int q = 0; q < 4; ++q) e[q] = h[lane + 32 * q];
+    double sq[4];
+    #pragma unroll
+    for (unsigned int q = 0; q < 4; ++q) sq[q] = 0.0 + (double) e[q] * (double) e[q];
+    double v = (sq[0] + sq[2]) + (sq[1] + sq[3]);
+    #pragma unroll
+    for (unsigned int s = 16; s > 0; s >>= 1) v += __shfl_down_sync(0xffffffffu, v, s);
+    v = __shfl_sync(0xffffffffu, v, 0);
+    const double r = 1.0 / sqrt(v / (double) d + (double) eps);
+    #pragma unroll
+    for (unsigned int q = 0; q < 4; ++q) {
+        const unsigned int i = lane + 32 * q;
+        h[i] = (float) ((double) e[q] * r) * w[i] * sigmoidf_ref(zh[i]);
+    }
+}
+
 // Each `d`-wide head: x = x / sqrt(sum x^2 + 1e-6), then x /= div.  grid = heads, block = 128.
 extern "C" __global__ void l2norm_heads(float* x, unsigned int d, float div) {
     float* h = x + (u64) blockIdx.x * d;

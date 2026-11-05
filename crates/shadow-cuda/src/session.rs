@@ -2436,6 +2436,20 @@ impl<'c, 'm> GpuSession<'c, 'm> {
         }
     }
 
+    /// The head-wise gated RMSNorm of the DeltaNet output for the batch's m rows (`bb.o` normalized in place, gated by `bb.z`): for heads of 128 a warp a (head, row) with the
+    /// block tree's sum order in registers (bit for bit the same; `SHADOW_GN_W=0` keeps the block-a-head kernel).
+    fn gated_norm_rows(&self, weight: &str, d: usize, vh: usize, vd: usize, m: usize) {
+        let bb = &self.bb;
+        let eps = self.m.cfg.eps;
+        if d == 128 && !std::env::var("SHADOW_GN_W").is_ok_and(|v| v == "0") {
+            self.k2("gated_rmsnorm_rows_w", (vh as u32).div_ceil(4), m as u32, 128, &[Arg::Ptr(bb.o.ptr), Arg::Ptr(self.sv(weight)), Arg::Ptr(bb.z.ptr),
+                                                                                    Arg::U32(d as u32), Arg::F32(eps), Arg::U32(vd as u32), Arg::U32(vh as u32)]);
+        } else {
+            self.k2("gated_rmsnorm_rows", vh as u32, m as u32, 128, &[Arg::Ptr(bb.o.ptr), Arg::Ptr(self.sv(weight)), Arg::Ptr(bb.z.ptr),
+                                                                     Arg::U32(d as u32), Arg::F32(eps), Arg::U32(vd as u32)]);
+        }
+    }
+
     fn hc_norm(&self, p: &str, r: u64, rn: u64) {
         let c = &self.m.cfg;
         self.k("rmsnorm_groups", c.streams as u32, 256, &[Arg::Ptr(r), Arg::Ptr(self.sv(&format!("{p}_norm.weight"))),
@@ -4469,9 +4483,17 @@ impl<'c, 'm> GpuSession<'c, 'm> {
             // conv and norms token by token (the conv window moves), then the recurrence for all of them at once
             let (s, conv) = self.delta[l].as_ref().unwrap();
             let kh = c.ssm_k_heads;
+            // every (token, channel) its own thread, the same sums in the same order (`SHADOW_CONV_PAR=0`: one thread a channel walking the tokens)
+            if m >= 8 && !std::env::var("SHADOW_CONV_PAR").is_ok_and(|v| v == "0") {
+                self.k2("conv_silu_steps_par", (ch as u32).div_ceil(256), m as u32, 256, &[Arg::Ptr(qkv_p), Arg::Ptr(conv.ptr),
+                                            Arg::Ptr(self.sv(&format!("{p}.ssm_conv1d.weight"))), Arg::Ptr(bb.x.ptr),
+                                            Arg::U32(ch as u32), Arg::U32(c.conv_k as u32), Arg::U32(m as u32)]);
+                self.k1("conv_state_update", ch, &[Arg::Ptr(qkv_p), Arg::Ptr(conv.ptr), Arg::U32(ch as u32), Arg::U32(c.conv_k as u32), Arg::U32(m as u32)]);
+            } else {
             self.k1("conv_silu_steps", ch, &[Arg::Ptr(qkv_p), Arg::Ptr(conv.ptr),
                                             Arg::Ptr(self.sv(&format!("{p}.ssm_conv1d.weight"))), Arg::Ptr(bb.x.ptr),
                                             Arg::U32(ch as u32), Arg::U32(c.conv_k as u32), Arg::U32(m as u32)]);
+            }
             self.k2("l2norm_qk_rows", (2 * kh) as u32, m as u32, 128, &[Arg::Ptr(bb.x.ptr), Arg::U32(kh as u32), Arg::U32(d as u32),
                                                                        Arg::F32((d as f32).sqrt()), Arg::U32(ch as u32)]);
             if self.fuse & 4 != 0 {
@@ -4493,8 +4515,7 @@ impl<'c, 'm> GpuSession<'c, 'm> {
                     self.k2("delta_chunk_run", vh as u32, (d / 16) as u32, 256, &[
                         Arg::Ptr(bb.x.ptr), Arg::Ptr(bb.x.ptr + (kd * 4) as u64), Arg::Ptr(bb.x.ptr + (2 * kd * 4) as u64), Arg::Ptr(self.dscr.ptr),
                         Arg::Ptr(s.ptr), Arg::Ptr(bb.o.ptr), Arg::U32(ch as u32), Arg::U32(vd as u32), Arg::U32(kh as u32), Arg::U32(vh as u32), Arg::U32(m as u32)]);
-                    self.k2("gated_rmsnorm_rows", vh as u32, m as u32, 128, &[Arg::Ptr(bb.o.ptr), Arg::Ptr(self.sv(&format!("{p}.ssm_norm.weight"))),
-                                                                             Arg::Ptr(bb.z.ptr), Arg::U32(d as u32), Arg::F32(c.eps), Arg::U32(vd as u32)]);
+                    self.gated_norm_rows(&format!("{p}.ssm_norm.weight"), d, vh, vd, m);
                 } else {
                 static DELTA_X8: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
                 let x8 = m >= 16 && *DELTA_X8.get_or_init(|| std::env::var("SHADOW_DELTA_X8").is_ok_and(|v| v == "1"));
@@ -4503,9 +4524,7 @@ impl<'c, 'm> GpuSession<'c, 'm> {
                     Arg::U32(ch as u32), Arg::Ptr(beta_p), Arg::Ptr(alpha_p), Arg::U32(vh as u32),
                     Arg::Ptr(self.sv(&format!("{p}.ssm_a"))), Arg::Ptr(self.sv(&format!("{p}.ssm_dt.bias"))), Arg::Ptr(s.ptr),
                     Arg::Ptr(bb.o.ptr), Arg::U32(vd as u32), Arg::U32(kh as u32), Arg::U32(m as u32)]);
-                self.k2("gated_rmsnorm_rows", vh as u32, m as u32, 128, &[Arg::Ptr(bb.o.ptr), Arg::Ptr(self.sv(&format!("{p}.ssm_norm.weight"))),
-                                                                         Arg::Ptr(bb.z.ptr), Arg::U32(d as u32), Arg::F32(c.eps),
-                                                                         Arg::U32(vd as u32)]);
+                self.gated_norm_rows(&format!("{p}.ssm_norm.weight"), d, vh, vd, m);
                 }
             }
         } else {
