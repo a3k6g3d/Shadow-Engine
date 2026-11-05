@@ -1980,7 +1980,8 @@ extern "C" __global__ void fill_words(unsigned int* p, unsigned int n, unsigned 
 // ascending) kept by insertion, the weights (ex / z) / (sum of the top k's ex / z).  Writes the k expert numbers (tidx) and weights (as f32, the form the combine
 // reads) of token j and counts the token among each chosen expert's users (cnt).  The CUDA exp() is not the host library's: weights can differ in the last bit of
 // a double, which is below an f32's rounding except by chance, so this is a fast-mode kernel, not an `--exact` one.
-extern "C" __global__ void route_topk_rows(const float* logits, unsigned int* tidx, float* weights, unsigned int* cnt, unsigned int ne, unsigned int k,
+// the one-thread-a-token router (`SHADOW_ROUTE_1T=1`)
+extern "C" __global__ void route_topk_rows_1t(const float* logits, unsigned int* tidx, float* weights, unsigned int* cnt, unsigned int ne, unsigned int k,
                                            unsigned int m) {
     const unsigned int j = blockIdx.x * blockDim.x + threadIdx.x;
     if (j >= m) return;
@@ -2010,6 +2011,60 @@ extern "C" __global__ void route_topk_rows(const float* logits, unsigned int* ti
         tidx[(u64) j * k + t] = top[t];
         weights[(u64) j * k + t] = (float) ((ex[top[t]] / z) / tz);
         atomicAdd(&cnt[top[t]], 1u);
+    }
+}
+
+extern "C" __global__ void __launch_bounds__(256) route_topk_rows(const float* logits, unsigned int* tidx, float* weights, unsigned int* cnt, unsigned int ne, unsigned int k,
+                                           unsigned int m) {
+    // a warp a token (blocks of 8 warps; ne <= 512, k <= 16): the logits' max and the exponentials in parallel, the sum z sequentially in index order by lane 0
+    // (the same double sum as one thread gave), the top k by k rounds of a warp-wide best-of (greater score, then smaller index: the order the insertion kept)
+    __shared__ double exs[8][512];
+    const unsigned int lane = threadIdx.x & 31, w = threadIdx.x >> 5;
+    const unsigned int j = blockIdx.x * 8 + w;
+    if (j >= m) return;                               // whole warps leave together
+    double* ex = exs[w];
+    const float* lg = logits + (u64) j * ne;
+    float mx = -3.402823466e+38f;
+    for (unsigned int i = lane; i < ne; i += 32) mx = fmaxf(mx, lg[i]);
+    #pragma unroll
+    for (unsigned int o = 16; o > 0; o >>= 1) mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, o));
+    for (unsigned int i = lane; i < ne; i += 32) ex[i] = exp((double) (lg[i] - mx));
+    __syncwarp();
+    double z = 0.0;
+    if (lane == 0) {
+        for (unsigned int i = 0; i < ne; ++i) z += ex[i];
+    }
+    z = __shfl_sync(0xffffffffu, z, 0);
+    unsigned int taken = 0;                           // bit q: expert lane + 32 q chosen
+    unsigned int top[16];
+    for (unsigned int t = 0; t < k; ++t) {
+        double bv = -1.0;
+        unsigned int bi = 0xffffffffu;
+        for (unsigned int q = 0; q * 32 + lane < ne; ++q) {
+            if (taken >> q & 1u) continue;
+            const double v = ex[q * 32 + lane];
+            const unsigned int i = q * 32 + lane;
+            if (v > bv || (v == bv && i < bi)) { bv = v; bi = i; }
+        }
+        #pragma unroll
+        for (unsigned int o = 16; o > 0; o >>= 1) {
+            const double ov = __shfl_xor_sync(0xffffffffu, bv, o);
+            const unsigned int oi = __shfl_xor_sync(0xffffffffu, bi, o);
+            if (ov > bv || (ov == bv && oi < bi)) { bv = ov; bi = oi; }
+        }
+        top[t] = bi;
+        if ((bi & 31u) == lane) taken |= 1u << (bi >> 5);
+    }
+    double tz = 0.0;
+    for (unsigned int t = 0; t < k; ++t) tz += ex[top[t]] / z;
+    if (lane < k) {
+        // top[] is the same on every lane; lane t writes the t-th
+        unsigned int mine = top[0];
+        #pragma unroll
+        for (unsigned int t = 1; t < 16; ++t) if (t == lane) mine = top[t];
+        tidx[(u64) j * k + lane] = mine;
+        weights[(u64) j * k + lane] = (float) ((ex[mine] / z) / tz);
+        atomicAdd(&cnt[mine], 1u);
     }
 }
 

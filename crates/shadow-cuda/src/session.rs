@@ -4700,7 +4700,14 @@ impl<'c, 'm> GpuSession<'c, 'm> {
         let nrec = 2 * 3 * g * (1 + 2 * chunk_n);
         self.k1("zero_words", ne, &[Arg::Ptr(self.dp_cnt.ptr), Arg::U32(ne as u32)]);
         self.k1("zero_words", nrec, &[Arg::Ptr(gt + r0 as u64), Arg::U32(nrec as u32)]);
-        self.k1("route_topk_rows", m, &[Arg::Ptr(rl), Arg::Ptr(self.dp_tidx.ptr), Arg::Ptr(gt + w as u64), Arg::Ptr(self.dp_cnt.ptr), Arg::U32(ne as u32), Arg::U32(k as u32), Arg::U32(m as u32)]);
+        assert!(ne <= 512 && k <= 16, "route_topk_rows: {ne} experts, top {k}");
+        let route_args = [Arg::Ptr(rl), Arg::Ptr(self.dp_tidx.ptr), Arg::Ptr(gt + w as u64), Arg::Ptr(self.dp_cnt.ptr), Arg::U32(ne as u32), Arg::U32(k as u32), Arg::U32(m as u32)];
+        if std::env::var("SHADOW_ROUTE_1T").is_ok_and(|v| v == "1") {
+            self.k1("route_topk_rows_1t", m, &route_args);
+        } else {
+            self.k("route_topk_rows", m.div_ceil(8) as u32, 256, &route_args);
+        }
+
         self.k("plan_scan", 1, 1024, &[Arg::Ptr(self.dp_cnt.ptr), Arg::Ptr(self.dp_copied.ptr), Arg::Ptr(self.dp_gstart.ptr), Arg::U32(ne as u32)]);
         self.k("plan_fill", ne as u32, 256, &[Arg::Ptr(self.dp_tidx.ptr), Arg::Ptr(self.dp_cnt.ptr), Arg::Ptr(self.dp_gstart.ptr), Arg::Ptr(self.dp_copied.ptr), Arg::Ptr(self.dp_eaddr.ptr),
                                               Arg::Ptr(gt), Arg::U32(ne as u32), Arg::U32(k as u32), Arg::U32(m as u32), Arg::U32(g as u32), Arg::U32((self.rows * k) as u32),
