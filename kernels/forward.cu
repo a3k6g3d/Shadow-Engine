@@ -2165,6 +2165,68 @@ extern "C" __global__ void index_scores_rows_f32(const float* iq, const float* b
     scores[r * sc_rs + b] = s / sqrtf((float) id);
 }
 
+// `index_scores_rows_f32` register-blocked (Nsight Compute: L1/TEX at 98.6%, two loads for every FMA): a block of 128 threads scores 4 rows, a thread 2 compressed blocks of
+// keys (b and b + 128), so each key float4 serves 4 rows and each query float4 (shared memory, a broadcast) serves 2 blocks: 8 FMAs a shared load.  Every dot product is
+// summed in the same order as the one-thread-a-block kernel (i = 0 .. id - 1 by fmaf), so the scores are bit for bit the same.  heads <= 4, id a multiple of 4 and <= 256;
+// the launch is (ceil(max_nb / 256), ceil(rows / 4)) blocks of 128 threads.
+extern "C" __global__ void __launch_bounds__(128) index_scores_rows_f32v2(const float* iq, const float* blocks, float* scores, unsigned int n0,
+                                                 unsigned int ratio, unsigned int heads, unsigned int id,
+                                                 unsigned int iq_rs, unsigned int sc_rs, unsigned int rows) {
+    __shared__ __align__(16) float qs[4][4 * 256];
+    const unsigned int tid = threadIdx.x;
+    const unsigned int r0 = blockIdx.y * 4;
+    const unsigned int nr = min(4u, rows - r0);
+    for (unsigned int idx = tid; idx < 4 * heads * id; idx += 128) {
+        const unsigned int r = idx / (heads * id), k = idx % (heads * id);
+        qs[r][k] = r < nr ? iq[(u64) (r0 + r) * iq_rs + k] : 0.0f;
+    }
+    __syncthreads();
+    unsigned int nbr[4];
+    unsigned int nb_max = 0;
+    #pragma unroll
+    for (unsigned int r = 0; r < 4; ++r) {
+        nbr[r] = r < nr ? (n0 + r0 + r) / ratio : 0u;
+        nb_max = max(nb_max, nbr[r]);
+    }
+    const unsigned int bA = blockIdx.x * 256 + tid, bB = bA + 128;
+    if (bA >= nb_max) return;
+    const bool hasB = bB < nb_max;
+    const float4* kA = (const float4*) (blocks + (u64) bA * id);
+    const float4* kB = (const float4*) (blocks + (u64) (hasB ? bB : bA) * id);
+    float dA[4][4], dB[4][4];                                         // [row][head]
+    #pragma unroll
+    for (unsigned int r = 0; r < 4; ++r)
+        #pragma unroll
+        for (unsigned int h = 0; h < 4; ++h) { dA[r][h] = 0.0f; dB[r][h] = 0.0f; }
+    for (unsigned int i4 = 0; i4 < id / 4; ++i4) {
+        const float4 a = kA[i4], b = kB[i4];
+        #pragma unroll
+        for (unsigned int h = 0; h < 4; ++h) {
+            if (h < heads) {
+                #pragma unroll
+                for (unsigned int r = 0; r < 4; ++r) {
+                    const float4 q = *(const float4*) &qs[r][h * id + 4 * i4];
+                    dA[r][h] = fmaf(q.x, a.x, dA[r][h]); dA[r][h] = fmaf(q.y, a.y, dA[r][h]); dA[r][h] = fmaf(q.z, a.z, dA[r][h]); dA[r][h] = fmaf(q.w, a.w, dA[r][h]);
+                    dB[r][h] = fmaf(q.x, b.x, dB[r][h]); dB[r][h] = fmaf(q.y, b.y, dB[r][h]); dB[r][h] = fmaf(q.z, b.z, dB[r][h]); dB[r][h] = fmaf(q.w, b.w, dB[r][h]);
+                }
+            }
+        }
+    }
+    const float inv = sqrtf((float) id);
+    #pragma unroll
+    for (unsigned int r = 0; r < 4; ++r) {
+        if (r < nr) {
+            float sA = 0.0f, sB = 0.0f;
+            #pragma unroll
+            for (unsigned int h = 0; h < 4; ++h) {
+                if (h < heads) { sA += fmaxf(dA[r][h], 0.0f); sB += fmaxf(dB[r][h], 0.0f); }
+            }
+            if (bA < nbr[r]) scores[(u64) (r0 + r) * sc_rs + bA] = sA / inv;
+            if (hasB && bB < nbr[r]) scores[(u64) (r0 + r) * sc_rs + bB] = sB / inv;
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------------------------------------------------------------
 // Device-side routing and planning of a long prompt's MoE (docs/PREFILL2_SPEC.md, stage 1): what the host did between the router's logits arriving and the
 // grouped expert kernels launching, so the host need not wait for the logits and can queue a whole pass ahead.

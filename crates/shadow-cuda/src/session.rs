@@ -4613,10 +4613,18 @@ impl<'c, 'm> GpuSession<'c, 'm> {
                 // float dot products (with `--tensor-prompt`; `SHADOW_IDX_F32=0` keeps the double ones that the card's FP64 rate bounds): a tie while the copies paced the
                 // pass, +2-7% with the device planner (docs/STATUS.md 2026-11-04), at the cost of a different (not a worse) reply
                 let idx_kernel = if self.tensor_prompt && !std::env::var("SHADOW_IDX_F32").is_ok_and(|v| v == "0") { "index_scores_rows_f32" } else { "index_scores_rows" };
+                // register-blocked (4 rows, 2 key blocks a thread; the same scores bit for bit): `SHADOW_IDX_V2=0` keeps the one-thread-a-block kernel
+                if idx_kernel == "index_scores_rows_f32" && idx_heads <= 4 && id % 4 == 0 && id <= 256 && !std::env::var("SHADOW_IDX_V2").is_ok_and(|v| v == "0") {
+                    self.k2("index_scores_rows_f32v2", (max_nb as u32).div_ceil(256), (e - j).div_ceil(4) as u32, 128, &[
+                        Arg::Ptr(bb.sel_iqn.ptr), Arg::Ptr(at.blocks.ptr), Arg::Ptr(bb.sel_scores.ptr), Arg::U32((p0 + j + 1) as u32),
+                        Arg::U32(ratio as u32), Arg::U32(idx_heads as u32), Arg::U32(id as u32), Arg::U32(iqd as u32),
+                        Arg::U32(sstride as u32), Arg::U32((e - j) as u32)]);
+                } else {
                 self.k2(idx_kernel, (max_nb as u32).div_ceil(256), (e - j) as u32, 256, &[
                     Arg::Ptr(bb.sel_iqn.ptr), Arg::Ptr(at.blocks.ptr), Arg::Ptr(bb.sel_scores.ptr), Arg::U32((p0 + j + 1) as u32),
                     Arg::U32(ratio as u32), Arg::U32(idx_heads as u32), Arg::U32(id as u32), Arg::U32(iqd as u32),
                     Arg::U32(sstride as u32)]);
+                }
                 let lens = bb.sel_toks.ptr + (sel_rows() * tstride * 4) as u64;
                 if !sel_cpu {
                     // the selection on the GPU (the same choice as the host's below): no download, no host work, the group's launches queue behind each other

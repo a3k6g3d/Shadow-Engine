@@ -252,6 +252,7 @@ pub const FILES: &[File] = &[
             e("attention_group_dense_rows_f32", &[C, C, C, U, C, W, W, U, U, U, U, U, U]),
             e("index_scores_rows", &[C, C, W, U, U, U, U, U, U]),
             e("index_scores_rows_f32", &[C, C, W, U, U, U, U, U, U]),
+            e("index_scores_rows_f32v2", &[C, C, W, U, U, U, U, U, U, U]),
             e("select_blocks_rows", &[C, W, W, U, U, U, U, U]),
             e("zero_words", &[W, U]),
             e("fill_words", &[W, U, U]),
