@@ -1240,6 +1240,200 @@ extern "C" __global__ void __launch_bounds__(256) attention_group_sel_rows_v2(co
     }
 }
 
+// ---- `attention_group_sel_rows_v2` with all of a KV group's heads (up to 12) in one block: the K and V rows of the selected positions are read once for the group, not once for
+// each block of 4 heads (v2's profile: 75% of L2 peak, the K and V reads three times over).  Scores 2 tokens a thread, 12 heads: a q load from shared memory feeds 8 FMAs.
+// The weighted sum: a float4 of V columns for 12 heads a thread (48 accumulators), 4 row groups, summed one group at a time through the dead q buffer.
+// Same arguments as `attention_group_sel_rows_v2`; the launch has one block a (group, row) and `group` <= 12.
+#define V3H 12
+static __device__ __forceinline__ void block12_reduce(float* v, float* w, bool is_max) {
+    #pragma unroll
+    for (unsigned int a = 0; a < V3H; ++a)
+        #pragma unroll
+        for (unsigned int o = 16; o > 0; o >>= 1) {
+            const float x = __shfl_xor_sync(0xffffffffu, v[a], o);
+            v[a] = is_max ? fmaxf(v[a], x) : v[a] + x;
+        }
+    if ((threadIdx.x & 31) == 0) {
+        #pragma unroll
+        for (unsigned int a = 0; a < V3H; ++a) w[a * 8 + (threadIdx.x >> 5)] = v[a];
+    }
+    __syncthreads();
+    #pragma unroll
+    for (unsigned int a = 0; a < V3H; ++a) {
+        float r = w[a * 8];
+        #pragma unroll
+        for (unsigned int k = 1; k < 8; ++k) r = is_max ? fmaxf(r, w[a * 8 + k]) : r + w[a * 8 + k];
+        v[a] = r;
+    }
+    __syncthreads();
+}
+
+extern "C" __global__ void __launch_bounds__(256) attention_group_sel_rows_v3(const float* q, const float* kc, const float* vc, const u32* toks,
+                                                    unsigned int tstride, const u32* ntoks, const float* gate, float* o,
+                                                    double* scratch_d, unsigned int stride, unsigned int nkv, unsigned int hd,
+                                                    unsigned int group, unsigned int nh, unsigned int hb) {
+    const u64 row = blockIdx.y;
+    const unsigned int g = blockIdx.x;
+    const unsigned int h0 = g * group;
+    const unsigned int nhh = group;                                  // <= 12
+    const float* qrow = q + row * nh * hd;
+    const float* gaterow = gate + row * nh * hd;
+    float* orow = o + row * nh * hd;
+    const u32* tk = toks + row * tstride;
+    const unsigned int ntok = ntoks[row];
+    float* scr = (float*) scratch_d + row * nh * stride;
+    __shared__ __align__(16) float qs[V3H * 256];                     // also the cross-group sum buffer at the end
+    __shared__ __align__(16) float scs[256 * V3H];
+    __shared__ unsigned int ps[256];
+    __shared__ float wred[V3H * 8];
+    const unsigned int tid = threadIdx.x;
+    for (unsigned int idx = tid; idx < V3H * 256; idx += 256) qs[idx] = 0.0f;
+    __syncthreads();
+    for (unsigned int idx = tid; idx < nhh * hd; idx += 256) qs[(idx / hd) * 256 + idx % hd] = qrow[(u64) h0 * hd + idx];
+    __syncthreads();
+    const float scale = 1.0f / sqrtf((float) hd);
+    float mx[V3H];
+    #pragma unroll
+    for (unsigned int a = 0; a < V3H; ++a) mx[a] = -1e30f;
+    for (unsigned int base = 0; base < ntok; base += 512) {
+        const float4* k4[2];
+        bool ok[2];
+        #pragma unroll
+        for (unsigned int u = 0; u < 2; ++u) {
+            const unsigned int t = base + tid + 256 * u;
+            ok[u] = t < ntok;
+            k4[u] = (const float4*) (kc + ((u64) (ok[u] ? tk[t] : 0u) * nkv + g) * hd);
+        }
+        float s[2][V3H];
+        #pragma unroll
+        for (unsigned int u = 0; u < 2; ++u)
+            #pragma unroll
+            for (unsigned int a = 0; a < V3H; ++a) s[u][a] = 0.0f;
+        for (unsigned int i0 = 0; i0 < hd; i0 += 16) {
+            float4 kv[2][4];
+            #pragma unroll
+            for (unsigned int u = 0; u < 2; ++u)
+                #pragma unroll
+                for (unsigned int c = 0; c < 4; ++c) kv[u][c] = k4[u][i0 / 4 + c];
+            #pragma unroll
+            for (unsigned int a = 0; a < V3H; ++a) {
+                if (a < nhh) {
+                    #pragma unroll
+                    for (unsigned int c = 0; c < 4; ++c) {
+                        const float4 qq = *(const float4*) &qs[a * 256 + i0 + 4 * c];
+                        #pragma unroll
+                        for (unsigned int u = 0; u < 2; ++u) {
+                            s[u][a] = fmaf(qq.x, kv[u][c].x, s[u][a]);
+                            s[u][a] = fmaf(qq.y, kv[u][c].y, s[u][a]);
+                            s[u][a] = fmaf(qq.z, kv[u][c].z, s[u][a]);
+                            s[u][a] = fmaf(qq.w, kv[u][c].w, s[u][a]);
+                        }
+                    }
+                }
+            }
+        }
+        #pragma unroll
+        for (unsigned int u = 0; u < 2; ++u) {
+            if (ok[u]) {
+                const unsigned int t = base + tid + 256 * u;
+                #pragma unroll
+                for (unsigned int a = 0; a < V3H; ++a) {
+                    if (a < nhh) {
+                        s[u][a] *= scale;
+                        scr[(u64) (h0 + a) * stride + t] = s[u][a];
+                        mx[a] = fmaxf(mx[a], s[u][a]);
+                    }
+                }
+            }
+        }
+    }
+    block12_reduce(mx, wred, true);
+    float zt[V3H];
+    #pragma unroll
+    for (unsigned int a = 0; a < V3H; ++a) zt[a] = 0.0f;
+    const unsigned int grp = tid >> 6, c4 = (tid & 63) * 4;
+    float4 acc[V3H];
+    #pragma unroll
+    for (unsigned int a = 0; a < V3H; ++a) acc[a] = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+    for (unsigned int tile = 0; tile < ntok; tile += 256) {
+        __syncthreads();
+        const unsigned int n = min(256u, ntok - tile);
+        #pragma unroll
+        for (unsigned int a = 0; a < V3H; ++a) {
+            float e = 0.0f;
+            if (a < nhh && tid < n) {
+                e = expf(scr[(u64) (h0 + a) * stride + tile + tid] - mx[a]);
+                zt[a] += e;
+            }
+            scs[tid * V3H + a] = e;
+        }
+        ps[tid] = tid < n ? tk[tile + tid] : 0u;
+        __syncthreads();
+        if (c4 < hd) {
+            const unsigned int npad = (n + 31) & ~31u;
+            for (unsigned int rb = 0; rb < npad; rb += 32) {
+                #pragma unroll
+                for (unsigned int kb = 0; kb < 8; kb += 4) {
+                    float4 v[4];
+                    #pragma unroll
+                    for (unsigned int k = 0; k < 4; ++k) {
+                        const unsigned int r = rb + grp * 8 + kb + k;
+                        v[k] = *(const float4*) (vc + ((u64) ps[r] * nkv + g) * hd + c4);
+                    }
+                    #pragma unroll
+                    for (unsigned int k = 0; k < 4; ++k) {
+                        const unsigned int r = rb + grp * 8 + kb + k;
+                        #pragma unroll
+                        for (unsigned int h4 = 0; h4 < V3H / 4; ++h4) {
+                            const float4 w = *(const float4*) &scs[r * V3H + h4 * 4];
+                            acc[h4 * 4 + 0].x = fmaf(w.x, v[k].x, acc[h4 * 4 + 0].x); acc[h4 * 4 + 0].y = fmaf(w.x, v[k].y, acc[h4 * 4 + 0].y);
+                            acc[h4 * 4 + 0].z = fmaf(w.x, v[k].z, acc[h4 * 4 + 0].z); acc[h4 * 4 + 0].w = fmaf(w.x, v[k].w, acc[h4 * 4 + 0].w);
+                            acc[h4 * 4 + 1].x = fmaf(w.y, v[k].x, acc[h4 * 4 + 1].x); acc[h4 * 4 + 1].y = fmaf(w.y, v[k].y, acc[h4 * 4 + 1].y);
+                            acc[h4 * 4 + 1].z = fmaf(w.y, v[k].z, acc[h4 * 4 + 1].z); acc[h4 * 4 + 1].w = fmaf(w.y, v[k].w, acc[h4 * 4 + 1].w);
+                            acc[h4 * 4 + 2].x = fmaf(w.z, v[k].x, acc[h4 * 4 + 2].x); acc[h4 * 4 + 2].y = fmaf(w.z, v[k].y, acc[h4 * 4 + 2].y);
+                            acc[h4 * 4 + 2].z = fmaf(w.z, v[k].z, acc[h4 * 4 + 2].z); acc[h4 * 4 + 2].w = fmaf(w.z, v[k].w, acc[h4 * 4 + 2].w);
+                            acc[h4 * 4 + 3].x = fmaf(w.w, v[k].x, acc[h4 * 4 + 3].x); acc[h4 * 4 + 3].y = fmaf(w.w, v[k].y, acc[h4 * 4 + 3].y);
+                            acc[h4 * 4 + 3].z = fmaf(w.w, v[k].z, acc[h4 * 4 + 3].z); acc[h4 * 4 + 3].w = fmaf(w.w, v[k].w, acc[h4 * 4 + 3].w);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    block12_reduce(zt, wred, false);
+    // the 4 row groups' partial sums, one group at a time through the (dead) q buffer
+    #pragma unroll
+    for (unsigned int k = 1; k < 4; ++k) {
+        __syncthreads();
+        if (grp == k && c4 < hd) {
+            #pragma unroll
+            for (unsigned int a = 0; a < V3H; ++a) *(float4*) &qs[a * 256 + c4] = acc[a];
+        }
+        __syncthreads();
+        if (grp == 0 && c4 < hd) {
+            #pragma unroll
+            for (unsigned int a = 0; a < V3H; ++a) {
+                const float4 x = *(const float4*) &qs[a * 256 + c4];
+                acc[a].x += x.x; acc[a].y += x.y; acc[a].z += x.z; acc[a].w += x.w;
+            }
+        }
+    }
+    if (grp == 0 && c4 < hd) {
+        #pragma unroll
+        for (unsigned int a = 0; a < V3H; ++a) {
+            if (a < nhh) {
+                const float inv = 1.0f / zt[a];
+                const float* gt = gaterow + (u64) (h0 + a) * hd + c4;
+                float* op = orow + (u64) (h0 + a) * hd + c4;
+                op[0] = (acc[a].x * inv) * sigmoidf_ref(gt[0]);
+                op[1] = (acc[a].y * inv) * sigmoidf_ref(gt[1]);
+                op[2] = (acc[a].z * inv) * sigmoidf_ref(gt[2]);
+                op[3] = (acc[a].w * inv) * sigmoidf_ref(gt[3]);
+            }
+        }
+    }
+}
+
 // `attention_heads_rows` for a prompt's first positions (every earlier token is attended) in float, a block a (row, key group, `hb` heads) as `attention_group_sel_rows_f32`
 // shares each key row's loads across the `hb` heads (the one-head-a-block kernel read every key row once per head of its group).  Same arguments as the sparse kernel
 // without the token lists: row r attends positions 0 .. ntok0 + r - 1.

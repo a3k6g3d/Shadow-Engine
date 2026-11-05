@@ -389,6 +389,8 @@ pub struct GpuSession<'c, 'm> {
     /// the residual streams of every row of a pass bigger than `rows` (see `sub_rows_cap`), one buffer of `rows` rows a part (carved wherever the lent ranges have room:
     /// a part is a sub-chunk's storage; the first sub-chunk, the remainder, sits at the end of part 0); `bb.r` is then a view of the sub-chunk being run
     rparts: Vec<DeviceBuffer<'c>>,
+    /// `prefill` wants the last row's logits only: `batch` skips the output projection of the rows before it (0.2 s of a 15k prompt)
+    logits_last: bool,
     /// whether the sub-chunk being run is the pass's last (the layer's copy pipeline advances once a layer, after it)
     sub_last: bool,
     sub_first: bool,
@@ -1590,7 +1592,7 @@ impl<'c, 'm> GpuSession<'c, 'm> {
         };
         let mut s = GpuSession {
             ctx, m, mvp, fw, w, v, b, bb, replay, dscr,
-            rparts: Vec::new(), sub_last: true, sub_first: true,
+            rparts: Vec::new(), logits_last: false, sub_last: true, sub_first: true,
             devplan: tiers.tensor_prompt && !std::env::var("SHADOW_PREFILL_DEVPLAN").is_ok_and(|v| v == "0"), dp_tidx, dp_cnt, dp_gstart, dp_copied, dp_eaddr, kv_regions, kv_extra: None, kv_extra_reg, prompt_hint: 0, kv_rows: 0, kv_halves: false, router_bias: std::env::var("SHADOW_ROUTER_BIAS").ok().and_then(|v| v.parse().ok()).unwrap_or(0.0), batch_scratch, delta, attn, ple_state, tokens: vec![], pictures: vec![], rope_tab: None, rope_on: false, cap, trace: None, stop_after: None,
             resident_bytes, expert_uploads: 0, cache, ram, copy_stream, copy_stream2, copy_ev2, copy_event, staging,
             pending: vec![], routing: RoutingCounts::new(c.n_layer, c.n_expert),
@@ -4182,8 +4184,9 @@ impl<'c, 'm> GpuSession<'c, 'm> {
             return vec![];
         }
         let mut logits = Vec::with_capacity(m);
-        logits.resize(m - m_obs, vec![]);
-        for j0 in (0..m_obs).step_by(COLS_MAX) {
+        let first = if self.logits_last { m_obs - 1 } else { 0 };
+        logits.resize(m - m_obs + first, vec![]);
+        for j0 in (first..m_obs).step_by(COLS_MAX) {
             let n = (m_obs - j0).min(COLS_MAX);
             self.mv_cols("output.weight", row(&self.bb.u, h, j0), h, self.bb.logits.ptr, c.vocab, n);
             let mut out = vec![0u8; n * c.vocab * 4];
@@ -4675,8 +4678,10 @@ impl<'c, 'm> GpuSession<'c, 'm> {
                         let f32_on = self.tensor_prompt && !std::env::var("SHADOW_ATT_F32").is_ok_and(|v| v == "0");
                         // the profile-built kernel (4 heads a block, 4 tokens a thread, shuffles, exp folded into the weighted sum): `SHADOW_ATT_V2=0` keeps the first float kernel
                         let v2 = f32_on && !std::env::var("SHADOW_ATT_V2").is_ok_and(|v| v == "0");
-                        let kernel = if v2 { "attention_group_sel_rows_v2" } else if f32_on { "attention_group_sel_rows_f32" } else { "attention_group_sel_rows" };
-                        let hb = if v2 { 4 } else { hb };
+                        // all of the KV group's heads in one block: K and V are read once for the group, not once for each 4 heads (`SHADOW_ATT_V3=0` off): +3.2-3.8%
+                        let v3 = v2 && group <= 12 && !std::env::var("SHADOW_ATT_V3").is_ok_and(|v| v == "0");
+                        let kernel = if v3 { "attention_group_sel_rows_v3" } else if v2 { "attention_group_sel_rows_v2" } else if f32_on { "attention_group_sel_rows_f32" } else { "attention_group_sel_rows" };
+                        let hb = if v3 { group } else if v2 { 4 } else { hb };
                         self.k2(kernel, (nkv * group.div_ceil(hb)) as u32, n as u32, 256, &a);
                     } else {
                         self.k2("attention_heads_sel_rows", nh as u32, n as u32, 256, &args);
@@ -5394,7 +5399,11 @@ impl Stepper for GpuSession<'_, '_> {
         GpuSession::step_prefill(self, token);
     }
     fn prefill(&mut self, tokens: &[u32]) -> Vec<f32> {
-        self.step_batch(tokens).pop().unwrap_or_default()
+        // a tie (docs/STATUS.md 2026-11-05 (31)): opt-in
+        self.logits_last = std::env::var("SHADOW_LOGITS_LAST").is_ok_and(|v| v == "1");
+        let out = self.step_batch(tokens).pop().unwrap_or_default();
+        self.logits_last = false;
+        out
     }
     fn start_trace(&mut self) {
         self.trace = Some(BTreeMap::new());
