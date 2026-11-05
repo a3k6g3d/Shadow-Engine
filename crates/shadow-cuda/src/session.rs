@@ -209,7 +209,12 @@ const COLS_MAX: usize = 8;
 /// Tokens a batched attention launch takes (its score scratch is per token).
 const ATT_ROWS: usize = 8;
 /// Tokens of a long prompt whose indexer selections are made together (`attention_batch`): one scores download for all of them.
-const SEL_ROWS: usize = 32;
+/// Rows per group of the sparse attention's selection and attention launches (`SHADOW_SEL_ROWS`): one group is ~5 launches, so the launch count of a long prompt scales with
+/// 1 / this (the host's launches stall once per Windows timer tick, docs/STATUS.md 2026-11-05 (29)).
+fn sel_rows() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| std::env::var("SHADOW_SEL_ROWS").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(128).clamp(1, 256))
+}
 
 /// The most tokens a speculative verify pass (`step_batch_verify`) keeps the recurrences' inputs of.
 pub const MAX_VERIFY: usize = 8;
@@ -257,7 +262,7 @@ struct BatchBufs<'c> {
     /// attention_heads_rows' scores for ATT_ROWS tokens (heads x cap doubles each)
     att: DeviceBuffer<'c>,
     rl: DeviceBuffer<'c>,
-    /// SEL_ROWS tokens' indexer queries (normalized, rotated), block scores and selected positions (`attention_batch`)
+    /// sel_rows() tokens' indexer queries (normalized, rotated), block scores and selected positions (`attention_batch`)
     sel_iqn: DeviceBuffer<'c>,
     sel_scores: DeviceBuffer<'c>,
     sel_toks: DeviceBuffer<'c>,
@@ -1308,9 +1313,9 @@ impl<'c, 'm> GpuSession<'c, 'm> {
         };
         let fixed = FixedBufs {
             att: ctx.alloc(ATT_ROWS * c.n_head * cap * 8).map_err(e)?,
-            sel_iqn: a(SEL_ROWS * c.idx_heads * id)?,
-            sel_scores: a(SEL_ROWS * (cap / c.compress.iter().copied().filter(|&r| r > 0).min().unwrap_or(1) + 1))?,
-            sel_toks: a(SEL_ROWS * (c.idx_budget + ratio) + SEL_ROWS)?,
+            sel_iqn: a(sel_rows() * c.idx_heads * id)?,
+            sel_scores: a(sel_rows() * (cap / c.compress.iter().copied().filter(|&r| r > 0).min().unwrap_or(1) + 1))?,
+            sel_toks: a(sel_rows() * (c.idx_budget + ratio) + sel_rows())?,
             logits: a(COLS_MAX * c.vocab)?,
         };
         ALIAS_ROWS.store(if tiers.pipeline { 0 } else { match std::env::var("SHADOW_ALIAS_ROWS").as_deref() { Ok("sets") => 1, Ok("up") => 2, Ok("0") | Ok("off") => 0, _ => 3 } }, std::sync::atomic::Ordering::Relaxed);
@@ -4038,7 +4043,15 @@ impl<'c, 'm> GpuSession<'c, 'm> {
         }
         let mut logs: Vec<Vec<u16>> = vec![vec![]; m];
         let graphs = self.graphs_on && self.trace.is_none() && self.stop_after.is_none() && self.prof.is_none()
-            && self.prefetch.is_none() && self.pregate.is_none() && self.cache.slots > 0;
+            && self.prefetch.is_none() && self.pregate.is_none() && self.cache.slots > 0
+            // `SHADOW_BATCH_GRAPHS=0`: no CUDA graphs for the prompt path.  A graph is keyed by buffer addresses and row counts, which a new prompt mostly changes, so a long prompt
+            // instantiates ~500 (18 ms each, hidden behind the GPU) and a repeated shape then runs 10% faster (follow-up of 5,609 tokens: 481-509 against 444-451 tok/s);
+            // a first run ties (docs/STATUS.md 2026-11-05 (30)).
+            && !std::env::var("SHADOW_BATCH_GRAPHS").is_ok_and(|v| v == "0");
+        if self.batch_graphs.len() > 4000 {
+            // the cache would grow with every new prompt shape
+            self.batch_graphs.clear();
+        }
         let mut rn_ready = false;
         self.lt_point("(start)");
         let piped = self.pipeline_ok(m);
@@ -4521,7 +4534,7 @@ impl<'c, 'm> GpuSession<'c, 'm> {
         let ratio = c.compress[l].max(1);
         if self.trace.is_none() {
             // the tokens before the first one that needs the sparse selection: everything per token in one launch per step, in
-            // token order; the rest select their positions SEL_ROWS at a time (one scores download for each group)
+            // token order; the rest select their positions sel_rows() at a time (one scores download for each group)
             let (nh, nkv, hd) = (c.n_head, c.n_kv_head, c.head_dim);
             let (rd, th, eps) = (c.rope_dims as u32, c.rope_theta as f32, c.eps);
             let done = self.attn[l].as_ref().unwrap().nblocks;
@@ -4587,7 +4600,7 @@ impl<'c, 'm> GpuSession<'c, 'm> {
             let mut j = jt;
             while j < m {
                 let tg = std::time::Instant::now();
-                let e = (j + SEL_ROWS).min(m);
+                let e = (j + sel_rows()).min(m);
                 // the group's rows in two launches: the indexer queries, then every row's block scores
                 self.k2("head_norm_rope_rows", idx_heads as u32, (e - j) as u32, 128, &[
                     Arg::Ptr(row(&bb.iq, iqd, j)), Arg::U32(id as u32), Arg::U32(iqd as u32), Arg::Ptr(bb.sel_iqn.ptr), Arg::U32(id as u32),
@@ -4601,7 +4614,7 @@ impl<'c, 'm> GpuSession<'c, 'm> {
                     Arg::Ptr(bb.sel_iqn.ptr), Arg::Ptr(at.blocks.ptr), Arg::Ptr(bb.sel_scores.ptr), Arg::U32((p0 + j + 1) as u32),
                     Arg::U32(ratio as u32), Arg::U32(idx_heads as u32), Arg::U32(id as u32), Arg::U32(iqd as u32),
                     Arg::U32(sstride as u32)]);
-                let lens = bb.sel_toks.ptr + (SEL_ROWS * tstride * 4) as u64;
+                let lens = bb.sel_toks.ptr + (sel_rows() * tstride * 4) as u64;
                 if !sel_cpu {
                     // the selection on the GPU (the same choice as the host's below): no download, no host work, the group's launches queue behind each other
                     self.k2("select_blocks_rows", (e - j) as u32, 1, 256, &[
@@ -4631,19 +4644,19 @@ impl<'c, 'm> GpuSession<'c, 'm> {
                     toks_host[r * tstride..r * tstride + toks.len()].copy_from_slice(&toks);
                     ntoks.push(toks.len());
                 }
-                // the selections, then their lengths (one word each) after the SEL_ROWS rows
+                // the selections, then their lengths (one word each) after the sel_rows() rows
                 t_cpu += tc.elapsed().as_secs_f64();
                 let tu = std::time::Instant::now();
-                toks_host.resize(SEL_ROWS * tstride + SEL_ROWS, 0);
+                toks_host.resize(sel_rows() * tstride + sel_rows(), 0);
                 for (r, &n) in ntoks.iter().enumerate() {
-                    toks_host[SEL_ROWS * tstride + r] = n as u32;
+                    toks_host[sel_rows() * tstride + r] = n as u32;
                 }
                 self.upload_to(bb.sel_toks.ptr, &toks_host.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>());
                 t_up += tu.elapsed().as_secs_f64();
                 }
                 groups += 1;
                 // a row needs only its selection's length of scratch (tstride), not the context's (cap): more rows a launch
-                let per_launch = (ATT_ROWS * self.cap / tstride).clamp(1, SEL_ROWS);
+                let per_launch = (ATT_ROWS * self.cap / tstride).clamp(1, sel_rows());
                 for r0 in (0..e - j).step_by(per_launch) {
                     let n = (e - j - r0).min(per_launch);
                     let group = nh / nkv;

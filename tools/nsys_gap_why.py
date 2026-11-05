@@ -11,9 +11,9 @@ names = {r[0]: r[1] for r in c.execute("select id,value from StringIds")}
 ks = c.execute("select start,end,shortName from CUPTI_ACTIVITY_KIND_KERNEL order by start").fetchall()
 ms = c.execute("select start,end,bytes from CUPTI_ACTIVITY_KIND_MEMCPY where copyKind=1 order by start").fetchall()
 sel = [k for k in ks if names.get(k[2], '') == 'select_blocks_rows']
-starts = [0] + [i for i in range(1, len(sel)) if sel[i][0] - sel[i - 1][1] > 1e9]
+starts = [0] + [i for i in range(1, len(sel)) if sel[i][0] - sel[i - 1][1] > 3e9]
 groups = [sel[a:b] for a, b in zip(starts, starts[1:] + [len(sel)])]
-last = [g for g in groups if len(g) >= 100][-1]
+last = max([g for g in groups if len(g) >= 100][-2:], key=len)
 t0, t1 = last[0][0], last[-1][1]
 ks = [k for k in ks if t0 <= k[0] <= t1]
 api = c.execute("select start,end,nameId from CUPTI_ACTIVITY_KIND_RUNTIME where end>=? and start<=? and end-start>1000000 order by start", (t0, t1)).fetchall()
