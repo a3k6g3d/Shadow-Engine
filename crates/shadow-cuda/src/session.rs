@@ -4615,7 +4615,11 @@ impl<'c, 'm> GpuSession<'c, 'm> {
                         a.push(Arg::U32(hb as u32));
                         // float scores, softmax and weighted sum (with `--tensor-prompt`; `SHADOW_ATT_F32=0` keeps the double kernel, FP64-bound at 74% of the pipe): a tie while the
                         // copies paced the pass, +2-7% with the device planner (docs/STATUS.md 2026-11-04)
-                        let kernel = if self.tensor_prompt && !std::env::var("SHADOW_ATT_F32").is_ok_and(|v| v == "0") { "attention_group_sel_rows_f32" } else { "attention_group_sel_rows" };
+                        let f32_on = self.tensor_prompt && !std::env::var("SHADOW_ATT_F32").is_ok_and(|v| v == "0");
+                        // the profile-built kernel (4 heads a block, 4 tokens a thread, shuffles, exp folded into the weighted sum): `SHADOW_ATT_V2=0` keeps the first float kernel
+                        let v2 = f32_on && !std::env::var("SHADOW_ATT_V2").is_ok_and(|v| v == "0");
+                        let kernel = if v2 { "attention_group_sel_rows_v2" } else if f32_on { "attention_group_sel_rows_f32" } else { "attention_group_sel_rows" };
+                        let hb = if v2 { 4 } else { hb };
                         self.k2(kernel, (nkv * group.div_ceil(hb)) as u32, n as u32, 256, &a);
                     } else {
                         self.k2("attention_heads_sel_rows", nh as u32, n as u32, 256, &args);
