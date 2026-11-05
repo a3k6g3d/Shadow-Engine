@@ -187,16 +187,16 @@ pub const MAX_BATCH: usize = 256;
 /// Tokens a long prompt reads together in the lent cache (`big_batch_on`): per-token buffers carved from it, not kept.
 pub const BIG_BATCH: usize = 2048;
 /// Tokens a pass can take at most (`lend_kv` picks 2,048, 1,024 or 512 by the lent KV tail). 4,096 was tried (half the copying a token) but the drafter's feature buffers have to hold a whole pass: +150 MB of VRAM, -2 points of the 24k window's prompt speed, and the tail is only that big in a window band where the staging pipeline cannot start (STATUS.md 2026-11-03)
-pub const BIG_BATCH_MAX: usize = 8192;
+pub const BIG_BATCH_MAX: usize = 16384;
 /// Rows a pass takes when the lent room allows (`SHADOW_BIG_ROWS` sets it): 4,096 read 9.5k and 15k prompts 14% and 23% faster than 2,048, 8,192 (run in sub-chunks, `sub_rows_cap`) 5-8% faster again
 /// (docs/STATUS.md 2026-11-04), at some cost to the first reply's decode speed (the cache is emptier)
 fn big_rows_cap() -> usize {
-    std::env::var("SHADOW_BIG_ROWS").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(8192).min(BIG_BATCH_MAX)
+    std::env::var("SHADOW_BIG_ROWS").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(16384).min(BIG_BATCH_MAX)
 }
 /// Rows of the layer's temporary buffers when a pass is bigger (`SHADOW_SUB_ROWS`): the pass is run layer by layer in sub-chunks of this many rows, so only the residual
 /// streams (4 x hidden floats a row) are kept for the whole pass and a pass of 8,192 rows takes less VRAM than 4,096 rows used to.
 fn sub_rows_cap() -> usize {
-    std::env::var("SHADOW_SUB_ROWS").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(2048).max(256)
+    std::env::var("SHADOW_SUB_ROWS").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(1024).max(256)
 }
 /// Bytes the big batch's buffers take for `total` rows a pass: the temporaries for the sub-chunk and the residual streams of every row.
 fn big_batch_bytes(c: &shadow_model::forward::Config, total: usize) -> usize {
@@ -3031,7 +3031,9 @@ impl<'c, 'm> GpuSession<'c, 'm> {
     /// Queues the copy of all of layer `l`'s experts that the VRAM cache does not hold into stage half l & 1 (slot = expert number), from the
     /// RAM tier or the read-ahead buffer (waiting for its reads), and records the half's event.
     fn stage_copy(&mut self, l: usize) {
+        let t_sc = std::time::Instant::now();
         self.stage_pipe_wait();
+        let t_rw = t_sc.elapsed();
         let names = ["gate", "up", "down"].map(|p| format!("blk.{l}.ffn_{p}_exps.weight"));
         let total: usize = names.iter().map(|n| self.m.expert_bytes(n)).sum();
         let stream = self.copy_stream.raw();
@@ -3115,7 +3117,13 @@ impl<'c, 'm> GpuSession<'c, 'm> {
             self.copy_ev2.record(Some(&self.copy_stream2)).unwrap();
             self.ctx.stream_wait_event(Some(&self.copy_stream), &self.copy_ev2).unwrap();
         } else {
+            let t_up = std::time::Instant::now();
             self.upload_batch(&mut dsts, &mut srcs, &host_srcs, &mut lens, stream);
+            if std::env::var("SHADOW_STAGE_TIME").is_ok_and(|v| v == "3") {
+                eprintln!("STAGECOPY L{l}: read wait {:.1} ms, build {:.1} ms, upload_batch {:.1} ms ({} pieces, {} file experts of {} bytes)", t_rw.as_secs_f64() * 1e3,
+                          (t_up - t_sc).as_secs_f64() * 1e3 - t_rw.as_secs_f64() * 1e3, t_up.elapsed().as_secs_f64() * 1e3, dsts.len(),
+                          self.sp.as_ref().unwrap().at[rb].len(), total);
+            }
         }
         self.expert_uploads += 3 * n as usize;
         let sp = self.sp.as_mut().unwrap();
@@ -3153,10 +3161,17 @@ impl<'c, 'm> GpuSession<'c, 'm> {
         // (`SHADOW_STAGE_EARLY=0`: after the layer, as before)
         let early = !lead2 && !std::env::var("SHADOW_STAGE_EARLY").is_ok_and(|v| v == "0");
         if early && self.sub_first && l + 1 < c.n_layer {
+            let t0 = std::time::Instant::now();
             self.ctx.stream_wait_event(Some(&self.copy_stream), &self.sp.as_ref().unwrap().done[(l + 1) & 1]).unwrap();
             self.stage_copy(l + 1);
+            let t1 = t0.elapsed();
             self.sp.as_ref().unwrap().buf_done[(l + 2) % 3].synchronize().unwrap();
+            let t2 = t0.elapsed();
             self.stage_pipe_read(l + 2);
+            if std::env::var("SHADOW_STAGE_TIME").is_ok_and(|v| v == "3") {
+                eprintln!("HOSTWAIT L{l}: stage_copy({}) incl. read wait {:.1} ms, buf_done wait {:.1} ms, read submit {:.1} ms", l + 1, t1.as_secs_f64() * 1e3,
+                          (t2 - t1).as_secs_f64() * 1e3, (t0.elapsed() - t2).as_secs_f64() * 1e3);
+            }
         }
         let (plan, n_set) = if let Some(tops) = tops {
             let mut seen = vec![false; ne];
