@@ -2386,10 +2386,10 @@ extern "C" __global__ void __launch_bounds__(256) route_topk_rows(const float* l
 
 // One block (ne <= 1024 threads): the first group of each expert within its phase.  An expert's cnt tokens make ceil(cnt / 32) groups; phase 0 holds the experts
 // with copied[e] == 0 (resident in the VRAM cache), phase 1 the others, each in expert order.
-extern "C" __global__ void plan_scan(const unsigned int* cnt, const unsigned char* copied, unsigned int* gstart, unsigned int ne) {
+extern "C" __global__ void plan_scan(const unsigned int* cnt, const unsigned char* copied, unsigned int* gstart, unsigned int ne, unsigned int chunk) {
     __shared__ unsigned int s0[1024], s1[1024];
     const unsigned int e = threadIdx.x;
-    unsigned int g = e < ne ? (cnt[e] + 31u) / 32u : 0u;
+    unsigned int g = e < ne ? (cnt[e] + chunk - 1u) / chunk : 0u;
     const unsigned int c = e < ne ? copied[e] : 0u;
     s0[e] = c ? 0u : g;
     s1[e] = c ? g : 0u;
@@ -2410,7 +2410,7 @@ extern "C" __global__ void plan_scan(const unsigned int* cnt, const unsigned cha
 // The records' counts were zeroed, so groups past the last one are empty and the kernels skip them.
 extern "C" __global__ void plan_fill(const unsigned int* tidx, const unsigned int* cnt, const unsigned int* gstart, const unsigned char* copied,
                                      const u64* eaddr, unsigned char* base, unsigned int ne, unsigned int k, unsigned int m, unsigned int G,
-                                     unsigned int up_off, unsigned int a0, unsigned int a1, unsigned int r0, unsigned int r1) {
+                                     unsigned int up_off, unsigned int a0, unsigned int a1, unsigned int r0, unsigned int r1, unsigned int chunk) {
     __shared__ unsigned int scan[256];
     const unsigned int e = blockIdx.x, tid = threadIdx.x;
     const unsigned int total = cnt[e];
@@ -2436,14 +2436,14 @@ extern "C" __global__ void plan_fill(const unsigned int* tidx, const unsigned in
         }
         const unsigned int incl = scan[tid], chunk_total = scan[255];
         if (rank >= 0) {
-            const unsigned int p = seen + incl - 1, g = g0 + p / 32, s = p % 32;
+            const unsigned int p = seen + incl - 1, g = g0 + p / chunk, s = p % chunk;
             const unsigned int pair = j * k + (unsigned int) rank;
             for (unsigned int part = 0; part < 3; ++part) {
-                unsigned int* r = rec + ((u64) part * G + g) * 65;
+                unsigned int* r = rec + ((u64) part * G + g) * (1 + 2 * chunk);
                 r[1 + s] = part == 2 ? pair : j;
-                r[33 + s] = part == 1 ? up_off + pair : pair;
+                r[1 + chunk + s] = part == 1 ? up_off + pair : pair;
                 if (s == 0) {
-                    r[0] = min(32u, total - 32u * (p / 32));
+                    r[0] = min(chunk, total - chunk * (p / chunk));
                     addr[(u64) part * G + g] = eaddr[(u64) part * ne + e];
                 }
             }

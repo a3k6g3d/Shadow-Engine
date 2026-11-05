@@ -210,6 +210,14 @@ const COLS_MAX: usize = 8;
 const ATT_ROWS: usize = 8;
 /// Tokens of a long prompt whose indexer selections are made together (`attention_batch`): one scores download for all of them.
 /// Rows per group of the sparse attention's selection and attention launches (`SHADOW_SEL_ROWS`): one group is ~5 launches, so the launch count of a long prompt scales with
+/// Tokens a group of the tensor-core grouped expert kernels holds (`SHADOW_MMA_GROUP`, 32 or 64): a weight tile is dequantized once for a whole group, so 64 halves the
+/// dequantization of an expert with more than 32 tokens (an average expert has ~40 in a 2,048-row sub-chunk).
+fn mma_group() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new()
+    ;
+    *N.get_or_init(|| std::env::var("SHADOW_MMA_GROUP").ok().and_then(|v| v.parse::<usize>().ok()).filter(|&n| n == 32 || n == 64).unwrap_or(32))
+}
+
 /// 1 / this (the host's launches stall once per Windows timer tick, docs/STATUS.md 2026-11-05 (29)).
 fn sel_rows() -> usize {
     static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
@@ -3219,7 +3227,7 @@ impl<'c, 'm> GpuSession<'c, 'm> {
                 None => half + (e * self.cache.slot_bytes) as u64,
             };
             let copied = |e: usize| !self.cache.map.contains_key(&(l, e));
-            let chunk_n = if self.mma_experts_ok(infos) { 32 } else { 8 };
+            let chunk_n = if self.mma_experts_ok(infos) { mma_group() } else { 8 };
             let plan = grouped_plan(tops, 0, m, &set, k, self.rows * k, addr, copied, part, chunk_n);
             assert!(plan.bytes.len() <= self.bb.gtab.bytes, "grouped experts: {} bytes of tables", plan.bytes.len());
             self.upload_to(self.bb.gtab.ptr, &plan.bytes);
@@ -4765,7 +4773,7 @@ impl<'c, 'm> GpuSession<'c, 'm> {
     fn dev_plan(&mut self, l: usize, m: usize, sizes: &[usize]) -> GroupedPlan {
         let c = &self.m.cfg;
         let (k, ne) = (c.n_expert_used, c.n_expert);
-        let chunk_n = 32usize;
+        let chunk_n = mma_group();
         let g = ne + (m * k).div_ceil(chunk_n);
         let rec = 4 * (1 + 2 * chunk_n);
         let (a0, a1) = (0usize, 3 * g * 8);
@@ -4805,10 +4813,10 @@ impl<'c, 'm> GpuSession<'c, 'm> {
             self.k("route_topk_rows", m.div_ceil(8) as u32, 256, &route_args);
         }
 
-        self.k("plan_scan", 1, 1024, &[Arg::Ptr(self.dp_cnt.ptr), Arg::Ptr(self.dp_copied.ptr), Arg::Ptr(self.dp_gstart.ptr), Arg::U32(ne as u32)]);
+        self.k("plan_scan", 1, 1024, &[Arg::Ptr(self.dp_cnt.ptr), Arg::Ptr(self.dp_copied.ptr), Arg::Ptr(self.dp_gstart.ptr), Arg::U32(ne as u32), Arg::U32(chunk_n as u32)]);
         self.k("plan_fill", ne as u32, 256, &[Arg::Ptr(self.dp_tidx.ptr), Arg::Ptr(self.dp_cnt.ptr), Arg::Ptr(self.dp_gstart.ptr), Arg::Ptr(self.dp_copied.ptr), Arg::Ptr(self.dp_eaddr.ptr),
                                               Arg::Ptr(gt), Arg::U32(ne as u32), Arg::U32(k as u32), Arg::U32(m as u32), Arg::U32(g as u32), Arg::U32((self.rows * k) as u32),
-                                              Arg::U32(a0 as u32), Arg::U32(a1 as u32), Arg::U32(r0 as u32), Arg::U32(r1 as u32)]);
+                                              Arg::U32(a0 as u32), Arg::U32(a1 as u32), Arg::U32(r0 as u32), Arg::U32(r1 as u32), Arg::U32(chunk_n as u32)]);
         if std::env::var("SHADOW_DEVPLAN_CHECK").is_ok_and(|v| v == "1") {
             // debugging: the host's routing of the same logits against the device's
             self.ctx.synchronize().unwrap();
@@ -5115,7 +5123,7 @@ impl<'c, 'm> GpuSession<'c, 'm> {
                     None => extra.iter().find(|x| x.0 == e).expect("a routed expert neither cached nor fetched").1,
                 };
                 let copied = |e: usize| copying.iter().any(|c| c.0 == e);
-                let chunk_n = if end - start >= 64 && self.mma_experts_ok(&infos) { 32 } else { 8 };
+                let chunk_n = if end - start >= 64 && self.mma_experts_ok(&infos) { mma_group() } else { 8 };
                 let p = grouped_plan(&tops, start, end, &set, k, self.rows * k, addr, copied, part, chunk_n);
                 assert!(p.bytes.len() <= self.bb.gtab.bytes, "grouped experts: {} bytes of tables", p.bytes.len());
                 self.upload_to(self.bb.gtab.ptr, &p.bytes);
@@ -5211,8 +5219,8 @@ impl<'c, 'm> GpuSession<'c, 'm> {
             // SAFETY: `count` table entries at gtab + wt (matrix addresses) and + gt (17 u32 each: count, input rows,
             // output rows; 65 for the 32-token records), each a rows x cols matrix in the cache or the scratch slots; the rows
             // they name are inside the batch's buffers at the strides given.
-            let (kernel, grid, block) = if p.chunk_n == 32 {
-                (format!("mma_grouped_{ty}"), (rows.div_ceil(64), count as u32, 1), 128)
+            let (kernel, grid, block) = if p.chunk_n >= 32 {
+                (if p.chunk_n == 64 { format!("mma_grouped64_{ty}") } else { format!("mma_grouped_{ty}") }, (rows.div_ceil(64), count as u32, 1), 128)
             } else {
                 // 8 rows a block: matvec.cu's GROUPED_RW = 1
                 (format!("matvec_grouped_{ty}"), (rows.div_ceil(8), count as u32, 1), 256)

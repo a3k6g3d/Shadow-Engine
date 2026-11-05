@@ -43,3 +43,13 @@ Time = kernels + idle. With the idle gone and kernels at today's speed: 9.5k ~12
 ## Constraints that stay (the user's)
 
 Measure; what loses stays opt-in; a tie is a loss; every model load under `tools/run_capped.ps1` (floor 3 GiB with the 36 GiB tier); the RAM tier is not enlarged and DRAM stays at its stable 2,933 MT/s; the user's own Shadow process is never killed; no destructive git.
+
+
+## Update 2026-11-05 evening (STATUS 30-36)
+
+* **Lever A is not a lever.** The "33% idle GPU" of the first timelines was CUDA graphs that Nsight Systems did not list (`--cuda-graph-trace=node` shows them). With graphs traced or off the prompt path has the GPU **91% busy**: it is kernel-bound. The ~16 ms `cuLaunchKernel` calls are the host waiting on a full launch queue.
+* Done, all checked (`--exact` hash 162a8e07, `quality_test` 12 of 12, `task_check` 42-43/48): 12-head sparse attention kernel (+3.5%), register-blocked index scores (+3%, bit-identical), DeltaNet conv + gated norm in parallel (+2.1%, bit-identical), logits of the last row only at the end of a prompt (+5.7-8.4%: the old path also downloaded 1 GB of logits), sub-chunks of 2,048 rows (+6-8%), selection groups of 128 rows (+1.5%).
+* **Now: 9.5k ~885 tok/s (Strata 934, -5%), 15k ~875 (Strata 1,422, -38%).**
+* Tried and not adopted (ties or losses, STATUS 28-36): thread priority, stream-query flush, 1 ms timer, direct I/O (-50%), early/late next-layer copy, prompt-graph on/off (tie on a first run; graphs win on a repeated shape), `SHADOW_DELTA_CHUNK` (+1%), `SHADOW_DELTA_X8` (-8%), `SHADOW_FUSE` bits, 64-token expert groups (+0.3% / +1.2%).
+* **Remaining kernel time, 15k prompt (nsys, graphs traced):** grouped MoE matrices ~31% (iq4_nl 1.27 s, iq2_s 1.16 s, iq3_xxs 1.05 s, iq3_s 0.69 s), dense projections `mma_cols_*` ~18% (q6_k 0.99 s, iq4_xs 0.98 s, q5_k 0.40 s, bf16 0.33 s), `delta_steps128` 6.8%, sparse attention 7.7%, `hc_write_rmsnorm_rows` 3.6%, `mma_hc_down_inject_bf16` 2.6%. **Next: Nsight Compute on the grouped MoE kernels and the dense projections** (`bench/ncu_attn_group.ps1`, six profiles, needs an elevated PowerShell): the dequantization-bound theory failed its test, so the real limiter has to be read from the counters before changing the kernels again.
+* 15k needs a further ~1.6x beyond today; the MoE and dense-projection kernels (49% of the time) are the only place that much can come from.
