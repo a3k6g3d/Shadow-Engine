@@ -317,7 +317,7 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
       display: flex;
       flex-direction: column;
       gap: 1.25rem;
-      scroll-behavior: smooth;
+      overflow-anchor: none;
     }
     .msg-row {
       display: flex;
@@ -1206,6 +1206,19 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
     let isGenerating = false;
     let availableTools = [];
     let currentAbortController = null;
+    let autoScroll = true;
+
+    messagesEl.addEventListener('scroll', () => {
+      const dist = messagesEl.scrollHeight - messagesEl.scrollTop - messagesEl.clientHeight;
+      autoScroll = dist < 48;
+    }, { passive: true });
+    messagesEl.addEventListener('wheel', (e) => {
+      if (e.deltaY < 0) autoScroll = false;
+    }, { passive: true });
+    function scrollToBottom(force) {
+      if (force) autoScroll = true;
+      if (autoScroll) messagesEl.scrollTop = messagesEl.scrollHeight;
+    }
 
     function stopGeneration(e) {
       if (e) {
@@ -1431,6 +1444,51 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
         }
       }
       return calls;
+    }
+
+    // Strip raw <tool_call>...</tool_call> XML blocks (including an unclosed trailing <tool_call> during live streaming)
+    // so raw XML tags never bleed into the chat bubble prose.
+    function stripToolCalls(text) {
+      if (!text) return '';
+      return String(text)
+        .replace(/<tool_call>[\s\S]*?<\/tool_call>/g, '')
+        .replace(/<tool_call>[\s\S]*$/g, '')
+        .trim();
+    }
+
+    function hasPendingToolCall(text) {
+      if (!text) return false;
+      const lastOpen = text.lastIndexOf('<tool_call>');
+      if (lastOpen === -1) return false;
+      const lastClose = text.indexOf('</tool_call>', lastOpen);
+      return lastClose === -1;
+    }
+
+    function pendingToolCallName(text) {
+      const lastOpen = text.lastIndexOf('<tool_call>');
+      if (lastOpen === -1) return '';
+      const tail = text.slice(lastOpen);
+      const m = /<function=([^>\s]+)/.exec(tail);
+      return m ? m[1].trim() : '';
+    }
+
+    function formatToolArgsSummary(args) {
+      if (!args) return '';
+      const entries = Object.entries(args);
+      if (!entries.length) return '';
+      return entries.map(([k, v]) => {
+        const s = String(v || '').replace(/\s+/g, ' ').trim();
+        return `${k}: ${s.length > 90 ? s.slice(0, 88) + '…' : s}`;
+      }).join(' · ');
+    }
+
+    function toggleToolOutput(headerEl) {
+      const card = headerEl.closest('.tool-call-block');
+      if (!card) return;
+      const out = card.querySelector('.tool-output');
+      if (!out) return;
+      const hidden = out.style.display === 'none';
+      out.style.display = hidden ? 'block' : 'none';
     }
 
     // Execute tool on Windows via /v1/tools/execute
@@ -1760,6 +1818,7 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
       userRow.className = 'msg-row user';
       userRow.innerHTML = `<div class="avatar">U</div><div class="bubble">${escapeHtml(text).replace(/\n/g, '<br>')}${sentFiles.length ? `<div class="att-note">${sentFiles.map(n => '📎 ' + escapeHtml(n)).join(' &nbsp; ')}</div>` : ''}</div>`;
       messagesEl.appendChild(userRow);
+      scrollToBottom(true);
       }
 
       const t0 = performance.now();
@@ -1793,7 +1852,7 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
             <div class="msg-content"><span class="reading-note">Reading your message...</span><span class="cursor-blink"></span></div>
           </div>`;
         messagesEl.appendChild(asstRow);
-        messagesEl.scrollTop = messagesEl.scrollHeight;
+        scrollToBottom(loopTurns === 1);
 
         const bubbleEl = asstRow.querySelector('.bubble');
         const thinkBlock = bubbleEl.querySelector('.think-block');
@@ -1808,11 +1867,10 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
         let thinkStart = performance.now();
         let isThinking = false;
 
-        trimHistory();
         const payloadMessages = [];
         const sys = systemPrompt();
         if (sys) payloadMessages.push({ role: 'system', content: sys });
-        payloadMessages.push(...history);
+        payloadMessages.push(...buildContextMessages(history));
 
         const requestBody = {
           messages: payloadMessages,
@@ -1894,9 +1952,13 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
                       if (chevron) chevron.style.display = 'inline-block';
                     }
                     rawContent += delta.content;
-                    msgContent.innerHTML = renderMarkdown(rawContent) + '<span class="cursor-blink"></span>';
+                    const cleanStream = stripToolCalls(rawContent);
+                    const pendingBadge = hasPendingToolCall(rawContent)
+                      ? `<div style="margin-top:0.35rem; font-size:0.8rem; color:var(--tool-text); opacity:0.88;">⚡ Preparing tool call${pendingToolCallName(rawContent) ? ` (<strong>${escapeHtml(pendingToolCallName(rawContent))}</strong>)` : ''}...</div>`
+                      : '';
+                    msgContent.innerHTML = (cleanStream ? renderMarkdown(cleanStream) : '') + pendingBadge + '<span class="cursor-blink"></span>';
                   }
-                  messagesEl.scrollTop = messagesEl.scrollHeight;
+                  scrollToBottom(false);
                 } catch (_) {}
               }
             }
@@ -1933,7 +1995,11 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
             if (chevron) chevron.style.display = 'inline-block';
           }
 
-          msgContent.innerHTML = renderMarkdown(rawContent);
+          // Check if assistant called tools
+          const toolCalls = parseToolCallsFromText(rawContent);
+          const cleanFinal = stripToolCalls(rawContent);
+          msgContent.innerHTML = cleanFinal ? renderMarkdown(cleanFinal) : '';
+          msgContent.style.display = (!cleanFinal && toolCalls.length > 0) ? 'none' : '';
           // the reply ran into a length limit (the context is full): without a word the bubble would just stop
           if (cutOff) {
             const note = document.createElement('div');
@@ -1950,29 +2016,28 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
             bubbleEl.appendChild(meta);
           }
 
-          // Check if assistant called tools
-          const toolCalls = parseToolCallsFromText(rawContent);
           if (toolsEnabled && toolCalls.length > 0) {
             history.push({ role: 'assistant', content: rawContent });
 
             for (const tc of toolCalls) {
+              const argSummary = formatToolArgsSummary(tc.arguments);
               const toolCard = document.createElement('div');
               toolCard.className = 'tool-call-block running';
               toolCard.innerHTML = `
-                <div class="tool-header">
-                  <span>⚡ Windows Tool: <strong>${escapeHtml(tc.name)}</strong></span>
+                <div class="tool-header" onclick="toggleToolOutput(this)">
+                  <span>⚡ Windows Tool: <strong>${escapeHtml(tc.name)}</strong>${argSummary ? ` <small style="opacity:0.78; font-weight:normal;">(${escapeHtml(argSummary)})</small>` : ''}</span>
                   <span style="font-size:0.75rem; opacity:0.8;">Running...</span>
                 </div>
                 <div class="tool-output">Executing in PowerShell...</div>`;
               bubbleEl.appendChild(toolCard);
-              messagesEl.scrollTop = messagesEl.scrollHeight;
+              scrollToBottom(false);
 
               const result = await executeLocalTool(tc.name, tc.arguments);
               if (tc.name.startsWith('memory_')) loadMemory();
               if (tc.name.startsWith('mcp__browser__')) browserNote(result.output);
               toolCard.classList.remove('running');
               const outputEl = toolCard.querySelector('.tool-output');
-              toolCard.querySelector('.tool-header span:last-child').textContent = result.is_error ? 'Error' : 'Complete';
+              toolCard.querySelector('.tool-header span:last-child').textContent = (result.is_error ? 'Error' : 'Complete') + ' ▾';
               outputEl.textContent = result.output;
 
               // Append tool response turn to history
@@ -2001,11 +2066,14 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
               const thinkStopBtn = thinkBlock.querySelector('.think-stop-btn');
               if (thinkStopBtn) thinkStopBtn.style.display = 'none';
             }
-            msgContent.innerHTML = renderMarkdown(rawContent);
+            const cleanAborted = stripToolCalls(rawContent);
+            msgContent.innerHTML = cleanAborted ? renderMarkdown(cleanAborted) : '<span style="opacity:0.65; font-size:0.85rem;">Stopped.</span>';
             const cursor = msgContent.querySelector('.cursor-blink');
             if (cursor) cursor.remove();
             timingInfo.textContent = 'Generation stopped by user';
-            history.push({ role: 'assistant', content: rawContent });
+            if (rawContent.trim()) {
+              history.push({ role: 'assistant', content: rawContent });
+            }
             break;
           }
           retryAction = () => { resumeOnly = true; sendMessage(); };
@@ -2168,7 +2236,14 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
       box.innerHTML = html;
       if (typeof dashChats === 'function') dashChats();
     }
-    function renderSaved(m) {
+    function unwrapToolResponse(text) {
+      return String(text || '')
+        .trim()
+        .replace(/^<tool_response>\s*/i, '')
+        .replace(/\s*<\/tool_response>$/i, '')
+        .trim();
+    }
+    function renderSaved(m, idx, all) {
       if (m.role === 'tool') return;
       const row = document.createElement('div');
       row.className = 'msg-row ' + (m.role === 'user' ? 'user' : 'assistant');
@@ -2181,7 +2256,33 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
           pics.map(p => `<div class="att-note"><img src="${p.image_url.url}" style="max-height:120px;border-radius:0.4rem"></div>`).join('') +
           (names.length ? `<div class="att-note">${names.map(n => '📎 ' + escapeHtml(n)).join(' &nbsp; ')}</div>` : '') + '</div>';
       } else {
-        row.innerHTML = `<div class="avatar">S</div><div class="bubble"><div class="msg-content">${renderMarkdown(messageText(m))}</div></div>`;
+        const raw = messageText(m);
+        const toolCalls = parseToolCallsFromText(raw);
+        const clean = stripToolCalls(raw);
+        // Skip empty assistant entries (e.g. a turn stopped before any content or tool call was produced)
+        if (!clean && !toolCalls.length) return;
+        let cardsHtml = '';
+        if (toolCalls.length && Array.isArray(all)) {
+          let tCursor = (idx || 0) + 1;
+          for (const tc of toolCalls) {
+            let toolOut = '';
+            if (tCursor < all.length && all[tCursor] && all[tCursor].role === 'tool') {
+              toolOut = unwrapToolResponse(messageText(all[tCursor]));
+              tCursor++;
+            }
+            const argSummary = formatToolArgsSummary(tc.arguments);
+            cardsHtml += `
+              <div class="tool-call-block">
+                <div class="tool-header" onclick="toggleToolOutput(this)">
+                  <span>⚡ Windows Tool: <strong>${escapeHtml(tc.name)}</strong>${argSummary ? ` <small style="opacity:0.78; font-weight:normal;">(${escapeHtml(argSummary)})</small>` : ''}</span>
+                  <span style="font-size:0.75rem; opacity:0.8;">Complete ▾</span>
+                </div>
+                <div class="tool-output">${escapeHtml(toolOut || '(tool output recorded)')}</div>
+              </div>`;
+          }
+        }
+        const proseHtml = clean ? `<div class="msg-content">${renderMarkdown(clean)}</div>` : `<div class="msg-content" style="display:none;"></div>`;
+        row.innerHTML = `<div class="avatar">S</div><div class="bubble">${proseHtml}${cardsHtml}</div>`;
       }
       messagesEl.appendChild(row);
     }
@@ -2197,7 +2298,7 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
       attachments.length = 0;
       renderTray();
       messagesEl.innerHTML = '';
-      for (const m of history) renderSaved(m);
+      history.forEach((m, i) => renderSaved(m, i, history));
       messagesEl.scrollTop = messagesEl.scrollHeight;
       timingInfo.textContent = '';
       switchView('chat');
@@ -2538,24 +2639,79 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
       if (!browserTimer) browserTimer = setInterval(() => { if (isGenerating) browserRefresh(); }, 4000);
     }
 
-    // ---- the context window: when the conversation nears it, the oldest tool outputs (pages, files, command results: most of an agent chat's tokens) are cut to
-    // a line, so the chat goes on instead of ending at "the conversation is full".  ~3 characters a token is assumed for such text.
+    // ---- Unlimited rolling context window (0 extra RAM/VRAM):
+    // Keeps `history` (and saved chats in localStorage) 100% intact for scrollback while building a bounded
+    // context payload that preserves the system prompt prefix (so `prefix.snap` always hits) and folds older
+    // turns/tool outputs into a rolling summary whenever the conversation grows near `serverCtx`.
     let serverCtx = 16384;
-    function trimHistory() {
-      const size = m => Array.isArray(m.content) ? m.content.reduce((n, p) => n + (p.text ? p.text.length : 0), 0) : String(m.content || '').length;
-      const room = (serverCtx - 3500) * 3; // the system prompt and tools take ~3,000 tokens, and the reply needs some
-      let total = history.reduce((n, m) => n + size(m), 0);
-      if (total <= room * 0.85) return;
-      let cut = 0;
-      for (const m of history) {
-        if (total <= room * 0.6) break;
-        if (m.role !== 'tool' || typeof m.content !== 'string' || m.content.length < 600) continue;
+    function buildContextMessages(hist) {
+      const size = m => Array.isArray(m.content) ? m.content.reduce((n, p) => n + (p.text ? p.text.length : 1800), 0) : String(m.content || '').length;
+      const room = Math.max(6000, (serverCtx - 3800) * 3); // system prompt + tool schemas + reply headroom
+      const cloned = hist.map(m => ({ ...m, content: Array.isArray(m.content) ? m.content.map(p => ({ ...p })) : m.content }));
+      let total = cloned.reduce((n, m) => n + size(m), 0);
+      if (total <= room * 0.8) return cloned;
+
+      // Stage 1: Compact older tool outputs (except trailing tool outputs of the current turn)
+      let lastNonTool = cloned.length - 1;
+      while (lastNonTool > 0 && cloned[lastNonTool].role === 'tool') lastNonTool--;
+      let shortenedTools = 0;
+      for (let i = 0; i < lastNonTool; i++) {
+        if (total <= room * 0.65) break;
+        const m = cloned[i];
+        if (m.role !== 'tool' || typeof m.content !== 'string' || m.content.length < 400) continue;
         const was = m.content.length;
-        m.content = `<tool_response>\n[older tool output removed to make room: ${was} characters]\n</tool_response>`;
+        const raw = unwrapToolResponse(m.content).replace(/\s+/g, ' ').trim();
+        const preview = raw.length > 160 ? raw.slice(0, 160) + '…' : raw;
+        m.content = `<tool_response>\n[earlier tool output (${was} chars): ${preview}]\n</tool_response>`;
         total -= was - m.content.length;
-        cut++;
+        shortenedTools++;
       }
-      if (cut) timingInfo.textContent = `Made room: ${cut} older tool output${cut > 1 ? 's' : ''} shortened.`;
+
+      // Stage 2: Fold oldest user/assistant/tool turn groups into a bounded rolling summary
+      const bullets = [];
+      let foldedTurns = 0;
+      while (cloned.length > 2 && total > room * 0.72) {
+        let nextUser = 1;
+        while (nextUser < cloned.length && cloned[nextUser].role !== 'user') nextUser++;
+        const remainingUsers = cloned.slice(nextUser).filter(m => m.role === 'user').length;
+        if (remainingUsers === 0) break;
+
+        const group = cloned.splice(0, nextUser);
+        let uTxt = '', aTxt = '';
+        const tNames = [];
+        for (const gm of group) {
+          total -= size(gm);
+          if (gm.role === 'user') {
+            uTxt = messageText(gm).replace(/\s+/g, ' ').trim().slice(0, 140);
+          } else if (gm.role === 'assistant') {
+            const rawA = messageText(gm);
+            for (const tc of parseToolCallsFromText(rawA)) tNames.push(tc.name);
+            const cleanA = stripToolCalls(rawA).replace(/\s+/g, ' ').trim();
+            if (cleanA) aTxt = cleanA.slice(0, 160);
+          }
+        }
+        foldedTurns++;
+        const toolNote = tNames.length ? ` (tools: ${tNames.join(', ')})` : '';
+        bullets.push(`- Turn ${foldedTurns}: User: "${uTxt}" -> Assistant${toolNote}: "${aTxt}"`);
+        if (bullets.length > 12) bullets.shift();
+      }
+
+      if (foldedTurns > 0 && cloned.length > 0 && cloned[0].role === 'user') {
+        const prefix = `[Earlier conversation summary — ${foldedTurns} earlier turn(s) compacted to fit context window]\n${bullets.join('\n')}\n\n[Current message]\n`;
+        if (Array.isArray(cloned[0].content)) {
+          cloned[0].content = cloned[0].content.map(p => p.type === 'text' ? { ...p, text: prefix + p.text } : p);
+        } else {
+          cloned[0].content = prefix + String(cloned[0].content || '');
+        }
+      }
+
+      if (foldedTurns > 0 || shortenedTools > 0) {
+        const parts = [];
+        if (foldedTurns > 0) parts.push(`${foldedTurns} earlier turn${foldedTurns > 1 ? 's' : ''} summarized`);
+        if (shortenedTools > 0) parts.push(`${shortenedTools} tool output${shortenedTools > 1 ? 's' : ''} compacted`);
+        timingInfo.textContent = `Rolling context active: ${parts.join(', ')} (0 B extra RAM)`;
+      }
+      return cloned;
     }
 
     // ---- queued messages: typed while a reply is being written, sent in order when it ends (each one needs the one before it answered)

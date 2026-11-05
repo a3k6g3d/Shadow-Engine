@@ -2,6 +2,42 @@
 
 All notable changes to Shadow will be documented in this file.
 
+## [0.1.31] — 2026-11-04
+### Added
+- **Opt-in Direct I/O Read Pool (SHADOW_DIRECT_IO=1, crates/shadow-model/src/readpool.rs)**:
+  - Implemented Windows unbuffered overlapped direct-I/O (FILE_FLAG_NO_BUFFERING | FILE_FLAG_OVERLAPPED) via a preallocated pool of 4KB-aligned staging slots and heap-pinned OVERLAPPED events (win::GetOverlappedResult).
+  - Added CLI flags --direct-io and --no-direct-io across serve, generate, and kv.
+  - Added unit test direct_io_matches_buffered_on_real_expert_slices in crates/shadow-model/tests/real_model.rs verifying bit-identical reads against authentic model tensor slices.
+  - Benchmarked across prompt-heavy and mixed regimes per docs/EXPERIMENT_SPEC_2026-11-04b.json: confirmed that bypassing the OS file cache costs -8.7% on mixed and -20% to -42% on prompt-heavy. Per project rules, direct I/O remains opt-in and off by default.
+
+## [0.1.30] — 2026-11-03
+### Changed
+- **Establish Winning Speculation & Engine Settings as Shadow Defaults (`crates/shadow/src/main.rs`)**:
+  - Validated by the 4-arm prompt-side speculation benchmark (`docs/EXPERIMENT_SPEC_2026-11-04.json`), which proved +49.2% decode speedup (34.56 -> 51.55 tok/s), +27.9% combined total throughput gain, and zero regression on prompt ingestion (+0.84% on massive prompts).
+  - Defaults locked in via `fastest_defaults`:
+    - Speculative decoding: `--spec 3` with DFlash 2 drafter (`models/dflash2`) and selector threshold `--dflash-min-p 0.5`.
+    - Routing placement profile: `profiles/routing-varied300.shrc` (34,990 tokens of empirical varied routing).
+    - Tiering: `--ram-tier-gib 36` (pinned DRAM tier) with guaranteed default `--ram-floor-gib 3` (protecting against watchdog false-positives under memory pressure).
+    - Verification & prompt acceleration: `--verify-rank 2`, `--tail-skip 3`, and tensor-core dense prompt projections (`--tensor-prompt`).
+  - Added multi-path resolution in `found()` (`current_exe` ancestors and manifest root) so models, drafters, and profiles resolve regardless of launch working directory.
+  - Wired `generate` to use `fastest_defaults` as well, bringing identical performance to CLI generation.
+
+## [0.1.29] — 2026-11-03
+### Fixed
+- **Allow Scrolling Up During Thinking & Streaming (`crates/shadow-serve/src/ui.rs`)**:
+  - Replaced unconditional `messagesEl.scrollTop = messagesEl.scrollHeight` on every streamed reasoning/content token with smart `autoScroll` tracking (`scrollToBottom()`), which immediately pauses auto-scrolling when you wheel up or drag the scrollbar away from the bottom (`dist >= 48px`) and resumes when you scroll back to the bottom or send a new message.
+  - Replaced `scroll-behavior: smooth` with `overflow-anchor: none` on `#messages` so high-frequency `scrollTop` updates (~45–52 tok/s) do not restart overlapping smooth-scroll animations that fought user scroll input.
+
+## [0.1.28] — 2026-11-03
+### Added
+- **Unlimited Rolling Context Window (`0 B` extra RAM/VRAM)**:
+  - Server-side `fit_context()` in `crates/shadow-serve/src/engine.rs` guarantees multi-turn and agent conversations never fail with `"exceed the context of ... positions: the conversation is full"`. Leading `Role::System` messages are kept untouched so `prefix.snap` (system prompt + tool schemas) always hits in ~15 ms, while older tool outputs are compacted to 1-line digests, older turn groups fold into a bounded `[Earlier conversation summary]` block, and oversized single messages are middle-truncated to leave guaranteed reply headroom inside the fixed GPU `n_ctx` arena.
+  - Non-destructive client-side `buildContextMessages()` in `crates/shadow-serve/src/ui.rs` keeps the full unabridged `history` in the UI and `localStorage` scrollback while sending a rolling summary + recent turns to `/v1/chat/completions`.
+### Fixed
+- **Strip Raw `<tool_call>` XML from Chat Bubbles (`crates/shadow-serve/src/ui.rs`)**:
+  - Added `stripToolCalls()`, `hasPendingToolCall()`, and `pendingToolCallName()` so `<tool_call><function=...>` XML blocks are stripped from assistant prose both during live streaming (replaced with a clean `⚡ Preparing tool call...` status indicator) and after completion.
+  - Updated `renderSaved()` when reopening saved conversations from the sidebar to reconstruct collapsible `.tool-call-block` cards paired with their corresponding `role: 'tool'` outputs instead of dumping raw `<tool_call>` XML into the chat bubble, and skipped empty aborted assistant turns.
+
 ## [Unreleased]
 ### Added
 - Long prompts (128+ unread tokens) borrow the tail of the VRAM expert cache as staging and are read in 256-token chunks; the cache is restored from the RAM tier afterwards.

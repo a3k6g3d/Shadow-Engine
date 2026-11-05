@@ -82,3 +82,48 @@ fn real_text_round_trips() {
     let bytes: usize = texts.iter().map(String::len).sum();
     eprintln!("{bytes} bytes -> {tokens} tokens ({:.2} bytes/token) in {:?}", bytes as f64 / tokens as f64, t0.elapsed());
 }
+
+#[test]
+fn direct_io_matches_buffered_on_real_expert_slices() {
+    let Some(g) = model() else { return };
+    let path = std::env::var("SHADOW_MODEL").map(PathBuf::from).unwrap_or_else(|_| PathBuf::from(DEFAULT));
+    let paths = vec![path.clone()];
+
+    // Tensor blk.0.ffn_down_exps.weight: 512 experts of 921,600 bytes
+    let t = g.tensor("blk.0.ffn_down_exps.weight").expect("tensor blk.0.ffn_down_exps.weight");
+    let per = (t.nbytes() / t.dims[2]) as usize;
+
+    // Read 3 experts using buffered seek_read
+    let experts = [0, 7, 23];
+    let mut buffered_data = vec![vec![0u8; per]; experts.len()];
+    {
+        use std::os::windows::fs::FileExt;
+        let f = std::fs::File::open(&path).unwrap();
+        for (i, &e) in experts.iter().enumerate() {
+            let off = t.offset + (e * per) as u64;
+            let mut done = 0;
+            while done < per {
+                let n = f.seek_read(&mut buffered_data[i][done..], off + done as u64).unwrap();
+                done += n;
+            }
+        }
+    }
+
+    // Now read using DirectIoPool
+    #[cfg(windows)]
+    {
+        use shadow_model::readpool::DirectIoPool;
+        let pool = DirectIoPool::new(&paths, 16).expect("DirectIoPool opens");
+        let mut direct_data = vec![vec![0u8; per]; experts.len()];
+        let mut jobs: Vec<(usize, u64, &mut [u8])> = experts.iter().zip(direct_data.iter_mut()).map(|(&e, b)| {
+            (0, t.offset + (e * per) as u64, b.as_mut_slice())
+        }).collect();
+        pool.read_many(&mut jobs).expect("read_many succeeds");
+
+        for i in 0..experts.len() {
+            assert_eq!(direct_data[i], buffered_data[i], "Direct I/O read mismatch on expert {}", experts[i]);
+        }
+        eprintln!("direct_io_matches_buffered_on_real_expert_slices: PASS, exact bit-identical match across all experts");
+    }
+}
+

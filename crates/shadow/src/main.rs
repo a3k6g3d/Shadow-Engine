@@ -92,6 +92,11 @@ fn dump(path: &std::path::Path, name: &str, out: &std::path::Path, rest: &[Strin
     let cols = t.dims[0];
     let row_bytes = cols / qk * qb;
     // (first byte, byte count) of each chunk to read, in order
+    if rest.iter().any(|a| a == "--direct-io") {
+        std::env::set_var("SHADOW_DIRECT_IO", "1");
+    } else if rest.iter().any(|a| a == "--no-direct-io") {
+        std::env::set_var("SHADOW_DIRECT_IO", "0");
+    }
     let flag = |f: &str| rest.iter().position(|a| a == f).and_then(|i| rest.get(i + 1));
     let expert_idx: Option<usize> = flag("--expert").map(|e| e.parse::<usize>().expect("expert index"));
     let chunks: Vec<(u64, u64)> = if let Some(r) = flag("--rows") {
@@ -260,7 +265,16 @@ fn fastest_defaults(rest: &[String]) -> Vec<String> {
     let has = |f: &str| rest.iter().any(|a| a == f);
     let found = |rel: &str| {
         let p = std::path::Path::new(rel);
-        [p.to_path_buf(), root.join(rel)].into_iter().find(|c| c.exists())
+        let mut candidates = vec![p.to_path_buf(), root.join(rel)];
+        if let Ok(exe) = std::env::current_exe() {
+            if let Some(parent) = exe.parent() {
+                candidates.push(parent.join(rel));
+                if let Some(gp) = parent.parent().and_then(|p| p.parent()) {
+                    candidates.push(gp.join(rel));
+                }
+            }
+        }
+        candidates.into_iter().find(|c| c.exists())
     };
     let mut set: Vec<String> = vec![];
     if !has("--tail-skip") {
@@ -286,10 +300,11 @@ fn fastest_defaults(rest: &[String]) -> Vec<String> {
         set.extend(["--ram-tier-gib".into(), if avail >= 49.0 { "36" } else { "30" }.into()]);
         if avail < 49.0 {
             eprintln!("shadow serve: {avail:.1} GiB of RAM available (49 needed for the 36 GiB tier): using the 30 GiB tier");
-        } else if !has("--ram-floor-gib") {
-            // starting from ~49 GiB, available RAM bottoms out at 4.1-5.1 GiB once the tier is pinned and the file cache fills
-            set.extend(["--ram-floor-gib".into(), "3".into()]);
         }
+    }
+    if !has("--ram-floor-gib") {
+        // starting from ~49 GiB, available RAM bottoms out at 4.1-5.1 GiB once the 36 GiB tier is pinned and file cache fills
+        set.extend(["--ram-floor-gib".into(), "3".into()]);
     }
     if !has("--placement") {
         // the profile of 300 varied prompts (docs/STATUS.md, 2026-10-30), else the six hash-table prompts' one
@@ -326,6 +341,11 @@ fn serve(path: &std::path::Path, rest: &[String]) -> ExitCode {
         std::env::set_var("RUST_BACKTRACE", "1");
     }
     let rest = &fastest_defaults(rest);
+    if rest.iter().any(|a| a == "--direct-io") {
+        std::env::set_var("SHADOW_DIRECT_IO", "1");
+    } else if rest.iter().any(|a| a == "--no-direct-io") {
+        std::env::set_var("SHADOW_DIRECT_IO", "0");
+    }
     let flag = |f: &str| rest.iter().position(|a| a == f).and_then(|i| rest.get(i + 1));
     let host = flag("--host").map(String::as_str).unwrap_or("127.0.0.1");
     let port: u16 = flag("--port").and_then(|v| v.parse().ok()).unwrap_or(8081);
@@ -366,6 +386,13 @@ fn serve(path: &std::path::Path, rest: &[String]) -> ExitCode {
 /// `--gpu` runs the whole forward pass on GPU 0; `--gpu-matvec` only its matrix-vector products; neither: the stage 1
 /// CPU reference, slow by design.
 fn generate(path: &std::path::Path, prompt: &str, rest: &[String]) -> ExitCode {
+    let rest_vec = fastest_defaults(rest);
+    let rest = &rest_vec;
+    if rest.iter().any(|a| a == "--direct-io") {
+        std::env::set_var("SHADOW_DIRECT_IO", "1");
+    } else if rest.iter().any(|a| a == "--no-direct-io") {
+        std::env::set_var("SHADOW_DIRECT_IO", "0");
+    }
     use shadow_model::chat::{render_for_arch, Message, Options, Role};
     // "@FILE": the prompt is that file's text (long prompts, without the command line's quoting)
     let from_file = prompt.strip_prefix('@').map(std::fs::read_to_string);

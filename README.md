@@ -77,8 +77,10 @@ LLM runner: a dense Llama or Qwen3 GGUF has no forward pass here.
 
 * **Desktop UI (`shadow-ui.exe`)**: Windows launcher built with Rust and Tauri 2 (WebView2); connects to `http://127.0.0.1:8081`.
 * **Web chat and process monitor**: streaming chat with collapsible `<think>` blocks, a reasoning-effort selector, native tool
-  orchestration (`read_file`, `glob`, `grep`, `edit_file`, `write_file`, `cmd`); the Dashboard tab charts CPU, GPU load, temperature, RAM,
-  expert-cache hit rates and the three memory tiers (VRAM, pinned RAM, NVMe).
+  orchestration (`read_file`, `glob`, `grep`, `edit_file`, `write_file`, `cmd`) rendered as collapsible `.tool-call-block` cards,
+  and an **unlimited rolling context window** (`0 B` extra RAM/VRAM) that preserves the system prompt prefix snapshot while
+  compacting older tool outputs and folding older turns into a bounded summary; the Dashboard tab charts CPU, GPU load, temperature,
+  RAM, expert-cache hit rates and the three memory tiers (VRAM, pinned RAM, NVMe).
 * **API**: `POST /v1/chat/completions` (streaming or not), `GET /v1/models`, `/health`, `/metrics` (Prometheus), `/v1/status`,
   `/v1/telemetry`, `/v1/tools`, `/v1/tools/execute`.
 

@@ -203,11 +203,13 @@ fn run(a: &[String]) {
                     // no flag: `shadow serve`'s own default tier (30 GiB) unless the arm says --exact
                     .map_or(if flags.contains("--exact") { 16 } else { 42 }, |g| g.ceil() as u64 + 12)
             };
+            let floor = flags.split_whitespace().skip_while(|w| *w != "--ram-floor-gib").nth(1)
+                .and_then(|g| g.parse::<f64>().ok()).unwrap_or(3.0);
             let log = out.join(format!("{name}-run{i}.log"));
             let args = format!("serve {model} --port {port} {flags}");
             let launch = match arm_launch.get(name) {
                 Some(cmd) => cmd.replace("{port}", &port.to_string()).replace("{log}", &log.display().to_string()),
-                None => format!("& '{}' -CapGiB {cap} -Out '{}' -Exe '{}' -Arguments '{}'", capped.display(),
+                None => format!("& '{}' -CapGiB {cap} -FloorGiB {floor} -Out '{}' -Exe '{}' -Arguments '{}'", capped.display(),
                                 log.display(), arm_exe.get(name).unwrap_or(&exe).display(), args),
             };
             let res = (!a.iter().any(|x| x == "--no-resources")).then(|| out.join(format!("{name}-run{i}")));

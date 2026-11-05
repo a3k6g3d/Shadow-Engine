@@ -434,20 +434,220 @@ fn argmax(v: &[f32]) -> u32 {
     v.iter().enumerate().max_by(|a, b| a.1.partial_cmp(b.1).unwrap()).map(|(i, _)| i as u32).unwrap()
 }
 
+/// Truncate UTF-8 string safely around a character budget, keeping head and tail.
+fn middle_truncate(s: &str, max_chars: usize) -> String {
+    let n = s.chars().count();
+    if n <= max_chars {
+        return s.to_string();
+    }
+    let head_n = (max_chars * 3) / 5;
+    let tail_n = max_chars.saturating_sub(head_n);
+    let head: String = s.chars().take(head_n).collect();
+    let tail: String = s.chars().skip(n.saturating_sub(tail_n)).collect();
+    format!("{head}\n...[{} chars compacted to fit context window]...\n{tail}", n.saturating_sub(head_n + tail_n))
+}
+
+/// Clean assistant prose for rolling conversation summary (strips `<tool_call>` blocks and `<think>` tags).
+fn summarize_turn_text(s: &str, max_chars: usize) -> String {
+    let mut clean = s.to_string();
+    while let Some(start) = clean.find("<tool_call>") {
+        if let Some(end) = clean[start..].find("</tool_call>") {
+            clean.replace_range(start..start + end + "</tool_call>".len(), "");
+        } else {
+            clean.truncate(start);
+            break;
+        }
+    }
+    while let Some(start) = clean.find("<think>") {
+        if let Some(end) = clean[start..].find("</think>") {
+            clean.replace_range(start..start + end + "</think>".len(), "");
+        } else {
+            break;
+        }
+    }
+    let collapsed = clean.replace(crate::IMAGE_MARK, "[image]").split_whitespace().collect::<Vec<_>>().join(" ");
+    let n = collapsed.chars().count();
+    if n <= max_chars {
+        collapsed
+    } else {
+        let head: String = collapsed.chars().take(max_chars).collect();
+        format!("{head}...")
+    }
+}
+
+/// Compacts `messages` and `images` in-place (on a local clone) when the prompt + reply budget would exceed `cap` (`n_ctx`),
+/// using zero extra RAM or VRAM:
+/// 1. Preserves leading `Role::System` messages 100% untouched so `prefix.snap` (system + tool definitions) always hits.
+/// 2. Compacts older `Role::Tool` outputs into concise 1-line digests.
+/// 3. Folds oldest conversation turns into a bounded `[Earlier conversation summary]` block so context length is unlimited.
+/// 4. Middle-truncates any remaining oversized single message so `ids.len() + max_tokens <= cap` is strictly guaranteed.
+fn fit_context(arch: &str, messages: &[Message], opts: &Options, images: &[Vec<u8>], cap: usize, req_max_tokens: usize,
+               encode_len: &mut dyn FnMut(&[Message], &[Vec<u8>]) -> Result<usize, String>)
+               -> Result<(Vec<Message>, Vec<Vec<u8>>, usize), String> {
+    let min_reply = if req_max_tokens > 0 {
+        req_max_tokens.min(cap / 2).max(64)
+    } else {
+        2048.min(cap / 4).max(128)
+    };
+    let target_prompt = cap.saturating_sub(min_reply + 8);
+
+    let mut msgs = messages.to_vec();
+    let mut imgs = images.to_vec();
+    let mut compacted_turns = 0usize;
+
+    let cur_len = encode_len(&msgs, &imgs)?;
+    if cur_len <= target_prompt {
+        return Ok((msgs, imgs, 0));
+    }
+
+    // Stage 1: Compact older Role::Tool outputs (except the trailing tool outputs from the active step)
+    let last_non_tool = msgs.iter().rposition(|m| m.role != shadow_model::chat::Role::Tool).unwrap_or(0);
+    let mut changed = false;
+    for (idx, m) in msgs.iter_mut().enumerate() {
+        if idx < last_non_tool && m.role == shadow_model::chat::Role::Tool && m.content.len() > 280 {
+            let clean = m.content
+                .trim()
+                .strip_prefix("<tool_response>")
+                .unwrap_or(&m.content)
+                .strip_suffix("</tool_response>")
+                .unwrap_or(&m.content)
+                .trim();
+            let preview = summarize_turn_text(clean, 160);
+            m.content = format!("[earlier tool output ({} chars): {preview}]", clean.len());
+            changed = true;
+        }
+    }
+    if changed && encode_len(&msgs, &imgs)? <= target_prompt {
+        return Ok((msgs, imgs, 1));
+    }
+
+    // Stage 2: Fold oldest conversation turns (after leading Role::System) into a bounded rolling summary
+    let sys_end = msgs.iter().position(|m| m.role != shadow_model::chat::Role::System).unwrap_or(msgs.len());
+    let mut summary_bullets: Vec<String> = Vec::new();
+    while msgs.len().saturating_sub(sys_end) > 2 && encode_len(&msgs, &imgs)? > target_prompt {
+        // Find the next User turn after `sys_end` (skipping index `sys_end` itself so we pop one full turn group)
+        let mut group_end = sys_end + 1;
+        while group_end < msgs.len() && msgs[group_end].role != shadow_model::chat::Role::User {
+            group_end += 1;
+        }
+        // Always keep at least the final user query (and any subsequent assistant/tool messages in the active turn)
+        let remaining_users = msgs[group_end..].iter().filter(|m| m.role == shadow_model::chat::Role::User).count();
+        if remaining_users == 0 {
+            break;
+        }
+
+        // Count how many IMAGE_MARK slots are in the messages being folded so `imgs` stays aligned
+        let mut dropped_pics = 0usize;
+        for m in &msgs[sys_end..group_end] {
+            dropped_pics += m.content.matches(crate::IMAGE_MARK).count();
+        }
+        if dropped_pics > 0 && dropped_pics <= imgs.len() {
+            imgs.drain(0..dropped_pics);
+        }
+
+        let mut u_text = String::new();
+        let mut a_text = String::new();
+        let mut tool_names: Vec<String> = Vec::new();
+        for m in msgs.drain(sys_end..group_end) {
+            match m.role {
+                shadow_model::chat::Role::User => {
+                    if !m.content.starts_with("[Earlier conversation summary") {
+                        u_text = summarize_turn_text(&m.content, 140);
+                    }
+                }
+                shadow_model::chat::Role::Assistant => {
+                    for tc in &m.tool_calls {
+                        tool_names.push(tc.name.clone());
+                    }
+                    let s = summarize_turn_text(&m.content, 160);
+                    if !s.is_empty() {
+                        a_text = s;
+                    }
+                }
+                _ => {}
+            }
+        }
+        compacted_turns += 1;
+        if !u_text.is_empty() || !a_text.is_empty() || !tool_names.is_empty() {
+            let tools_note = if tool_names.is_empty() { String::new() } else { format!(" (tools: {})", tool_names.join(", ")) };
+            summary_bullets.push(format!("- Turn {compacted_turns}: User: \"{u_text}\" -> Assistant{tools_note}: \"{a_text}\""));
+            // Keep rolling summary strictly bounded (~12 most recent archived turns) so summary is O(1) in size
+            if summary_bullets.len() > 12 {
+                summary_bullets.remove(0);
+            }
+        }
+
+        // Inject or update the rolling summary right at `msgs[sys_end]` if it's a User message
+        if let Some(first_user) = msgs.get_mut(sys_end) {
+            if first_user.role == shadow_model::chat::Role::User && !summary_bullets.is_empty() {
+                let raw_user = if let Some(pos) = first_user.content.find("\n\n[Current message]\n") {
+                    first_user.content[pos + "\n\n[Current message]\n".len()..].to_string()
+                } else {
+                    first_user.content.clone()
+                };
+                first_user.content = format!(
+                    "[Earlier conversation summary — {compacted_turns} earlier turn(s) compacted to fit context window]\n{}\n\n[Current message]\n{raw_user}",
+                    summary_bullets.join("\n")
+                );
+            }
+        }
+    }
+
+    // Stage 3: If still over target_prompt (e.g. a huge single message or tool output in the active turn), middle-truncate non-system messages
+    let mut pass = 0;
+    while encode_len(&msgs, &imgs)? > target_prompt && pass < 6 {
+        pass += 1;
+        // Find the longest non-system message
+        if let Some((longest_i, _)) = msgs.iter().enumerate()
+            .filter(|(_, m)| m.role != shadow_model::chat::Role::System && !m.content.contains(crate::IMAGE_MARK))
+            .max_by_key(|(_, m)| m.content.len())
+        {
+            let cur_chars = msgs[longest_i].content.chars().count();
+            if cur_chars <= 256 {
+                break;
+            }
+            let new_budget = (cur_chars / 2).max(256);
+            msgs[longest_i].content = middle_truncate(&msgs[longest_i].content, new_budget);
+            msgs[longest_i].reasoning = None;
+            compacted_turns = compacted_turns.max(1);
+        } else {
+            break;
+        }
+    }
+
+    let _ = arch;
+    let _ = opts;
+    Ok((msgs, imgs, compacted_turns))
+}
+
 #[allow(clippy::too_many_arguments)] // the engine loop's state, passed rather than bundled
 fn answer<'c>(arch: &str, req: &Request, tok: &Tokenizer, sess: &mut GpuSession<'c, '_>, last_logits: &mut Vec<f32>,
               stops: &[u32], think_end: Option<u32>, prefix: &mut PrefixCache<'c>, spec: usize, pics: &mut Pics,
               model: &std::path::Path) -> Result<Stats, String> {
-    let text = render_for_arch(arch, &req.messages, &req.opts)?;
+    let cap = sess.capacity();
+    let (fit_msgs, fit_imgs, compacted) = fit_context(arch, &req.messages, &req.opts, &req.images, cap, req.max_tokens, &mut |m, im| {
+        let t = render_for_arch(arch, m, &req.opts)?;
+        let raw_ids = tok.encode(&t, true);
+        let (exp_ids, _) = expand_pictures(tok, raw_ids, im, pics, model)?;
+        Ok(exp_ids.len())
+    })?;
+    if compacted > 0 {
+        eprintln!("shadow serve: rolling context compacted {compacted} earlier turn(s)/output(s) to fit {cap}-token window (0 B extra RAM)");
+    }
+    let text = render_for_arch(arch, &fit_msgs, &req.opts)?;
     let ids = tok.encode(&text, true);
-    let (ids, spans) = expand_pictures(tok, ids, &req.images, pics, model)?;
+    let (ids, spans) = expand_pictures(tok, ids, &fit_imgs, pics, model)?;
     // leaving a conversation: its last snapshot goes to disk
     if prefix.pending.as_ref().is_some_and(|t| !(ids.len() > t.len() && ids[..t.len()] == t[..])) {
         spill(prefix);
     }
     // no `max_tokens` given: as many as fit.  (It used to be 1,024, which a reasoning model can spend on thinking alone: the reply ended
     // mid-thought with no answer.)
-    let max_tokens = if req.max_tokens == 0 { sess.capacity().saturating_sub(ids.len() + 8) } else { req.max_tokens };
+    let max_tokens = if req.max_tokens == 0 {
+        sess.capacity().saturating_sub(ids.len() + 8)
+    } else {
+        req.max_tokens.min(sess.capacity().saturating_sub(ids.len() + 1))
+    };
     if max_tokens == 0 || ids.len() + max_tokens > sess.capacity() {
         return Err(format!("{} prompt tokens + {} max_tokens exceed the context of {} positions: the conversation is full, start a new chat", ids.len(),
                            max_tokens, sess.capacity()));
@@ -776,3 +976,39 @@ fn answer<'c>(arch: &str, req: &Request, tok: &Tokenizer, sess: &mut GpuSession<
         finish_reason: finish,
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use shadow_model::chat::Role;
+
+    #[test]
+    fn compacts_unlimited_context_without_touching_system_prompt() {
+        let opts = Options::default();
+        let mut msgs = vec![Message::new(Role::System, "You are Shadow, an assistant on Windows.")];
+        for turn in 1..=25 {
+            msgs.push(Message::new(Role::User, &format!("Turn {turn}: please inspect the directory and report item {}", "x".repeat(120))));
+            msgs.push(Message::new(Role::Assistant, &format!("I checked item {turn}. <tool_call><function=cmd><parameter=command>dir</parameter></function></tool_call>")));
+            msgs.push(Message::new(Role::Tool, &format!("<tool_response>\nDirectory listing for turn {turn}: {}\n</tool_response>", "file_entry ".repeat(80))));
+            msgs.push(Message::new(Role::Assistant, &format!("Here is the summary for turn {turn}: {}", "result ".repeat(40))));
+        }
+        msgs.push(Message::new(Role::User, "What did we find in the latest turns?"));
+
+        let cap = 2048;
+        let (fit_msgs, fit_imgs, compacted) = fit_context("qwen35", &msgs, &opts, &[], cap, 512, &mut |m, _| {
+            let rendered = render_for_arch("qwen35", m, &opts)?;
+            // Approximate token count as 1 token per 3 bytes
+            Ok(rendered.len() / 3)
+        }).unwrap();
+
+        assert!(compacted > 0, "expected older turns to be compacted");
+        assert!(fit_imgs.is_empty());
+        assert_eq!(fit_msgs[0].role, Role::System);
+        assert_eq!(fit_msgs[0].content, "You are Shadow, an assistant on Windows.");
+        assert!(fit_msgs[1].content.contains("[Earlier conversation summary"), "expected rolling summary in first user message");
+        assert_eq!(fit_msgs.last().unwrap().content, "What did we find in the latest turns?");
+        let final_rendered = render_for_arch("qwen35", &fit_msgs, &opts).unwrap();
+        assert!(final_rendered.len() / 3 + 512 <= cap, "expected compacted prompt to fit comfortably within cap");
+    }
+}
+

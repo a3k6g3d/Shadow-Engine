@@ -1,0 +1,34 @@
+{
+  "project": "Shadow (Rust MoE inference engine, repo J:\\Shadow on this PC)",
+  "written": "2026-11-04, for Gemini to run",
+  "task": "Bench prompt-side speculation - the one speed lever that multiplies and has never been measured.",
+  "state_of_the_tree": "Uncommitted work in progress: the UI fix (raw-XML strip + collapsible cards on reopen, in CHANGELOG) and quant-kernel work in engine.rs (matvec/mma Q4_K/Q5_K, SHADOW_MMA_QK, SHADOW_DELTA_X8). Build on top of it, do not revert it.",
+  "the_unprobed_asymmetry": "Speculation on DECODE is measured and kept (--spec 3, DFlash 2 accepted, 52.1 tok/s vs Strata's 47.7). Speculation on PROMPTS has never been benched. A prompt pass is one big batch; if the draft accepts even two tokens on a long prompt, that pass's expert traffic amortizes over 3x the tokens - the DRAM cost per token DROPS instead of rising. Decode acceptance is 0.55-0.95; on a cold prompt the first token's router tops are exactly the ones the cache hasn't seen, so the draft must be right about those - the same bet the cache admission filter already makes and wins.",
+  "why_this_is_the_one_to_run": "It is the cheapest experiment on the list: no new code, just arms. If it wins it multiplies the copy path's payoff too, because every accepted token is a token that didn't pay for its own expert.",
+  "bench_arms": [
+    "arm A: baseline, spec off, prompt-heavy workload",
+    "arm B: --spec 3 on, same workload",
+    "arm C: baseline, mixed prompt+decode (the usual headline)",
+    "arm D: --spec 3 on, mixed",
+    "4 arms x 3 runs, interleaved, one fresh launch per run, warm turns only"
+  ],
+  "scoring": "TOTAL throughput, not the median. Noise floor 0.8% median / 2.0% p90 - anything under ~1% is a tie, and a tie is a loss.",
+  "harness": "bench/bench_total.py and bench_vs_strata.ps1 are the scoring harnesses; bench/*.sh (fid, corr, ceil, chunk, mb, post) are the existing workload scripts; the prompt-2026-11-02-b2k-cross-session* dirs are the last prompt benchmarks - match their shape. tools/autotune.py is the tuning loop.",
+  "machine_facts": {
+    "gpu": "RTX 5070 12.2 GB, expert cache 4.42 GiB (bigger caches measured as losses: 4.8 -5%, 5.0 -10%)",
+    "cpu": "i7-11700K, 8C/16T, HAS full AVX-512 (verified via CPUID family 6 model 167)",
+    "dram": "DDR4-2933 ~30 GB/s - the wall; copy engine gets 13, link can do 23-28",
+    "ram": "64 GB, 36 GiB pinned tier, 3 GiB pinned floor (machine froze hard at 0.4 GiB free)",
+    "model": "89 GiB IQ3_S GGUF, mmap'd from disk; OS file cache ~50 GiB, buffered reads ~9.5 GB/s, unbuffered 3.5 GB/s (drive ceiling)"
+  },
+  "rules": [
+    "measure, and what loses stays opt-in (off by default)",
+    "every experiment gets a dated STATUS.md entry with its measured numbers, wins and losses alike",
+    "do not touch the decode path (it is already a win: 52.1 vs Strata's 47.7)",
+    "do not change the pinned tier, the floor, or the cache size",
+    "the flag-level knobs are exhausted - the tuning loop said so when it stopped; this is a bench, not a tuning run"
+  ],
+  "expected_cost": "no new code; ~40 min per bench round + server restarts (36 s load, ~30 s tier refill)",
+  "honest_odds": "about 50/50. The asymmetry is real and unprobed; the risk is that prompt-side acceptance is lower than decode-side (cold router tops), and the draft's cost - which ate most of the decode gain - is paid per-pass, not per-token, so a low acceptance rate on prompts is worse than on decode.",
+  "second_lever_still_pending": "The Avalon port (move compute to the data: CPU computes cache-miss experts straight from the mmap'd file, one DRAM read, no host join) is unbuilt - its spec is docs/EXPERIMENT_SPEC_2026-11-01.json, ~40% odds, same DRAM math, kernel already fast enough at 17-21 GB/s. Run this bench first; it's cheaper, and if it wins the Avalon port's payoff multiplies too."
+}

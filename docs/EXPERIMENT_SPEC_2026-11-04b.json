@@ -1,0 +1,39 @@
+{
+  "project": "Shadow (Rust MoE inference engine, repo J:\\Shadow on this PC)",
+  "written": "2026-11-04, for Gemini to run",
+  "task": "Two-part plan agreed with the human: (1) hybrid read path - the one 'untried' line in the notes; (2) then the Avalon port per docs/EXPERIMENT_SPEC_2026-11-01.json.",
+  "the_physics": "The copy engine can only DMA from pinned memory - a hardware rule, not a choice. The fast path (OS file cache, ~50 GiB of the 89 GiB model, memory speed) is pageable, so its bytes must be copied into pinned staging first: bytes cross DRAM three times (page cache -> pinned read+write, pinned -> link). DRAM is ~30 GB/s total; the copy engine measures 13, the link ceiling is 23-28. Two copy streams measured a TIE (65.0 vs 65.5 s) - scheduling is not the problem, traffic is. The GPU waiting on the copy is now ~677 ms a pass, roughly a fifth of a prompt pass - the copy is the critical path.",
+  "task_1_hybrid_read_path": {
+    "what_to_build": "A hybrid policy: bytes the file cache already holds (the ~50 GiB hot set) keep the current buffered path; genuinely cold bytes go direct-I/O (unbuffered) straight into the pinned buffer, overlapped into an event pool - the notes' exact 'Untried: overlapped reads into an event pool' line. Gate behind SHADOW_DIRECT_IO=1; baseline stays default until measured.",
+    "why_it_might_win": "Skips one DRAM trip for cold bytes: two touches instead of three.",
+    "why_it_might_lose": "Direct I/O loses the file cache, and unbuffered reads always go to the NVMe at its 3.5 GB/s ceiling. For hot bytes the triple path at memory speed beats it; only cold bytes can win, and the tier amortizes most of the rest.",
+    "honest_odds": "~50/50, expected gain 10-25% on prompt-heavy, ~0 on decode (decode already has the tier warm)"
+  },
+  "task_2_avalon": "Run second, per the old spec's own logic: if task 1 wins, Avalon's payoff multiplies. Its spec is docs/EXPERIMENT_SPEC_2026-11-01.json - do not rewrite it, just execute it. ~40% odds, ceiling ~1.4x, kernel already fast enough at 17-21 GB/s on 14 threads, AVX-512 present (family 6 model 167, verified via CPUID - the notes' premises were wrong once on this).",
+  "bench_arms": [
+    "arm A: baseline (current fastest-mode defaults), prompt-heavy workload",
+    "arm B: SHADOW_DIRECT_IO=1, same workload",
+    "arm C: baseline, mixed prompt+decode (the usual headline)",
+    "arm D: SHADOW_DIRECT_IO=1, mixed",
+    "4 arms x 3 runs, interleaved, one fresh launch per run, warm turns only"
+  ],
+  "scoring": "TOTAL throughput, not the median. Noise floor 0.8% median / 2.0% p90 - anything under ~1% is a tie, and a tie is a loss.",
+  "harness": "bench/bench_total.py and bench_vs_strata.ps1; bench/*.sh (fid, corr, ceil, chunk, mb, post); match the shape of the prompt-2026-11-02-b2k-cross-session* runs.",
+  "machine_facts": {
+    "gpu": "RTX 5070 12.2 GB, expert cache 4.42 GiB (bigger caches measured as losses)",
+    "cpu": "i7-11700K, 8C/16T, HAS full AVX-512",
+    "dram": "DDR4-2933 ~30 GB/s - the wall; copy engine gets 13, link can do 23-28",
+    "ram": "64 GB, 36 GiB pinned tier, 3 GiB pinned floor (machine froze hard at 0.4 GiB free)",
+    "model": "89 GiB IQ3_S GGUF; OS file cache ~50 GiB, buffered reads ~9.5 GB/s, unbuffered 3.5 GB/s (drive ceiling)"
+  },
+  "rules": [
+    "measure, and what loses stays opt-in (off by default)",
+    "every experiment gets a dated STATUS.md entry with its measured numbers, wins and losses alike",
+    "do not touch the decode path (it is already a win: 52.1 vs Strata's 47.7, locked in as defaults)",
+    "do not change the pinned tier, the floor, the cache size, or the fastest-mode defaults (--spec 3, DFlash 2, verify-rank 2, tail-skip 3, tensor-prompt)",
+    "the flag-level knobs are exhausted - this is code work, as the notes say",
+    "do not commit anything without the human; the AI measures, the human commits"
+  ],
+  "expected_cost": "task 1 is real code (read-path policy + overlapped I/O pool, roughly half a day) plus one bench round (~40 min + restarts: 36 s load, ~30 s tier refill). task 2 is the full Avalon port per its own spec.",
+  "the_honest_ceiling": "Neither task alone is 2x. Task 1 + task 2 + the IQ2_S quant bench (kernels already built and tested, quality band is the risk) is the honest path to 1.5-2x; all three fight over the same DRAM bus, so the landing zone is not a clean 2x."
+}
