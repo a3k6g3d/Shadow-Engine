@@ -393,6 +393,16 @@ impl<'c> Program<'c> {
             t.borrow_mut().push((entry.name, a, b));
         }
         use std::sync::atomic::Ordering::Relaxed;
+        // `SHADOW_FLUSH_EVERY=N`: nudge the driver to submit its batched launches every N launches
+        static FLUSH: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+        let every = *FLUSH.get_or_init(|| std::env::var("SHADOW_FLUSH_EVERY").ok().and_then(|v| v.parse::<u64>().ok()).unwrap_or(0));
+        if every > 0 {
+            if let Some(s) = stream {
+                if (LAUNCHES.0.load(Relaxed) + 1) % every == 0 {
+                    s.flush();
+                }
+            }
+        }
         LAUNCHES.0.fetch_add(1, Relaxed);
         LAUNCHES.1.fetch_add(t0.elapsed().as_nanos() as u64, Relaxed);
         r

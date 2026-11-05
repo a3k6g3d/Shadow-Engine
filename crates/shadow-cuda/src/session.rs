@@ -3974,6 +3974,18 @@ impl<'c, 'm> GpuSession<'c, 'm> {
                 fn GetCurrentThread() -> isize;
                 fn SetThreadPriority(h: isize, p: i32) -> i32;
             }
+            #[link(name = "winmm")]
+            extern "system" {
+                fn timeBeginPeriod(ms: u32) -> u32;
+            }
+            static TIMER: std::sync::Once = std::sync::Once::new();
+            // `SHADOW_TIMER_MS=N`: the Windows timer resolution (default tick 15.6 ms), for any wait the driver or OS makes in whole ticks
+            TIMER.call_once(|| {
+                if let Some(ms) = std::env::var("SHADOW_TIMER_MS").ok().and_then(|v| v.parse::<u32>().ok()) {
+                    // SAFETY: winmm's timeBeginPeriod, a resolution in milliseconds.
+                    unsafe { timeBeginPeriod(ms) };
+                }
+            });
             static PRIO: std::sync::OnceLock<Option<i32>> = std::sync::OnceLock::new();
             if let Some(p) = *PRIO.get_or_init(|| std::env::var("SHADOW_MAIN_PRIO").ok().and_then(|v| v.parse::<i32>().ok())) {
                 // SAFETY: the pseudo-handle of this thread; a priority between -2 and 2.

@@ -105,6 +105,7 @@ table! {
     cuStreamCreate: fn(*mut H, c_uint) = ["cuStreamCreate"];
     cuStreamDestroy: fn(H) = ["cuStreamDestroy_v2"];
     cuStreamSynchronize: fn(H) = ["cuStreamSynchronize"];
+    cuStreamQuery: fn(H) = ["cuStreamQuery"];
     cuStreamWaitEvent: fn(H, H, c_uint) = ["cuStreamWaitEvent"];
     cuEventCreate: fn(*mut H, c_uint) = ["cuEventCreate"];
     cuEventDestroy: fn(H) = ["cuEventDestroy_v2"];
@@ -409,6 +410,9 @@ pub struct Stream<'c> {
     stream: H,
 }
 
+/// A stream capture is open (`Stream::begin_capture` .. `end_capture`): no stream queries.
+static CAPTURING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 impl Stream<'_> {
     pub fn raw(&self) -> *mut c_void {
         self.stream
@@ -419,6 +423,15 @@ impl Stream<'_> {
         call!(self.ctx.api, cuStreamSynchronize(self.stream))
     }
 
+    /// `cuStreamQuery`, its answer ignored: on Windows (WDDM) the driver batches launches and submits the batch when it is full or on a timer tick (~15.6 ms); a query
+    /// makes it submit what it holds now.
+    pub fn flush(&self) {
+        if CAPTURING.load(std::sync::atomic::Ordering::Relaxed) {
+            return; // a query would invalidate the capture
+        }
+        let _ = call!(self.ctx.api, cuStreamQuery(self.stream));
+    }
+
     pub fn wait_event(&self, event: &Event) -> Result<(), CudaError> {
         self.ctx.stream_wait_event(Some(self), event)
     }
@@ -427,6 +440,7 @@ impl Stream<'_> {
     /// use the driver meanwhile).  Nothing may touch the default stream until `end_capture`.
     pub fn begin_capture(&self) -> Result<(), CudaError> {
         self.ctx.bind()?;
+        CAPTURING.store(true, std::sync::atomic::Ordering::Relaxed);
         call!(self.ctx.api, cuStreamBeginCapture(self.stream, 2)) // CU_STREAM_CAPTURE_MODE_RELAXED
     }
 
@@ -437,6 +451,7 @@ impl<'c> Stream<'c> {
     pub fn end_capture(&self) -> Result<Graph<'c>, CudaError> {
         self.ctx.bind()?;
         let mut g: H = std::ptr::null_mut();
+        CAPTURING.store(false, std::sync::atomic::Ordering::Relaxed);
         call!(self.ctx.api, cuStreamEndCapture(self.stream, &mut g))?;
         let mut exec: H = std::ptr::null_mut();
         if let Err(e) = call!(self.ctx.api, cuGraphInstantiateWithFlags(&mut exec, g, 0)) {
