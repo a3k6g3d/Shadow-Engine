@@ -4786,8 +4786,11 @@ impl<'c, 'm> GpuSession<'c, 'm> {
                         // all of the KV group's heads in one block: K and V are read once for the group, not once for each 4 heads (`SHADOW_ATT_V3=0` off): +3.2-3.8%
                         let v3 = v2 && group <= 12 && !std::env::var("SHADOW_ATT_V3").is_ok_and(|v| v == "0");
                         // the scores on the tensor cores (fp16 inputs, fp32 sums; `SHADOW_ATT_TC=0` keeps the fp32 FMA scores): docs/STATUS.md 2026-11-06 (50)
-                        let tc = v3 && !std::env::var("SHADOW_ATT_TC").is_ok_and(|v| v == "0");
-                        let kernel = if tc { "attention_group_sel_rows_tc" } else if v3 { "attention_group_sel_rows_v3" } else if v2 { "attention_group_sel_rows_v2" } else if f32_on { "attention_group_sel_rows_f32" } else { "attention_group_sel_rows" };
+                        let tcv = std::env::var("SHADOW_ATT_TC").ok();
+                        let tc = v3 && tcv.as_deref() != Some("0");
+                        // `SHADOW_ATT_TC=2`: the weighted sum on the tensor cores as well (STATUS 2026-11-06 (51))
+                        let tc2 = tc && hd == 256 && tcv.as_deref() == Some("2");
+                        let kernel = if tc2 { "attention_group_sel_rows_tc2" } else if tc { "attention_group_sel_rows_tc" } else if v3 { "attention_group_sel_rows_v3" } else if v2 { "attention_group_sel_rows_v2" } else if f32_on { "attention_group_sel_rows_f32" } else { "attention_group_sel_rows" };
                         let hb = if v3 { group } else if v2 { 4 } else { hb };
                         self.k2(kernel, (nkv * group.div_ceil(hb)) as u32, n as u32, 256, &a);
                     } else {
