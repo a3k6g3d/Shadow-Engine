@@ -58,6 +58,15 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
       --cyan: #06b6d4;
     }
     * { box-sizing: border-box; margin: 0; padding: 0; }
+    /* quiet scroll bars: thin, no arrows, a track that disappears into the page, a thumb a shade above the borders that brightens on hover
+       (only the ::-webkit-scrollbar rules: a `scrollbar-color` / `scrollbar-width` would switch them off in Chromium) */
+    html { color-scheme: dark; }
+    *::-webkit-scrollbar { width: 10px; height: 10px; }
+    *::-webkit-scrollbar-track, *::-webkit-scrollbar-corner { background: transparent; }
+    *::-webkit-scrollbar-button { display: none; width: 0; height: 0; }
+    *::-webkit-scrollbar-thumb { background: rgba(132, 146, 166, 0.20); border-radius: 8px; border: 3px solid transparent; background-clip: content-box; min-height: 36px; }
+    *::-webkit-scrollbar-thumb:hover { background: rgba(132, 146, 166, 0.42); background-clip: content-box; }
+    *::-webkit-scrollbar-thumb:active { background: rgba(165, 180, 252, 0.55); background-clip: content-box; }
     html, body {
       background: var(--bg);
       color: var(--text);

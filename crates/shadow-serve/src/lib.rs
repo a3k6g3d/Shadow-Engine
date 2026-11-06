@@ -181,14 +181,46 @@ fn image_url(p: &Value) -> Option<&str> {
     u.get("url").and_then(Value::as_str).or_else(|| u.as_str())
 }
 
+/// Text that came from a message (a page a tool fetched, a file, what the user typed, the model's own earlier words) with every
+/// special-token string in it (`<|image_pad|>`, `<|im_start|>`, ...) disarmed by a zero-width space after its `<`: the prompt is encoded
+/// with special tokens on (the chat template's own markers must be), so a literal `<|image_pad|>` in a fetched web page would otherwise
+/// become a picture slot ("0 pictures sent but the prompt has 2 picture slots") and `<|im_start|>` in a page could open a fake turn.
+/// Only the shape `<|name|>` is touched; `<|>` and the like are left alone.
+pub fn neutralize_specials(s: &str) -> String {
+    if !s.contains("<|") {
+        return s.to_string();
+    }
+    let b = s.as_bytes();
+    let mut out = String::with_capacity(s.len() + 8);
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'<' && b.get(i + 1) == Some(&b'|') {
+            let mut j = i + 2;
+            while j < b.len() && (b[j].is_ascii_alphanumeric() || b[j] == b'_') {
+                j += 1;
+            }
+            if j > i + 2 && b.get(j) == Some(&b'|') && b.get(j + 1) == Some(&b'>') {
+                out.push('<');
+                out.push('\u{200b}');
+                i += 1;
+                continue;
+            }
+        }
+        let ch = s[i..].chars().next().unwrap();
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+    out
+}
+
 /// A message's content: a string, or an array of parts: text ones are joined, a picture becomes `IMAGE_MARK` (its bytes come from
-/// `parse_images`); anything else is refused.
+/// `parse_images`); anything else is refused.  Text is passed through `neutralize_specials`, so only a real picture part makes a slot.
 fn content_text(v: &Value) -> Result<String, String> {
     match v {
-        Value::String(s) => Ok(s.clone()),
+        Value::String(s) => Ok(neutralize_specials(s)),
         Value::Null => Ok(String::new()),
         Value::Array(parts) => parts.iter().map(|p| match p.get("type").and_then(Value::as_str) {
-            Some("text") => Ok(p.get("text").and_then(Value::as_str).unwrap_or("").to_string()),
+            Some("text") => Ok(neutralize_specials(p.get("text").and_then(Value::as_str).unwrap_or(""))),
             Some("image_url") if image_url(p).is_some() => Ok(IMAGE_MARK.to_string()),
             other => Err(format!("content part type {other:?} is not supported (text and images only)")),
         }).collect::<Result<Vec<_>, _>>().map(|v| v.concat()),
@@ -371,7 +403,7 @@ pub fn parse_chat(body: &Value) -> Result<(Vec<Message>, Options, usize, bool), 
             other => return Err(format!("unknown role {other:?}")),
         };
         let mut msg = Message::new(role, &content_text(m.get("content").unwrap_or(&Value::Null))?);
-        msg.reasoning = m.get("reasoning_content").and_then(Value::as_str).map(str::to_string);
+        msg.reasoning = m.get("reasoning_content").and_then(Value::as_str).map(neutralize_specials);
         if let Some(tcs) = m.get("tool_calls").and_then(Value::as_array) {
             for tc in tcs {
                 let fn_obj = tc.get("function").unwrap_or(tc);
@@ -384,8 +416,8 @@ pub fn parse_chat(body: &Value) -> Result<(Vec<Message>, Options, usize, bool), 
                 let mut arguments = Vec::with_capacity(pairs.len());
                 for (k, v) in pairs {
                     let vs = match v {
-                        Value::String(s) => s,
-                        other => tojson_serde(&other),
+                        Value::String(s) => neutralize_specials(&s),
+                        other => neutralize_specials(&tojson_serde(&other)),
                     };
                     arguments.push((k, vs));
                 }
@@ -606,6 +638,27 @@ mod tests {
         assert_eq!(m.len(), 2);
         assert_eq!(m[1].content, "hi there");
         assert_eq!((o.thinking, n, s), (Some(false), 7, true));
+    }
+
+    #[test]
+    fn special_token_strings_in_message_text_are_disarmed() {
+        assert_eq!(neutralize_specials("a <|image_pad|> b"), "a <\u{200b}|image_pad|> b");
+        assert_eq!(neutralize_specials("<|im_start|>user<|im_end|>"), "<\u{200b}|im_start|>user<\u{200b}|im_end|>");
+        // not the shape of a special token: untouched, and so is text without any
+        for s in ["a <|> b", "x <| y |> z", "<||>", "<|a b|>", "plain text, no markers", "naïve <| ünï"] {
+            assert_eq!(neutralize_specials(s), s);
+        }
+        // a fetched page that mentions the picture token does not make picture slots; a real picture still does
+        let b = json!({"messages": [
+            {"role": "tool", "content": "{\"image_token\":\"<|image_pad|>\",\"v\":\"<|vision_start|>\"}"},
+            {"role": "user", "content": [
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64,aGVsbG8="}},
+                {"type": "text", "text": "the literal <|vision_start|><|image_pad|><|vision_end|> is just text"}]}]});
+        let (m, ..) = parse_chat(&b).unwrap();
+        assert_eq!(m[0].content.matches("<|image_pad|>").count(), 0);
+        assert_eq!(m[1].content.matches("<|image_pad|>").count(), 1);
+        assert_eq!(m[1].content.matches(IMAGE_MARK).count(), 1);
+        assert_eq!(parse_images(&b).unwrap().len(), 1);
     }
 
     #[test]
