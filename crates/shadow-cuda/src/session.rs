@@ -398,6 +398,9 @@ pub struct GpuSession<'c, 'm> {
     replay: Replay<'c>,
     /// `delta_chunk_prep`'s output for up to BIG_BATCH tokens: 8,448 floats a (64-token chunk, value head)
     dscr: DeviceBuffer<'c>,
+    /// llama.cpp's int8 MMQ products for the quantized dense projections of a long prompt (`mmq.rs`, `SHADOW_MMQ=0` off), and the buffer for the quantized activations
+    mmq: Option<crate::mmq::Mmq>,
+    mmq_y: DeviceBuffer<'c>,
     /// with `--tensor-prompt` (`SHADOW_PREFILL_DEVPLAN=0` off): a long prompt's MoE is routed and planned on the device (`dev_plan`); these are its scratch buffers:
     /// each token's chosen experts, the users of each expert, each expert's first group, and the host's per-layer expert tables (copied flags, addresses)
     /// the residual streams of every row of a pass bigger than `rows` (see `sub_rows_cap`), one buffer of `rows` rows a part (carved wherever the lent ranges have room:
@@ -1341,6 +1344,9 @@ impl<'c, 'm> GpuSession<'c, 'm> {
             ple: a(MAX_VERIFY * ch)?, pass: None, on: std::cell::Cell::new(false),
         };
         let dscr = a(BIG_BATCH.div_ceil(64) * c.ssm_v_heads * 8448)?;
+        let mmq = if tiers.tensor_prompt { crate::mmq::Mmq::load() } else { None };
+        // the largest input a projection takes is the attention output's (n_head * head_dim) or the SSM output's, for the rows of a sub-chunk
+        let mmq_y = a(mmq.as_ref().map_or(1, |q| q.y_bytes((c.n_head * c.head_dim).max(c.ssm_v_heads * c.ssm_head_dim).max(c.hidden), sub_rows_cap().max(MAX_BATCH)).div_ceil(4)))?;
         let (dp_tidx, dp_cnt, dp_gstart, dp_copied, dp_eaddr) = (a(BIG_BATCH_MAX * 16)?, a(1024)?, a(1024)?, a(256)?, a(6144)?);
         let kv_lend = !std::env::var("SHADOW_KV_LEND").is_ok_and(|v| v == "0");
         let mut kv_regions: Vec<crate::kvvmm::VmmRegion<'c>> = Vec::new();
@@ -1605,7 +1611,7 @@ impl<'c, 'm> GpuSession<'c, 'm> {
             None
         };
         let mut s = GpuSession {
-            ctx, m, mvp, fw, w, v, b, bb, replay, dscr,
+            ctx, m, mvp, fw, w, v, b, bb, replay, dscr, mmq, mmq_y,
             rparts: Vec::new(), logits_last: false, sub_last: true, sub_first: true,
             devplan: tiers.tensor_prompt && !std::env::var("SHADOW_PREFILL_DEVPLAN").is_ok_and(|v| v == "0"), dp_tidx, dp_cnt, dp_gstart, dp_copied, dp_eaddr, kv_regions, kv_extra: None, kv_extra_reg, prompt_hint: 0, kv_rows: 0, kv_halves: false, router_bias: std::env::var("SHADOW_ROUTER_BIAS").ok().and_then(|v| v.parse().ok()).unwrap_or(0.0), batch_scratch, delta, attn, ple_state, tokens: vec![], pictures: vec![], rope_tab: None, rope_on: false, cap, trace: None, stop_after: None,
             resident_bytes, expert_uploads: 0, cache, ram, copy_stream, copy_stream2, copy_ev2, copy_event, staging,
@@ -4279,6 +4285,22 @@ impl<'c, 'm> GpuSession<'c, 'm> {
             }
             .unwrap_or_else(|err| panic!("{name}: {err}"));
             return;
+        }
+        // llama.cpp's int8 MMQ for the K-quants and IQ4_XS with enough rows to pay for the quantization (`mmq.rs`)
+        if let (Some(mq), true) = (self.mmq.as_ref(), self.tensor_prompt && m >= 128 && entry.starts_with("matvec_cols_") && !entry.starts_with("matvec_cols_ref_")) {
+            if let Some(gty) = crate::mmq::Mmq::ggml_type(&ty) {
+                let k = t.dims[0] as usize;
+                if k % 256 == 0 && xs % 4 == 0 && x % 16 == 0 && mq.y_bytes(k, m) <= self.mmq_y.bytes {
+                    let stream = self.ls().map_or(0, |s| s.raw() as u64);
+                    // SAFETY: x holds m rows of k floats xs apart (the caller's buffers), the quantized copy fits mmq_y (checked), the weights are `rows` rows of k values in their GGUF
+                    // layout, y holds m rows of `rows` floats ys apart.
+                    unsafe {
+                        mq.quantize(x, self.mmq_y.ptr, k, m, xs, gty, stream).unwrap_or_else(|e| panic!("{name}: {e}"));
+                        mq.gemm(gty, wptr, self.mmq_y.ptr, y, rows, k, m, ys, stream).unwrap_or_else(|e| panic!("{name}: {e}"));
+                    }
+                    return;
+                }
+            }
         }
         static MMA_NL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         // on since the device planner (the pass is no longer paced by the copies: the shared experts' IQ4_NL down projection took 331 ms of a 3.5 s kernel window as 8-column launches); `SHADOW_MMA_NL=0` off

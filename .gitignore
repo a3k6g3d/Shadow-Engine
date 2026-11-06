@@ -23,3 +23,8 @@ models/mtp-basalt-ft1/*.bin
 /bin/strata-vision.exe
 /models/Qwen3.8-Flash-Next.mmproj-f16.gguf
 /.playwright-mcp/
+
+# built native pieces
+/native/*/*.dll
+/native/*/*.exp
+/native/*/*.lib
