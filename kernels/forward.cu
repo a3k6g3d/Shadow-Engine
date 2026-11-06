@@ -425,6 +425,66 @@ extern "C" __global__ void delta_steps128_f(const float* q, const float* k, cons
     for (unsigned int i = 0; i < d; ++i) s[i * d + j] = col[i];
 }
 
+// ---- Float rope for the prompt path's attention (`--tensor-prompt`): the double `pow` / `cos` / `sin` of `rope_one` were ~100 FP64 operations a pair, per (row, head).  The
+// base^(2i / dims) table is made once per launch (`rope_pow_table`, in double), the angle is still formed in double (pos / table[i]: a float angle at position 15,000 would be
+// off by ~1e-3 rad) and reduced to [-pi, pi] in double, then float `sincosf`.
+__device__ double g_rope_pow[128];
+extern "C" __global__ void rope_pow_table(float theta, unsigned int dims) {
+    const unsigned int i = threadIdx.x;
+    if (i < dims / 2 && i < 128) g_rope_pow[i] = pow((double) theta, 2.0 * (double) i / (double) dims);
+}
+
+static __device__ void rope_one_t(float* x, unsigned int pos, unsigned int dims) {
+    unsigned int half = dims / 2;
+    unsigned int pp[3] = {pos, pos, pos};
+    const int* tab = g_rope_tab;
+    if (tab != nullptr) {
+        pp[0] = (unsigned int) tab[3 * (u64) pos];
+        pp[1] = (unsigned int) tab[3 * (u64) pos + 1];
+        pp[2] = (unsigned int) tab[3 * (u64) pos + 2];
+    }
+    for (unsigned int i = threadIdx.x; i < half; i += blockDim.x) {
+        const double f = (double) pp[i % 3] / g_rope_pow[i];
+        const double fr = f - 6.283185307179586 * rint(f * 0.15915494309189535);
+        float sn, cs;
+        sincosf((float) fr, &sn, &cs);
+        const float a = x[i], b = x[i + half];
+        x[i] = a * cs - b * sn;
+        x[i + half] = b * cs + a * sn;
+    }
+}
+
+static __device__ __forceinline__ void head_norm_rope_qgk_one_f(const float* qg, float* q, float* gate, const float* wq,
+                                                                const float* kk, float* kc, const float* wk,
+                                                                unsigned int nh, unsigned int d, float eps,
+                                                                unsigned int pos, unsigned int rope_dims, unsigned int b) {
+    if (b < nh) {
+        const float* x = qg + (u64) b * 2 * d;
+        float* y = q + (u64) b * d;
+        float* g = gate + (u64) b * d;
+        for (unsigned int i = threadIdx.x; i < d; i += blockDim.x) g[i] = x[d + i];
+        rmsnorm_one_f(x, wq, y, d, eps);
+        __syncthreads();
+        rope_one_t(y, pos, rope_dims);
+    } else {
+        unsigned int kh = b - nh;
+        const float* x = kk + (u64) kh * d;
+        float* y = kc + (u64) kh * d;
+        rmsnorm_one_f(x, wk, y, d, eps);
+        __syncthreads();
+        rope_one_t(y, pos, rope_dims);
+    }
+}
+
+extern "C" __global__ void head_norm_rope_qgk_rows_f(const float* qg, float* q, float* gate, const float* wq,
+                                                     const float* kk, float* kc, const float* wk, unsigned int nh,
+                                                     unsigned int nkv, unsigned int d, float eps, unsigned int pos0,
+                                                     unsigned int rope_dims, float theta) {
+    const u64 j = blockIdx.y, qd = (u64) nh * d, kd = (u64) nkv * d;
+    head_norm_rope_qgk_one_f(qg + j * 2 * qd, q + j * qd, gate + j * qd, wq, kk + j * kd, kc + (pos0 + j) * kd, wk,
+                             nh, d, eps, pos0 + (unsigned int) j, rope_dims, blockIdx.x);
+}
+
 // Each `d`-wide head: x = x / sqrt(sum x^2 + 1e-6), then x /= div.  grid = heads, block = 128.
 extern "C" __global__ void l2norm_heads(float* x, unsigned int d, float div) {
     float* h = x + (u64) blockIdx.x * d;

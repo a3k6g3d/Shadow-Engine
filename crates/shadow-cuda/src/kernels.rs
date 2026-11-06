@@ -245,7 +245,7 @@ pub const FILES: &[File] = &[
             e("l2norm_qk_rows", &[W, U, U, F, U]), e("l2norm_qk_rows_f", &[W, U, U, F, U]),
             e("gated_rmsnorm_rows", &[W, C, C, U, F, U]),
             e("gated_rmsnorm_rows_w", &[W, C, C, U, F, U, U]), e("gated_rmsnorm_rows_wf", &[W, C, C, U, F, U, U]),
-            e("head_norm_rope_qgk_rows", &[C, W, W, C, C, W, C, U, U, U, F, U, U, F]),
+            e("head_norm_rope_qgk_rows", &[C, W, W, C, C, W, C, U, U, U, F, U, U, F]), e("head_norm_rope_qgk_rows_f", &[C, W, W, C, C, W, C, U, U, U, F, U, U, F]), e("rope_pow_table", &[F, U]),
             e("attention_heads_rows", &[C, C, C, U, C, W, W, U, U, U, U, U]),
             e("attention_heads_sel_rows", &[C, C, C, C, U, C, C, W, W, U, U, U, U, U]),
             e("attention_group_sel_rows", &[C, C, C, C, U, C, C, W, W, U, U, U, U, U, U]),

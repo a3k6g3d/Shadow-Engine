@@ -4608,7 +4608,12 @@ impl<'c, 'm> GpuSession<'c, 'm> {
             self.attn[l].as_mut().unwrap().nblocks = (p0 + m) / ratio;
             let bb = &self.bb;
             let at = self.attn[l].as_ref().unwrap();
-            self.k2("head_norm_rope_qgk_rows", (nh + nkv) as u32, m as u32, 128, &[
+            let qgk = if std::env::var("SHADOW_ROPE_F32").is_ok_and(|v| v == "0") { "head_norm_rope_qgk_rows" } else { self.nk("head_norm_rope_qgk_rows", "head_norm_rope_qgk_rows_f") };
+            if qgk.ends_with("_f") {
+                // the float kernel reads base^(2i / dims) from a table made here (a one-block launch)
+                self.k("rope_pow_table", 1, 128, &[Arg::F32(th), Arg::U32(rd)]);
+            }
+            self.k2(qgk, (nh + nkv) as u32, m as u32, 128, &[
                 Arg::Ptr(bb.qg.ptr), Arg::Ptr(bb.q.ptr), Arg::Ptr(bb.gate.ptr), Arg::Ptr(self.sv(&format!("{p}.attn_q_norm.weight"))),
                 Arg::Ptr(bb.kk.ptr), Arg::Ptr(at.k.ptr), Arg::Ptr(self.sv(&format!("{p}.attn_k_norm.weight"))),
                 Arg::U32(nh as u32), Arg::U32(nkv as u32), Arg::U32(hd as u32), Arg::F32(eps), Arg::U32(p0 as u32),
