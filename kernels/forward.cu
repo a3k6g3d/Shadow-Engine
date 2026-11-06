@@ -1729,7 +1729,8 @@ static __device__ __forceinline__ void block12_reduce(float* v, float* w, bool i
     __syncthreads();
 }
 
-extern "C" __global__ void __launch_bounds__(256) attention_group_sel_rows_v3(const float* q, const float* kc, const float* vc, const u32* toks,
+template <bool TC>
+static __device__ __forceinline__ void att_v3_body(const float* q, const float* kc, const float* vc, const u32* toks,
                                                     unsigned int tstride, const u32* ntoks, const float* gate, float* o,
                                                     double* scratch_d, unsigned int stride, unsigned int nkv, unsigned int hd,
                                                     unsigned int group, unsigned int nh, unsigned int hb) {
@@ -1756,6 +1757,7 @@ extern "C" __global__ void __launch_bounds__(256) attention_group_sel_rows_v3(co
     float mx[V3H];
     #pragma unroll
     for (unsigned int a = 0; a < V3H; ++a) mx[a] = -1e30f;
+    if (!TC) {
     for (unsigned int base = 0; base < ntok; base += 512) {
         const float4* k4[2];
         bool ok[2];
@@ -1809,6 +1811,84 @@ extern "C" __global__ void __launch_bounds__(256) attention_group_sel_rows_v3(co
         }
     }
     block12_reduce(mx, wred, true);
+    } else {
+        // the scores on the tensor cores (fp16 inputs, fp32 sums; fast mode): a warp takes 16 selected positions at a time as the rows of an m16n8k16 product, the group's heads
+        // (padded to 16) as its columns; each lane holds 4 scores of two heads
+        __shared__ __align__(16) unsigned short qh[16][264];
+        __shared__ float wred2[V3H * 8];
+        const unsigned int warp = tid >> 5, lane = tid & 31, grp8 = lane >> 2, tg = lane & 3;
+        for (unsigned int idx = tid; idx < 16 * hd; idx += 256) {
+            const unsigned int a = idx / hd, i = idx % hd;
+            const float x = a < nhh ? qrow[(u64) (h0 + a) * hd + i] : 0.0f;
+            unsigned int hv;
+            asm("cvt.rn.f16x2.f32 %0, %1, %2;" : "=r"(hv) : "f"(0.0f), "f"(x));
+            qh[a][i] = (unsigned short) (hv & 0xffffu);
+        }
+        __syncthreads();
+        float mxl[2][2];
+        #pragma unroll
+        for (unsigned int nt = 0; nt < 2; ++nt) { mxl[nt][0] = -1e30f; mxl[nt][1] = -1e30f; }
+        const unsigned int ntile = (ntok + 15) / 16;
+        for (unsigned int tile = warp; tile < ntile; tile += 8) {
+            const unsigned int t0 = tile * 16, ta = t0 + grp8, tb = t0 + grp8 + 8;
+            const float* ka = kc + ((u64) (ta < ntok ? tk[ta] : 0u) * nkv + g) * hd;
+            const float* kb = kc + ((u64) (tb < ntok ? tk[tb] : 0u) * nkv + g) * hd;
+            float c[2][4];
+            #pragma unroll
+            for (unsigned int nt = 0; nt < 2; ++nt)
+                #pragma unroll
+                for (unsigned int e = 0; e < 4; ++e) c[nt][e] = 0.0f;
+            #pragma unroll 4
+            for (unsigned int k0 = 0; k0 < hd; k0 += 16) {
+                const float2 a00 = *(const float2*) (ka + k0 + tg * 2), a01 = *(const float2*) (ka + k0 + 8 + tg * 2);
+                const float2 a10 = *(const float2*) (kb + k0 + tg * 2), a11 = *(const float2*) (kb + k0 + 8 + tg * 2);
+                unsigned int A0, A1, A2, A3;
+                asm("cvt.rn.f16x2.f32 %0, %1, %2;" : "=r"(A0) : "f"(a00.y), "f"(a00.x));
+                asm("cvt.rn.f16x2.f32 %0, %1, %2;" : "=r"(A1) : "f"(a10.y), "f"(a10.x));
+                asm("cvt.rn.f16x2.f32 %0, %1, %2;" : "=r"(A2) : "f"(a01.y), "f"(a01.x));
+                asm("cvt.rn.f16x2.f32 %0, %1, %2;" : "=r"(A3) : "f"(a11.y), "f"(a11.x));
+                #pragma unroll
+                for (unsigned int nt = 0; nt < 2; ++nt) {
+                    const unsigned int B0 = *(const unsigned int*) &qh[nt * 8 + grp8][k0 + tg * 2];
+                    const unsigned int B1 = *(const unsigned int*) &qh[nt * 8 + grp8][k0 + 8 + tg * 2];
+                    asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
+                                 : "+f"(c[nt][0]), "+f"(c[nt][1]), "+f"(c[nt][2]), "+f"(c[nt][3])
+                                 : "r"(A0), "r"(A1), "r"(A2), "r"(A3), "r"(B0), "r"(B1));
+                }
+            }
+            #pragma unroll
+            for (unsigned int nt = 0; nt < 2; ++nt)
+                #pragma unroll
+                for (unsigned int e = 0; e < 4; ++e) {
+                    const unsigned int tok = t0 + grp8 + (e >= 2 ? 8 : 0), head = nt * 8 + tg * 2 + (e & 1);
+                    if (tok < ntok && head < nhh) {
+                        const float sv = c[nt][e] * scale;
+                        scr[(u64) (h0 + head) * stride + tok] = sv;
+                        mxl[nt][e & 1] = fmaxf(mxl[nt][e & 1], sv);
+                    }
+                }
+        }
+        #pragma unroll
+        for (unsigned int nt = 0; nt < 2; ++nt)
+            #pragma unroll
+            for (unsigned int e = 0; e < 2; ++e) {
+                float v = mxl[nt][e];
+                v = fmaxf(v, __shfl_xor_sync(0xffffffffu, v, 4));
+                v = fmaxf(v, __shfl_xor_sync(0xffffffffu, v, 8));
+                v = fmaxf(v, __shfl_xor_sync(0xffffffffu, v, 16));
+                const unsigned int head = nt * 8 + tg * 2 + e;
+                if (grp8 == 0 && head < V3H) wred2[head * 8 + warp] = v;
+            }
+        __syncthreads();
+        #pragma unroll
+        for (unsigned int a = 0; a < V3H; ++a) {
+            float r = wred2[a * 8];
+            #pragma unroll
+            for (unsigned int k = 1; k < 8; ++k) r = fmaxf(r, wred2[a * 8 + k]);
+            mx[a] = r;
+        }
+        __syncthreads();
+    }
     float zt[V3H];
     #pragma unroll
     for (unsigned int a = 0; a < V3H; ++a) zt[a] = 0.0f;
@@ -1893,6 +1973,19 @@ extern "C" __global__ void __launch_bounds__(256) attention_group_sel_rows_v3(co
             }
         }
     }
+}
+
+extern "C" __global__ void __launch_bounds__(256) attention_group_sel_rows_v3(const float* q, const float* kc, const float* vc, const u32* toks,
+                                                    unsigned int tstride, const u32* ntoks, const float* gate, float* o,
+                                                    double* scratch_d, unsigned int stride, unsigned int nkv, unsigned int hd,
+                                                    unsigned int group, unsigned int nh, unsigned int hb) {
+    att_v3_body<false>(q, kc, vc, toks, tstride, ntoks, gate, o, scratch_d, stride, nkv, hd, group, nh, hb);
+}
+extern "C" __global__ void __launch_bounds__(256) attention_group_sel_rows_tc(const float* q, const float* kc, const float* vc, const u32* toks,
+                                                    unsigned int tstride, const u32* ntoks, const float* gate, float* o,
+                                                    double* scratch_d, unsigned int stride, unsigned int nkv, unsigned int hd,
+                                                    unsigned int group, unsigned int nh, unsigned int hb) {
+    att_v3_body<true>(q, kc, vc, toks, tstride, ntoks, gate, o, scratch_d, stride, nkv, hd, group, nh, hb);
 }
 
 // `attention_heads_rows` for a prompt's first positions (every earlier token is attended) in float, a block a (row, key group, `hb` heads) as `attention_group_sel_rows_f32`
