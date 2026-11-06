@@ -5289,14 +5289,49 @@ impl<'c, 'm> GpuSession<'c, 'm> {
             }
             .unwrap_or_else(|err| panic!("{}: {err}", t.name));
         };
-        if !self.moe_gate_up(p, &infos[0], &infos[1], w, g, n) {
-            grouped(&infos[0], w, g, 2 * n, bb.u.ptr, h, bb.eg.ptr, ff);
+        if self.gate_up_swiglu(p, &infos[0], &infos[1], w, g, n) {
+            // gate, up and SwiGLU in one kernel: bb.act is written, bb.eg / bb.eu are not
+        } else {
+            if !self.moe_gate_up(p, &infos[0], &infos[1], w, g, n) {
+                grouped(&infos[0], w, g, 2 * n, bb.u.ptr, h, bb.eg.ptr, ff);
+            }
+            let rows = (start * k * ff * 4) as u64;
+            let len = (end - start) * k * ff;
+            self.k1("swiglu", len, &[Arg::Ptr(bb.eg.ptr + rows), Arg::Ptr(bb.eg.ptr + up + rows), Arg::Ptr(bb.act.ptr + rows),
+                                     Arg::U32(len as u32)]);
         }
-        let rows = (start * k * ff * 4) as u64;
-        let len = (end - start) * k * ff;
-        self.k1("swiglu", len, &[Arg::Ptr(bb.eg.ptr + rows), Arg::Ptr(bb.eg.ptr + up + rows), Arg::Ptr(bb.act.ptr + rows),
-                                 Arg::U32(len as u32)]);
         grouped(&infos[2], w + 16 * n as u64, g + (2 * n * 4 * (1 + 2 * p.chunk_n)) as u64, n, bb.act.ptr, ff, bb.eo.ptr, h);
+    }
+
+    /// The gate and up projections of a phase's n groups and SwiGLU in one kernel (`mma_grouped_gu_*`, `matvec.cu`; `SHADOW_GU_SWIGLU=0` off): the same arithmetic as the
+    /// two products and `swiglu`, so bit-identical; false when the layer's matrices are not the tensor-core kinds with a shared type and shape.
+    fn gate_up_swiglu(&self, p: &GroupedPlan, gate: &TensorInfo, up: &TensorInfo, w: u64, g: u64, n: usize) -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if !*ON.get_or_init(|| !std::env::var("SHADOW_GU_SWIGLU").is_ok_and(|v| v == "0")) || p.chunk_n < 32 || gate.ty != up.ty || gate.dims != up.dims {
+            return false;
+        }
+        if self.moe_gate_up_wanted(gate) {
+            return false;
+        }
+        let ty = gate.ty.name().to_lowercase();
+        let kernel = if p.chunk_n == 64 { format!("mma_grouped64_gu_{ty}") } else { format!("mma_grouped_gu_{ty}") };
+        let (rows, cols) = (gate.dims[1] as u32, gate.dims[0] as u32);
+        let (h, ff) = (self.m.cfg.hidden, self.m.cfg.expert_ff);
+        let bb = &self.bb;
+        // SAFETY: as `routed_grouped`'s grouped launches: n table entries for the gate matrices then n for the up matrices at gtab + w, the gate part's n records at gtab + g, rows
+        // inside bb.u (h floats a row) and bb.act (expert_ff floats a row).
+        unsafe {
+            self.mvp.launch(&kernel, (rows.div_ceil(64), n as u32, 1), (128, 1, 1), 0, self.ls(),
+                            &[Arg::Ptr(bb.gtab.ptr + w), Arg::Ptr(bb.gtab.ptr + g), Arg::Ptr(bb.u.ptr), Arg::U32(h as u32),
+                              Arg::Ptr(bb.act.ptr), Arg::U32(ff as u32), Arg::U32(rows), Arg::U32(cols)])
+        }
+        .unwrap_or_else(|err| panic!("{}: {err}", gate.name));
+        true
+    }
+
+    /// Whether `moe_gate_up` (opt-in `SHADOW_MMQ_MOE=1`) would take this layer's gate / up matrices.
+    fn moe_gate_up_wanted(&self, gate: &TensorInfo) -> bool {
+        self.mmq.as_ref().is_some_and(|mq| mq.moe_type(&gate.ty.name()).is_some())
     }
 
     /// The gate and up projections of a phase's groups (2 * n of them: gate then up, at `w` / `g` in the plan tables) on llama.cpp's int8 tensor-core kernels (`mmq.rs`
