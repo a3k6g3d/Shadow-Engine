@@ -5303,11 +5303,11 @@ impl<'c, 'm> GpuSession<'c, 'm> {
         grouped(&infos[2], w + 16 * n as u64, g + (2 * n * 4 * (1 + 2 * p.chunk_n)) as u64, n, bb.act.ptr, ff, bb.eo.ptr, h);
     }
 
-    /// The gate and up projections of a phase's n groups and SwiGLU in one kernel (`mma_grouped_gu_*`, `matvec.cu`; `SHADOW_GU_SWIGLU=0` off): the same arithmetic as the
+    /// The gate and up projections of a phase's n groups and SwiGLU in one kernel (`mma_grouped_gu_*`, `matvec.cu`; opt-in with `SHADOW_GU_SWIGLU=1`: slower, docs/STATUS.md 2026-11-06 (47)): the same arithmetic as the
     /// two products and `swiglu`, so bit-identical; false when the layer's matrices are not the tensor-core kinds with a shared type and shape.
     fn gate_up_swiglu(&self, p: &GroupedPlan, gate: &TensorInfo, up: &TensorInfo, w: u64, g: u64, n: usize) -> bool {
         static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        if !*ON.get_or_init(|| !std::env::var("SHADOW_GU_SWIGLU").is_ok_and(|v| v == "0")) || p.chunk_n < 32 || gate.ty != up.ty || gate.dims != up.dims {
+        if !*ON.get_or_init(|| std::env::var("SHADOW_GU_SWIGLU").is_ok_and(|v| v == "1")) || p.chunk_n < 32 || gate.ty != up.ty || gate.dims != up.dims {
             return false;
         }
         if self.moe_gate_up_wanted(gate) {
