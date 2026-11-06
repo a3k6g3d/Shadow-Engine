@@ -1037,6 +1037,14 @@ static __device__ __forceinline__ void mma_grouped64(const u64* wtab, const unsi
     if (gi[0] == 0) return;
     mma_core<Q, 64>((const u8*) wtab[blockIdx.y], x, xs, y, ys, rows, cols, gi[0], 0, gi + 1, gi + 65);
 }
+// The same with groups of 48 tokens (records of 97 u32): an expert with the average ~40 tokens of a 2,048-row sub-chunk fits one group with less padding than 32 or 64.
+template <typename Q>
+static __device__ __forceinline__ void mma_grouped48(const u64* wtab, const unsigned int* gtab, const float* x, unsigned int xs, float* y,
+                                                     unsigned int ys, unsigned int rows, unsigned int cols) {
+    const unsigned int* gi = gtab + (u64) blockIdx.y * 97;
+    if (gi[0] == 0) return;
+    mma_core<Q, 48>((const u8*) wtab[blockIdx.y], x, xs, y, ys, rows, cols, gi[0], 0, gi + 1, gi + 49);
+}
 // `mma_cols` with 64 tokens a tile: a weight tile is dequantized once for 64 tokens instead of 32 (the n-tiles past the batch's last token are skipped).
 template <typename Q>
 static __device__ __forceinline__ void mma_cols64(const u8* w, const float* x, unsigned int xs, float* y, unsigned int ys,
@@ -1140,6 +1148,13 @@ MMA_GU_ENTRIES(q2_0, Q20)
 MMA_GU_ENTRIES(iq2_s, IQ2S)
 MMA_GU_ENTRIES(iq3_xxs, IQ3XXS)
 MMA_GU_ENTRIES(iq3_s, IQ3S)
+extern "C" __global__ void mma_grouped48_q6_k(const u64* wtab, const unsigned int* gtab, const float* x, unsigned int xs, float* y, unsigned int ys, unsigned int rows, unsigned int cols) { mma_grouped48<Q6K>(wtab, gtab, x, xs, y, ys, rows, cols); }
+extern "C" __global__ void mma_grouped48_iq4_xs(const u64* wtab, const unsigned int* gtab, const float* x, unsigned int xs, float* y, unsigned int ys, unsigned int rows, unsigned int cols) { mma_grouped48<IQ4XS>(wtab, gtab, x, xs, y, ys, rows, cols); }
+extern "C" __global__ void mma_grouped48_iq4_nl(const u64* wtab, const unsigned int* gtab, const float* x, unsigned int xs, float* y, unsigned int ys, unsigned int rows, unsigned int cols) { mma_grouped48<IQ4NL>(wtab, gtab, x, xs, y, ys, rows, cols); }
+extern "C" __global__ void mma_grouped48_q2_0(const u64* wtab, const unsigned int* gtab, const float* x, unsigned int xs, float* y, unsigned int ys, unsigned int rows, unsigned int cols) { mma_grouped48<Q20>(wtab, gtab, x, xs, y, ys, rows, cols); }
+extern "C" __global__ void mma_grouped48_iq2_s(const u64* wtab, const unsigned int* gtab, const float* x, unsigned int xs, float* y, unsigned int ys, unsigned int rows, unsigned int cols) { mma_grouped48<IQ2S>(wtab, gtab, x, xs, y, ys, rows, cols); }
+extern "C" __global__ void mma_grouped48_iq3_xxs(const u64* wtab, const unsigned int* gtab, const float* x, unsigned int xs, float* y, unsigned int ys, unsigned int rows, unsigned int cols) { mma_grouped48<IQ3XXS>(wtab, gtab, x, xs, y, ys, rows, cols); }
+extern "C" __global__ void mma_grouped48_iq3_s(const u64* wtab, const unsigned int* gtab, const float* x, unsigned int xs, float* y, unsigned int ys, unsigned int rows, unsigned int cols) { mma_grouped48<IQ3S>(wtab, gtab, x, xs, y, ys, rows, cols); }
 extern "C" __global__ void mma_cols_q6_k(const u8* w, const float* x, unsigned int xs, float* y, unsigned int ys, unsigned int rows, unsigned int cols, unsigned int m) { mma_cols<Q6K>(w, x, xs, y, ys, rows, cols, m); }
 extern "C" __global__ void mma_cols64_q6_k(const u8* w, const float* x, unsigned int xs, float* y, unsigned int ys, unsigned int rows, unsigned int cols, unsigned int m) { mma_cols64<Q6K>(w, x, xs, y, ys, rows, cols, m); }
 extern "C" __global__ void mma_grouped_q6_k(const u64* wtab, const unsigned int* gtab, const float* x, unsigned int xs, float* y, unsigned int ys, unsigned int rows, unsigned int cols) { mma_grouped<Q6K>(wtab, gtab, x, xs, y, ys, rows, cols); }

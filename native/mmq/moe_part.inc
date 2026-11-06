@@ -63,6 +63,8 @@ static int dispatch_moe(int64_t chunk, const unsigned long long * xtab, const in
     const bool fb = rows % 128 != 0;
     if (chunk == 32) return fb ? launch_moe<type, 32, true>(xtab, y, rec, dst, rows, k, ncols_y, dst_stride, ngroups, ny_groups, s)
                                : launch_moe<type, 32, false>(xtab, y, rec, dst, rows, k, ncols_y, dst_stride, ngroups, ny_groups, s);
+    if (chunk == 48) return fb ? launch_moe<type, 48, true>(xtab, y, rec, dst, rows, k, ncols_y, dst_stride, ngroups, ny_groups, s)
+                               : launch_moe<type, 48, false>(xtab, y, rec, dst, rows, k, ncols_y, dst_stride, ngroups, ny_groups, s);
     if (chunk == 64) return fb ? launch_moe<type, 64, true>(xtab, y, rec, dst, rows, k, ncols_y, dst_stride, ngroups, ny_groups, s)
                                : launch_moe<type, 64, false>(xtab, y, rec, dst, rows, k, ncols_y, dst_stride, ngroups, ny_groups, s);
     return 1;
@@ -86,7 +88,7 @@ EXPORT size_t shadow_mmq_moe_bytes(int64_t k, int64_t ny_groups, int64_t chunk) 
 // rows; dst row r (the records' output rows) at dst + r * dst_stride; chunk = 32 or 64 tokens a group.
 EXPORT int shadow_mmq_moe(int type, unsigned long long xtab, unsigned long long rec, int64_t ngroups, int64_t ny_groups, int64_t chunk, unsigned long long x, int64_t xs,
                           int64_t k, int64_t rows, unsigned long long dst, int64_t dst_stride, unsigned long long scratch, void * stream) {
-    if (k % 256 != 0 || xs % 4 != 0 || (chunk != 32 && chunk != 64)) return 2;
+    if (k % 256 != 0 || xs % 4 != 0 || (chunk != 32 && chunk != 48 && chunk != 64)) return 2;
     cudaStream_t s = (cudaStream_t) stream;
     const int64_t ncols = ny_groups * chunk;
     int * ids = (int *) scratch;

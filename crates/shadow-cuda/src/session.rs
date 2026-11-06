@@ -221,7 +221,7 @@ fn cols_tok() -> usize {
 fn mma_group() -> usize {
     static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new()
     ;
-    *N.get_or_init(|| std::env::var("SHADOW_MMA_GROUP").ok().and_then(|v| v.parse::<usize>().ok()).filter(|&n| n == 32 || n == 64).unwrap_or(32))
+    *N.get_or_init(|| std::env::var("SHADOW_MMA_GROUP").ok().and_then(|v| v.parse::<usize>().ok()).filter(|&n| n == 32 || n == 48 || n == 64).unwrap_or(32))
 }
 
 /// 1 / this (the host's launches stall once per Windows timer tick, docs/STATUS.md 2026-11-05 (29)).
@@ -5277,7 +5277,7 @@ impl<'c, 'm> GpuSession<'c, 'm> {
             // output rows; 65 for the 32-token records), each a rows x cols matrix in the cache or the scratch slots; the rows
             // they name are inside the batch's buffers at the strides given.
             let (kernel, grid, block) = if p.chunk_n >= 32 {
-                (if p.chunk_n == 64 { format!("mma_grouped64_{ty}") } else { format!("mma_grouped_{ty}") }, (rows.div_ceil(64), count as u32, 1), 128)
+                (match p.chunk_n { 64 => format!("mma_grouped64_{ty}"), 48 => format!("mma_grouped48_{ty}"), _ => format!("mma_grouped_{ty}") }, (rows.div_ceil(64), count as u32, 1), 128)
             } else {
                 // 8 rows a block: matvec.cu's GROUPED_RW = 1
                 (format!("matvec_grouped_{ty}"), (rows.div_ceil(8), count as u32, 1), 256)
@@ -5341,7 +5341,7 @@ impl<'c, 'm> GpuSession<'c, 'm> {
         let (Some(mq), Some(region)) = (self.mmq.as_ref(), self.bb._region.as_ref()) else { return false };
         let Some(gty) = mq.moe_type(&gate.ty.name()) else { return false };
         let (k, rows) = (gate.dims[0] as usize, gate.dims[1] as usize);
-        if gate.ty != up.ty || gate.dims != up.dims || !self.tensor_prompt || !matches!(p.chunk_n, 32 | 64) || k % 256 != 0 || k != self.m.cfg.hidden {
+        if gate.ty != up.ty || gate.dims != up.dims || !self.tensor_prompt || !matches!(p.chunk_n, 32 | 48 | 64) || k % 256 != 0 || k != self.m.cfg.hidden {
             return false;
         }
         if mq.moe_bytes(k, n, p.chunk_n) > region.bytes {
