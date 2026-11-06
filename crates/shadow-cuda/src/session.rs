@@ -5289,12 +5289,38 @@ impl<'c, 'm> GpuSession<'c, 'm> {
             }
             .unwrap_or_else(|err| panic!("{}: {err}", t.name));
         };
-        grouped(&infos[0], w, g, 2 * n, bb.u.ptr, h, bb.eg.ptr, ff);
+        if !self.moe_gate_up(p, &infos[0], &infos[1], w, g, n) {
+            grouped(&infos[0], w, g, 2 * n, bb.u.ptr, h, bb.eg.ptr, ff);
+        }
         let rows = (start * k * ff * 4) as u64;
         let len = (end - start) * k * ff;
         self.k1("swiglu", len, &[Arg::Ptr(bb.eg.ptr + rows), Arg::Ptr(bb.eg.ptr + up + rows), Arg::Ptr(bb.act.ptr + rows),
                                  Arg::U32(len as u32)]);
         grouped(&infos[2], w + 16 * n as u64, g + (2 * n * 4 * (1 + 2 * p.chunk_n)) as u64, n, bb.act.ptr, ff, bb.eo.ptr, h);
+    }
+
+    /// The gate and up projections of a phase's groups (2 * n of them: gate then up, at `w` / `g` in the plan tables) on llama.cpp's int8 tensor-core kernels (`mmq.rs`
+    /// `moe`; IQ2_S, IQ3_XXS, IQ3_S; opt-in with `SHADOW_MMQ_MOE=1`): false when they cannot take them and the caller runs `mma_grouped_*`.  The quantized activations and the gather
+    /// list go in the layer's aliased attention / DeltaNet region, which is dead while the experts run.
+    fn moe_gate_up(&self, p: &GroupedPlan, gate: &TensorInfo, up: &TensorInfo, w: u64, g: u64, n: usize) -> bool {
+        let (Some(mq), Some(region)) = (self.mmq.as_ref(), self.bb._region.as_ref()) else { return false };
+        let Some(gty) = mq.moe_type(&gate.ty.name()) else { return false };
+        let (k, rows) = (gate.dims[0] as usize, gate.dims[1] as usize);
+        if gate.ty != up.ty || gate.dims != up.dims || !self.tensor_prompt || !matches!(p.chunk_n, 32 | 64) || k % 256 != 0 || k != self.m.cfg.hidden {
+            return false;
+        }
+        if mq.moe_bytes(k, n, p.chunk_n) > region.bytes {
+            return false;
+        }
+        let bb = &self.bb;
+        let stream = self.ls().map_or(0, |s| s.raw() as u64);
+        // SAFETY: `n` groups' addresses at gtab + w (three parts of them: gate, up, down) and their records at gtab + g, each a rows x k matrix of this type in the cache or the
+        // stage halves; the records' rows are inside bb.u (k floats a row) and bb.eg (expert_ff floats a row); the region is dead during the experts (`alias_rows`).
+        unsafe {
+            mq.moe(gty, bb.gtab.ptr + w, bb.gtab.ptr + g, 2 * n, n, p.chunk_n, bb.u.ptr, k, k, rows, bb.eg.ptr, self.m.cfg.expert_ff, region.ptr, stream)
+        }
+        .unwrap_or_else(|err| panic!("{}: {err}", gate.name));
+        true
     }
 
     /// Token j's routed experts (resident in the cache, or at `extra`'s scratch addresses) and the combine with its

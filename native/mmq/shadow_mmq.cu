@@ -96,3 +96,6 @@ EXPORT int shadow_mmq_gemm(int type, const void * w, const void * yq, float * ds
     }
     return cudaGetLastError() == cudaSuccess ? 0 : 3;
 }
+
+// grouped experts (the MoE gate/up projections of a long prompt)
+#include "moe_part.inc"
