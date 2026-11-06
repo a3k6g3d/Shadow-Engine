@@ -3357,20 +3357,36 @@ impl<'c, 'm> GpuSession<'c, 'm> {
             }
             total <= rows || (0..total.div_ceil(rows)).all(|_| take(rows * ch).is_ok())
         };
-        let sub = sub_rows_cap().min(cap);
-        let mut rows = sub / 64 * 64;
-        while rows >= 2 * MAX_BATCH && !fits(rows, rows) {
-            rows -= 64;
+        // the sub-chunk rows (a multiple of 64) whose temporaries fit, and the most rows a pass can have with them (at most the cap)
+        let plan = |sub: usize| -> Option<(usize, usize)> {
+            let mut rows = sub.min(cap) / 64 * 64;
+            while rows >= 2 * MAX_BATCH && !fits(rows, rows) {
+                rows -= 64;
+            }
+            if rows < 2 * MAX_BATCH {
+                return None;
+            }
+            let mut total = cap / 64 * 64;
+            while total > rows && !fits(rows, total) {
+                total -= 64;
+            }
+            Some((rows, total.max(rows)))
+        };
+        let Some((mut rows, mut total)) = plan(sub_rows_cap()) else { return false };
+        // A prompt that does not fit one pass reads every layer's experts again for the next pass (the 15k prompt: 12,288 rows + 2,848, 2.4x the copying): smaller
+        // temporaries leave room for the residual streams of the whole prompt.  Not when `SHADOW_SUB_ROWS` names the size (docs/STATUS.md 2026-11-06 (45)).
+        if total < self.prompt_hint && total < cap && std::env::var("SHADOW_SUB_ROWS").is_err() && !std::env::var("SHADOW_ONE_PASS").is_ok_and(|v| v == "0") {
+            for sub in [1792, 1536, 1280, 1024, 768] {
+                if let Some((r, tt)) = plan(sub) {
+                    if tt > total {
+                        (rows, total) = (r, tt);
+                    }
+                    if total >= self.prompt_hint.min(cap) {
+                        break;
+                    }
+                }
+            }
         }
-        if rows < 2 * MAX_BATCH {
-            return false;
-        }
-        // the most rows a pass can have with those temporaries (a multiple of 64, at most the cap)
-        let mut total = cap / 64 * 64;
-        while total > rows && !fits(rows, total) {
-            total -= 64;
-        }
-        let total = total.max(rows);
         if std::env::var("SHADOW_STAGE_TIME").is_ok_and(|v| v == "1") {
             eprintln!("BIGBATCH lent {} slots ({:.2} GiB), halves {:.2} GiB, ranges {} ({:.2} GiB), rows {rows} of cap {cap}, pass {total} rows",
                       lent.n, (lent.n * self.cache.slot_bytes) as f64 / 1073741824.0, halves as f64 / 1073741824.0,
