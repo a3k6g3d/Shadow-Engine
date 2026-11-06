@@ -460,9 +460,18 @@ pub fn parse_entries(source: &str) -> Vec<(String, Vec<Option<P>>)> {
     let mut rest = source;
     while let Some(i) = rest.find("extern \"C\" __global__") {
         rest = &rest[i..];
-        let open = match rest.find('(') { Some(o) => o, None => break };
+        // a `__launch_bounds__(N)` before the name has its own parentheses: skip it, the name follows it
+        let mut from = 0usize;
+        let open = loop {
+            let o = match rest[from..].find('(') { Some(o) => from + o, None => return out };
+            if rest[from..o].trim_end().ends_with("__launch_bounds__") {
+                match rest[o..].find(')') { Some(c) => from = o + c + 1, None => return out }
+            } else {
+                break o;
+            }
+        };
         let close = match rest[open..].find(')') { Some(c) => open + c, None => break };
-        let head = &rest[..open];
+        let head = &rest[from..open];
         let name = head.split_whitespace().last().unwrap_or("").to_string();
         let params = rest[open + 1..close]
             .split(',')
@@ -489,5 +498,8 @@ mod tests {
         assert_eq!(parse_param("double x"), None);
         let e = parse_entries("extern \"C\" __global__ void k(const float* a, int n) {}\n");
         assert_eq!(e, vec![("k".to_string(), vec![Some(P::ConstPtr), Some(P::I32)])]);
+        // launch bounds before the name (one number or two) do not hide the name or the parameters
+        let e = parse_entries("extern \"C\" __global__ void __launch_bounds__(256) k1(const float* a) {}\nextern \"C\" __global__ void __launch_bounds__(128, 2)\nk2(float* o, unsigned int n) {}\n");
+        assert_eq!(e, vec![("k1".to_string(), vec![Some(P::ConstPtr)]), ("k2".to_string(), vec![Some(P::Ptr), Some(P::U32)])]);
     }
 }
