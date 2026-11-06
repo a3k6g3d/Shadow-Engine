@@ -4127,7 +4127,9 @@ impl<'c, 'm> GpuSession<'c, 'm> {
                     let all: Vec<i64> = (0..m).flat_map(|j| ple_rows(c, &self.tokens[..p0 + j + 1])).collect();
                     self.m.ple_prefetch(&all);
                     let t_pref = t_ple_block.elapsed().as_secs_f64();
-                    for j in 0..m {
+                    // the whole batch at once with `--tensor-prompt` (`SHADOW_PLE_BATCH=0`: token by token)
+                    let batched = self.tensor_prompt && !self.replay.on.get() && m >= 16 && !std::env::var("SHADOW_PLE_BATCH").is_ok_and(|v| v == "0") && self.ple_batch(l, p0, m);
+                    for j in (if batched { m } else { 0 })..m {
                         let r = row(&self.bb.r, ch, j);
                         self.ple_at(l, p0 + j + 1, r);
                         if self.replay.on.get() {
@@ -4548,7 +4550,7 @@ impl<'c, 'm> GpuSession<'c, 'm> {
                 } else {
                 static DELTA_X8: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
                 let x8 = m >= 16 && *DELTA_X8.get_or_init(|| std::env::var("SHADOW_DELTA_X8").is_ok_and(|v| v == "1"));
-                self.k(if x8 { "delta_steps128_x8" } else if std::env::var("SHADOW_DELTA_F32").is_ok_and(|v| v == "0") { "delta_steps128" } else { self.nk("delta_steps128", "delta_steps128_f") }, vh as u32, if x8 { 1024 } else { 128 }, &[
+                self.k(if x8 { "delta_steps128_x8" } else if std::env::var("SHADOW_DELTA_F32").is_ok_and(|v| v == "0") { "delta_steps128" } else if std::env::var("SHADOW_DELTA_PF").is_ok_and(|v| v == "1") { self.nk("delta_steps128", "delta_steps128_fp") } else { self.nk("delta_steps128", "delta_steps128_f") }, vh as u32, if x8 { 1024 } else { 128 }, &[
                     Arg::Ptr(bb.x.ptr), Arg::Ptr(bb.x.ptr + (kd * 4) as u64), Arg::Ptr(bb.x.ptr + (2 * kd * 4) as u64),
                     Arg::U32(ch as u32), Arg::Ptr(beta_p), Arg::Ptr(alpha_p), Arg::U32(vh as u32),
                     Arg::Ptr(self.sv(&format!("{p}.ssm_a"))), Arg::Ptr(self.sv(&format!("{p}.ssm_dt.bias"))), Arg::Ptr(s.ptr),
@@ -5408,6 +5410,47 @@ impl<'c, 'm> GpuSession<'c, 'm> {
     }
 
     /// The n-gram memory at layer l for the token at position n - 1 with streams r, into gv.
+    /// The per-layer-embedding step of layer `l` for the batch's m tokens (positions p0 .. p0 + m) in a handful of launches: one upload of every token's n-gram rows, the key and
+    /// value projections as `mv_cols` (tensor cores), the norms / gate / dilated convolution as row kernels, `r += gv + silu(conv)`.  Four of the batch's per-row buffers that are
+    /// idle here (`rn`, `up`, `qkv`, `x`) and `u` hold the intermediates.  False (nothing done) when they are too small.
+    fn ple_batch(&self, l: usize, p0: usize, m: usize) -> bool {
+        let c = &self.m.cfg;
+        let p = format!("blk.{l}");
+        let (h, cs) = (c.hidden, c.streams);
+        let ch = h * cs;
+        let mut e: Vec<f32> = Vec::new();
+        let mut width = 0usize;
+        for j in 0..m {
+            for row in ple_rows(c, &self.tokens[..p0 + j + 1]) {
+                e.extend(self.m.ple_row(row));
+            }
+            if j == 0 {
+                width = e.len();
+            } else if e.len() != width * (j + 1) {
+                return false;
+            }
+        }
+        let bb = &self.bb;
+        let need = m * ch * 4;
+        if width == 0 || width % 4 != 0 || m * width * 4 > bb.qkv.bytes || [&bb.rn, &bb.up, &bb.qkv, &bb.x].iter().any(|b| b.bytes < need) || bb.u.bytes < m * h * 4 {
+            return false;
+        }
+        let (a_key, b_qry, c_gv, d_gvn, u_val) = (bb.rn.ptr, bb.up.ptr, bb.qkv.ptr, bb.x.ptr, bb.u.ptr);
+        self.upload_to(c_gv, &f32s(&e));
+        self.mv_cols(&format!("{p}.ple_key.weight"), c_gv, width, a_key, ch, m);
+        self.mv_cols(&format!("{p}.ple_value.weight"), c_gv, width, u_val, h, m);
+        let (rn_rows, groups) = ("rmsnorm_groups_rows_f", cs as u32);
+        self.k2(rn_rows, groups, m as u32, 256, &[Arg::Ptr(a_key), Arg::Ptr(self.sv(&format!("{p}.ple_norm_key.weight"))), Arg::Ptr(a_key), Arg::U32(h as u32), Arg::F32(c.eps), Arg::U32(cs as u32)]);
+        self.k2(rn_rows, groups, m as u32, 256, &[Arg::Ptr(bb.r.ptr), Arg::Ptr(self.sv(&format!("{p}.ple_norm_query.weight"))), Arg::Ptr(b_qry), Arg::U32(h as u32), Arg::F32(c.eps), Arg::U32(cs as u32)]);
+        self.k2("ple_gate_rows_f", cs as u32, m as u32, 256, &[Arg::Ptr(a_key), Arg::Ptr(b_qry), Arg::Ptr(u_val), Arg::Ptr(c_gv), Arg::U32(h as u32), Arg::U32(ch as u32)]);
+        self.k2(rn_rows, groups, m as u32, 256, &[Arg::Ptr(c_gv), Arg::Ptr(self.sv(&format!("{p}.ple_norm_conv.weight"))), Arg::Ptr(d_gvn), Arg::U32(h as u32), Arg::F32(c.eps), Arg::U32(cs as u32)]);
+        let (k, dil) = (c.ple_conv_k as u32, c.ple_ngram as u32);
+        self.k2("ple_conv_rows_f", (ch as u32).div_ceil(256), m as u32, 256, &[Arg::Ptr(d_gvn), Arg::Ptr(self.ple_state.ptr), Arg::Ptr(self.sv(&format!("{p}.ple_conv1d.weight"))),
+                                                                          Arg::Ptr(c_gv), Arg::Ptr(bb.r.ptr), Arg::U32(ch as u32), Arg::U32(k), Arg::U32(dil)]);
+        self.k1("ple_state_update", ch, &[Arg::Ptr(d_gvn), Arg::Ptr(self.ple_state.ptr), Arg::U32(ch as u32), Arg::U32((k - 1) * dil), Arg::U32(m as u32)]);
+        true
+    }
+
     fn ple_at(&self, l: usize, n: usize, r: u64) {
         let c = &self.m.cfg;
         let p = format!("blk.{l}");

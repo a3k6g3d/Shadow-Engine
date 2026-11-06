@@ -425,6 +425,63 @@ extern "C" __global__ void delta_steps128_f(const float* q, const float* k, cons
     for (unsigned int i = 0; i < d; ++i) s[i * d + j] = col[i];
 }
 
+// `delta_steps128_f` with the next token's q, k, v, b, a loaded into registers while the current token computes (the token loop waited on its own global loads).
+extern "C" __global__ void delta_steps128_fp(const float* q, const float* k, const float* v, unsigned int xs, const float* b,
+                                            const float* a, unsigned int bs, const float* A, const float* dtb, float* S,
+                                            float* o, unsigned int os, unsigned int kh, unsigned int m) {
+    const unsigned int d = 128;
+    __shared__ float qs[128], ks[128];
+    unsigned int h = blockIdx.x, j = threadIdx.x, kx = h % kh;
+    float* s = S + (u64) h * d * d;
+    float col[128];
+#pragma unroll
+    for (unsigned int i = 0; i < d; ++i) col[i] = s[i * d + j];
+    const float Ah = A[h], dth = dtb[h];
+    float qn = q[kx * d + j], kn = k[kx * d + j], vn = v[h * d + j], bn = b[h], an = a[h];
+    for (unsigned int t = 0; t < m; ++t) {
+        __syncthreads();
+        qs[j] = qn;
+        ks[j] = kn;
+        __syncthreads();
+        const float vcur = vn, bcur = bn, acur = an;
+        if (t + 1 < m) {                                   // the next token's inputs arrive while this one computes
+            qn = q[(u64) (t + 1) * xs + kx * d + j];
+            kn = k[(u64) (t + 1) * xs + kx * d + j];
+            vn = v[(u64) (t + 1) * xs + h * d + j];
+            bn = b[(u64) (t + 1) * bs + h];
+            an = a[(u64) (t + 1) * bs + h];
+        }
+        const float beta = sigmoidf_ref(bcur);
+        const float decay = expf(Ah * softplusf_ref(acur + dth));
+        float mem = 0.0f;
+#pragma unroll
+        for (unsigned int i0 = 0; i0 < d; i0 += 16) {
+            float part = 0.0f;
+#pragma unroll
+            for (unsigned int i = i0; i < i0 + 16; ++i) {
+                col[i] *= decay;
+                part = fmaf(col[i], ks[i], part);
+            }
+            mem += part;
+        }
+        const float delta = (vcur - mem) * beta;
+        float acc = 0.0f;
+#pragma unroll
+        for (unsigned int i0 = 0; i0 < d; i0 += 16) {
+            float part = 0.0f;
+#pragma unroll
+            for (unsigned int i = i0; i < i0 + 16; ++i) {
+                col[i] += ks[i] * delta;
+                part = fmaf(col[i], qs[i], part);
+            }
+            acc += part;
+        }
+        o[(u64) t * os + h * d + j] = acc;
+    }
+#pragma unroll
+    for (unsigned int i = 0; i < d; ++i) s[i * d + j] = col[i];
+}
+
 // ---- Float rope for the prompt path's attention (`--tensor-prompt`): the double `pow` / `cos` / `sin` of `rope_one` were ~100 FP64 operations a pair, per (row, head).  The
 // base^(2i / dims) table is made once per launch (`rope_pow_table`, in double), the angle is still formed in double (pos / table[i]: a float angle at position 15,000 would be
 // off by ~1e-3 rad) and reduced to [-pi, pi] in double, then float `sincosf`.
@@ -483,6 +540,47 @@ extern "C" __global__ void head_norm_rope_qgk_rows_f(const float* qg, float* q, 
     const u64 j = blockIdx.y, qd = (u64) nh * d, kd = (u64) nkv * d;
     head_norm_rope_qgk_one_f(qg + j * 2 * qd, q + j * qd, gate + j * qd, wq, kk + j * kd, kc + (pos0 + j) * kd, wk,
                              nh, d, eps, pos0 + (unsigned int) j, rope_dims, blockIdx.x);
+}
+
+// ---- The per-layer-embedding step for a whole batch (`--tensor-prompt`): it ran token by token, a blocking upload and five tiny launches each (200-470 ms of host time a 2,048-row
+// chunk with the GPU waiting).  Row j of key / qry / gv / gvn is ch = streams * h floats, val and e are rows of their own.
+// g = (key_s . qry_s) / sqrt(h), signed square root, sigmoid; gv_s = sg * val.  Grid (streams, rows).
+extern "C" __global__ void ple_gate_rows_f(const float* key, const float* qry, const float* val, float* gv, unsigned int h, unsigned int ch) {
+    const unsigned int s = blockIdx.x;
+    const u64 j = blockIdx.y;
+    float dot = 0.0f;
+    for (unsigned int i = threadIdx.x; i < h; i += blockDim.x) dot = fmaf(key[j * ch + s * h + i], qry[j * ch + s * h + i], dot);
+    dot = block_sum_f(dot) / sqrtf((float) h);
+    const float g = sqrtf(fmaxf(fabsf(dot), 1e-6f)) * copysignf(1.0f, dot);
+    const float sg = sigmoidf_ref(g);
+    for (unsigned int i = threadIdx.x; i < h; i += blockDim.x) gv[j * ch + s * h + i] = sg * val[j * h + i];
+}
+
+// The dilated causal convolution of `ple_conv_step` for every token of the batch at once: token j's window is gvn rows j - back (back = (k - 1 - t) * dil), or the carried state
+// for rows before the batch; r[j] += gv[j] + silu(conv).  Launch (ceil(ch / 256), m); `ple_state_update` then moves the state on.
+extern "C" __global__ void ple_conv_rows_f(const float* gvn, const float* state, const float* w, const float* gv, float* r, unsigned int ch,
+                                           unsigned int k, unsigned int dil) {
+    const unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
+    const int j = (int) blockIdx.y;
+    if (i >= ch) return;
+    const int hist = (int) ((k - 1) * dil);
+    float acc = w[i * k + (k - 1)] * gvn[(u64) j * ch + i];
+    for (unsigned int t = 0; t + 1 < k; ++t) {
+        const int back = (int) ((k - 1 - t) * dil);
+        const int n = j - back;
+        const float v = n >= 0 ? gvn[(u64) n * ch + i] : state[(u64) (hist + n) * ch + i];
+        acc = fmaf(w[i * k + t], v, acc);
+    }
+    r[(u64) j * ch + i] += gv[(u64) j * ch + i] + siluf_ref(acc);
+}
+
+extern "C" __global__ void ple_state_update(const float* gvn, float* state, unsigned int ch, unsigned int hist, unsigned int m) {
+    const unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= ch) return;
+    for (unsigned int x = 0; x < hist; ++x) {
+        const int n = (int) m - (int) hist + (int) x;
+        state[(u64) x * ch + i] = n >= 0 ? gvn[(u64) n * ch + i] : state[(u64) (m + x) * ch + i];   // m + x > x: not yet overwritten
+    }
 }
 
 // Each `d`-wide head: x = x / sqrt(sum x^2 + 1e-6), then x /= div.  grid = heads, block = 128.
