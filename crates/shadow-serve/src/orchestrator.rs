@@ -38,6 +38,66 @@ fn tail_clip(s: String) -> String {
     clip_to(s, MAX_OUTPUT_CHARS)
 }
 
+/// A name against a pattern with `*` (any run of characters) and `?` (one character); both already lower-cased.
+fn seg_match(pat: &str, text: &str) -> bool {
+    let (p, t): (Vec<char>, Vec<char>) = (pat.chars().collect(), text.chars().collect());
+    let (mut pi, mut ti, mut star, mut mark) = (0usize, 0usize, usize::MAX, 0usize);
+    while ti < t.len() {
+        if pi < p.len() && (p[pi] == '?' || p[pi] == t[ti]) {
+            pi += 1;
+            ti += 1;
+        } else if pi < p.len() && p[pi] == '*' {
+            star = pi;
+            mark = ti;
+            pi += 1;
+        } else if star != usize::MAX {
+            pi = star + 1;
+            mark += 1;
+            ti = mark;
+        } else {
+            return false;
+        }
+    }
+    while pi < p.len() && p[pi] == '*' {
+        pi += 1;
+    }
+    pi == p.len()
+}
+
+/// Folder segments against pattern segments, where a `**` segment stands for any number of folders (none included).
+fn segs_match(pat: &[&str], path: &[&str]) -> bool {
+    match pat.split_first() {
+        None => path.is_empty(),
+        Some((&"**", rest)) => (0..=path.len()).any(|i| segs_match(rest, &path[i..])),
+        Some((first, rest)) => path.split_first().is_some_and(|(p, tail)| seg_match(first, p) && segs_match(rest, tail)),
+    }
+}
+
+/// Whether a file matches the `glob` tool's pattern (already lower-cased).  With a `*` or `?` in it, a real glob: `*` within a name, `**` across folders, `?` one
+/// character, a pattern with no `/` against the file name (`*.rs` finds every .rs file), one with a `/` against the path under the root or the whole path
+/// (`crates/**/Cargo.toml`, `src/*.rs`).  Without, a substring of the file name, as the tool always did (`readme` finds README.md).
+fn glob_file_matches(pattern_lc: &str, glob_mode: bool, root: &Path, path: &Path, fname: &str) -> bool {
+    if pattern_lc.is_empty() {
+        return true;
+    }
+    if !glob_mode {
+        return fname.to_lowercase().contains(pattern_lc);
+    }
+    let pat = pattern_lc.replace('\\', "/");
+    let pat = pat.trim_start_matches("./");
+    if !pat.contains('/') {
+        return seg_match(pat, &fname.to_lowercase());
+    }
+    let segs = |p: &Path| -> Vec<String> { p.to_string_lossy().to_lowercase().replace('\\', "/").split('/').filter(|s| !s.is_empty() && *s != ".").map(str::to_string).collect() };
+    let pat_segs: Vec<&str> = pat.split('/').filter(|s| !s.is_empty()).collect();
+    let rel = segs(path.strip_prefix(root).unwrap_or(path));
+    let full = segs(path);
+    fn as_refs(v: &[String]) -> Vec<&str> {
+        v.iter().map(String::as_str).collect()
+    }
+    segs_match(&pat_segs, &as_refs(&rel)) || segs_match(&pat_segs, &as_refs(&full))
+}
+
 /// At most `max` characters of `s` (cut on a character boundary), with a note when it was cut.
 fn clip_to(s: String, max: usize) -> String {
     if s.len() <= max {
@@ -159,7 +219,9 @@ pub fn execute_tool(inv: &ToolInvocation) -> ToolResult {
 
             let mut matches = Vec::new();
             let mut stack = vec![PathBuf::from(root)];
-            let search_term = pattern.replace("**", "").replace("*", "").to_lowercase();
+            let glob_mode = pattern.contains('*') || pattern.contains('?');
+            let search_term = pattern.to_lowercase();
+            let root_path = PathBuf::from(root);
 
             while let Some(dir) = stack.pop() {
                 if let Ok(entries) = std::fs::read_dir(&dir) {
@@ -171,7 +233,7 @@ pub fn execute_tool(inv: &ToolInvocation) -> ToolResult {
                         }
                         if path.is_dir() {
                             stack.push(path);
-                        } else if search_term.is_empty() || fname.to_lowercase().contains(&search_term) {
+                        } else if glob_file_matches(&search_term, glob_mode, &root_path, &path, fname) {
                             matches.push(path.to_string_lossy().to_string());
                             if matches.len() >= max_results {
                                 break;
@@ -201,6 +263,8 @@ pub fn execute_tool(inv: &ToolInvocation) -> ToolResult {
             }
 
             let needle = if ignore_case { pattern.to_lowercase() } else { pattern.to_string() };
+            // the schema says "substring or regex": a line matches when it contains the text or the text, read as a regex (when it is one), matches it
+            let re = regex::RegexBuilder::new(pattern).case_insensitive(ignore_case).build().ok();
             let mut matches = Vec::new();
             let mut stack = vec![PathBuf::from(root)];
 
@@ -218,11 +282,11 @@ pub fn execute_tool(inv: &ToolInvocation) -> ToolResult {
                             if meta.len() < MAX_FILE_SIZE {
                                 if let Ok(content) = std::fs::read_to_string(&path) {
                                     for (line_idx, line) in content.lines().enumerate() {
-                                        let matched = if ignore_case {
+                                        let matched = (if ignore_case {
                                             line.to_lowercase().contains(&needle)
                                         } else {
                                             line.contains(&needle)
-                                        };
+                                        }) || re.as_ref().is_some_and(|r| r.is_match(line));
                                         if matched {
                                             matches.push(format!("{}:{}: {}", path.display(), line_idx + 1, line.trim()));
                                             if matches.len() >= max_results {
@@ -431,7 +495,7 @@ fn builtin_tool_definitions() -> Value {
             "input_schema": {
                 "type": "object",
                 "properties": {
-                    "pattern": { "type": "string", "description": "File search pattern e.g. *.rs or *.json" },
+                    "pattern": { "type": "string", "description": "A glob such as *.rs, **/*.toml or crates/**/Cargo.toml (without a / it is matched against file names at any depth; with one, against the path under 'path'), or plain text that is part of a file name" },
                     "path": { "type": "string", "description": "Root directory to search (defaults to current dir)" },
                     "max_results": { "type": "integer", "description": "Maximum number of results" }
                 },
@@ -504,6 +568,48 @@ mod tests {
         assert_eq!(a["path"], json!("C:\\x.txt"));
         assert_eq!(coerce_arguments("read_file", &json!({"start": "abc"}))["start"], json!("abc"));
         assert_eq!(coerce_arguments("nope", &json!({"a": "1"}))["a"], json!("1"));
+    }
+
+    #[test]
+    fn glob_finds_files_by_real_patterns_and_grep_takes_regexes() {
+        // a small tree: <tmp>/crates/a/src/engine.rs, <tmp>/crates/a/Cargo.toml, <tmp>/crates/b/src/lib.rs, <tmp>/Cargo.toml, <tmp>/README.md
+        let root = std::env::temp_dir().join(format!("shadow-tools-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        for (rel, body) in [("crates/a/src/engine.rs", "pub busy: bool,\nstruct Status {\nfn push(x: u32)"), ("crates/a/Cargo.toml", "[package]"),
+                            ("crates/b/src/lib.rs", "let state = 1;\nfoo(bar)"), ("Cargo.toml", "[workspace]"), ("README.md", "hello")] {
+            let p = root.join(rel);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(&p, body).unwrap();
+        }
+        let r = root.to_string_lossy().to_string();
+        let names = |pattern: &str| -> Vec<String> {
+            let res = execute_tool(&ToolInvocation { name: "glob".into(), arguments: json!({"pattern": pattern, "path": r}) });
+            let mut v: Vec<String> = res.output.lines().filter(|l| !l.starts_with("no matching")).map(|l| l.replace('\\', "/").rsplit(&format!("{}/", r.replace('\\', "/"))).next().unwrap().to_string()).collect();
+            v.sort();
+            v
+        };
+        assert_eq!(names("*.rs"), ["crates/a/src/engine.rs", "crates/b/src/lib.rs"]);
+        assert_eq!(names("**/*.rs"), ["crates/a/src/engine.rs", "crates/b/src/lib.rs"]);
+        assert_eq!(names("*.toml"), ["Cargo.toml", "crates/a/Cargo.toml"]);
+        assert_eq!(names("crates/**/Cargo.toml"), ["crates/a/Cargo.toml"]);
+        assert_eq!(names("crates/*/src/*.rs"), ["crates/a/src/engine.rs", "crates/b/src/lib.rs"]);
+        assert_eq!(names("src/*.rs"), Vec::<String>::new()); // a pattern with a folder is anchored at the root
+        assert_eq!(names("eng?ne.rs"), ["crates/a/src/engine.rs"]);
+        assert_eq!(names("readme"), ["README.md"]); // no wildcard: a substring of the name, as before
+        assert_eq!(names("*.nothing"), Vec::<String>::new());
+        // grep: a literal, an alternation, a regex, and text that is a literal but not a valid regex
+        let hits = |pattern: &str| -> usize {
+            let res = execute_tool(&ToolInvocation { name: "grep".into(), arguments: json!({"pattern": pattern, "path": r}) });
+            if res.output.starts_with("no occurrences") { 0 } else { res.output.lines().count() }
+        };
+        assert_eq!(hits("busy"), 1);
+        assert_eq!(hits("busy|state"), 2); // the model writes regexes; this used to find nothing
+        assert_eq!(hits("struct\\s+Status"), 1);
+        assert_eq!(hits("struct Status {"), 1); // not a valid regex: taken literally
+        assert_eq!(hits("fn push("), 1);
+        assert_eq!(hits("foo(bar)"), 1); // a regex group, but the literal text is in the file
+        assert_eq!(hits("not-in-any-file"), 0);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
