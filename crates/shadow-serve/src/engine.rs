@@ -385,14 +385,33 @@ struct Emitter {
     reasoning: bool,
     first_content: bool,
     utf8: Utf8,
+    /// the `<tool_call>` token: a model that opens a tool call while it is still thinking (no `</think>` first) has finished thinking
+    tool_open: Option<u32>,
+    /// the think block was left by a `<tool_call>`, so a `</think>` that follows is not shown
+    left_for_tool: bool,
+}
+
+/// What token `t` does to the think block: `(still reasoning, left for a tool call, token is a marker to swallow)`.  `</think>` closes it and is swallowed;
+/// a `<tool_call>` inside it closes it too and is kept (it opens the content, where the client looks for tool calls: the turn used to end with the
+/// calls sitting inside the "thinking" and nothing run); a `</think>` after that is swallowed.
+fn think_step(reasoning: bool, left_for_tool: bool, t: u32, think_end: Option<u32>, tool_open: Option<u32>) -> (bool, bool, bool) {
+    if Some(t) == think_end && (reasoning || left_for_tool) {
+        return (false, left_for_tool, true);
+    }
+    if reasoning && Some(t) == tool_open {
+        return (false, true, false);
+    }
+    (reasoning, left_for_tool, false)
 }
 
 impl Emitter {
     /// Streams token t; false when the client has gone away.
     fn push(&mut self, tok: &Tokenizer, t: u32, think_end: Option<u32>,
             tx: &tokio::sync::mpsc::UnboundedSender<Event>) -> bool {
-        if Some(t) == think_end && self.reasoning {
-            self.reasoning = false;
+        let (reasoning, left, swallow) = think_step(self.reasoning, self.left_for_tool, t, think_end, self.tool_open);
+        self.reasoning = reasoning;
+        self.left_for_tool = left;
+        if swallow {
             return true;
         }
         let mut piece = self.utf8.push(&tok.decode_bytes(&[t]));
@@ -825,7 +844,7 @@ fn answer<'c>(arch: &str, req: &Request, tok: &Tokenizer, sess: &mut GpuSession<
     let t1 = Instant::now();
     // thinking on: the answer opens inside the think block
     let mut em = Emitter { reasoning: text.ends_with("<think>\n") || text.ends_with("<|thought|>\n"), first_content: true,
-                           utf8: Utf8 { pending: Vec::new() } };
+                           utf8: Utf8 { pending: Vec::new() }, tool_open: tok.id("<tool_call>"), left_for_tool: false };
     let mut n = 0;
     let mut finish = "length";
     // drafts from the MTP layer when it is loaded (`--mtp DIR`, 3 a pass unless --spec says), else prompt lookup
@@ -981,6 +1000,27 @@ fn answer<'c>(arch: &str, req: &Request, tok: &Tokenizer, sess: &mut GpuSession<
 mod tests {
     use super::*;
     use shadow_model::chat::Role;
+
+    #[test]
+    fn a_tool_call_opened_inside_the_think_block_leaves_it() {
+        const END: u32 = 10; // </think>
+        const TOOL: u32 = 20; // <tool_call>
+        const WORD: u32 = 30;
+        let (end, tool) = (Some(END), Some(TOOL));
+        // ordinary thinking goes on; </think> closes it and is swallowed
+        assert_eq!(think_step(true, false, WORD, end, tool), (true, false, false));
+        assert_eq!(think_step(true, false, END, end, tool), (false, false, true));
+        // a tool call opened while thinking ends the thinking and is kept (it becomes content, where the client finds the call)
+        assert_eq!(think_step(true, false, TOOL, end, tool), (false, true, false));
+        // after that a stray </think> is swallowed, and words stay content
+        assert_eq!(think_step(false, true, END, end, tool), (false, true, true));
+        assert_eq!(think_step(false, true, WORD, end, tool), (false, true, false));
+        // not thinking, no tool call before: a </think> or a <tool_call> is not touched (the old behaviour)
+        assert_eq!(think_step(false, false, END, end, tool), (false, false, false));
+        assert_eq!(think_step(false, false, TOOL, end, tool), (false, false, false));
+        // a model without those tokens never changes state
+        assert_eq!(think_step(true, false, TOOL, None, None), (true, false, false));
+    }
 
     #[test]
     fn compacts_unlimited_context_without_touching_system_prompt() {
