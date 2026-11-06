@@ -4588,7 +4588,11 @@ impl<'c, 'm> GpuSession<'c, 'm> {
                 } else {
                 static DELTA_X8: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
                 let x8 = m >= 16 && *DELTA_X8.get_or_init(|| std::env::var("SHADOW_DELTA_X8").is_ok_and(|v| v == "1"));
-                self.k(if x8 { "delta_steps128_x8" } else if std::env::var("SHADOW_DELTA_F32").is_ok_and(|v| v == "0") { "delta_steps128" } else if std::env::var("SHADOW_DELTA_PF").is_ok_and(|v| v == "1") { self.nk("delta_steps128", "delta_steps128_fp") } else { self.nk("delta_steps128", "delta_steps128_f") }, vh as u32, if x8 { 1024 } else { 128 }, &[
+                // the float recurrence on 512 threads, four to a column of the state (`delta_steps128_f4`, bit-identical; `SHADOW_DELTA_F4=0` keeps the 128-thread kernel)
+                let kname = if x8 { "delta_steps128_x8" } else if std::env::var("SHADOW_DELTA_F32").is_ok_and(|v| v == "0") { "delta_steps128" } else if std::env::var("SHADOW_DELTA_PF").is_ok_and(|v| v == "1") { self.nk("delta_steps128", "delta_steps128_fp") } else { self.nk("delta_steps128", "delta_steps128_f") };
+                static DELTA_F4: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+                let (kname, kthreads) = if kname == "delta_steps128_f" && *DELTA_F4.get_or_init(|| !std::env::var("SHADOW_DELTA_F4").is_ok_and(|v| v == "0")) { ("delta_steps128_f4", 512) } else { (kname, if x8 { 1024 } else { 128 }) };
+                self.k(kname, vh as u32, kthreads, &[
                     Arg::Ptr(bb.x.ptr), Arg::Ptr(bb.x.ptr + (kd * 4) as u64), Arg::Ptr(bb.x.ptr + (2 * kd * 4) as u64),
                     Arg::U32(ch as u32), Arg::Ptr(beta_p), Arg::Ptr(alpha_p), Arg::U32(vh as u32),
                     Arg::Ptr(self.sv(&format!("{p}.ssm_a"))), Arg::Ptr(self.sv(&format!("{p}.ssm_dt.bias"))), Arg::Ptr(s.ptr),
