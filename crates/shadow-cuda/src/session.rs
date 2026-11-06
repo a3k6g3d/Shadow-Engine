@@ -211,6 +211,12 @@ const ATT_ROWS: usize = 8;
 /// Tokens of a long prompt whose indexer selections are made together (`attention_batch`): one scores download for all of them.
 /// Rows per group of the sparse attention's selection and attention launches (`SHADOW_SEL_ROWS`): one group is ~5 launches, so the launch count of a long prompt scales with
 /// Tokens a group of the tensor-core grouped expert kernels holds (`SHADOW_MMA_GROUP`, 32 or 64): a weight tile is dequantized once for a whole group, so 64 halves the
+/// Tokens a tile of the dense tensor-core projections (`mma_cols_*`) holds (`SHADOW_MMA_COLS_TOK`, 32 or 64): a weight tile is dequantized once for a whole tile of tokens.
+fn cols_tok() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| std::env::var("SHADOW_MMA_COLS_TOK").ok().and_then(|v| v.parse::<usize>().ok()).filter(|&n| n == 32 || n == 64).unwrap_or(64))
+}
+
 /// dequantization of an expert with more than 32 tokens (an average expert has ~40 in a 2,048-row sub-chunk).
 fn mma_group() -> usize {
     static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new()
@@ -4282,7 +4288,7 @@ impl<'c, 'm> GpuSession<'c, 'm> {
             // SAFETY: as the launches below: `rows` rows of t.dims[0] weights, m inputs of t.dims[0] floats at x + j * xs, m outputs of `rows`
             // floats at y + j * ys; the kernel reads 16-byte groups of the inputs (x and xs checked above) and guards the last tiles.
             unsafe {
-                self.mvp.launch(&format!("mma_cols_{}", ty.to_lowercase()), ((rows as u32).div_ceil(64), (m as u32).div_ceil(32), 1), (128, 1, 1), 0,
+                self.mvp.launch(&format!("mma_cols{}_{}", if cols_tok() == 64 { "64" } else { "" }, ty.to_lowercase()), ((rows as u32).div_ceil(64), (m as u32).div_ceil(cols_tok() as u32), 1), (128, 1, 1), 0,
                                 self.ls(), &[Arg::Ptr(wptr), Arg::Ptr(x), Arg::U32(xs as u32), Arg::Ptr(y), Arg::U32(ys as u32),
                                              Arg::U32(rows as u32), Arg::U32(t.dims[0] as u32), Arg::U32(m as u32)])
             }

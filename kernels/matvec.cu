@@ -1037,26 +1037,40 @@ static __device__ __forceinline__ void mma_grouped64(const u64* wtab, const unsi
     if (gi[0] == 0) return;
     mma_core<Q, 64>((const u8*) wtab[blockIdx.y], x, xs, y, ys, rows, cols, gi[0], 0, gi + 1, gi + 65);
 }
+// `mma_cols` with 64 tokens a tile: a weight tile is dequantized once for 64 tokens instead of 32 (the n-tiles past the batch's last token are skipped).
+template <typename Q>
+static __device__ __forceinline__ void mma_cols64(const u8* w, const float* x, unsigned int xs, float* y, unsigned int ys,
+                                                  unsigned int rows, unsigned int cols, unsigned int m) {
+    mma_core<Q, 64>(w, x, xs, y, ys, rows, cols, m, blockIdx.y, nullptr, nullptr);
+}
 extern "C" __global__ void mma_cols_q6_k(const u8* w, const float* x, unsigned int xs, float* y, unsigned int ys, unsigned int rows, unsigned int cols, unsigned int m) { mma_cols<Q6K>(w, x, xs, y, ys, rows, cols, m); }
+extern "C" __global__ void mma_cols64_q6_k(const u8* w, const float* x, unsigned int xs, float* y, unsigned int ys, unsigned int rows, unsigned int cols, unsigned int m) { mma_cols64<Q6K>(w, x, xs, y, ys, rows, cols, m); }
 extern "C" __global__ void mma_grouped_q6_k(const u64* wtab, const unsigned int* gtab, const float* x, unsigned int xs, float* y, unsigned int ys, unsigned int rows, unsigned int cols) { mma_grouped<Q6K>(wtab, gtab, x, xs, y, ys, rows, cols); }
 extern "C" __global__ void mma_grouped64_q6_k(const u64* wtab, const unsigned int* gtab, const float* x, unsigned int xs, float* y, unsigned int ys, unsigned int rows, unsigned int cols) { mma_grouped64<Q6K>(wtab, gtab, x, xs, y, ys, rows, cols); }
 extern "C" __global__ void mma_cols_iq4_xs(const u8* w, const float* x, unsigned int xs, float* y, unsigned int ys, unsigned int rows, unsigned int cols, unsigned int m) { mma_cols<IQ4XS>(w, x, xs, y, ys, rows, cols, m); }
+extern "C" __global__ void mma_cols64_iq4_xs(const u8* w, const float* x, unsigned int xs, float* y, unsigned int ys, unsigned int rows, unsigned int cols, unsigned int m) { mma_cols64<IQ4XS>(w, x, xs, y, ys, rows, cols, m); }
 extern "C" __global__ void mma_grouped_iq4_xs(const u64* wtab, const unsigned int* gtab, const float* x, unsigned int xs, float* y, unsigned int ys, unsigned int rows, unsigned int cols) { mma_grouped<IQ4XS>(wtab, gtab, x, xs, y, ys, rows, cols); }
 extern "C" __global__ void mma_grouped64_iq4_xs(const u64* wtab, const unsigned int* gtab, const float* x, unsigned int xs, float* y, unsigned int ys, unsigned int rows, unsigned int cols) { mma_grouped64<IQ4XS>(wtab, gtab, x, xs, y, ys, rows, cols); }
 extern "C" __global__ void mma_cols_iq4_nl(const u8* w, const float* x, unsigned int xs, float* y, unsigned int ys, unsigned int rows, unsigned int cols, unsigned int m) { mma_cols<IQ4NL>(w, x, xs, y, ys, rows, cols, m); }
+extern "C" __global__ void mma_cols64_iq4_nl(const u8* w, const float* x, unsigned int xs, float* y, unsigned int ys, unsigned int rows, unsigned int cols, unsigned int m) { mma_cols64<IQ4NL>(w, x, xs, y, ys, rows, cols, m); }
 extern "C" __global__ void mma_grouped_iq4_nl(const u64* wtab, const unsigned int* gtab, const float* x, unsigned int xs, float* y, unsigned int ys, unsigned int rows, unsigned int cols) { mma_grouped<IQ4NL>(wtab, gtab, x, xs, y, ys, rows, cols); }
 extern "C" __global__ void mma_grouped64_iq4_nl(const u64* wtab, const unsigned int* gtab, const float* x, unsigned int xs, float* y, unsigned int ys, unsigned int rows, unsigned int cols) { mma_grouped64<IQ4NL>(wtab, gtab, x, xs, y, ys, rows, cols); }
 extern "C" __global__ void mma_cols_q2_0(const u8* w, const float* x, unsigned int xs, float* y, unsigned int ys, unsigned int rows, unsigned int cols, unsigned int m) { mma_cols<Q20>(w, x, xs, y, ys, rows, cols, m); }
+extern "C" __global__ void mma_cols64_q2_0(const u8* w, const float* x, unsigned int xs, float* y, unsigned int ys, unsigned int rows, unsigned int cols, unsigned int m) { mma_cols64<Q20>(w, x, xs, y, ys, rows, cols, m); }
 extern "C" __global__ void mma_grouped_q2_0(const u64* wtab, const unsigned int* gtab, const float* x, unsigned int xs, float* y, unsigned int ys, unsigned int rows, unsigned int cols) { mma_grouped<Q20>(wtab, gtab, x, xs, y, ys, rows, cols); }
 extern "C" __global__ void mma_grouped64_q2_0(const u64* wtab, const unsigned int* gtab, const float* x, unsigned int xs, float* y, unsigned int ys, unsigned int rows, unsigned int cols) { mma_grouped64<Q20>(wtab, gtab, x, xs, y, ys, rows, cols); }
 extern "C" __global__ void mma_cols_iq2_s(const u8* w, const float* x, unsigned int xs, float* y, unsigned int ys, unsigned int rows, unsigned int cols, unsigned int m) { mma_cols<IQ2S>(w, x, xs, y, ys, rows, cols, m); }
+extern "C" __global__ void mma_cols64_iq2_s(const u8* w, const float* x, unsigned int xs, float* y, unsigned int ys, unsigned int rows, unsigned int cols, unsigned int m) { mma_cols64<IQ2S>(w, x, xs, y, ys, rows, cols, m); }
 extern "C" __global__ void mma_grouped_iq2_s(const u64* wtab, const unsigned int* gtab, const float* x, unsigned int xs, float* y, unsigned int ys, unsigned int rows, unsigned int cols) { mma_grouped<IQ2S>(wtab, gtab, x, xs, y, ys, rows, cols); }
 extern "C" __global__ void mma_grouped64_iq2_s(const u64* wtab, const unsigned int* gtab, const float* x, unsigned int xs, float* y, unsigned int ys, unsigned int rows, unsigned int cols) { mma_grouped64<IQ2S>(wtab, gtab, x, xs, y, ys, rows, cols); }
 extern "C" __global__ void mma_cols_iq3_xxs(const u8* w, const float* x, unsigned int xs, float* y, unsigned int ys, unsigned int rows, unsigned int cols, unsigned int m) { mma_cols<IQ3XXS>(w, x, xs, y, ys, rows, cols, m); }
+extern "C" __global__ void mma_cols64_iq3_xxs(const u8* w, const float* x, unsigned int xs, float* y, unsigned int ys, unsigned int rows, unsigned int cols, unsigned int m) { mma_cols64<IQ3XXS>(w, x, xs, y, ys, rows, cols, m); }
 extern "C" __global__ void mma_grouped_iq3_xxs(const u64* wtab, const unsigned int* gtab, const float* x, unsigned int xs, float* y, unsigned int ys, unsigned int rows, unsigned int cols) { mma_grouped<IQ3XXS>(wtab, gtab, x, xs, y, ys, rows, cols); }
 extern "C" __global__ void mma_grouped64_iq3_xxs(const u64* wtab, const unsigned int* gtab, const float* x, unsigned int xs, float* y, unsigned int ys, unsigned int rows, unsigned int cols) { mma_grouped64<IQ3XXS>(wtab, gtab, x, xs, y, ys, rows, cols); }
 extern "C" __global__ void mma_cols_q4_k(const u8* w, const float* x, unsigned int xs, float* y, unsigned int ys, unsigned int rows, unsigned int cols, unsigned int m) { mma_cols<Q4K>(w, x, xs, y, ys, rows, cols, m); }
+extern "C" __global__ void mma_cols64_q4_k(const u8* w, const float* x, unsigned int xs, float* y, unsigned int ys, unsigned int rows, unsigned int cols, unsigned int m) { mma_cols64<Q4K>(w, x, xs, y, ys, rows, cols, m); }
 extern "C" __global__ void mma_cols_q5_k(const u8* w, const float* x, unsigned int xs, float* y, unsigned int ys, unsigned int rows, unsigned int cols, unsigned int m) { mma_cols<Q5K>(w, x, xs, y, ys, rows, cols, m); }
+extern "C" __global__ void mma_cols64_q5_k(const u8* w, const float* x, unsigned int xs, float* y, unsigned int ys, unsigned int rows, unsigned int cols, unsigned int m) { mma_cols64<Q5K>(w, x, xs, y, ys, rows, cols, m); }
 // F32 weights (the MoE router and the shared expert's gate) on the tensor cores without giving up the bits that matter to the top-k: weight and activation are each split
 // into a bf16 high part and a bf16 low part (x = hi + lo, ~16 bits of mantissa together) and three bf16 products are accumulated in f32 (hi*hi + hi*lo + lo*hi), error ~2^-16
 // of the dot product against ~2^-11 for one half-precision product.  Same tile as mma_cols (64 rows x 32 tokens x 64 k, 128 threads).  cols a multiple of 64, rows any (guarded).
@@ -1143,7 +1157,9 @@ extern "C" __global__ void mma_cols_f32x3(const u8* w, const float* x, unsigned 
 }
 
 extern "C" __global__ void mma_cols_bf16(const u8* w, const float* x, unsigned int xs, float* y, unsigned int ys, unsigned int rows, unsigned int cols, unsigned int m) { mma_cols<BF16>(w, x, xs, y, ys, rows, cols, m); }
+extern "C" __global__ void mma_cols64_bf16(const u8* w, const float* x, unsigned int xs, float* y, unsigned int ys, unsigned int rows, unsigned int cols, unsigned int m) { mma_cols64<BF16>(w, x, xs, y, ys, rows, cols, m); }
 extern "C" __global__ void mma_cols_iq3_s(const u8* w, const float* x, unsigned int xs, float* y, unsigned int ys, unsigned int rows, unsigned int cols, unsigned int m) { mma_cols<IQ3S>(w, x, xs, y, ys, rows, cols, m); }
+extern "C" __global__ void mma_cols64_iq3_s(const u8* w, const float* x, unsigned int xs, float* y, unsigned int ys, unsigned int rows, unsigned int cols, unsigned int m) { mma_cols64<IQ3S>(w, x, xs, y, ys, rows, cols, m); }
 extern "C" __global__ void mma_grouped_iq3_s(const u64* wtab, const unsigned int* gtab, const float* x, unsigned int xs, float* y, unsigned int ys, unsigned int rows, unsigned int cols) { mma_grouped<IQ3S>(wtab, gtab, x, xs, y, ys, rows, cols); }
 extern "C" __global__ void mma_grouped64_iq3_s(const u64* wtab, const unsigned int* gtab, const float* x, unsigned int xs, float* y, unsigned int ys, unsigned int rows, unsigned int cols) { mma_grouped64<IQ3S>(wtab, gtab, x, xs, y, ys, rows, cols); }
 
