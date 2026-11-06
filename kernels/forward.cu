@@ -2070,7 +2070,8 @@ extern "C" __global__ void __launch_bounds__(256) attention_group_sel_rows_tc2(c
 // `attention_heads_rows` for a prompt's first positions (every earlier token is attended) in float, a block a (row, key group, `hb` heads) as `attention_group_sel_rows_f32`
 // shares each key row's loads across the `hb` heads (the one-head-a-block kernel read every key row once per head of its group).  Same arguments as the sparse kernel
 // without the token lists: row r attends positions 0 .. ntok0 + r - 1.
-extern "C" __global__ void attention_group_dense_rows_f32(const float* q, const float* kc, const float* vc, unsigned int ntok0, const float* gate, float* o,
+template <bool TC>
+static __device__ __forceinline__ void att_dense_body(const float* q, const float* kc, const float* vc, unsigned int ntok0, const float* gate, float* o,
                                                     double* scratch_d, unsigned int stride, unsigned int nkv, unsigned int hd,
                                                     unsigned int group, unsigned int nh, unsigned int hb) {
     const u64 row = blockIdx.y;
@@ -2092,6 +2093,7 @@ extern "C" __global__ void attention_group_dense_rows_f32(const float* q, const 
     float mx[HBMAX];
     #pragma unroll
     for (unsigned int a = 0; a < HBMAX; ++a) mx[a] = -1e30f;
+    if (!TC) {
     for (unsigned int t = threadIdx.x; t < ntok; t += blockDim.x) {
         const float4* k4 = (const float4*) (kc + ((u64) t * nkv + g) * hd);
         float s[HBMAX];
@@ -2121,6 +2123,58 @@ extern "C" __global__ void attention_group_dense_rows_f32(const float* q, const 
                 scr[(u64) (h0 + a) * stride + t] = s[a];
                 mx[a] = fmaxf(mx[a], s[a]);
             }
+        }
+    }
+    } else {
+        // the scores on the tensor cores (fp16 inputs, fp32 sums; fast mode): a warp takes 16 consecutive positions as the rows of an m16n8k16 product and the block's heads
+        // (at most 8, the n of the product) as its columns; a lane holds the scores of two heads for two positions, the other heads' maxima stay at -1e30
+        __shared__ __align__(16) unsigned short qh[8][264];
+        const unsigned int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, grp8 = lane >> 2, tg = lane & 3;
+        for (unsigned int idx = threadIdx.x; idx < 8 * hd; idx += blockDim.x) {
+            const unsigned int a = idx / hd, i = idx % hd;
+            const float x = a < nhh ? qrow[(u64) (h0 + a) * hd + i] : 0.0f;
+            unsigned int hv;
+            asm("cvt.rn.f16x2.f32 %0, %1, %2;" : "=r"(hv) : "f"(0.0f), "f"(x));
+            qh[a][i] = (unsigned short) (hv & 0xffffu);
+        }
+        __syncthreads();
+        float m0 = -1e30f, m1 = -1e30f;
+        const unsigned int ntile = (ntok + 15) / 16;
+        for (unsigned int tile = warp; tile < ntile; tile += 8) {
+            const unsigned int t0 = tile * 16, ta = min(t0 + grp8, ntok - 1), tb = min(t0 + grp8 + 8, ntok - 1);
+            const float* ka = kc + ((u64) ta * nkv + g) * hd;
+            const float* kb = kc + ((u64) tb * nkv + g) * hd;
+            float c0 = 0.0f, c1 = 0.0f, c2 = 0.0f, c3 = 0.0f;
+            #pragma unroll 4
+            for (unsigned int k0 = 0; k0 < hd; k0 += 16) {
+                const float2 a00 = *(const float2*) (ka + k0 + tg * 2), a01 = *(const float2*) (ka + k0 + 8 + tg * 2);
+                const float2 a10 = *(const float2*) (kb + k0 + tg * 2), a11 = *(const float2*) (kb + k0 + 8 + tg * 2);
+                unsigned int A0, A1, A2, A3;
+                asm("cvt.rn.f16x2.f32 %0, %1, %2;" : "=r"(A0) : "f"(a00.y), "f"(a00.x));
+                asm("cvt.rn.f16x2.f32 %0, %1, %2;" : "=r"(A1) : "f"(a10.y), "f"(a10.x));
+                asm("cvt.rn.f16x2.f32 %0, %1, %2;" : "=r"(A2) : "f"(a01.y), "f"(a01.x));
+                asm("cvt.rn.f16x2.f32 %0, %1, %2;" : "=r"(A3) : "f"(a11.y), "f"(a11.x));
+                const unsigned int B0 = *(const unsigned int*) &qh[grp8][k0 + tg * 2];
+                const unsigned int B1 = *(const unsigned int*) &qh[grp8][k0 + 8 + tg * 2];
+                asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
+                             : "+f"(c0), "+f"(c1), "+f"(c2), "+f"(c3)
+                             : "r"(A0), "r"(A1), "r"(A2), "r"(A3), "r"(B0), "r"(B1));
+            }
+            // c0: (position t0 + grp8, head tg * 2), c1: (.., tg * 2 + 1), c2 / c3: the same for position t0 + grp8 + 8
+            const unsigned int pa = t0 + grp8, pb = t0 + grp8 + 8, h_a = tg * 2, h_b = tg * 2 + 1;
+            if (pa < ntok) {
+                if (h_a < nhh) { const float sv = c0 * scale; scr[(u64) (h0 + h_a) * stride + pa] = sv; m0 = fmaxf(m0, sv); }
+                if (h_b < nhh) { const float sv = c1 * scale; scr[(u64) (h0 + h_b) * stride + pa] = sv; m1 = fmaxf(m1, sv); }
+            }
+            if (pb < ntok) {
+                if (h_a < nhh) { const float sv = c2 * scale; scr[(u64) (h0 + h_a) * stride + pb] = sv; m0 = fmaxf(m0, sv); }
+                if (h_b < nhh) { const float sv = c3 * scale; scr[(u64) (h0 + h_b) * stride + pb] = sv; m1 = fmaxf(m1, sv); }
+            }
+        }
+        #pragma unroll
+        for (unsigned int a = 0; a < HBMAX; ++a) {
+            if (a == tg * 2) mx[a] = m0;
+            if (a == tg * 2 + 1) mx[a] = m1;
         }
     }
     float z[HBMAX];
@@ -2173,6 +2227,17 @@ extern "C" __global__ void attention_group_dense_rows_f32(const float* q, const 
         for (unsigned int a = 0; a < HBMAX; ++a)
             if (a < nhh) orow[(u64) (h0 + a) * hd + j] = (acc[a] / z[a]) * sigmoidf_ref(gaterow[(u64) (h0 + a) * hd + j]);
     }
+}
+
+extern "C" __global__ void attention_group_dense_rows_f32(const float* q, const float* kc, const float* vc, unsigned int ntok0, const float* gate, float* o,
+                                                    double* scratch_d, unsigned int stride, unsigned int nkv, unsigned int hd,
+                                                    unsigned int group, unsigned int nh, unsigned int hb) {
+    att_dense_body<false>(q, kc, vc, ntok0, gate, o, scratch_d, stride, nkv, hd, group, nh, hb);
+}
+extern "C" __global__ void attention_group_dense_rows_tc(const float* q, const float* kc, const float* vc, unsigned int ntok0, const float* gate, float* o,
+                                                    double* scratch_d, unsigned int stride, unsigned int nkv, unsigned int hd,
+                                                    unsigned int group, unsigned int nh, unsigned int hb) {
+    att_dense_body<true>(q, kc, vc, ntok0, gate, o, scratch_d, stride, nkv, hd, group, nh, hb);
 }
 
 // Softmax attention of each query head over positions start_pos .. start_pos + ntok, GQA, with a learned per-head

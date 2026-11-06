@@ -4673,8 +4673,10 @@ impl<'c, 'm> GpuSession<'c, 'm> {
                 let n = (jt - j0).min(dense_rows);
                 if dense_f32 {
                     let group = nh / nkv;
-                    let hb = std::env::var("SHADOW_ATT_HB").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(4).clamp(1, 8).min(group);
-                    self.k2("attention_group_dense_rows_f32", (nkv * group.div_ceil(hb)) as u32, n as u32, 256, &[
+                    // the scores on the tensor cores (`SHADOW_ATT_TCD=1`, fp16 inputs; the block's heads are the product's 8 columns): docs/STATUS.md 2026-11-06 (52)
+                    let tcd = hd % 16 == 0 && hd <= 256 && std::env::var("SHADOW_ATT_TCD").is_ok_and(|v| v == "1");
+                    let hb = if tcd { 8.min(group) } else { std::env::var("SHADOW_ATT_HB").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(4).clamp(1, 8).min(group) };
+                    self.k2(if tcd { "attention_group_dense_rows_tc" } else { "attention_group_dense_rows_f32" }, (nkv * group.div_ceil(hb)) as u32, n as u32, 256, &[
                         Arg::Ptr(row(&bb.q, qd, j0)), Arg::Ptr(at.k.ptr), Arg::Ptr(at.v.ptr), Arg::U32((p0 + j0 + 1) as u32),
                         Arg::Ptr(row(&bb.gate, qd, j0)), Arg::Ptr(row(&bb.ao, qd, j0)), Arg::Ptr(bb.att.ptr),
                         Arg::U32(self.cap as u32), Arg::U32(nkv as u32), Arg::U32(hd as u32), Arg::U32(group as u32),

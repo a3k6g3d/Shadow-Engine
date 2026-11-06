@@ -252,7 +252,7 @@ pub const FILES: &[File] = &[
             e("attention_group_sel_rows_f32", &[C, C, C, C, U, C, C, W, W, U, U, U, U, U, U]),
             e("attention_group_sel_rows_v2", &[C, C, C, C, U, C, C, W, W, U, U, U, U, U, U]),
             e("attention_group_sel_rows_v3", &[C, C, C, C, U, C, C, W, W, U, U, U, U, U, U]), e("attention_group_sel_rows_tc", &[C, C, C, C, U, C, C, W, W, U, U, U, U, U, U]), e("attention_group_sel_rows_tc2", &[C, C, C, C, U, C, C, W, W, U, U, U, U, U, U]),
-            e("attention_group_dense_rows_f32", &[C, C, C, U, C, W, W, U, U, U, U, U, U]),
+            e("attention_group_dense_rows_f32", &[C, C, C, U, C, W, W, U, U, U, U, U, U]), e("attention_group_dense_rows_tc", &[C, C, C, U, C, W, W, U, U, U, U, U, U]),
             e("index_scores_rows", &[C, C, W, U, U, U, U, U, U]),
             e("index_scores_rows_f32", &[C, C, W, U, U, U, U, U, U]),
             e("index_scores_rows_f32v2", &[C, C, W, U, U, U, U, U, U, U]),
