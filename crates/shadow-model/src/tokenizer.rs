@@ -421,6 +421,11 @@ impl Tokenizer {
         self.ids.get(token).copied()
     }
 
+    /// The strings of the special tokens (`<|im_start|>`, `<think>`, ...): what `encode(text, true)` turns into one token each.
+    pub fn special_strings(&self) -> impl Iterator<Item = &str> {
+        self.specials.iter().map(|(s, _)| s.as_str())
+    }
+
     /// BPE over one pre-tokenizer piece.
     fn bpe(&self, piece: &str, out: &mut Vec<u32>) {
         let mapped: String = piece.bytes().map(|b| self.byte_char[b as usize]).collect();

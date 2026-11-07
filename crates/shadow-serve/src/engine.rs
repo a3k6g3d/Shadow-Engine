@@ -246,6 +246,8 @@ fn run(cfg: Config, rx: std::sync::mpsc::Receiver<Request>, status: &Mutex<Statu
     }
     let g = Gguf::open(&cfg.model).map_err(|e| e.to_string())?;
     let tok = Tokenizer::from_gguf(&g).map_err(|e| e.0)?;
+    // message text is defanged only where it holds a real special token's string (`neutralize_specials`)
+    crate::set_special_tokens(tok.special_strings());
     let model = Model::load(g)?;
     check_layout(&model.g, &model.cfg)?;
     let ctx = shadow_cuda::Context::new(0).map_err(|e| format!("GPU: {e}"))?;

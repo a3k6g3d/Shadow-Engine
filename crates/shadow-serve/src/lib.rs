@@ -185,8 +185,20 @@ fn image_url(p: &Value) -> Option<&str> {
 /// special-token string in it (`<|image_pad|>`, `<|im_start|>`, ...) disarmed by a zero-width space after its `<`: the prompt is encoded
 /// with special tokens on (the chat template's own markers must be), so a literal `<|image_pad|>` in a fetched web page would otherwise
 /// become a picture slot ("0 pictures sent but the prompt has 2 picture slots") and `<|im_start|>` in a page could open a fake turn.
-/// Only the shape `<|name|>` is touched; `<|>` and the like are left alone.
+/// Only the shape `<|name|>` is touched, and once the engine has loaded the tokenizer (`set_special_tokens`) only the names that really are special tokens of the model: text
+/// such as `<|role|>` in a document is not a token, and changing it would change the model's input (and every hash of a run on that text) for nothing.
 pub fn neutralize_specials(s: &str) -> String {
+    neutralize_with(s, SPECIALS.get())
+}
+
+static SPECIALS: std::sync::OnceLock<std::collections::HashSet<String>> = std::sync::OnceLock::new();
+
+/// The special tokens' strings of the loaded model, from the engine's tokenizer; until it is called every `<|name|>` counts.
+pub fn set_special_tokens<'a>(strings: impl Iterator<Item = &'a str>) {
+    let _ = SPECIALS.set(strings.map(str::to_string).collect());
+}
+
+fn neutralize_with(s: &str, specials: Option<&std::collections::HashSet<String>>) -> String {
     if !s.contains("<|") {
         return s.to_string();
     }
@@ -199,7 +211,7 @@ pub fn neutralize_specials(s: &str) -> String {
             while j < b.len() && (b[j].is_ascii_alphanumeric() || b[j] == b'_') {
                 j += 1;
             }
-            if j > i + 2 && b.get(j) == Some(&b'|') && b.get(j + 1) == Some(&b'>') {
+            if j > i + 2 && b.get(j) == Some(&b'|') && b.get(j + 1) == Some(&b'>') && specials.is_none_or(|sp| sp.contains(&s[i..j + 2])) {
                 out.push('<');
                 out.push('\u{200b}');
                 i += 1;
@@ -648,6 +660,10 @@ mod tests {
         for s in ["a <|> b", "x <| y |> z", "<||>", "<|a b|>", "plain text, no markers", "naïve <| ünï"] {
             assert_eq!(neutralize_specials(s), s);
         }
+        // with the model's special tokens known, only those are touched
+        let sp: std::collections::HashSet<String> = ["<|im_start|>", "<|image_pad|>"].iter().map(|s| s.to_string()).collect();
+        assert_eq!(neutralize_with("a <|role|> b <|im_start|> c", Some(&sp)), "a <|role|> b <\u{200b}|im_start|> c");
+        assert_eq!(neutralize_with("a <|role|> b", Some(&sp)), "a <|role|> b");
         // a fetched page that mentions the picture token does not make picture slots; a real picture still does
         let b = json!({"messages": [
             {"role": "tool", "content": "{\"image_token\":\"<|image_pad|>\",\"v\":\"<|vision_start|>\"}"},
