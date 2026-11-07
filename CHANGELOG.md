@@ -2,6 +2,22 @@
 
 All notable changes to Shadow will be documented in this file.
 
+## [Unreleased] — 2026-11-05 and 2026-11-06
+Prompt reading with `--tensor-prompt` (the default fast mode) is about 5% / 11% / 23% faster than at the start of 2026-11-06 for 3k / 9.6k / 15k-token prompts (535 / 1,068 / 1,038 tok/s, mean of four server runs each); decode and `--exact` are unchanged (exact hash 162a8e07, `quality_test` 12 of 12).
+### Fixed
+- **Garbled replies in a chat that started from the stored shared-prefix snapshot** (default since 2026-11-05 14:27): a prompt-path CUDA graph recorded for one prompt was replayed over big-batch buffers that another prompt had placed elsewhere; the graph key now covers every buffer's address (`GpuSession::bb_sig`). Regression test: `tools/prefix_restore_test.py`. (docs/STATUS.md 53)
+- **Tool calls opened while the model is still thinking** (no `</think>` first) now end the thinking and run; before, the turn stopped with the calls shown inside the reasoning.
+- **`glob` tool**: real patterns (`*`, `**`, `?`, folders); it used to match a substring of the file name, so `**/*.html` found nothing. **`grep` tool**: regexes as its description says (`busy|telemetry`); literal text still matches.
+- **"N pictures sent but the prompt has M picture slots"**: literal special-token text in a message (a fetched page that mentions `<|image_pad|>`) is defanged with a zero-width space, only for the model's real special tokens, so it no longer becomes a picture slot or a fake turn.
+- Kernel-signature drift test: the parser skips `__launch_bounds__(N)`; it had been failing since 2026-11-05.
+### Changed
+- Prompt path (fast mode only): 15k-token prompts run in one pass (sub-chunk size fitted to the prompt, `SHADOW_ONE_PASS=0` off), DeltaNet recurrence on 512 threads (bit-identical, `SHADOW_DELTA_F4=0` off), sparse-attention scores on tensor cores with fp16 inputs (`SHADOW_ATT_TC=0` off), int8 MMQ dense projections when `native/mmq/shadow_mmq.dll` is built (`SHADOW_MMQ=0` off), float norm/DeltaNet/rope kernels, batched per-layer-embedding step. STATUS entries 31-52.
+- Web UI: thin, quiet scroll bars.
+### Added
+- Start Menu entry "Shadow" (the desktop launcher `shadow-ui.exe`, which starts the server and opens the chat).
+- Tools: `tools/needle_test.py` (long-prompt retrieval), `tools/replay_snapshot.py` (replay a stored conversation), `tools/prefix_restore_test.py`, `tools/nsys_last_run.py`, `tools/nsys_gap_why.py`.
+- Opt-in experiments, all measured ties or losses (docs/STATUS.md 36, 46-48, 51, 52): `SHADOW_MMQ_MOE=1` (gate/up experts on int8 kernels), `SHADOW_GU_SWIGLU=1` (gate+up+SwiGLU in one kernel), `SHADOW_MMA_GROUP=48|64`, `SHADOW_ATT_TC=2` (tensor-core weighted sum), `SHADOW_ATT_TCD=1` (dense attention scores on tensor cores).
+
 ## [0.1.31] — 2026-11-04
 ### Added
 - **Opt-in Direct I/O Read Pool (SHADOW_DIRECT_IO=1, crates/shadow-model/src/readpool.rs)**:
