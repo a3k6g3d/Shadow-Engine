@@ -13,6 +13,7 @@ Prompt reading with `--tensor-prompt` (the default fast mode) is about 5% / 11% 
 ### Changed
 - Prompt path (fast mode only): 15k-token prompts run in one pass (sub-chunk size fitted to the prompt, `SHADOW_ONE_PASS=0` off), DeltaNet recurrence on 512 threads (bit-identical, `SHADOW_DELTA_F4=0` off), sparse-attention scores on tensor cores with fp16 inputs (`SHADOW_ATT_TC=0` off), int8 MMQ dense projections when `native/mmq/shadow_mmq.dll` is built (`SHADOW_MMQ=0` off), float norm/DeltaNet/rope kernels, batched per-layer-embedding step. STATUS entries 31-52.
 - Web UI: thin, quiet scroll bars.
+- Desktop launcher (`shadow-ui.exe`): closing the window now quits it and stops the server it started (its 36+ GiB of pinned RAM comes back); it used to hide to the tray. `"closeToTray": true` in `%APPDATA%\Shadow\desktop.json` brings the old behaviour back.
 ### Added
 - Start Menu entry "Shadow" (the desktop launcher `shadow-ui.exe`, which starts the server and opens the chat).
 - Tools: `tools/needle_test.py` (long-prompt retrieval), `tools/replay_snapshot.py` (replay a stored conversation), `tools/prefix_restore_test.py`, `tools/nsys_last_run.py`, `tools/nsys_gap_why.py`.

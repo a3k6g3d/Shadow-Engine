@@ -49,7 +49,8 @@ impl Default for Config {
             launcher: String::new(),
             console_log: log_path.to_string_lossy().to_string(),
             stop_on_quit: true,
-            close_to_tray: true,
+            // closing the window quits (and stops the server it started, which holds tens of GiB of pinned RAM); `"closeToTray": true` in desktop.json hides it to the tray instead
+            close_to_tray: false,
             load_timeout_minutes: 5,
         }
     }
