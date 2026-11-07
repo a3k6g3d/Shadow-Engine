@@ -98,7 +98,19 @@ if __name__ == '__main__':
     ids = read_tokens(path)
     text = detokenize(ids, vocab(gguf))
     msgs = to_messages(text)
+    # REPLAY_APPEND_CHARS=N: a further tool result of N characters (docs/STATUS.md text) after the conversation's last message, as when a tool returns a big page: the prompt
+    # then passes the context window's budget and the server compacts it (older tool outputs shortened, older turns folded into a summary)
+    extra = int(os.environ.get('REPLAY_APPEND_CHARS', '0'))
+    if extra:
+        page = open('J:/Shadow/docs/STATUS.md', encoding='utf-8').read()[:extra]
+        msgs.append({'role': 'assistant', 'reasoning_content': 'I need the next page of the list.', 'content': 'Let me read the next page.\n\n<tool_call>\n<function=web_fetch>\n<parameter=url>\nhttps://example.org/page\n</parameter>\n</function>\n</tool_call>'})
+        msgs.append({'role': 'user', 'content': '<tool_response>\n<tool_response>\nhttps://example.org/page\n' + page + '\n</tool_response>\n</tool_response>'})
     print(f'{len(ids)} tokens -> {len(text)} chars -> {len(msgs)} messages ({", ".join(m["role"][0] for m in msgs[:3])} ... {msgs[-1]["role"]})', flush=True)
+    if os.environ.get('REPLAY_TWICE') == '1' and extra:
+        base_msgs = msgs[:-2]
+        warm = {'messages': base_msgs, 'max_tokens': 8, 'temperature': 0, 'stream': False}
+        r0 = json.load(urllib.request.urlopen(urllib.request.Request(f'http://127.0.0.1:{port}/v1/chat/completions', json.dumps(warm).encode(), {'Content-Type': 'application/json'}), timeout=3000))
+        print('warm-up request:', r0.get('timings', {}).get('prompt_n'), 'prompt tokens read', flush=True)
     body = {'messages': msgs, 'max_tokens': max_tokens, 'temperature': 0, 'stream': False}
     t0 = time.time()
     r = json.load(urllib.request.urlopen(urllib.request.Request(f'http://127.0.0.1:{port}/v1/chat/completions', json.dumps(body).encode(), {'Content-Type': 'application/json'}), timeout=3000))

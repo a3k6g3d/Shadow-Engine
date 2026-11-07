@@ -406,6 +406,9 @@ pub struct GpuSession<'c, 'm> {
     /// the residual streams of every row of a pass bigger than `rows` (see `sub_rows_cap`), one buffer of `rows` rows a part (carved wherever the lent ranges have room:
     /// a part is a sub-chunk's storage; the first sub-chunk, the remainder, sits at the end of part 0); `bb.r` is then a view of the sub-chunk being run
     rparts: Vec<DeviceBuffer<'c>>,
+    /// a hash of where every big-batch buffer (and every part of the residual streams) lies, 0 with the small batch: part of a prompt graph's key, because a captured graph carries
+    /// the buffers' addresses, and a prompt that lends another stretch of memory (another length: the KV tail kept, the arena part lent) puts them elsewhere
+    bb_sig: u64,
     /// `prefill` wants the last row's logits only: `batch` skips the output projection of the rows before it (0.2 s of a 15k prompt)
     logits_last: bool,
     /// whether the sub-chunk being run is the pass's last (the layer's copy pipeline advances once a layer, after it)
@@ -1612,7 +1615,7 @@ impl<'c, 'm> GpuSession<'c, 'm> {
         };
         let mut s = GpuSession {
             ctx, m, mvp, fw, w, v, b, bb, replay, dscr, mmq, mmq_y,
-            rparts: Vec::new(), logits_last: false, sub_last: true, sub_first: true,
+            rparts: Vec::new(), bb_sig: 0, logits_last: false, sub_last: true, sub_first: true,
             devplan: tiers.tensor_prompt && !std::env::var("SHADOW_PREFILL_DEVPLAN").is_ok_and(|v| v == "0"), dp_tidx, dp_cnt, dp_gstart, dp_copied, dp_eaddr, kv_regions, kv_extra: None, kv_extra_reg, prompt_hint: 0, kv_rows: 0, kv_halves: false, router_bias: std::env::var("SHADOW_ROUTER_BIAS").ok().and_then(|v| v.parse().ok()).unwrap_or(0.0), batch_scratch, delta, attn, ple_state, tokens: vec![], pictures: vec![], rope_tab: None, rope_on: false, cap, trace: None, stop_after: None,
             resident_bytes, expert_uploads: 0, cache, ram, copy_stream, copy_stream2, copy_ev2, copy_event, staging,
             pending: vec![], routing: RoutingCounts::new(c.n_layer, c.n_expert),
@@ -1949,6 +1952,9 @@ impl<'c, 'm> GpuSession<'c, 'm> {
     /// same kernels with the same arguments every time (no host decisions, uploads or reads inside).
     /// `graph_segment` for the batched step's segments.
     fn batch_graph_segment(&mut self, key: (usize, bool, usize, bool, usize, u64), f: impl FnOnce(&Self)) {
+        // the key's last part is one buffer's address; the others' addresses (`bb_sig`) belong to it too, or a graph captured for another layout of the same row count is replayed
+        // over buffers that have moved (the garbled reply of a chat resumed from the shared-prefix snapshot, docs/STATUS.md 2026-11-06 (53))
+        let key = (key.0, key.1, key.2, key.3, key.4, key.5.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ self.bb_sig);
         if !self.batch_graphs.contains_key(&key) {
             self.gstream.begin_capture().unwrap();
             self.capturing.set(true);
@@ -3418,10 +3424,24 @@ impl<'c, 'm> GpuSession<'c, 'm> {
                 self.rows = rows;
                 self.batch_max = if !rparts.is_empty() && rparts.len() == total.div_ceil(rows) { total } else { rows };
                 self.rparts = rparts;
+                self.bb_sig = self.bb_signature();
                 true
             }
             Err(_) => false, // cannot happen: `take` does not fail; the fixed buffers are dropped views
         }
+    }
+
+    /// A hash of the addresses of the big batch's buffers and of the residual streams' parts (`bb_sig`).
+    fn bb_signature(&self) -> u64 {
+        let b = &self.bb;
+        let ptrs = [b.r.ptr, b.rn.ptr, b.u.ptr, b.g.ptr, b.y.ptr, b.down.ptr, b.up.ptr, b.qkv.ptr, b.x.ptr, b.z.ptr, b.beta.ptr, b.alpha.ptr, b.o.ptr, b.qg.ptr, b.q.ptr, b.gate.ptr,
+                    b.kk.ptr, b.iq.ptr, b.ao.ptr, b.att.ptr, b.rl.ptr, b.sel_iqn.ptr, b.sel_scores.ptr, b.sel_toks.ptr, b.sgl.ptr, b.sg.ptr, b.su.ptr, b.sa.ptr, b.so.ptr,
+                    b.logits.ptr, b.gtab.ptr, b.eg.ptr, b.act.ptr, b.eo.ptr];
+        let mut h = 0xcbf2_9ce4_8422_2325u64;
+        for p in ptrs.iter().copied().chain(self.rparts.iter().map(|r| r.ptr)).chain([self.mmq_y.ptr, self.dscr.ptr]) {
+            h = (h ^ p).wrapping_mul(0x0100_0000_01b3);
+        }
+        h | 1 // never 0, which is the small batch's
     }
 
     /// Back to the buffers for `MAX_BATCH` tokens (the shared ones move back).
@@ -3433,6 +3453,7 @@ impl<'c, 'm> GpuSession<'c, 'm> {
         }
         self.bb = small;
         self.rparts = Vec::new();
+        self.bb_sig = 0;
         self.rows = MAX_BATCH;
         self.batch_max = MAX_BATCH;
     }
