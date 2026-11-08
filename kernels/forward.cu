@@ -2974,6 +2974,17 @@ extern "C" __global__ void __launch_bounds__(256) route_topk_rows(const float* l
     }
 }
 
+// Debug only (`SHADOW_ROUTE_UNIFORM=1`, wrong output): every token routes to experts (j * k + i) % ne with weight 1 / k, so each expert gets m * k / ne tokens, to time the MoE products
+// on evenly filled groups.
+extern "C" __global__ void route_uniform_rows(const float* logits, unsigned int* tidx, float* weights, unsigned int* cnt, unsigned int ne, unsigned int k, unsigned int m) {
+    for (unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x; idx < m * k; idx += gridDim.x * blockDim.x) {
+        const unsigned int e = idx % ne;
+        tidx[idx] = e;
+        weights[idx] = 1.0f / (float) k;
+        atomicAdd(&cnt[e], 1u);
+    }
+}
+
 // One block (ne <= 1024 threads): the first group of each expert within its phase.  An expert's cnt tokens make ceil(cnt / 32) groups; phase 0 holds the experts
 // with copied[e] == 0 (resident in the VRAM cache), phase 1 the others, each in expert order.
 extern "C" __global__ void plan_scan(const unsigned int* cnt, const unsigned char* copied, unsigned int* gstart, unsigned int ne, unsigned int chunk) {

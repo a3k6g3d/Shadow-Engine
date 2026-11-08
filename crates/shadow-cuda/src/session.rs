@@ -4735,7 +4735,9 @@ impl<'c, 'm> GpuSession<'c, 'm> {
         self.k1("zero_words", nrec, &[Arg::Ptr(gt + r0 as u64), Arg::U32(nrec as u32)]);
         assert!(ne <= 512 && k <= 16, "route_topk_rows: {ne} experts, top {k}");
         let route_args = [Arg::Ptr(rl), Arg::Ptr(self.dp_tidx.ptr), Arg::Ptr(gt + w as u64), Arg::Ptr(self.dp_cnt.ptr), Arg::U32(ne as u32), Arg::U32(k as u32), Arg::U32(m as u32)];
-        if std::env::var("SHADOW_ROUTE_1T").is_ok_and(|v| v == "1") {
+        if std::env::var("SHADOW_ROUTE_UNIFORM").is_ok_and(|v| v == "1") {
+            self.k1("route_uniform_rows", m * k, &route_args);
+        } else if std::env::var("SHADOW_ROUTE_1T").is_ok_and(|v| v == "1") {
             self.k1("route_topk_rows_1t", m, &route_args);
         } else {
             self.k("route_topk_rows", m.div_ceil(8) as u32, 256, &route_args);
@@ -4745,6 +4747,21 @@ impl<'c, 'm> GpuSession<'c, 'm> {
         self.k("plan_fill", ne as u32, 256, &[Arg::Ptr(self.dp_tidx.ptr), Arg::Ptr(self.dp_cnt.ptr), Arg::Ptr(self.dp_gstart.ptr), Arg::Ptr(self.dp_copied.ptr), Arg::Ptr(self.dp_eaddr.ptr),
                                               Arg::Ptr(gt), Arg::U32(ne as u32), Arg::U32(k as u32), Arg::U32(m as u32), Arg::U32(g as u32), Arg::U32((self.rows * k) as u32),
                                               Arg::U32(a0 as u32), Arg::U32(a1 as u32), Arg::U32(r0 as u32), Arg::U32(r1 as u32), Arg::U32(chunk_n as u32)]);
+        if std::env::var("SHADOW_MOE_STATS").is_ok_and(|v| v == "1") {
+            // debugging: the pass's per-expert token counts and what they make of the groups (one line a layer)
+            self.ctx.synchronize().unwrap();
+            let mut cb = vec![0u8; ne * 4];
+            self.download(self.dp_cnt.ptr, &mut cb);
+            let cnt: Vec<usize> = (0..ne).map(|e| u32::from_le_bytes(cb[e * 4..e * 4 + 4].try_into().unwrap()) as usize).collect();
+            let mut sorted = cnt.clone();
+            sorted.sort_unstable();
+            let active = cnt.iter().filter(|&&n| n > 0).count();
+            let groups: usize = cnt.iter().map(|&n| n.div_ceil(chunk_n)).sum();
+            let res_groups: usize = (0..ne).filter(|&e| self.cache.map.contains_key(&(l, e))).map(|e| cnt[e].div_ceil(chunk_n)).sum();
+            let padded: usize = groups * chunk_n;
+            eprintln!("MOE-STATS L{l} m={m}: pairs {} active {active} groups {groups} (resident {res_groups}) fill {:.0}% count min/p25/p50/p75/max {}/{}/{}/{}/{}",
+                      m * k, 100.0 * (m * k) as f64 / padded.max(1) as f64, sorted[0], sorted[ne / 4], sorted[ne / 2], sorted[3 * ne / 4], sorted[ne - 1]);
+        }
         if std::env::var("SHADOW_DEVPLAN_CHECK").is_ok_and(|v| v == "1") {
             // debugging: the host's routing of the same logits against the device's
             self.ctx.synchronize().unwrap();

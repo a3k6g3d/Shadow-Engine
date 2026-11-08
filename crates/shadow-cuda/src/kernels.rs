@@ -254,6 +254,7 @@ pub const FILES: &[File] = &[
             e("fill_words", &[W, U, U]),
             e("route_topk_rows", &[C, W, W, W, U, U, U]),
             e("route_topk_rows_1t", &[C, W, W, W, U, U, U]),
+            e("route_uniform_rows", &[C, W, W, W, U, U, U]),
             e("plan_scan", &[C, C, W, U, U]),
             e("plan_fill", &[C, C, C, C, C, W, U, U, U, U, U, U, U, U, U, U]),
             e("head_norm_rope_rows", &[C, U, U, W, U, U, C, U, F, U, U, F]),
