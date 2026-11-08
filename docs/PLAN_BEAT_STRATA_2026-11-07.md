@@ -10,6 +10,16 @@ Supersedes the numbers of `PLAN_EXCEED_STRATA.md` (2026-11-05) and `PLAN_INT8_MM
 | 9.6k | 1,844 (5.3 s) | 1,068 (9.0 s) | 1.7x, 3.7 s |
 | 15k | 2,447 (6.3 s) | 1,038 (14.6 s) | 2.4x, 8.3 s |
 
+**Update 2026-11-08** (STATUS 58-66; Strata re-measured the same day, STATUS 65; Shadow from the second prompt of a server on, as in a chat; Strata's 15k is its second prompt, the first read 715):
+
+| prompt | Strata 0.2.11 | Shadow now | gap |
+|---|---|---|---|
+| 3k tokens | 1,210 tok/s (2.4 s) | about 630 (445-740, noisy; ~4.5 s) | 1.9x, ~2 s |
+| 9.6k | 1,735 (5.5 s) | 1,375 (7.0 s) | 1.26x, 1.5 s |
+| 15k | 1,543 (9.9 s); 2,447 (6.3 s) on 2026-11-05 | 1,407 (10.8 s) | 1.1x (1.7x against the older figure) |
+
+Done since the table above: prompt-path graphs off (+10% at 15k), `LONG_PROMPT` 512, the width-class MoE planner (+15% at 15k), a fix for its small-buffer failure, grouped embedding rows, the stage pipeline's buffers kept between prompts (+6% at 9.6k and 15k). Open: the MoE kernels (39% of kernel time; Strata's are fused int8), DeltaNet's three-heads-a-thread staging, layer-wide MoE groups, and the 3k SSD floor (the user's decision, Phase 5).
+
 Strata's own cost model fits all three: **T = 1.8 s x chunks of 8,192 tokens + 0.18 ms x tokens** (1.8 s is its expert set, 45 of 46.8 GiB pinned in RAM, going over PCIe once a chunk; 0.18 ms is 5,500 tok/s of compute). Shadow's 15k prompt is one pass whose 49 GB of expert copies hide under the compute, so Shadow is **ahead structurally** at 15k (no 3.6 s of copying); it loses on compute: its kernels need **0.57 ms a token (8.7 s)** against Strata's 0.18 ms, 3.2x.
 
 Shadow's 15k prompt (Nsight Systems, graphs off, STATUS 44-50), kernel share of the 8.7 s: MoE products 39% (gate/up IQ2_S + IQ3_XXS + IQ3_S 27%, IQ4_NL down 11%, Q2_0 2%), attention 14% (sparse 8%, dense 3%), dense int8 projections 10% + bf16 3%, DeltaNet 5%, hyper-connection / norm / swiglu kernels 11%. **Outside the layer loop: ~2.3 s (20% of the wall time)**, and the default (graphs on) build reads **~2 s slower than the same prompt with graphs off** (14.0-14.6 s against 11.7-12.0 s in the profiled runs; the A/B in STATUS 54's neighbourhood saw +4%): both are unexplained and cheap to look at.
