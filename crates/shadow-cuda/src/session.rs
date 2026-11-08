@@ -328,7 +328,7 @@ fn bb_row_floats(c: &shadow_model::forward::Config) -> usize {
     if std::env::var("SHADOW_ROW_INVENTORY").is_ok_and(|v| v == "1") {
         let parts = [("r,rn,up (3 x ch)", 3 * ch), ("u + y (2 x h)", 2 * h), ("g", cs), ("down (hc_rank)", c.hc_rank), ("qkv + x (2 x (2kd+vd))", 2 * (2 * kd + vd)), ("z + o (2 x vd)", 2 * vd),
                      ("beta + alpha", 2 * c.ssm_v_heads), ("qg + q + gate + ao", 2 * qd + qd + qd + qd), ("kk (kvd)", kvd), ("iq (idx_heads*idx_dim)", c.idx_heads * c.idx_dim),
-                     ("rl + sgl (n_expert + 1)", c.n_expert + 1), ("sg + su + sa (3 x shared_ff)", 3 * c.shared_ff), ("so (h)", h), ("gtab (64 k)", 64 * k),
+                     ("rl + sgl (n_expert + 1)", c.n_expert + 1), ("sg + su + sa (3 x shared_ff)", 3 * c.shared_ff), ("so (h)", h), ("gtab (96 k)", 96 * k),
                      ("eg (2 k ff)", 2 * k * c.expert_ff), ("act (k ff)", k * c.expert_ff), ("eo (k h)", k * h)];
         let total: usize = parts.iter().map(|p| p.1).sum();
         eprintln!("ROWS: hidden {h} streams {cs} k {k} expert_ff {} shared_ff {} qd {qd} kvd {kvd} kd {kd} vd {vd}: {total} floats = {:.0} KB a row", c.expert_ff, c.shared_ff, total as f64 * 4.0 / 1024.0);
@@ -342,7 +342,7 @@ fn bb_row_floats(c: &shadow_model::forward::Config) -> usize {
     let sets = if alias_sets() { delta_set.max(attn_set) } else { delta_set + attn_set };
     let up = if alias_up() { 0 } else { ch };
     2 * ch + up + 2 * h + cs + c.hc_rank + sets + 2 * c.ssm_v_heads + kvd
-        + c.idx_heads * c.idx_dim + c.n_expert + 1 + 3 * c.shared_ff + h + 64 * k + 2 * k * c.expert_ff + k * c.expert_ff + k * h
+        + c.idx_heads * c.idx_dim + c.n_expert + 1 + 3 * c.shared_ff + h + 96 * k + 2 * k * c.expert_ff + k * c.expert_ff + k * h
 }
 
 /// Whether the per-row buffers of the two layer kinds (and `up` / `eg`) share memory: on by default (`SHADOW_ALIAS_ROWS=0` off, `sets` / `up` one of the two): +9-12% on 9-15k prompts, `--exact` byte-identical, but the fast modes agree less with `--exact` (0.219 against 0.339, docs/STATUS.md 2026-11-04); a pipelined session never.
@@ -397,7 +397,7 @@ fn make_bb<'c>(c: &shadow_model::forward::Config, rows: usize,
         rl: ab(c.n_expert)?, sgl: ab(1)?,
         sel_iqn: fixed.sel_iqn, sel_scores: fixed.sel_scores, sel_toks: fixed.sel_toks,
         sg: ab(c.shared_ff)?, su: ab(c.shared_ff)?, sa: ab(c.shared_ff)?, so: ab(h)?, logits: fixed.logits,
-        gtab: ab(64 * k)?, eg, act: ab(k * c.expert_ff)?, eo: ab(k * h)?,
+        gtab: ab(96 * k)?, eg, act: ab(k * c.expert_ff)?, eo: ab(k * h)?,
     })
 }
 
@@ -435,6 +435,8 @@ pub struct GpuSession<'c, 'm> {
     dp_gstart: DeviceBuffer<'c>,
     dp_copied: DeviceBuffer<'c>,
     dp_eaddr: DeviceBuffer<'c>,
+    /// the width-class planner's layout words (`bucket_layout`)
+    dp_lay: DeviceBuffer<'c>,
     /// `SHADOW_KV_LEND=1`: the KV window's buffers are virtual-memory regions, and a long prompt borrows the unfilled tail of them (`lend_kv`) for its batch buffers
     kv_regions: Vec<crate::kvvmm::VmmRegion<'c>>,
     kv_extra: Option<DeviceBuffer<'c>>,
@@ -1121,6 +1123,54 @@ fn cols_rows_per_block(entry: &str, rows: usize) -> u32 {
 /// Rows a block of the plain `matvec_cols_*` kernels (and `matvec_cols_multi`) covers: 8 warps x `COLS_PLAIN` (matvec.cu) rows (tests/matvec.rs assumes 8).
 const COLS_PLAIN_ROWS: u32 = 8 * 1;
 
+/// Widths of the device planner's group classes (`plan_fill_w`, docs/STATUS.md 60): an expert's tokens fill groups of 64 and one group of the narrowest width that holds the rest.
+const BUCKET_W: [usize; 3] = [16, 32, 64];
+
+/// Where the width-class planner puts its tables in `bb.gtab` for m rows: per phase and class the matrix addresses (gate, up, down: `caps[class]` groups of 8 bytes each), then
+/// the records (1 + 2 W words a group), then the routing weights and the per-token expert counts.  `lay_words` is what `plan_fill_w` reads of it.
+struct BucketLayout {
+    caps: [usize; 3],
+    aoff: [[usize; 3]; 2],
+    roff: [[usize; 3]; 2],
+    weights: usize,
+    counts: usize,
+    total: usize,
+}
+
+fn bucket_layout(m: usize, k: usize, ne: usize) -> BucketLayout {
+    // at most one remainder group an expert in each class, and the full groups of 64 are at most m * k / 64 in all
+    let caps = [ne, ne, ne + (m * k) / 64];
+    let mut off = 0usize;
+    let mut aoff = [[0usize; 3]; 2];
+    for a in aoff.iter_mut() {
+        for (cl, o) in a.iter_mut().enumerate() {
+            *o = off;
+            off += 3 * caps[cl] * 8;
+        }
+    }
+    let mut roff = [[0usize; 3]; 2];
+    for r in roff.iter_mut() {
+        for (cl, o) in r.iter_mut().enumerate() {
+            *o = off;
+            off += 3 * caps[cl] * (1 + 2 * BUCKET_W[cl]) * 4;
+        }
+    }
+    let weights = off;
+    off += m * k * 4;
+    let counts = off;
+    off += m * 4;
+    BucketLayout { caps, aoff, roff, weights, counts, total: off }
+}
+
+impl BucketLayout {
+    fn lay_words(&self) -> Vec<u8> {
+        let mut w: Vec<u32> = self.caps.iter().map(|&x| x as u32).collect();
+        w.extend(self.aoff.iter().flatten().map(|&x| x as u32));
+        w.extend(self.roff.iter().flatten().map(|&x| x as u32));
+        w.iter().flat_map(|x| x.to_le_bytes()).collect()
+    }
+}
+
 /// `moe_batch`'s grouped routed experts for tokens start..end, as one upload: per phase (0: experts resident before
 /// this group's copies, 1: the ones being copied) the groups - an expert and up to 8 of its tokens - as matrix
 /// addresses [gate.., up.., down..] and 17-u32 records [gate.., up.., down..] (count, input rows, output rows), then
@@ -1365,7 +1415,7 @@ impl<'c, 'm> GpuSession<'c, 'm> {
         let mmq = if tiers.tensor_prompt { crate::mmq::Mmq::load() } else { None };
         // the largest input a projection takes is the attention output's (n_head * head_dim) or the SSM output's, for the rows of a sub-chunk
         let mmq_y = a(mmq.as_ref().map_or(1, |q| q.y_bytes((c.n_head * c.head_dim).max(c.ssm_v_heads * c.ssm_head_dim).max(c.hidden), sub_rows_cap().max(MAX_BATCH)).div_ceil(4)))?;
-        let (dp_tidx, dp_cnt, dp_gstart, dp_copied, dp_eaddr) = (a(BIG_BATCH_MAX * 16)?, a(1024)?, a(1024)?, a(256)?, a(6144)?);
+        let (dp_tidx, dp_cnt, dp_gstart, dp_copied, dp_eaddr, dp_lay) = (a(BIG_BATCH_MAX * 16)?, a(1024)?, a(3072)?, a(256)?, a(6144)?, a(32)?);
         let kv_lend = !std::env::var("SHADOW_KV_LEND").is_ok_and(|v| v == "0");
         let mut kv_regions: Vec<crate::kvvmm::VmmRegion<'c>> = Vec::new();
         let kv_extra_reg: Option<crate::kvvmm::VmmRegion<'c>> = None; // made at the first lend, when the slot size is known
@@ -1631,7 +1681,7 @@ impl<'c, 'm> GpuSession<'c, 'm> {
         let mut s = GpuSession {
             ctx, m, mvp, fw, w, v, b, bb, replay, dscr, mmq, mmq_y,
             rparts: Vec::new(), bb_sig: 0, logits_last: false, sub_last: true, sub_first: true,
-            devplan: tiers.tensor_prompt && !std::env::var("SHADOW_PREFILL_DEVPLAN").is_ok_and(|v| v == "0"), dp_tidx, dp_cnt, dp_gstart, dp_copied, dp_eaddr, kv_regions, kv_extra: None, kv_extra_reg, prompt_hint: 0, kv_rows: 0, kv_halves: false, router_bias: std::env::var("SHADOW_ROUTER_BIAS").ok().and_then(|v| v.parse().ok()).unwrap_or(0.0), batch_scratch, delta, attn, ple_state, tokens: vec![], pictures: vec![], rope_tab: None, rope_on: false, cap, trace: None, stop_after: None,
+            devplan: tiers.tensor_prompt && !std::env::var("SHADOW_PREFILL_DEVPLAN").is_ok_and(|v| v == "0"), dp_tidx, dp_cnt, dp_gstart, dp_copied, dp_eaddr, dp_lay, kv_regions, kv_extra: None, kv_extra_reg, prompt_hint: 0, kv_rows: 0, kv_halves: false, router_bias: std::env::var("SHADOW_ROUTER_BIAS").ok().and_then(|v| v.parse().ok()).unwrap_or(0.0), batch_scratch, delta, attn, ple_state, tokens: vec![], pictures: vec![], rope_tab: None, rope_on: false, cap, trace: None, stop_after: None,
             resident_bytes, expert_uploads: 0, cache, ram, copy_stream, copy_stream2, copy_ev2, copy_event, staging,
             pending: vec![], routing: RoutingCounts::new(c.n_layer, c.n_expert),
             prof: std::env::var("SHADOW_PROFILE").is_ok_and(|v| v == "1")
@@ -3099,6 +3149,8 @@ impl<'c, 'm> GpuSession<'c, 'm> {
                           (t2 - t1).as_secs_f64() * 1e3, (t0.elapsed() - t2).as_secs_f64() * 1e3);
             }
         }
+        let buckets = tops.is_none() && self.buckets_on(infos);
+        let mut blay: Option<(BucketLayout, bool)> = None;
         let (plan, n_set) = if let Some(tops) = tops {
             let mut seen = vec![false; ne];
             let mut set: Vec<usize> = Vec::new();
@@ -3130,16 +3182,32 @@ impl<'c, 'm> GpuSession<'c, 'm> {
             assert!(plan.bytes.len() <= self.bb.gtab.bytes, "grouped experts: {} bytes of tables", plan.bytes.len());
             self.upload_to(self.bb.gtab.ptr, &plan.bytes);
             (plan, set.len())
+        } else if buckets {
+            // routed and planned on the device, in width classes (`plan_fill_w`)
+            let (lay, any_res) = self.dev_plan_buckets(l, m, sizes);
+            let plan = GroupedPlan { bytes: vec![], phase: [(0, 0, 0); 2], weights: lay.weights as u64, counts: lay.counts as u64, chunk_n: 32 };
+            blay = Some((lay, any_res));
+            (plan, 0)
         } else {
             // routed and planned on the device: nothing the host decided depends on the tokens' routing
             (self.dev_plan(l, m, sizes), 0)
         };
         let t_plan = t_start.elapsed();
-        self.routed_grouped(&plan, 0, 0, m, infos);
+        match &blay {
+            Some((lay, any_res)) => {
+                if *any_res {
+                    self.routed_buckets(lay, 0, m, infos);
+                }
+            }
+            None => self.routed_grouped(&plan, 0, 0, m, infos),
+        }
         self.lt_point("staged: resident experts done");
         self.ctx.stream_wait_event(None, &self.sp.as_ref().unwrap().events[p]).unwrap();
         self.lt_point("staged: GPU stalled on the copy");
-        self.routed_grouped(&plan, 1, 0, m, infos);
+        match &blay {
+            Some((lay, _)) => self.routed_buckets(lay, 1, m, infos),
+            None => self.routed_grouped(&plan, 1, 0, m, infos),
+        }
         self.lt_point("staged: copied experts done");
         let t_launch = t_start.elapsed();
         heap_check("moe_staged experts launched");
@@ -4792,6 +4860,98 @@ impl<'c, 'm> GpuSession<'c, 'm> {
         let nc = m;
         self.k1("fill_words", nc, &[Arg::Ptr(gt + counts as u64), Arg::U32(nc as u32), Arg::U32(k as u32)]);
         GroupedPlan { bytes: vec![], phase: [(g, a0 as u64, r0 as u64), (g, a1 as u64, r1 as u64)], weights: w as u64, counts: counts as u64, chunk_n }
+    }
+
+    /// The width-class planner's `dev_plan`: routes layer l's m tokens (`route_topk_rows`) and plans them (`plan_scan_w`, `plan_fill_w`) on the device into `bb.gtab` as `bucket_layout` says;
+    /// the second value is whether any of the layer's experts is resident in the VRAM cache (else phase 0 is empty and is not launched).
+    fn dev_plan_buckets(&mut self, l: usize, m: usize, sizes: &[usize]) -> (BucketLayout, bool) {
+        let c = &self.m.cfg;
+        let (k, ne) = (c.n_expert_used, c.n_expert);
+        let lay = bucket_layout(m, k, ne);
+        assert!(lay.total <= self.bb.gtab.bytes, "width-class plan: {} bytes of tables for {} ({} rows)", lay.total, self.bb.gtab.bytes, m);
+        let p = l & 1;
+        let arena = self.cache.arena.as_ref().unwrap().ptr;
+        let half = self.sp.as_ref().unwrap().base + (p * ne * self.cache.slot_bytes) as u64;
+        let part = [0u64, sizes[0] as u64, (sizes[0] + sizes[1]) as u64];
+        let mut eaddr: Vec<u8> = Vec::with_capacity(3 * ne * 8);
+        let mut copied = vec![0u8; ne.next_multiple_of(4)];
+        for pt in 0..3 {
+            for e in 0..ne {
+                let base = match self.cache.map.get(&(l, e)) {
+                    Some(&s) => arena + self.cache.slot_offset[s],
+                    None => half + (e * self.cache.slot_bytes) as u64,
+                };
+                eaddr.extend_from_slice(&(base + part[pt]).to_le_bytes());
+            }
+        }
+        let mut any_res = false;
+        for e in 0..ne {
+            let res = self.cache.map.contains_key(&(l, e));
+            copied[e] = !res as u8;
+            any_res |= res;
+        }
+        self.upload_to(self.dp_eaddr.ptr, &eaddr);
+        self.upload_to(self.dp_copied.ptr, &copied);
+        self.upload_to(self.dp_lay.ptr, &lay.lay_words());
+        let (gt, rl) = (self.bb.gtab.ptr, self.bb.rl.ptr);
+        let nrec = (lay.weights - lay.roff[0][0]) / 4;
+        self.k1("zero_words", ne, &[Arg::Ptr(self.dp_cnt.ptr), Arg::U32(ne as u32)]);
+        self.k1("zero_words", nrec, &[Arg::Ptr(gt + lay.roff[0][0] as u64), Arg::U32(nrec as u32)]);
+        assert!(ne <= 512 && k <= 16, "route_topk_rows: {ne} experts, top {k}");
+        let route_args = [Arg::Ptr(rl), Arg::Ptr(self.dp_tidx.ptr), Arg::Ptr(gt + lay.weights as u64), Arg::Ptr(self.dp_cnt.ptr), Arg::U32(ne as u32), Arg::U32(k as u32), Arg::U32(m as u32)];
+        if std::env::var("SHADOW_ROUTE_UNIFORM").is_ok_and(|v| v == "1") {
+            self.k1("route_uniform_rows", m * k, &route_args);
+        } else {
+            self.k("route_topk_rows", m.div_ceil(8) as u32, 256, &route_args);
+        }
+        self.k("plan_scan_w", 1, 1024, &[Arg::Ptr(self.dp_cnt.ptr), Arg::Ptr(self.dp_copied.ptr), Arg::Ptr(self.dp_gstart.ptr), Arg::U32(ne as u32)]);
+        self.k("plan_fill_w", ne as u32, 256, &[Arg::Ptr(self.dp_tidx.ptr), Arg::Ptr(self.dp_cnt.ptr), Arg::Ptr(self.dp_gstart.ptr), Arg::Ptr(self.dp_copied.ptr), Arg::Ptr(self.dp_eaddr.ptr),
+                                                Arg::Ptr(gt), Arg::Ptr(self.dp_lay.ptr), Arg::U32(ne as u32), Arg::U32(k as u32), Arg::U32(m as u32), Arg::U32((self.rows * k) as u32)]);
+        self.k1("fill_words", m, &[Arg::Ptr(gt + lay.counts as u64), Arg::U32(m as u32), Arg::U32(k as u32)]);
+        (lay, any_res)
+    }
+
+    /// Whether layer l's routed experts use the width-class planner: `SHADOW_MMA_BUCKETS=0` off; not with the opt-in int8 gate/up, the fused gate/up kernel or a fixed `SHADOW_MMA_GROUP`.
+    fn buckets_on(&self, infos: &[TensorInfo]) -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| !std::env::var("SHADOW_MMA_BUCKETS").is_ok_and(|v| v == "0") && !std::env::var("SHADOW_GU_SWIGLU").is_ok_and(|v| v == "1") && std::env::var("SHADOW_MMA_GROUP").is_err())
+            && infos[0].ty == infos[1].ty
+            && infos[0].dims == infos[1].dims
+            && !self.moe_gate_up_wanted(&infos[0])
+    }
+
+    /// Phase `ph` of the width-class plan (0: the resident experts, 1: the copied ones) for the pass's m rows: per class gate + up grouped, then SwiGLU over the rows, then per class
+    /// down into bb.eo row (token, rank).  A class's grid holds its capacity of groups; the empty ones (count 0) leave at once.
+    fn routed_buckets(&self, lay: &BucketLayout, ph: usize, m: usize, infos: &[TensorInfo]) {
+        let c = &self.m.cfg;
+        let (h, ff, k) = (c.hidden, c.expert_ff, c.n_expert_used);
+        let bb = &self.bb;
+        let up = (self.rows * k * ff * 4) as u64;
+        let grouped = |t: &TensorInfo, cl: usize, wt: usize, gt: usize, count: usize, x: u64, xs: usize, y: u64, ys: usize| {
+            let ty = t.ty.name().to_lowercase();
+            let (rows, cols) = (t.dims[1] as u32, t.dims[0] as u32);
+            let kernel = match cl {
+                0 => format!("mma_grouped16_{ty}"),
+                1 => format!("mma_grouped_{ty}"),
+                _ => format!("mma_grouped64_{ty}"),
+            };
+            // SAFETY: `count` table entries at gtab + wt (matrix addresses in the cache or the stage halves) and their records (1 + 2 W u32 each: count, W input rows, W output rows) at
+            // gtab + gt, laid out by `bucket_layout`; the rows they name are inside the batch's buffers at the strides given.
+            unsafe {
+                self.mvp.launch(&kernel, (rows.div_ceil(64), count as u32, 1), (128, 1, 1), 0, self.ls(),
+                                &[Arg::Ptr(bb.gtab.ptr + wt as u64), Arg::Ptr(bb.gtab.ptr + gt as u64), Arg::Ptr(x), Arg::U32(xs as u32), Arg::Ptr(y), Arg::U32(ys as u32), Arg::U32(rows), Arg::U32(cols)])
+            }
+            .unwrap_or_else(|err| panic!("{}: {err}", t.name));
+        };
+        for cl in 0..3 {
+            grouped(&infos[0], cl, lay.aoff[ph][cl], lay.roff[ph][cl], 2 * lay.caps[cl], bb.u.ptr, h, bb.eg.ptr, ff);
+        }
+        let len = m * k * ff;
+        self.k1("swiglu", len, &[Arg::Ptr(bb.eg.ptr), Arg::Ptr(bb.eg.ptr + up), Arg::Ptr(bb.act.ptr), Arg::U32(len as u32)]);
+        for cl in 0..3 {
+            let cap = lay.caps[cl];
+            grouped(&infos[2], cl, lay.aoff[ph][cl] + 2 * cap * 8, lay.roff[ph][cl] + 2 * cap * (1 + 2 * BUCKET_W[cl]) * 4, cap, bb.act.ptr, ff, bb.eo.ptr, h);
+        }
     }
 
     /// `router_done`: `moe_router_batch` already ran (in a graph).

@@ -2985,6 +2985,93 @@ extern "C" __global__ void route_uniform_rows(const float* logits, unsigned int*
     }
 }
 
+// The width-class planner (docs/STATUS.md 60).  An expert's n tokens go to full groups of 64 (n / 64 of them) and, for the rest r = n % 64, one group of the narrowest width that
+// holds it: 16 (r <= 16), 32 (r <= 32) or 64 (r > 32), instead of ceil(n / 32) groups of 32 (a group costs the same whatever its count: 2.7 / 4.3 / 5.7 us at 16 / 32 / 64 on the
+// grouped kernels).  Classes 0 / 1 / 2 are widths 16 / 32 / 64; phase 0 holds the experts with copied[e] == 0 (resident), phase 1 the others.
+//
+// One block (ne <= 1024 threads): gstart[e * 3 + class] = the first group of expert e in its phase's table of that class (the prefix over experts).
+extern "C" __global__ void plan_scan_w(const unsigned int* cnt, const unsigned char* copied, unsigned int* gstart, unsigned int ne) {
+    __shared__ unsigned int s[1024];
+    const unsigned int e = threadIdx.x;
+    const unsigned int n = e < ne ? cnt[e] : 0u, c = e < ne ? copied[e] : 0u;
+    const unsigned int f = n >> 6, rem = n & 63u;
+    unsigned int ng[3];
+    ng[0] = (rem > 0u && rem <= 16u) ? 1u : 0u;
+    ng[1] = (rem > 16u && rem <= 32u) ? 1u : 0u;
+    ng[2] = f + (rem > 32u ? 1u : 0u);
+    for (unsigned int ph = 0; ph < 2; ++ph) {
+        for (unsigned int cl = 0; cl < 3; ++cl) {
+            const unsigned int v = (c == ph) ? ng[cl] : 0u;
+            s[e] = v;
+            __syncthreads();
+            for (unsigned int off = 1; off < 1024; off <<= 1) {
+                const unsigned int a = e >= off ? s[e - off] : 0u;
+                __syncthreads();
+                s[e] += a;
+                __syncthreads();
+            }
+            if (e < ne && c == ph) gstart[e * 3 + cl] = s[e] - v;
+            __syncthreads();
+        }
+    }
+}
+
+// One block (256 threads) an expert: its tokens in token order, written as the records and matrix addresses `mma_grouped{16,,64}_*` read.  lay: caps[3], aoff[2][3], roff[2][3]
+// (bytes from `base`; 3 parts x cap groups of 8 bytes of addresses and 3 parts x cap records of 1 + 2 W u32 for each phase and class); part 0 = gate (in row j, out row pair),
+// 1 = up (in j, out up_off + pair), 2 = down (in pair, out pair); pair = j * k + the expert's rank in token j's list.  The records' counts were zeroed: groups past the last
+// one are empty and the kernels skip them.
+extern "C" __global__ void plan_fill_w(const unsigned int* tidx, const unsigned int* cnt, const unsigned int* gstart, const unsigned char* copied, const u64* eaddr,
+                                       unsigned char* base, const unsigned int* lay, unsigned int ne, unsigned int k, unsigned int m, unsigned int up_off) {
+    __shared__ unsigned int scan[256];
+    const unsigned int e = blockIdx.x, tid = threadIdx.x;
+    const unsigned int total = cnt[e];
+    if (total == 0) return;
+    const unsigned int ph = copied[e];
+    const unsigned int f = total >> 6, rem = total & 63u;
+    const unsigned int rc = rem <= 16u ? 0u : (rem <= 32u ? 1u : 2u);
+    unsigned int seen = 0;
+    for (unsigned int t0 = 0; t0 < m; t0 += 256) {
+        const unsigned int j = t0 + tid;
+        int rank = -1;
+        if (j < m) {
+            for (unsigned int i = 0; i < k; ++i) if (tidx[(u64) j * k + i] == e) { rank = (int) i; break; }
+        }
+        scan[tid] = rank >= 0 ? 1u : 0u;
+        __syncthreads();
+        for (unsigned int off = 1; off < 256; off <<= 1) {
+            const unsigned int v = tid >= off ? scan[tid - off] : 0u;
+            __syncthreads();
+            scan[tid] += v;
+            __syncthreads();
+        }
+        const unsigned int incl = scan[tid], chunk_total = scan[255];
+        if (rank >= 0) {
+            const unsigned int p = seen + incl - 1;
+            unsigned int cl, g, s, count;
+            if (p < 64u * f) {
+                cl = 2u; g = gstart[e * 3 + 2] + (p >> 6); s = p & 63u; count = 64u;
+            } else {
+                cl = rc; g = gstart[e * 3 + rc] + (rc == 2u ? f : 0u); s = p - 64u * f; count = rem;
+            }
+            const unsigned int W = 16u << cl, cap = lay[cl];
+            u64* addr = (u64*) (base + lay[3 + ph * 3 + cl]);
+            unsigned int* rec = (unsigned int*) (base + lay[9 + ph * 3 + cl]);
+            const unsigned int pair = j * k + (unsigned int) rank;
+            for (unsigned int part = 0; part < 3; ++part) {
+                unsigned int* r = rec + ((u64) part * cap + g) * (1u + 2u * W);
+                r[1 + s] = part == 2 ? pair : j;
+                r[1 + W + s] = part == 1 ? up_off + pair : pair;
+                if (s == 0) {
+                    r[0] = count;
+                    addr[(u64) part * cap + g] = eaddr[(u64) part * ne + e];
+                }
+            }
+        }
+        seen += chunk_total;
+        __syncthreads();
+    }
+}
+
 // One block (ne <= 1024 threads): the first group of each expert within its phase.  An expert's cnt tokens make ceil(cnt / 32) groups; phase 0 holds the experts
 // with copied[e] == 0 (resident in the VRAM cache), phase 1 the others, each in expert order.
 extern "C" __global__ void plan_scan(const unsigned int* cnt, const unsigned char* copied, unsigned int* gstart, unsigned int ne, unsigned int chunk) {
