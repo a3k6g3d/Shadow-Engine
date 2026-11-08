@@ -175,6 +175,13 @@ extern "C" __global__ void broadcast(const float* x, float* r, unsigned int h, u
     if (i < h * streams) r[i] = x[i % h];
 }
 
+// n rows at once: r[(row * streams + s) * h + i] = x[row * h + i] (a prompt pass's embedding rows, one upload for a group of them)
+extern "C" __global__ void broadcast_rows(const float* x, float* r, unsigned int h, unsigned int streams, unsigned int n) {
+    unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
+    const unsigned int rs = h * streams;
+    if (i < rs * n) r[i] = x[(i / rs) * h + (i % rs) % h];
+}
+
 // a += b
 extern "C" __global__ void add(float* a, const float* b, unsigned int n) {
     unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;

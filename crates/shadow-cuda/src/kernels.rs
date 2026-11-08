@@ -264,6 +264,7 @@ pub const FILES: &[File] = &[
             e("hc_write", &[W, C, C, U, U]),
             e("hc_write_rmsnorm_groups", &[W, C, C, C, W, U, F]),
             e("broadcast", &[C, W, U, U]),
+            e("broadcast_rows", &[C, W, U, U, U]),
             e("add", &[W, C, U]),
             e("copy", &[W, C, U]),
             e("copy_words", &[W, C, U]),

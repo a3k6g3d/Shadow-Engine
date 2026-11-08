@@ -10,6 +10,9 @@ Prompt reading with `--tensor-prompt` (the default fast mode) is about 5% / 11% 
 - **`glob` tool**: real patterns (`*`, `**`, `?`, folders); it used to match a substring of the file name, so `**/*.html` found nothing. **`grep` tool**: regexes as its description says (`busy|telemetry`); literal text still matches.
 - **"N pictures sent but the prompt has M picture slots"**: literal special-token text in a message (a fetched page that mentions `<|image_pad|>`) is defanged with a zero-width space, only for the model's real special tokens, so it no longer becomes a picture slot or a fake turn.
 - Kernel-signature drift test: the parser skips `__launch_bounds__(N)`; it had been failing since 2026-11-05.
+### Changed (2026-11-08, prompt path)
+- A long prompt's embedding rows go up in groups of 512 (new kernel `broadcast_rows`; `SHADOW_EMBED_ROWS=0` keeps the per-token loop), and the layer-ahead pipeline's three pinned read-ahead buffers (1.33 GiB) are kept between prompts while RAM is plentiful (`SHADOW_KEEP_PIPE=0` frees them as before): about 0.45 s less per prompt from the second one on, +6% at 9.6k and 15k in A-B-B-A, output bit-identical (docs/STATUS.md 66).
+
 ### Fixed (2026-11-08)
 - The width-class MoE planner (2026-11-07) failed with "internal error: width-class plan: ... bytes of tables" on a small batch buffer (768 rows) and reset the conversation's cache; its table buffer is now sized for its fixed part, and a pass whose tables do not fit takes the fixed-width planner instead of failing (docs/STATUS.md 62).
 

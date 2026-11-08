@@ -502,6 +502,9 @@ pub struct GpuSession<'c, 'm> {
     /// the tail of the VRAM expert cache, lent to a long prompt as staging (`lend_cache` / `restore_cache`)
     lent: Option<Lent>,
     sp: Option<StagePipe<'c>>,
+    /// the last prompt's pipeline buffers and events, kept (pinned) for the next long prompt while RAM is plentiful: pinning three regions took 0.25 s a prompt and freeing them 0.1 s
+    /// (`SHADOW_KEEP_PIPE=0` frees them as before)
+    sp_spare: Option<StagePipe<'c>>,
     /// rows of `bb` now (`MAX_BATCH`, or `BIG_BATCH` while a long prompt is read), and the small buffers while the big ones are in
     rows: usize,
     small_bb: Option<BatchBufs<'c>>,
@@ -1703,6 +1706,7 @@ impl<'c, 'm> GpuSession<'c, 'm> {
             tensor_prompt: tiers.tensor_prompt,
             lent: None,
             sp: None,
+            sp_spare: None,
             rows: MAX_BATCH,
             small_bb: None,
             pipeline: tiers.pipeline,
@@ -2855,7 +2859,9 @@ impl<'c, 'm> GpuSession<'c, 'm> {
             self.big_batch_on();
             return true;
         }
+        let t_lend0 = std::time::Instant::now();
         let kv_lent = pipe && big && arena_hosts && self.lend_kv(false);
+        let t_lend_kv = t_lend0.elapsed().as_secs_f64();
         let big_cap = big_rows_cap();
         // more rows than the KV tail holds (`SHADOW_BIG_ROWS`): the rest of their buffers from the arena, past the halves (256 MiB more for the carving's gaps)
         let extra = if kv_lent {
@@ -2878,7 +2884,9 @@ impl<'c, 'm> GpuSession<'c, 'm> {
             self.unlend_kv();
             return false;
         }
+        let t_lend_a = t_lend0.elapsed().as_secs_f64();
         self.ctx.synchronize().unwrap(); // nothing is still reading the entries about to go
+        let t_lend_sync = t_lend0.elapsed().as_secs_f64();
         let mut saved = vec![];
         for s in s0..self.cache.slots {
             if let Some((l, e)) = self.cache.owner[s].take() {
@@ -2906,13 +2914,20 @@ impl<'c, 'm> GpuSession<'c, 'm> {
         if std::env::var("SHADOW_STAGE_TIME").is_ok_and(|v| v == "1") {
             eprintln!("LEND long {long} pipe {pipe} big {big} kv_lent {kv_lent}: {} of {} slots lent (n {n}, need {} for the pipeline), want {:.2} GiB", self.cache.slots - s0, self.cache.slots, 2 * self.m.cfg.n_expert, want as f64 / 1073741824.0);
         }
+        let t_lend_pin = t_lend0.elapsed().as_secs_f64();
         let ptr = self.cache.arena.as_ref().unwrap().ptr + start as u64;
         self.lent = Some(Lent { ptr, n, saved, evict_saved });
+        let mut t_lend_pipe = 0.0;
         if pipe && n >= 2 * self.m.cfg.n_expert {
             self.stage_pipe_init(ptr);
+            t_lend_pipe = t_lend0.elapsed().as_secs_f64();
             if big {
                 self.big_batch_on();
             }
+        }
+        if phases_on() {
+            eprintln!("SHADOW_PHASES lend_cache: KV tail {t_lend_kv:.3} s; to the evictions {t_lend_a:.3}; device drained {t_lend_sync:.3}; evictions and staging region {t_lend_pin:.3}; stage pipe (3 pinned regions) {t_lend_pipe:.3}; all {:.3} s",
+                      t_lend0.elapsed().as_secs_f64());
         }
         true
     }
@@ -2930,6 +2945,22 @@ impl<'c, 'm> GpuSession<'c, 'm> {
             slots = n.max(1);
         }
         let bytes = slots * self.cache.slot_bytes;
+        if let Some(mut s) = self.sp_spare.take() {
+            if s.bufs.iter().all(|b| b.len() >= bytes) {
+                // the last prompt's buffers and events (all done: `restore_cache` drained the device and the copy stream), as new
+                s.base = base;
+                s.ready = [usize::MAX; 2];
+                s.layer = [usize::MAX; 3];
+                s.at = [HashMap::new(), HashMap::new(), HashMap::new()];
+                s.slots = slots;
+                s.pending = false;
+                if phases_on() {
+                    eprintln!("SHADOW_PHASES stage pipe: the kept buffers again ({:.2} GiB pinned)", 3.0 * s.bufs[0].len() as f64 / 1073741824.0);
+                }
+                self.sp = Some(s);
+                return;
+            }
+        }
         let (Ok(a), Ok(b), Ok(c3), Ok(e0), Ok(e1)) =
             (PinnedRegion::new(self.ctx, bytes), PinnedRegion::new(self.ctx, bytes), PinnedRegion::new(self.ctx, bytes), self.ctx.event(), self.ctx.event()) else { return };
         let (Ok(d0), Ok(d1), Ok(b0), Ok(b1), Ok(b2)) = (self.ctx.event(), self.ctx.event(), self.ctx.event(), self.ctx.event(), self.ctx.event()) else { return };
@@ -3420,8 +3451,10 @@ impl<'c, 'm> GpuSession<'c, 'm> {
         for r in self.fv_regs.iter_mut() {
             r.release(self.ctx);
         }
+        let t_r_wait = t_restore.elapsed().as_secs_f64();
         self.big_batch_off();
         self.unlend_kv();
+        let t_r_kv = t_restore.elapsed().as_secs_f64();
         self.cache.evict_range = lent.evict_saved;
         let arena = self.cache.arena.as_ref().unwrap().ptr;
         let stream = self.copy_stream.raw();
@@ -3459,7 +3492,12 @@ impl<'c, 'm> GpuSession<'c, 'm> {
                 }
                 self.copy_stream.synchronize().unwrap();
             }
+            // kept for the next long prompt unless RAM is getting short (4 GiB over the floor) or `SHADOW_KEEP_PIPE=0`
+            if !std::env::var("SHADOW_KEEP_PIPE").is_ok_and(|v| v == "0") && crate::pinned::available_ram() >= crate::pinned::ram_floor() + (4 << 30) {
+                self.sp_spare = Some(sp);
+            }
         }
+        let t_r_cold = t_restore.elapsed().as_secs_f64();
         for (s, l, e) in lent.saved {
             // the prompt may have loaded this expert again into another slot: one owner only
             if self.cache.map.contains_key(&(l, e)) {
@@ -3479,7 +3517,8 @@ impl<'c, 'm> GpuSession<'c, 'm> {
         }
         self.copy_stream.synchronize().unwrap();
         if phases_on() {
-            eprintln!("SHADOW_PHASES restore_cache: {:.3} s ({} evicted experts to bring back)", t_restore.elapsed().as_secs_f64(), n_saved);
+            eprintln!("SHADOW_PHASES restore_cache: {:.3} s ({} evicted experts to bring back): read-ahead + device drained {t_r_wait:.3}; big batch off + KV tail {:.3}; file reads + stage pipe dropped {:.3}; RAM-tier uploads {:.3}",
+                      t_restore.elapsed().as_secs_f64(), n_saved, t_r_kv - t_r_wait, t_r_cold - t_r_kv, t_restore.elapsed().as_secs_f64() - t_r_cold);
         }
     }
 
@@ -4023,15 +4062,35 @@ impl<'c, 'm> GpuSession<'c, 'm> {
             let (t, bytes) = self.m.dense("token_embd.weight");
             let (qk, qb) = t.ty.block().unwrap();
             let rb = (t.dims[0] / qk * qb) as usize;
-            for (j, &tok) in toks.iter().enumerate() {
-                let mut x = vec![0f32; h];
-                match self.picture_row(p0 + j) {
-                    Some(r) => x.copy_from_slice(r),
-                    None => dequantize(t.ty, &bytes[tok as usize * rb..(tok as usize + 1) * rb], &mut x).unwrap(),
+            let fill = |j: usize, x: &mut [f32]| match self.picture_row(p0 + j) {
+                Some(r) => x.copy_from_slice(r),
+                None => dequantize(t.ty, &bytes[toks[j] as usize * rb..(toks[j] as usize + 1) * rb], x).unwrap(),
+            };
+            if m < 64 || std::env::var("SHADOW_EMBED_ROWS").is_ok_and(|v| v == "0") {
+                for j in 0..m {
+                    let mut x = vec![0f32; h];
+                    fill(j, &mut x);
+                    self.upload_to(self.b.e.ptr, &f32s(&x));
+                    self.k1("broadcast", ch, &[Arg::Ptr(self.b.e.ptr), Arg::Ptr(row_ptr(j)), Arg::U32(h as u32),
+                                               Arg::U32(cs as u32)]);
                 }
-                self.upload_to(self.b.e.ptr, &f32s(&x));
-                self.k1("broadcast", ch, &[Arg::Ptr(self.b.e.ptr), Arg::Ptr(row_ptr(j)), Arg::U32(h as u32),
-                                           Arg::U32(cs as u32)]);
+            } else {
+                // groups of rows: one upload and one launch each (a launch and a copy a token took 0.27 s for 15k tokens); a group ends where the residual storage moves to the next part
+                const G: usize = 512;
+                let scratch = self.ctx.alloc(G * h * 4).unwrap();
+                let mut host = vec![0f32; G * h];
+                let mut j0 = 0;
+                while j0 < m {
+                    let boundary = if sub_mode { (j0 + pad) / self.rows * self.rows + self.rows - pad } else { m };
+                    let j1 = (j0 + G).min(m).min(boundary);
+                    for j in j0..j1 {
+                        fill(j, &mut host[(j - j0) * h..(j - j0 + 1) * h]);
+                    }
+                    self.upload_to(scratch.ptr, &f32s(&host[..(j1 - j0) * h]));
+                    self.k1("broadcast_rows", (j1 - j0) * ch, &[Arg::Ptr(scratch.ptr), Arg::Ptr(row_ptr(j0)), Arg::U32(h as u32), Arg::U32(cs as u32), Arg::U32((j1 - j0) as u32)]);
+                    j0 = j1;
+                }
+                self.ctx.synchronize().unwrap(); // the launches read `scratch`, which goes with this block
             }
         }
         let t_embed = t_pass.elapsed().as_secs_f64();
