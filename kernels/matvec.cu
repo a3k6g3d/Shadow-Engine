@@ -870,6 +870,125 @@ template <> struct Dec8<IQ3S> {
     }
 };
 
+
+// Weight formats whose per-thread bytes are loaded one tile ahead (the loads of the next tile are in flight while the matrix multiplies of this tile run) and decoded after, with
+// the codebook gather also one tile ahead where `deep(TOK)` (it costs registers: worth it where 5 blocks an SM still fit).  `use(TOK)` says for which width classes a format takes this path (only where measured faster); the decode arithmetic is the
+// `Dec8` one, so the bits are the same (docs/STATUS.md 69).  A raw value is three words, the format's choice of what goes in them.
+template <typename Q> struct DecRaw { typedef uint2 R; static __device__ constexpr bool use(unsigned int) { return false; } static __device__ constexpr bool deep(unsigned int) { return false; } };
+template <> struct DecRaw<Q20> {
+    typedef uint2 R;
+    static __device__ constexpr bool use(unsigned int tok) { return tok == 16 || tok == 32 || tok == 64; }
+    static __device__ constexpr bool deep(unsigned int) { return true; }
+    static __device__ __forceinline__ uint2 load(const u8* r, unsigned int i) {
+        const u8* b = r + (i / 64) * 18;
+        return make_uint2((unsigned int) *(const u16*) (b + 2 + (i % 64) / 4), (unsigned int) *(const u16*) b);
+    }
+    static __device__ __forceinline__ u64 gather(uint2, unsigned int) { return 0; }
+    static __device__ __forceinline__ void dec8(uint2 raw, u64, unsigned int, float* o) {
+        float d = f16_to_f32((u16) raw.y);
+#pragma unroll
+        for (unsigned int k = 0; k < 8; k++) o[k] = __fmul_rn((float) ((int) ((raw.x >> (2 * k)) & 0x03) - 1), d);
+    }
+};
+template <> struct DecRaw<IQ2S> {
+    typedef uint2 R;
+    static __device__ constexpr bool use(unsigned int tok) { return tok == 16 || tok == 32 || tok == 64; }
+    static __device__ constexpr bool deep(unsigned int tok) { return tok <= 32; }
+    static __device__ __forceinline__ uint2 load(const u8* r, unsigned int i) {
+        const u8* b = r + (i / 256) * 82;
+        unsigned int e0 = i % 256, j = e0 / 8;
+        unsigned int w = (unsigned int) b[2 + j] | ((unsigned int) b[66 + j / 4] << 8) | ((unsigned int) b[34 + j] << 16) | ((unsigned int) b[74 + e0 / 32] << 24);
+        return make_uint2(w, (unsigned int) *(const u16*) b);
+    }
+    static __device__ __forceinline__ u64 gather(uint2 raw, unsigned int i) {
+        unsigned int e0 = i % 256, j = e0 / 8;
+        unsigned int idx = (raw.x & 0xff) | ((((raw.x >> 8) & 0xff) >> (2 * (j % 4))) & 3) << 8;
+        return *(const u64*) kIQ2SGrid[idx];
+    }
+    static __device__ __forceinline__ void dec8(uint2 raw, u64 row, unsigned int i, float* o) {
+        unsigned int e0 = i % 256;
+        unsigned int sc = ((raw.x >> 24) >> (4 * ((e0 / 16) % 2))) & 0x0f;
+        float d = f16_to_f32((u16) raw.y);
+        float db = __fmul_rn(__fmul_rn(d, __fadd_rn(0.5f, (float) sc)), 0.25f);
+        u8 signs = (u8) (raw.x >> 16);
+#pragma unroll
+        for (unsigned int k = 0; k < 8; k++) o[k] = qsign(__fmul_rn(db, (float) (u8) (row >> (8 * k))), signs >> k);
+    }
+};
+template <> struct DecRaw<IQ4NL> {
+    typedef uint3 R;
+    static __device__ constexpr bool use(unsigned int tok) { return tok == 16; }   // measured: a loss at 32 and 64 (registers)
+    static __device__ constexpr bool deep(unsigned int) { return true; }
+    static __device__ __forceinline__ uint3 load(const u8* r, unsigned int i) {
+        const u8* b = r + (i / 32) * 18;
+        const u16* q = (const u16*) (b + 2 + ((i % 32) & 15));
+        return make_uint3((unsigned int) q[0] | ((unsigned int) q[1] << 16), (unsigned int) q[2] | ((unsigned int) q[3] << 16), (unsigned int) *(const u16*) b);
+    }
+    static __device__ __forceinline__ u64 gather(uint3, unsigned int) { return 0; }
+    static __device__ __forceinline__ void dec8(uint3 raw, u64, unsigned int i, float* o) {
+        const unsigned int sh = (i % 32 >= 16) ? 4u : 0u;
+        float d = f16_to_f32((u16) raw.z);
+#pragma unroll
+        for (unsigned int k = 0; k < 4; k++) {
+            unsigned int w = ((k < 2 ? raw.x : raw.y) >> (16 * (k % 2))) & 0xffffu;
+            o[2 * k] = __fmul_rn(d, iq4nl_val((w >> sh) & 0x0f));
+            o[2 * k + 1] = __fmul_rn(d, iq4nl_val((w >> (8 + sh)) & 0x0f));
+        }
+    }
+};
+template <> struct DecRaw<IQ3XXS> {
+    typedef uint3 R;
+    static __device__ constexpr bool use(unsigned int tok) { return tok == 32 || tok == 64; }   // measured: a loss at 16
+    static __device__ constexpr bool deep(unsigned int tok) { return tok <= 32; }
+    static __device__ __forceinline__ uint3 load(const u8* r, unsigned int i) {
+        const u8* b = r + (i / 256) * 98;
+        unsigned int e0 = i % 256, g = e0 / 32;
+        const u16* sp = (const u16*) (b + 66 + g * 4);
+        return make_uint3((unsigned int) *(const u16*) (b + 2 + e0 / 4), (unsigned int) sp[0] | ((unsigned int) sp[1] << 16), (unsigned int) *(const u16*) b);
+    }
+    static __device__ __forceinline__ u64 gather(uint3 raw, unsigned int) {
+        u32 r0 = *(const u32*) kIQ3XXSGrid[raw.x & 0xff], r1 = *(const u32*) kIQ3XXSGrid[(raw.x >> 8) & 0xff];
+        return (u64) r0 | ((u64) r1 << 32);
+    }
+    static __device__ __forceinline__ void dec8(uint3 raw, u64 rows, unsigned int i, float* o) {
+        const unsigned int kk = (i % 32) / 8, s32 = raw.y;
+        float db = __fmul_rn(__fmul_rn(f16_to_f32((u16) raw.z), __fadd_rn(0.5f, (float) (s32 >> 28))), 0.5f);
+        u8 signs = kKSigns[(s32 >> (7 * kk)) & 0x7f];
+#pragma unroll
+        for (unsigned int k = 0; k < 8; k++) {
+            u8 v = (u8) (rows >> (8 * k));
+            o[k] = qsign(__fmul_rn(db, (float) v), signs >> k);
+        }
+    }
+};
+template <> struct DecRaw<IQ3S> {
+    typedef uint3 R;
+    static __device__ constexpr bool use(unsigned int) { return false; }   // measured: a loss at 16 and 64, a tie at 32
+    static __device__ constexpr bool deep(unsigned int tok) { return tok <= 32; }
+    static __device__ __forceinline__ uint3 load(const u8* r, unsigned int i) {
+        const u8* b = r + (i / 256) * 110;
+        unsigned int e0 = i % 256, j0 = e0 / 4, g = e0 / 32;
+        unsigned int w = (unsigned int) *(const u16*) (b + 2 + j0) | ((unsigned int) b[66 + g] << 16) | ((unsigned int) b[74 + e0 / 8] << 24);
+        return make_uint3(w, (unsigned int) b[106 + g / 2], (unsigned int) *(const u16*) b);
+    }
+    static __device__ __forceinline__ u64 gather(uint3 raw, unsigned int i) {
+        const unsigned int sh0 = ((i % 256) / 4) % 8, q2 = raw.x & 0xffffu, qh = (raw.x >> 16) & 0xffu;
+        u32 r0 = *(const u32*) kIQ3SGrid[(q2 & 0xff) | (((qh >> sh0) & 1u) << 8)];
+        u32 r1 = *(const u32*) kIQ3SGrid[(q2 >> 8) | (((qh >> (sh0 + 1)) & 1u) << 8)];
+        return (u64) r0 | ((u64) r1 << 32);
+    }
+    static __device__ __forceinline__ void dec8(uint3 raw, u64 rows, unsigned int i, float* o) {
+        const unsigned int g = (i % 256) / 32;
+        unsigned int sc = (raw.y >> (4 * (g % 2))) & 0x0f;
+        float db = __fmul_rn(f16_to_f32((u16) raw.z), (float) (1 + 2 * sc));
+        u8 signs = (u8) (raw.x >> 24);
+#pragma unroll
+        for (unsigned int k = 0; k < 8; k++) {
+            u8 v = (u8) (rows >> (8 * k));
+            o[k] = qsign(__fmul_rn(db, (float) v), signs >> k);
+        }
+    }
+};
 template <typename Q, unsigned int TOK>
 static __device__ __forceinline__ void mma_core(const u8* w, const float* x, unsigned int xs, float* y, unsigned int ys,
                                                 unsigned int rows, unsigned int cols, unsigned int m, unsigned int tok_tile,
@@ -884,13 +1003,32 @@ static __device__ __forceinline__ void mma_core(const u8* w, const float* x, uns
     for (unsigned int n = 0; n < TOK / 8; n++)
 #pragma unroll
         for (unsigned int e = 0; e < 4; e++) acc[n][e] = 0.0f;
+    typedef typename DecRaw<Q>::R RawT;
+    constexpr bool dr = DecRaw<Q>::use(TOK);
+    RawT raw[4], rawn[4];
+    u64 gr[4], grn[4];
+    if constexpr (dr) {
+#pragma unroll
+        for (unsigned int t = 0; t < 4; t++) {
+            unsigned int ch = tid + 128 * t, row = ch / 8, kk = (ch % 8) * 8;
+            raw[t] = row_base + row < rows ? DecRaw<Q>::load(w + (u64) (row_base + row) * rb, kk) : RawT();
+            if constexpr (DecRaw<Q>::deep(TOK)) {
+                rawn[t] = row_base + row < rows && MMA_K < cols ? DecRaw<Q>::load(w + (u64) (row_base + row) * rb, MMA_K + kk) : RawT();
+                gr[t] = DecRaw<Q>::gather(raw[t], kk);
+            }
+        }
+    }
     for (unsigned int kc = 0; kc < cols; kc += MMA_K) {
 #pragma unroll
         for (unsigned int t = 0; t < 4; t++) {
             unsigned int ch = tid + 128 * t, row = ch / 8, kk = (ch % 8) * 8;
             float v[8];
             if (row_base + row < rows) {
-                Dec8<Q>::dec8(w + (u64) (row_base + row) * rb, kc + kk, v);
+                if constexpr (dr) {
+                    if constexpr (DecRaw<Q>::deep(TOK)) DecRaw<Q>::dec8(raw[t], gr[t], kc + kk, v);
+                    else DecRaw<Q>::dec8(raw[t], DecRaw<Q>::gather(raw[t], kc + kk), kc + kk, v);
+                }
+                else Dec8<Q>::dec8(w + (u64) (row_base + row) * rb, kc + kk, v);
             } else {
 #pragma unroll
                 for (unsigned int e = 0; e < 8; e++) v[e] = 0.0f;
@@ -898,6 +1036,18 @@ static __device__ __forceinline__ void mma_core(const u8* w, const float* x, uns
             uint4 p;
             p.x = pack_half2(v[0], v[1]); p.y = pack_half2(v[2], v[3]); p.z = pack_half2(v[4], v[5]); p.w = pack_half2(v[6], v[7]);
             *(uint4*) &ws[row][kk] = p;
+        }
+        if constexpr (dr) {
+#pragma unroll
+            for (unsigned int t = 0; t < 4; t++) {
+                unsigned int ch = tid + 128 * t, row = ch / 8, kk = (ch % 8) * 8;
+                if constexpr (DecRaw<Q>::deep(TOK)) {
+                    grn[t] = DecRaw<Q>::gather(rawn[t], kc + MMA_K + kk);              // the gather of the next tile, in flight during this tile's multiplies
+                    raw[t] = row_base + row < rows && kc + 2 * MMA_K < cols ? DecRaw<Q>::load(w + (u64) (row_base + row) * rb, kc + 2 * MMA_K + kk) : RawT();
+                } else {
+                    raw[t] = row_base + row < rows && kc + MMA_K < cols ? DecRaw<Q>::load(w + (u64) (row_base + row) * rb, kc + MMA_K + kk) : RawT();
+                }
+            }
         }
 #pragma unroll
         for (unsigned int t = 0; t < TOK / 8; t++) {
@@ -927,6 +1077,10 @@ static __device__ __forceinline__ void mma_core(const u8* w, const float* x, uns
             }
         }
         __syncthreads();
+        if constexpr (dr && DecRaw<Q>::deep(TOK)) {
+#pragma unroll
+            for (unsigned int t = 0; t < 4; t++) { RawT nx = raw[t]; raw[t] = rawn[t]; rawn[t] = nx; gr[t] = grn[t]; }
+        }
     }
 #pragma unroll
     for (unsigned int n = 0; n < TOK / 8; n++)
