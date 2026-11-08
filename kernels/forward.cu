@@ -538,6 +538,174 @@ extern "C" __global__ void delta_steps128_f4(const float* q, const float* k, con
     delta_f4_body<0xffffffffu>(q, k, v, xs, b, a, bs, A, dtb, S, o, os, kh, m);
 }
 
+// ---- `delta_steps128_f4` with the three value heads of a key head in one thread (heads qh, qh + kh, qh + 2 kh share q and k) and the inputs staged by cp.async, 8 tokens a block.
+// grid = key heads x 4 column blocks, 128 threads: thread (r, cl) keeps rows 32r..32r+31 of column 32 cb + cl of the state of all three heads (96 registers).  f4 re-read q and k for every
+// head, from shared memory it had to refill (two __syncthreads) every token; here a block of 8 tokens' q, k, v, b and a is copied while the block before computes, each k / q float4
+// serves three heads, and a token needs no synchronization at all (the four row quarters of a column are four lanes of one warp: the sums are shuffles).  Per head and column the same
+// operations in the same order as f4 (decay then the 16-row fmaf runs, the eight partials added one after the other, the same sigmoid / softplus / expf): the same bits.
+// Needs v heads = 3 x key heads and head dimension 128.
+__device__ __forceinline__ void dkh_cp16(float* smem, const float* gmem) {
+    asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" ::"r"((unsigned) __cvta_generic_to_shared(smem)), "l"(gmem));
+}
+__device__ __forceinline__ void dkh_cp4(float* smem, const float* gmem) {
+    asm volatile("cp.async.ca.shared.global [%0], [%1], 4;\n" ::"r"((unsigned) __cvta_generic_to_shared(smem)), "l"(gmem));
+}
+template <unsigned int W>   // warps a block: 8 W columns of the state, 32 W threads
+static __device__ __forceinline__ void delta_kh_body(const float* q, const float* k, const float* v, unsigned int xs, const float* b,
+                                                     const float* a, unsigned int bs, const float* A, const float* dtb, float* S,
+                                                     float* o, unsigned int os, unsigned int kh, unsigned int m) {
+    const unsigned int d = 128;
+    // q and k rows padded as in f4 (element u at u + 4 * (u / 32)): the four row quarters of a warp read four different bank groups
+    __shared__ __align__(16) float sq[2][8][144], sk[2][8][144];
+    __shared__ __align__(16) float sv[2][8][3][8 * W];
+    __shared__ float sb[2][8][3], sa[2][8][3], sc[8][3][2];
+    const unsigned int tid = threadIdx.x, lane = tid % 32, r = lane % 4, cl = (tid / 32) * 8 + lane / 4, base = lane & ~3u;
+    const unsigned int ncb = 16 / W, qh = blockIdx.x / ncb, cb = blockIdx.x % ncb, col = cb * 8 * W + cl;
+    float st[3][32];
+#pragma unroll
+    for (unsigned int j = 0; j < 3; ++j) {
+        const float* s = S + (u64) (qh + j * kh) * d * d;
+#pragma unroll
+        for (unsigned int i = 0; i < 32; ++i) st[j][i] = s[(32 * r + i) * d + col];
+    }
+    auto stage = [&](unsigned int blk) {   // tokens [8 blk, 8 blk + 8) into buffer blk & 1
+        const unsigned int bi = blk & 1, t0 = blk * 8;
+        for (unsigned int p = tid; p < 8 * 2 * 32; p += 32 * W) {
+            const unsigned int i = p / 64, w = p % 64, isk = w / 32, pc = w % 32;
+            if (t0 + i < m)
+                dkh_cp16(isk ? &sk[bi][i][4 * pc + 4 * (pc >> 3)] : &sq[bi][i][4 * pc + 4 * (pc >> 3)], (isk ? k : q) + (u64) (t0 + i) * xs + qh * d + 4 * pc);
+        }
+        for (unsigned int p = tid; p < 8 * 3 * 2 * W; p += 32 * W) {
+            const unsigned int i = p / (6 * W), w = p % (6 * W), j = w / (2 * W), pp = w % (2 * W);
+            if (t0 + i < m) dkh_cp16(&sv[bi][i][j][4 * pp], v + (u64) (t0 + i) * xs + (qh + j * kh) * d + cb * 8 * W + 4 * pp);
+        }
+        for (unsigned int p = tid; p < 8 * 3; p += 32 * W) {
+            const unsigned int i = p / 3, j = p % 3;
+            if (t0 + i < m) {
+                dkh_cp4(&sb[bi][i][j], b + (u64) (t0 + i) * bs + qh + j * kh);
+                dkh_cp4(&sa[bi][i][j], a + (u64) (t0 + i) * bs + qh + j * kh);
+            }
+        }
+    };
+    const unsigned int nblk = (m + 7) / 8;
+    if (nblk > 0) stage(0);
+    asm volatile("cp.async.commit_group;\n" ::);
+    for (unsigned int blk = 0; blk < nblk; ++blk) {
+        // buffer (blk + 1) & 1 was read by block blk - 1, whose last __syncthreads every thread has passed
+        if (blk + 1 < nblk) stage(blk + 1);
+        asm volatile("cp.async.commit_group;\n" ::);
+        asm volatile("cp.async.wait_group 1;\n" ::);   // every group but the newest has landed
+        __syncthreads();
+        const unsigned int bi = blk & 1, t0 = blk * 8, n = min(8u, m - t0);
+        if (tid < n * 3) {
+            const unsigned int i = tid / 3, j = tid % 3, h = qh + j * kh;
+            sc[i][j][0] = sigmoidf_ref(sb[bi][i][j]);
+            sc[i][j][1] = expf(A[h] * softplusf_ref(sa[bi][i][j] + dtb[h]));
+        }
+        __syncthreads();
+        for (unsigned int i = 0; i < n; ++i) {
+            const float4* kr = (const float4*) &sk[bi][i][36 * r];
+            const float4* qr = (const float4*) &sq[bi][i][36 * r];
+            float beta[3], decay[3], vcur[3], p0[3], p1[3];
+#pragma unroll
+            for (unsigned int j = 0; j < 3; ++j) { beta[j] = sc[i][j][0]; decay[j] = sc[i][j][1]; vcur[j] = sv[bi][i][j][cl]; p0[j] = 0.0f; p1[j] = 0.0f; }
+#pragma unroll
+            for (unsigned int c = 0; c < 4; ++c) {
+                const float4 kv = kr[c];
+#pragma unroll
+                for (unsigned int j = 0; j < 3; ++j) {
+                    st[j][4 * c + 0] *= decay[j]; p0[j] = fmaf(st[j][4 * c + 0], kv.x, p0[j]);
+                    st[j][4 * c + 1] *= decay[j]; p0[j] = fmaf(st[j][4 * c + 1], kv.y, p0[j]);
+                    st[j][4 * c + 2] *= decay[j]; p0[j] = fmaf(st[j][4 * c + 2], kv.z, p0[j]);
+                    st[j][4 * c + 3] *= decay[j]; p0[j] = fmaf(st[j][4 * c + 3], kv.w, p0[j]);
+                }
+            }
+#pragma unroll
+            for (unsigned int c = 4; c < 8; ++c) {
+                const float4 kv = kr[c];
+#pragma unroll
+                for (unsigned int j = 0; j < 3; ++j) {
+                    st[j][4 * c + 0] *= decay[j]; p1[j] = fmaf(st[j][4 * c + 0], kv.x, p1[j]);
+                    st[j][4 * c + 1] *= decay[j]; p1[j] = fmaf(st[j][4 * c + 1], kv.y, p1[j]);
+                    st[j][4 * c + 2] *= decay[j]; p1[j] = fmaf(st[j][4 * c + 2], kv.z, p1[j]);
+                    st[j][4 * c + 3] *= decay[j]; p1[j] = fmaf(st[j][4 * c + 3], kv.w, p1[j]);
+                }
+            }
+            float delta[3];
+#pragma unroll
+            for (unsigned int j = 0; j < 3; ++j) {
+                float mem = 0.0f;
+#pragma unroll
+                for (unsigned int r2 = 0; r2 < 4; ++r2) {
+                    const float x0 = __shfl_sync(0xffffffffu, p0[j], base + r2), x1 = __shfl_sync(0xffffffffu, p1[j], base + r2);
+                    mem += x0;
+                    mem += x1;
+                }
+                delta[j] = (vcur[j] - mem) * beta[j];
+            }
+            float q0[3], q1[3];
+#pragma unroll
+            for (unsigned int j = 0; j < 3; ++j) { q0[j] = 0.0f; q1[j] = 0.0f; }
+#pragma unroll
+            for (unsigned int c = 0; c < 4; ++c) {
+                const float4 kv = kr[c], qv = qr[c];
+#pragma unroll
+                for (unsigned int j = 0; j < 3; ++j) {
+                    st[j][4 * c + 0] += kv.x * delta[j]; q0[j] = fmaf(st[j][4 * c + 0], qv.x, q0[j]);
+                    st[j][4 * c + 1] += kv.y * delta[j]; q0[j] = fmaf(st[j][4 * c + 1], qv.y, q0[j]);
+                    st[j][4 * c + 2] += kv.z * delta[j]; q0[j] = fmaf(st[j][4 * c + 2], qv.z, q0[j]);
+                    st[j][4 * c + 3] += kv.w * delta[j]; q0[j] = fmaf(st[j][4 * c + 3], qv.w, q0[j]);
+                }
+            }
+#pragma unroll
+            for (unsigned int c = 4; c < 8; ++c) {
+                const float4 kv = kr[c], qv = qr[c];
+#pragma unroll
+                for (unsigned int j = 0; j < 3; ++j) {
+                    st[j][4 * c + 0] += kv.x * delta[j]; q1[j] = fmaf(st[j][4 * c + 0], qv.x, q1[j]);
+                    st[j][4 * c + 1] += kv.y * delta[j]; q1[j] = fmaf(st[j][4 * c + 1], qv.y, q1[j]);
+                    st[j][4 * c + 2] += kv.z * delta[j]; q1[j] = fmaf(st[j][4 * c + 2], qv.z, q1[j]);
+                    st[j][4 * c + 3] += kv.w * delta[j]; q1[j] = fmaf(st[j][4 * c + 3], qv.w, q1[j]);
+                }
+            }
+#pragma unroll
+            for (unsigned int j = 0; j < 3; ++j) {
+                float acc = 0.0f;
+#pragma unroll
+                for (unsigned int r2 = 0; r2 < 4; ++r2) {
+                    const float x0 = __shfl_sync(0xffffffffu, q0[j], base + r2), x1 = __shfl_sync(0xffffffffu, q1[j], base + r2);
+                    acc += x0;
+                    acc += x1;
+                }
+                if (r == 0) o[(u64) (t0 + i) * os + (qh + j * kh) * d + col] = acc;
+            }
+        }
+        __syncthreads();   // every thread is done with buffer bi and sc: the next block's copy may overwrite
+    }
+#pragma unroll
+    for (unsigned int j = 0; j < 3; ++j) {
+        float* s = S + (u64) (qh + j * kh) * d * d;
+#pragma unroll
+        for (unsigned int i = 0; i < 32; ++i) s[(32 * r + i) * d + col] = st[j][i];
+    }
+}
+
+extern "C" __global__ void __launch_bounds__(128) delta_steps128_kh(const float* q, const float* k, const float* v, unsigned int xs, const float* b,
+                                                                    const float* a, unsigned int bs, const float* A, const float* dtb, float* S,
+                                                                    float* o, unsigned int os, unsigned int kh, unsigned int m) {
+    delta_kh_body<4>(q, k, v, xs, b, a, bs, A, dtb, S, o, os, kh, m);
+}
+extern "C" __global__ void __launch_bounds__(64) delta_steps128_kh2(const float* q, const float* k, const float* v, unsigned int xs, const float* b,
+                                                                    const float* a, unsigned int bs, const float* A, const float* dtb, float* S,
+                                                                    float* o, unsigned int os, unsigned int kh, unsigned int m) {
+    delta_kh_body<2>(q, k, v, xs, b, a, bs, A, dtb, S, o, os, kh, m);
+}
+extern "C" __global__ void __launch_bounds__(32) delta_steps128_kh1(const float* q, const float* k, const float* v, unsigned int xs, const float* b,
+                                                                    const float* a, unsigned int bs, const float* A, const float* dtb, float* S,
+                                                                    float* o, unsigned int os, unsigned int kh, unsigned int m) {
+    delta_kh_body<1>(q, k, v, xs, b, a, bs, A, dtb, S, o, os, kh, m);
+}
+
 // `delta_steps128_f` with the next token's q, k, v, b, a loaded into registers while the current token computes (the token loop waited on its own global loads).
 extern "C" __global__ void delta_steps128_fp(const float* q, const float* k, const float* v, unsigned int xs, const float* b,
                                             const float* a, unsigned int bs, const float* A, const float* dtb, float* S,

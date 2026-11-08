@@ -274,6 +274,7 @@ pub const FILES: &[File] = &[
             e("l2norm_qk_heads", &[W, U, U, F]),
             e("delta_step", &[C, C, C, C, C, C, C, W, W, U, U]),
             e("delta_steps128", &[C, C, C, U, C, C, U, C, C, W, W, U, U, U]), e("delta_steps128_f", &[C, C, C, U, C, C, U, C, C, W, W, U, U, U]), e("delta_steps128_fp", &[C, C, C, U, C, C, U, C, C, W, W, U, U, U]), e("delta_steps128_f4", &[C, C, C, U, C, C, U, C, C, W, W, U, U, U]),
+            e("delta_steps128_kh", &[C, C, C, U, C, C, U, C, C, W, W, U, U, U]), e("delta_steps128_kh2", &[C, C, C, U, C, C, U, C, C, W, W, U, U, U]), e("delta_steps128_kh1", &[C, C, C, U, C, C, U, C, C, W, W, U, U, U]),
             e("delta_chunk_prep", &[C, C, C, C, C, C, W, U, U, U, U, U]),
             e("delta_chunk_run", &[C, C, C, C, W, W, U, U, U, U, U]),
             e("delta_steps128_x8", &[C, C, C, U, C, C, U, C, C, W, W, U, U, U]),

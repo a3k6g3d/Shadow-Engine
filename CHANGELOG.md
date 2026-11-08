@@ -11,9 +11,11 @@ Prompt reading with `--tensor-prompt` (the default fast mode) is about 5% / 11% 
 - **"N pictures sent but the prompt has M picture slots"**: literal special-token text in a message (a fetched page that mentions `<|image_pad|>`) is defanged with a zero-width space, only for the model's real special tokens, so it no longer becomes a picture slot or a fake turn.
 - Kernel-signature drift test: the parser skips `__launch_bounds__(N)`; it had been failing since 2026-11-05.
 ### Changed (2026-11-08, prompt path)
+- The DeltaNet recurrence of a prompt pass runs the three value heads of a key head in one thread with the inputs copied ahead (`delta_steps128_kh2`, bit-identical to the previous kernel, 1.08x standalone; `SHADOW_DELTA_KH=0` keeps the previous one; docs/STATUS.md 67).
 - A long prompt's embedding rows go up in groups of 512 (new kernel `broadcast_rows`; `SHADOW_EMBED_ROWS=0` keeps the per-token loop), and the layer-ahead pipeline's three pinned read-ahead buffers (1.33 GiB) are kept between prompts while RAM is plentiful (`SHADOW_KEEP_PIPE=0` frees them as before): about 0.45 s less per prompt from the second one on, +6% at 9.6k and 15k in A-B-B-A, output bit-identical (docs/STATUS.md 66).
 
 ### Fixed (2026-11-08)
+- The grouped embedding upload (earlier the same day) allocated a 5 MB device scratch at the start of a pass and ran out of VRAM on a ~20k-token prompt (HTTP 400, session reset); it now uses a buffer the pass already owns (docs/STATUS.md 67).
 - The width-class MoE planner (2026-11-07) failed with "internal error: width-class plan: ... bytes of tables" on a small batch buffer (768 rows) and reset the conversation's cache; its table buffer is now sized for its fixed part, and a pass whose tables do not fit takes the fixed-width planner instead of failing (docs/STATUS.md 62).
 
 ### Changed (2026-11-07, prompt path)

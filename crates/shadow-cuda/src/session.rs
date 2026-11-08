@@ -4066,7 +4066,10 @@ impl<'c, 'm> GpuSession<'c, 'm> {
                 Some(r) => x.copy_from_slice(r),
                 None => dequantize(t.ty, &bytes[toks[j] as usize * rb..(toks[j] as usize + 1) * rb], x).unwrap(),
             };
-            if m < 64 || std::env::var("SHADOW_EMBED_ROWS").is_ok_and(|v| v == "0") {
+            // the scratch for a group of rows is `bb.rn` (the normalized rows, not written before layer 0): an allocation here failed with out-of-memory on a 20k-token prompt, when the
+            // big batch has taken nearly all of the VRAM
+            let g_rows = (self.bb.rn.bytes / (h * 4)).min(512);
+            if m < 64 || g_rows < 64 || std::env::var("SHADOW_EMBED_ROWS").is_ok_and(|v| v == "0") {
                 for j in 0..m {
                     let mut x = vec![0f32; h];
                     fill(j, &mut x);
@@ -4076,21 +4079,20 @@ impl<'c, 'm> GpuSession<'c, 'm> {
                 }
             } else {
                 // groups of rows: one upload and one launch each (a launch and a copy a token took 0.27 s for 15k tokens); a group ends where the residual storage moves to the next part
-                const G: usize = 512;
-                let scratch = self.ctx.alloc(G * h * 4).unwrap();
-                let mut host = vec![0f32; G * h];
+                let scratch_ptr = self.bb.rn.ptr;
+                let mut host = vec![0f32; g_rows * h];
                 let mut j0 = 0;
                 while j0 < m {
                     let boundary = if sub_mode { (j0 + pad) / self.rows * self.rows + self.rows - pad } else { m };
-                    let j1 = (j0 + G).min(m).min(boundary);
+                    let j1 = (j0 + g_rows).min(m).min(boundary);
                     for j in j0..j1 {
                         fill(j, &mut host[(j - j0) * h..(j - j0 + 1) * h]);
                     }
-                    self.upload_to(scratch.ptr, &f32s(&host[..(j1 - j0) * h]));
-                    self.k1("broadcast_rows", (j1 - j0) * ch, &[Arg::Ptr(scratch.ptr), Arg::Ptr(row_ptr(j0)), Arg::U32(h as u32), Arg::U32(cs as u32), Arg::U32((j1 - j0) as u32)]);
+                    // one stream (the default): the next group's upload waits for this group's launch
+                    self.upload_to(scratch_ptr, &f32s(&host[..(j1 - j0) * h]));
+                    self.k1("broadcast_rows", (j1 - j0) * ch, &[Arg::Ptr(scratch_ptr), Arg::Ptr(row_ptr(j0)), Arg::U32(h as u32), Arg::U32(cs as u32), Arg::U32((j1 - j0) as u32)]);
                     j0 = j1;
                 }
-                self.ctx.synchronize().unwrap(); // the launches read `scratch`, which goes with this block
             }
         }
         let t_embed = t_pass.elapsed().as_secs_f64();
@@ -4588,7 +4590,11 @@ impl<'c, 'm> GpuSession<'c, 'm> {
                 let kname = if x8 { "delta_steps128_x8" } else if std::env::var("SHADOW_DELTA_F32").is_ok_and(|v| v == "0") { "delta_steps128" } else if std::env::var("SHADOW_DELTA_PF").is_ok_and(|v| v == "1") { self.nk("delta_steps128", "delta_steps128_fp") } else { self.nk("delta_steps128", "delta_steps128_f") };
                 static DELTA_F4: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
                 let (kname, kthreads) = if kname == "delta_steps128_f" && *DELTA_F4.get_or_init(|| !std::env::var("SHADOW_DELTA_F4").is_ok_and(|v| v == "0")) { ("delta_steps128_f4", 512) } else { (kname, if x8 { 1024 } else { 128 }) };
-                self.k(kname, vh as u32, kthreads, &[
+                // the three value heads of a key head in one thread, 8 tokens' inputs copied ahead (`delta_steps128_kh2`, bit-identical to f4, 1.08x standalone; `SHADOW_DELTA_KH=0` keeps f4)
+                static DELTA_KH: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+                let kh_ok = kname == "delta_steps128_f4" && vh == 3 * kh && d == 128 && vd == vh * d && *DELTA_KH.get_or_init(|| !std::env::var("SHADOW_DELTA_KH").is_ok_and(|v| v == "0"));
+                let (kname, kgrid, kthreads) = if kh_ok { ("delta_steps128_kh2", (kh * 8) as u32, 64) } else { (kname, vh as u32, kthreads) };
+                self.k(kname, kgrid, kthreads, &[
                     Arg::Ptr(bb.x.ptr), Arg::Ptr(bb.x.ptr + (kd * 4) as u64), Arg::Ptr(bb.x.ptr + (2 * kd * 4) as u64),
                     Arg::U32(ch as u32), Arg::Ptr(beta_p), Arg::Ptr(alpha_p), Arg::U32(vh as u32),
                     Arg::Ptr(self.sv(&format!("{p}.ssm_a"))), Arg::Ptr(self.sv(&format!("{p}.ssm_dt.bias"))), Arg::Ptr(s.ptr),
