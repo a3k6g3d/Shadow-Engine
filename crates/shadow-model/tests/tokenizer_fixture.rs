@@ -4,13 +4,12 @@
 //! without it every test says SKIPPED and passes.
 
 use shadow_eval::json::{parse, Value as J};
-use shadow_model::chat::{parse_tool_calls, render, render_flint, Effort, Message, Options, Role, ToolCall};
+use shadow_model::chat::{parse_tool_calls, render, Effort, Message, Options, Role, ToolCall};
 use shadow_model::gguf::Gguf;
 use shadow_model::tokenizer::Tokenizer;
 
 const MODEL: &str =
     "J:/Strata-work/models/swift15/IQ3_S/Swift-Qwen3.8-Flash-Next-GSQ-RCO-abliterated-IQ3_S-00001-of-00002.gguf";
-const FLINT_MODEL: &str = "I:/Flint-40B-A2.5B-abliterated-NVFP4.gguf";
 
 fn fixture(name: &str) -> J {
     let p = format!("{}/../../eval/fixtures/{name}", env!("CARGO_MANIFEST_DIR"));
@@ -45,13 +44,7 @@ fn check_tokenizer_fixture(model_path: &str, fixture_name: &str) {
 #[test]
 fn ids_match_the_checkpoints_tokenizer() {
     let p = std::env::var("SHADOW_MODEL").unwrap_or_else(|_| MODEL.into());
-    let fix = if p.to_ascii_lowercase().contains("flint") { "tokenizer_flint.json" } else { "tokenizer.json" };
-    check_tokenizer_fixture(&p, fix);
-}
-
-#[test]
-fn flint_ids_match_the_checkpoints_tokenizer() {
-    check_tokenizer_fixture(FLINT_MODEL, "tokenizer_flint.json");
+    check_tokenizer_fixture(&p, "tokenizer.json");
 }
 
 fn check_chat_fixture(fixture_name: &str, f_render: fn(&[Message], &Options) -> Result<String, String>) {
@@ -95,7 +88,6 @@ fn check_chat_fixture(fixture_name: &str, f_render: fn(&[Message], &Options) -> 
         if let Some(tools) = opts.get("tools").and_then(J::as_arr) {
             for t in tools {
                 o.tools.push(t.tojson());
-                o.tools_fn.push(t.get("function").unwrap_or(t).tojson());
             }
         }
         o.effort = match opts.get("reasoning_effort").and_then(J::as_str) {
@@ -118,11 +110,7 @@ fn check_chat_fixture(fixture_name: &str, f_render: fn(&[Message], &Options) -> 
 #[test]
 fn chat_template_matches_the_checkpoints() {
     check_chat_fixture("chat.json", render);
-    check_chat_fixture("chat_flint.json", render_flint);
     let (rem, calls) = parse_tool_calls("Let me check.\n\n<tool_call>\n<function=read_file>\n<parameter=path>\na/b.rs\n</parameter>\n<parameter=start>\n10\n</parameter>\n</function>\n</tool_call>");
     assert_eq!(rem, "Let me check.");
     assert_eq!(calls, vec![ToolCall { name: "read_file".into(), arguments: vec![("path".into(), "a/b.rs".into()), ("start".into(), "10".into())] }]);
-    let (rem_f, calls_f) = parse_tool_calls("Checking.<tool_call>read_file<arg_key>path</arg_key><arg_value>a/b.rs</arg_value><arg_key>start</arg_key><arg_value>10</arg_value></tool_call>");
-    assert_eq!(rem_f, "Checking.");
-    assert_eq!(calls_f, calls);
 }

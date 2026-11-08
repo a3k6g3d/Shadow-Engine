@@ -9,7 +9,6 @@ use std::path::Path;
 
 const MODEL: &str =
     "J:/Strata-work/models/swift15/IQ3_S/Swift-Qwen3.8-Flash-Next-GSQ-RCO-abliterated-IQ3_S-00001-of-00002.gguf";
-const FLINT_MODEL: &str = "I:/Flint-40B-A2.5B-abliterated-NVFP4.gguf";
 
 fn run(fixture: &str) -> Option<Report> {
     run_on(fixture, &CpuBackend)
@@ -161,32 +160,6 @@ fn the_gpu_sessions_sparse_indexer_matches_the_reference() {
     let sel = r.selections.iter().find(|(n, _)| n == "layer3").expect("layer 3 selection");
     assert!(sel.1.iter().all(|&d| d == 0), "layer 3 attends to different positions than the reference: {:?}", sel.1);
     assert_exact(&r, "gpu session, long prompt", 5e-3);
-}
-
-#[test]
-fn flint_matches_the_reference_on_shadows_own_weights() {
-    let p = std::env::var("SHADOW_FLINT_MODEL").unwrap_or_else(|_| FLINT_MODEL.into());
-    if !Path::new(&p).is_file() {
-        return eprintln!("SKIPPED, not passed: no Flint model at {p}");
-    }
-    let fx = Fixture::load(&Path::new(env!("CARGO_MANIFEST_DIR")).join("../../eval/fixtures/reference_flint_gguf")).unwrap();
-    let model = Model::load(Gguf::open(Path::new(&p)).unwrap()).unwrap();
-    let r = compare(&model, &CpuBackend, &fx);
-    assert_exact(&r, "flint cpu", 1e-3);
-}
-
-#[test]
-fn flint_gpu_session_matches_the_reference() {
-    let p = std::env::var("SHADOW_FLINT_MODEL").unwrap_or_else(|_| FLINT_MODEL.into());
-    if !Path::new(&p).is_file() {
-        return eprintln!("SKIPPED, not passed: no Flint model at {p}");
-    }
-    let Ok(ctx) = shadow_cuda::Context::new(0) else { return eprintln!("SKIPPED, not passed: no CUDA device") };
-    let fx = Fixture::load(&Path::new(env!("CARGO_MANIFEST_DIR")).join("../../eval/fixtures/reference_flint_gguf")).unwrap();
-    let model = Model::load(Gguf::open(Path::new(&p)).unwrap()).unwrap();
-    let mut s = shadow_cuda::session::GpuSession::new(&ctx, &model, 4096).unwrap();
-    let r = shadow::reference::compare_stepper(&mut s, &fx);
-    assert_exact(&r, "flint gpu session", 5e-3);
 }
 
 /// `GpuSession::snapshot` / `restore`, the rollback a speculative pass needs and the prefix a new chat reuses: after

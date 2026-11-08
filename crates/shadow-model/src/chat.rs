@@ -57,10 +57,8 @@ pub struct Options {
     pub add_generation_prompt: bool,
     /// None = undefined, which behaves as on.
     pub preserve_thinking: Option<bool>,
-    /// Tool definitions already formatted as `tool | tojson` (for Qwen, or Flint when `tools_fn` is empty).
+    /// Tool definitions already formatted as `tool | tojson`.
     pub tools: Vec<String>,
-    /// Tool definitions unwrapped as `(tool.function if defined else tool) | tojson` for Flint.
-    pub tools_fn: Vec<String>,
 }
 
 impl Default for Options {
@@ -71,7 +69,6 @@ impl Default for Options {
             add_generation_prompt: true,
             preserve_thinking: None,
             tools: Vec::new(),
-            tools_fn: Vec::new(),
         }
     }
 }
@@ -216,98 +213,13 @@ pub fn render(messages: &[Message], o: &Options) -> Result<String, String> {
     Ok(out)
 }
 
-fn flint_text(t: &str) -> String {
-    t.replace('\0', "")
-        .replace("<think>", "")
-        .replace("</think>", "")
-        .replace("<|begin_of_text|>", "&lt;|begin_of_text|&gt;")
-        .replace("<|end_of_text|>", "&lt;|end_of_text|&gt;")
-        .replace("<|system|>", "&lt;|system|&gt;")
-        .replace("<|developer|>", "&lt;|developer|&gt;")
-        .replace("<|user|>", "&lt;|user|&gt;")
-        .replace("<|assistant|>", "&lt;|assistant|&gt;")
-        .replace("<|observation|>", "&lt;|observation|&gt;")
-}
-
-/// Flint's chat template (`RecursiveSI/flint` `chat_template.jinja`).
-pub fn render_flint(messages: &[Message], o: &Options) -> Result<String, String> {
-    if messages.is_empty() {
-        return Err("No messages provided.".into());
-    }
-    let tools_list = if !o.tools_fn.is_empty() { &o.tools_fn } else { &o.tools };
-    let tool_preamble = if !tools_list.is_empty() {
-        let mut p = String::from("<|system|>\n# Tools\n\nYou may call one or more functions to assist with the user query.\n\n\
-            You are provided with function signatures within <tools></tools> XML tags:\n<tools>");
-        for t in tools_list {
-            p += t;
-        }
-        p += "</tools>\n\nFor each function call, output the function name and arguments within the following XML format:\n\
-            <tool_call>{function-name}<arg_key>{arg-key-1}</arg_key><arg_value>{arg-value-1}</arg_value>...</tool_call>\n";
-        p
-    } else {
-        String::new()
-    };
-    let mut tools_pending = true;
-    let mut out = String::new();
-    for m in messages {
-        if tools_pending && m.role != Role::System {
-            out += &tool_preamble;
-            tools_pending = false;
-        }
-        match m.role {
-            Role::System => {
-                out += "<|system|>";
-                out += &flint_text(&m.content);
-            }
-            Role::User => {
-                out += "<|user|>";
-                out += &flint_text(&m.content);
-            }
-            Role::Assistant => {
-                out += "<|assistant|>";
-                if let Some(r) = &m.reasoning {
-                    if !r.is_empty() {
-                        out += "<think>";
-                        out += r;
-                        out += "</think>";
-                    }
-                }
-                out += &m.content;
-                for tc in &m.tool_calls {
-                    out += "<tool_call>";
-                    out += &tc.name;
-                    for (k, v) in &tc.arguments {
-                        out += &format!("<arg_key>{k}</arg_key><arg_value>{v}</arg_value>");
-                    }
-                    out += "</tool_call>";
-                }
-            }
-            Role::Tool => {
-                out += "<|observation|><tool_response>";
-                out += &flint_text(&m.content);
-                out += "</tool_response>";
-            }
-        }
-    }
-    if tools_pending {
-        out += &tool_preamble;
-    }
-    if o.add_generation_prompt {
-        out += "<|assistant|>";
-    }
-    Ok(out)
-}
-
-pub fn render_for_arch(arch: &str, messages: &[Message], o: &Options) -> Result<String, String> {
-    match arch {
-        "flint" => render_flint(messages, o),
-        _ => render(messages, o),
-    }
+/// The chat template for an architecture.  Only the Qwen3.5-family template is implemented.
+pub fn render_for_arch(_arch: &str, messages: &[Message], o: &Options) -> Result<String, String> {
+    render(messages, o)
 }
 
 /// Extracts `<tool_call>...</tool_call>` blocks from an assistant message's output, returning `(remaining_content, tool_calls)`.
-/// Handles both Qwen's `<function=NAME>\n<parameter=KEY>\nVAL\n</parameter>\n</function>` and Flint's
-/// `NAME<arg_key>KEY</arg_key><arg_value>VAL</arg_value>`.
+/// Understands Qwen's `<function=NAME>\n<parameter=KEY>\nVAL\n</parameter>\n</function>` form.
 pub fn parse_tool_calls(text: &str) -> (String, Vec<ToolCall>) {
     let Some(first_pos) = text.find("<tool_call>") else {
         return (text.to_string(), Vec::new());
@@ -341,26 +253,6 @@ pub fn parse_tool_calls(text: &str) -> (String, Vec<ToolCall>) {
                 if !name.is_empty() {
                     calls.push(ToolCall { name, arguments });
                 }
-            }
-        } else {
-            let name_end = body.find("<arg_key>").unwrap_or(body.len());
-            let name = body[..name_end].trim().to_string();
-            let mut inner = &body[name_end..];
-            let mut arguments = Vec::new();
-            while let Some(ks) = inner.find("<arg_key>") {
-                let after_k = &inner[ks + "<arg_key>".len()..];
-                let Some(ke) = after_k.find("</arg_key>") else { break };
-                let key = after_k[..ke].trim().to_string();
-                let after_ke = &after_k[ke + "</arg_key>".len()..];
-                let Some(vs) = after_ke.find("<arg_value>") else { break };
-                let after_v = &after_ke[vs + "<arg_value>".len()..];
-                let Some(ve) = after_v.find("</arg_value>") else { break };
-                let val = after_v[..ve].to_string();
-                arguments.push((key, val));
-                inner = &after_v[ve + "</arg_value>".len()..];
-            }
-            if !name.is_empty() {
-                calls.push(ToolCall { name, arguments });
             }
         }
         rest = &after_open[e + "</tool_call>".len()..];

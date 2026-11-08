@@ -90,15 +90,6 @@ def main() -> None:
         text = tok.apply_chat_template(msgs, tokenize=False, add_generation_prompt=kw.pop("add_generation_prompt", True), **kw)
         chats.append({"name": name, "messages": msgs, "options": kw, "text": text})
     (OUT / "chat.json").write_text(json.dumps({"cases": chats}, ensure_ascii=False, indent=1), encoding="utf-8", newline="\n")
-    flint_dir = pathlib.Path("I:/shadow-ref/flint")
-    if flint_dir.is_dir():
-        tok_f = AutoTokenizer.from_pretrained(str(flint_dir))
-        chats_f = []
-        for name, msgs, kw in CONVS:
-            kw = dict(kw)
-            text = tok_f.apply_chat_template(msgs, tokenize=False, add_generation_prompt=kw.pop("add_generation_prompt", True), **kw)
-            chats_f.append({"name": name, "messages": msgs, "options": kw, "text": text})
-        (OUT / "chat_flint.json").write_text(json.dumps({"cases": chats_f}, ensure_ascii=False, indent=1), encoding="utf-8", newline="\n")
     print(f"{len(cases)} tokenizer cases ({sum(len(c['ids']) for c in cases)} ids), {len(chats)} chat cases -> {OUT}")
 
 

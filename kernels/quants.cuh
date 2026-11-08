@@ -101,28 +101,6 @@ struct Q20 {
     }
 };
 
-static __device__ __forceinline__ float ue4m3_half(u8 sb) {
-    if (sb == 0 || sb == 0x7f) return 0.0f;
-    unsigned int exp = (sb >> 3) & 0x0f, man = sb & 0x07;
-    if (exp == 0) return __fmul_rn((float) man, 1.0f / 1024.0f);
-    return __fmul_rn((float) (8 + man), __uint_as_float((116 + exp) << 23));
-}
-
-static __device__ __forceinline__ float e2m1_double(u8 q) {
-    int mag = (int) ((0xc8643210u >> ((q & 7u) * 4u)) & 0x0fu);
-    return (float) ((q & 8u) ? -mag : mag);
-}
-
-struct NVFP4 {
-    static const unsigned int QK = 64, BYTES = 36;
-    static __device__ __forceinline__ float at(const u8* b, unsigned int e) {
-        unsigned int g = e / 16, c = e % 16;
-        u8 qb = b[4 + g * 8 + (c % 8)];
-        u8 q = c < 8 ? (qb & 0x0f) : (qb >> 4);
-        return __fmul_rn(ue4m3_half(b[g]), e2m1_double(q));
-    }
-};
-
 struct IQ2S {
     static const unsigned int QK = 256, BYTES = 82;
     static __device__ __forceinline__ float at(const u8* b, unsigned int e) {

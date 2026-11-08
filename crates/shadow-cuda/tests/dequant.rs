@@ -64,7 +64,7 @@ fn gpu_dequant_matches_the_reference_bit_for_bit() {
         *checked.entry(ty).or_insert(0) += 1;
     }
     eprintln!("fixture blocks checked on the GPU: {checked:?}");
-    assert_eq!(checked.len(), 10, "every quant type of the models that has fixtures, BF16 and NVFP4 included");
+    assert_eq!(checked.len(), 9, "every quant type of the model that has fixtures and a CUDA kernel, BF16 included");
 
     // Q2_0: no fixture exists, so against the Rust implementation on real blocks - a whole expert of blk.1's down
     // projection - when the model is here.

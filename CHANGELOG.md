@@ -10,6 +10,8 @@ Prompt reading with `--tensor-prompt` (the default fast mode) is about 5% / 11% 
 - **`glob` tool**: real patterns (`*`, `**`, `?`, folders); it used to match a substring of the file name, so `**/*.html` found nothing. **`grep` tool**: regexes as its description says (`busy|telemetry`); literal text still matches.
 - **"N pictures sent but the prompt has M picture slots"**: literal special-token text in a message (a fetched page that mentions `<|image_pad|>`) is defanged with a zero-width space, only for the model's real special tokens, so it no longer becomes a picture slot or a fake turn.
 - Kernel-signature drift test: the parser skips `__launch_bounds__(N)`; it had been failing since 2026-11-05.
+### Removed
+- **Flint** (`RecursiveSI/flint`, NVFP4) is no longer part of this build: its CPU and GPU forward paths, chat template, pre-tokenizer, NVFP4 kernels, tests and fixtures. A Flint file is refused with a clear message; `shadow inspect` still reads it. It stays in git history (tag `pre-flint-removal`) and will be tested on tandem.cpp later (docs/STATUS.md 57).
 ### Changed
 - Prompt path (fast mode only): 15k-token prompts run in one pass (sub-chunk size fitted to the prompt, `SHADOW_ONE_PASS=0` off), DeltaNet recurrence on 512 threads (bit-identical, `SHADOW_DELTA_F4=0` off), sparse-attention scores on tensor cores with fp16 inputs (`SHADOW_ATT_TC=0` off), int8 MMQ dense projections when `native/mmq/shadow_mmq.dll` is built (`SHADOW_MMQ=0` off), float norm/DeltaNet/rope kernels, batched per-layer-embedding step. STATUS entries 31-52.
 - Web UI: thin, quiet scroll bars.

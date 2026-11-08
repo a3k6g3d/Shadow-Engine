@@ -43,7 +43,6 @@ impl<'c, 'm> GpuSession<'c, 'm> {
             && self.fuse & 1 == 0
             && !self.timing_no_sync
             && self.ltime.is_none()
-            && self.m.cfg.arch != "flint"
     }
 
     /// Whether the host needs the MoE input of the group's tokens next to the router logits (CPU experts).

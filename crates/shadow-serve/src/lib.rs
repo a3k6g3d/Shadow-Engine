@@ -401,7 +401,6 @@ pub fn parse_chat(body: &Value) -> Result<(Vec<Message>, Options, usize, bool), 
                 return Err("each tool definition must have a \"name\"".into());
             }
             opts.tools.push(tojson_serde(t));
-            opts.tools_fn.push(tojson_serde(fn_obj));
         }
     }
     let msgs = body.get("messages").and_then(Value::as_array).ok_or("\"messages\" must be an array")?;

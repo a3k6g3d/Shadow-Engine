@@ -69,9 +69,9 @@ smaller machine pass `--ram-tier-gib` explicitly.
 | [docs/SHADOW_PLAN.md](docs/SHADOW_PLAN.md), [docs/HANDOFF.md](docs/HANDOFF.md) | the plan and the state handed over |
 | [CHANGELOG.md](CHANGELOG.md) | release notes |
 
-Shadow runs two architectures: Qwen3.8-Flash-Next (everything above) and Flint (`RecursiveSI/flint`, NVFP4). Flint uses the
-memory tiers and the server but not the batched verify pass, so none of the speculation applies to it. It is not a general
-LLM runner: a dense Llama or Qwen3 GGUF has no forward pass here.
+Shadow runs one model family: Qwen3.8-Flash-Next (everything above). Flint (`RecursiveSI/flint`, NVFP4) was removed from this
+build on 2026-11-07 (it stays in git history, tag `pre-flint-removal`; it will be tested on tandem.cpp later), and a Flint file
+is refused with a clear message. It is not a general LLM runner: a dense Llama or Qwen3 GGUF has no forward pass here.
 
 ## Server & Web UI
 

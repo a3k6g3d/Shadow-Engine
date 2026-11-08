@@ -1,5 +1,5 @@
 """Writes crates/shadow-model/src/unicode_table.rs: the code point ranges in the general categories used by the
-qwen35 and flint pre-tokenizers:
+qwen35 pre-tokenizer:
   LU_LT = 1   (\\p{Lu}, \\p{Lt})
   LL    = 2   (\\p{Ll})
   LM_LO = 4   (\\p{Lm}, \\p{Lo})   -> L = 1 | 2 | 4 = 7
