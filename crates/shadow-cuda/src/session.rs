@@ -208,7 +208,13 @@ fn sub_rows_cap() -> usize {
 /// Bytes the big batch's buffers take for `total` rows a pass: the temporaries for the sub-chunk and the residual streams of every row.
 fn big_batch_bytes(c: &shadow_model::forward::Config, total: usize) -> usize {
     let sub = sub_rows_cap().min(total);
-    bb_row_floats(c) * 4 * sub + if total > sub { c.streams * c.hidden * 4 * total.next_multiple_of(sub) } else { 0 }
+    bb_row_floats(c) * 4 * sub + bb_table_extra(c, sub) + if total > sub { c.streams * c.hidden * 4 * total.next_multiple_of(sub) } else { 0 }
+}
+/// Bytes the table buffer (`gtab`) takes beyond its 96 k words a row at `rows` rows: the width-class planner's tables have a part that does not shrink with the rows, so a small
+/// buffer needs more (see `BatchBufs`' allocation).
+fn bb_table_extra(c: &shadow_model::forward::Config, rows: usize) -> usize {
+    let k = c.n_expert_used;
+    bucket_layout(rows, k, c.n_expert).total.div_ceil(4 * rows).saturating_sub(96 * k) * 4 * rows
 }
 /// Unread prompt tokens from which the layer-ahead pipeline and the big batch are used.
 // 512 since 2026-11-07 (it was 1,024): below it a prompt reads in passes of 256 rows at ~1.9 s each (every pass fetches most experts of every layer), above it one big pass costs ~4 s
@@ -397,7 +403,9 @@ fn make_bb<'c>(c: &shadow_model::forward::Config, rows: usize,
         rl: ab(c.n_expert)?, sgl: ab(1)?,
         sel_iqn: fixed.sel_iqn, sel_scores: fixed.sel_scores, sel_toks: fixed.sel_toks,
         sg: ab(c.shared_ff)?, su: ab(c.shared_ff)?, sa: ab(c.shared_ff)?, so: ab(h)?, logits: fixed.logits,
-        gtab: ab(96 * k)?, eg, act: ab(k * c.expert_ff)?, eo: ab(k * h)?,
+        // 96 k words a row for the host-planned tables; the width-class planner's tables (`bucket_layout`) carry a part that does not shrink with the rows (up to one group an expert
+        // and class: ~3.3 MB), so a buffer of few rows (768 on a small sub-chunk) needs more a row than 96 k
+        gtab: ab((96 * k).max(bucket_layout(rows, k, c.n_expert).total.div_ceil(4 * rows)))?, eg, act: ab(k * c.expert_ff)?, eo: ab(k * h)?,
     })
 }
 
@@ -2778,11 +2786,11 @@ impl<'c, 'm> GpuSession<'c, 'm> {
         let avail = freed.saturating_sub(halves + (1 << 16) + (8 << 20));
         let cap = std::env::var("SHADOW_BIG_ROWS").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(BIG_BATCH);
         // the rows are one of a few values, so the graphs captured per row count stay few
-        let rows = [BIG_BATCH_MAX, 4096, BIG_BATCH, 1024, 512].into_iter().find(|&r| r <= cap.max(512) && rb * r <= avail).unwrap_or(0);
+        let rows = [BIG_BATCH_MAX, 4096, BIG_BATCH, 1024, 512].into_iter().find(|&r| r <= cap.max(512) && rb * r + bb_table_extra(&self.m.cfg, r) <= avail).unwrap_or(0);
         // with the halves in the arena, a smaller batch than the arena itself can carve (1,600 rows at the 24k window) is no reason to take the KV tail
         // a tail too small for a pass alone still adds to the arena's part (`lend_cache` lends the rest of the rows' buffers from the arena)
         let rows = if !with_halves && rows < 512 { 0 } else { rows };
-        let want = halves + rb * rows + (1 << 16);
+        let want = halves + rb * rows + if rows > 0 { bb_table_extra(&self.m.cfg, rows) } else { 0 } + (1 << 16);
         if self.kv_extra_reg.is_none() {
             let size = 2 * self.m.cfg.n_expert * self.cache.slot_bytes + rb * BIG_BATCH_MAX + (1 << 16);
             self.kv_extra_reg = crate::kvvmm::VmmRegion::new_empty(self.ctx, size).ok();
@@ -3149,7 +3157,8 @@ impl<'c, 'm> GpuSession<'c, 'm> {
                           (t2 - t1).as_secs_f64() * 1e3, (t0.elapsed() - t2).as_secs_f64() * 1e3);
             }
         }
-        let buckets = tops.is_none() && self.buckets_on(infos);
+        // never past the buffer: a pass whose tables do not fit takes the fixed-width device planner instead of failing
+        let buckets = tops.is_none() && self.buckets_on(infos) && bucket_layout(m, k, ne).total <= self.bb.gtab.bytes;
         let mut blay: Option<(BucketLayout, bool)> = None;
         let (plan, n_set) = if let Some(tops) = tops {
             let mut seen = vec![false; ne];

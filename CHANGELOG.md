@@ -10,6 +10,9 @@ Prompt reading with `--tensor-prompt` (the default fast mode) is about 5% / 11% 
 - **`glob` tool**: real patterns (`*`, `**`, `?`, folders); it used to match a substring of the file name, so `**/*.html` found nothing. **`grep` tool**: regexes as its description says (`busy|telemetry`); literal text still matches.
 - **"N pictures sent but the prompt has M picture slots"**: literal special-token text in a message (a fetched page that mentions `<|image_pad|>`) is defanged with a zero-width space, only for the model's real special tokens, so it no longer becomes a picture slot or a fake turn.
 - Kernel-signature drift test: the parser skips `__launch_bounds__(N)`; it had been failing since 2026-11-05.
+### Fixed (2026-11-08)
+- The width-class MoE planner (2026-11-07) failed with "internal error: width-class plan: ... bytes of tables" on a small batch buffer (768 rows) and reset the conversation's cache; its table buffer is now sized for its fixed part, and a pass whose tables do not fit takes the fixed-width planner instead of failing (docs/STATUS.md 62).
+
 ### Changed (2026-11-07, prompt path)
 - The MoE products of a long prompt run in groups of 16 / 32 / 64 tokens matched to each expert's count (device planner `plan_fill_w`, `SHADOW_MMA_BUCKETS=0` off): the MoE kernel time -17%, a 9.6k prompt's kernel time -9%, 15k prompts +15% and 9.6k +3.6% in A-B-B-A; output bit-identical (docs/STATUS.md 60-61).
 - Prompts of 512-1,023 tokens now use the single big pass (`LONG_PROMPT` 1,024 -> 512, `SHADOW_LONG_PROMPT=n`): a 1,000-token prompt reads in ~4.1 s instead of ~7.7 s, 700 tokens in 4.0 s instead of 5.3 s; below 512 nothing changes.
