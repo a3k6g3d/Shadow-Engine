@@ -188,6 +188,13 @@ pub const MAX_BATCH: usize = 256;
 pub const BIG_BATCH: usize = 2048;
 /// Tokens a pass can take at most (`lend_kv` picks 2,048, 1,024 or 512 by the lent KV tail). 4,096 was tried (half the copying a token) but the drafter's feature buffers have to hold a whole pass: +150 MB of VRAM, -2 points of the 24k window's prompt speed, and the tail is only that big in a window band where the staging pipeline cannot start (STATUS.md 2026-11-03)
 pub const BIG_BATCH_MAX: usize = 16384;
+/// `SHADOW_PHASES=1`: wall-clock phases of a prompt pass (embedding rows, the layer loop with the device drained at its end, the logits, the lend and the
+/// restore of the expert cache) on stderr.  Off, the code adds no synchronization.
+pub fn phases_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("SHADOW_PHASES").is_ok_and(|v| v == "1"))
+}
+
 /// Rows a pass takes when the lent room allows (`SHADOW_BIG_ROWS` sets it): 4,096 read 9.5k and 15k prompts 14% and 23% faster than 2,048, 8,192 (run in sub-chunks, `sub_rows_cap`) 5-8% faster again
 /// (docs/STATUS.md 2026-11-04), at some cost to the first reply's decode speed (the cache is emptier)
 fn big_rows_cap() -> usize {
@@ -204,7 +211,15 @@ fn big_batch_bytes(c: &shadow_model::forward::Config, total: usize) -> usize {
     bb_row_floats(c) * 4 * sub + if total > sub { c.streams * c.hidden * 4 * total.next_multiple_of(sub) } else { 0 }
 }
 /// Unread prompt tokens from which the layer-ahead pipeline and the big batch are used.
-pub const LONG_PROMPT: usize = 1024;
+// 512 since 2026-11-07 (it was 1,024): below it a prompt reads in passes of 256 rows at ~1.9 s each (every pass fetches most experts of every layer), above it one big pass costs ~4 s
+// whatever its length up to ~2k tokens, plus ~0.65 s to lend and restore the cache; the two meet at ~500 tokens (A-B-B-A, docs/STATUS.md 58).
+pub const LONG_PROMPT: usize = 512;
+
+/// `LONG_PROMPT`, or `SHADOW_LONG_PROMPT=n` tokens: from this many unread tokens a prompt takes the layer-ahead pipeline and the big batch.
+pub fn long_prompt() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| std::env::var("SHADOW_LONG_PROMPT").ok().and_then(|v| v.parse().ok()).unwrap_or(LONG_PROMPT))
+}
 const COLS_MAX: usize = 8;
 /// Tokens a batched attention launch takes (its score scratch is per token).
 const ATT_ROWS: usize = 8;
@@ -3321,6 +3336,8 @@ impl<'c, 'm> GpuSession<'c, 'm> {
     /// (the ones it holds; the rest warm up by demand).
     pub fn restore_cache(&mut self) {
         let Some(lent) = self.lent.take() else { return };
+        let t_restore = std::time::Instant::now();
+        let n_saved = lent.saved.len();
         self.stage_pipe_wait();
         self.ctx.synchronize().unwrap();
         for r in self.fv_regs.iter_mut() {
@@ -3384,6 +3401,9 @@ impl<'c, 'm> GpuSession<'c, 'm> {
             self.cache.stamp[s] = 0;
         }
         self.copy_stream.synchronize().unwrap();
+        if phases_on() {
+            eprintln!("SHADOW_PHASES restore_cache: {:.3} s ({} evicted experts to bring back)", t_restore.elapsed().as_secs_f64(), n_saved);
+        }
     }
 
     /// The router's logits (and the shared expert's gate logit) for layer l into rl (and sgl).
@@ -3892,6 +3912,7 @@ impl<'c, 'm> GpuSession<'c, 'm> {
                 unsafe { SetThreadPriority(GetCurrentThread(), p.clamp(-2, 2)) };
             }
         }
+        let t_pass = std::time::Instant::now();
         let m = toks.len();
         let p0 = self.tokens.len();
         assert!(p0 + m <= self.cap, "this session was made for {} positions", self.cap);
@@ -3936,13 +3957,14 @@ impl<'c, 'm> GpuSession<'c, 'm> {
                                            Arg::U32(cs as u32)]);
             }
         }
+        let t_embed = t_pass.elapsed().as_secs_f64();
         let mut logs: Vec<Vec<u16>> = vec![vec![]; m];
         let graphs = self.graphs_on && self.trace.is_none() && self.stop_after.is_none() && self.prof.is_none()
             && self.prefetch.is_none() && self.pregate.is_none() && self.cache.slots > 0
-            // `SHADOW_BATCH_GRAPHS=0`: no CUDA graphs for the prompt path.  A graph is keyed by buffer addresses and row counts, which a new prompt mostly changes, so a long prompt
-            // instantiates ~500 (18 ms each, hidden behind the GPU) and a repeated shape then runs 10% faster (follow-up of 5,609 tokens: 481-509 against 444-451 tok/s);
-            // a first run ties (docs/STATUS.md 2026-11-05 (30)).
-            && !std::env::var("SHADOW_BATCH_GRAPHS").is_ok_and(|v| v == "0");
+            // `SHADOW_BATCH_GRAPHS=1`: CUDA graphs for the prompt path (off by default since 2026-11-07).  A graph is keyed by buffer addresses and row counts, which a new prompt mostly
+            // changes, so a long prompt instantiates ~500 (18 ms each) and a repeated shape then runs 10% faster (follow-up of 5,609 tokens: 481-509 against 444-451 tok/s,
+            // docs/STATUS.md 2026-11-05 (30)); a new prompt ties at 0.5k-9.6k tokens and loses 10% at 15k (A-B-B-A, STATUS 58).
+            && std::env::var("SHADOW_BATCH_GRAPHS").is_ok_and(|v| v == "1");
         if self.batch_graphs.len() > 4000 {
             // the cache would grow with every new prompt shape
             self.batch_graphs.clear();
@@ -4055,6 +4077,11 @@ impl<'c, 'm> GpuSession<'c, 'm> {
             }
             rn_layer = rn_ready;
         }
+        let t_layers_queued = t_pass.elapsed().as_secs_f64();
+        if phases_on() {
+            self.ctx.synchronize().unwrap();
+        }
+        let t_layers = t_pass.elapsed().as_secs_f64();
         let (m_obs, p0_obs) = { let &(s0, ms) = subs.last().unwrap(); (ms, p0 + s0) };
         if with_logits {
             // the last sub-chunk's output rows (a sub-chunked pass gives logits for its last rows only; the rows before come back empty)
@@ -4074,6 +4101,11 @@ impl<'c, 'm> GpuSession<'c, 'm> {
         }
         if self.dflash.is_some() {
             self.dflash_observe(m_obs, p0_obs);
+        }
+        if phases_on() {
+            self.ctx.synchronize().unwrap();
+            eprintln!("SHADOW_PHASES pass m={m} (graphs {graphs}): embed rows {:.3} s, layers queued by {:.3} s, device drained at {:.3} s (so {:.3} s waiting after the last launch), observers {:.3} s",
+                      t_embed, t_layers_queued - t_embed, t_layers - t_embed, t_layers - t_layers_queued, t_pass.elapsed().as_secs_f64() - t_layers);
         }
         if !with_logits {
             return vec![];

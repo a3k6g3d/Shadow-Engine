@@ -645,6 +645,7 @@ fn fit_context(arch: &str, messages: &[Message], opts: &Options, images: &[Vec<u
 fn answer<'c>(arch: &str, req: &Request, tok: &Tokenizer, sess: &mut GpuSession<'c, '_>, last_logits: &mut Vec<f32>,
               stops: &[u32], think_end: Option<u32>, prefix: &mut PrefixCache<'c>, spec: usize, pics: &mut Pics,
               model: &std::path::Path) -> Result<Stats, String> {
+    let t_answer = Instant::now();
     let cap = sess.capacity();
     let (fit_msgs, fit_imgs, compacted) = fit_context(arch, &req.messages, &req.opts, &req.images, cap, req.max_tokens, &mut |m, im| {
         let t = render_for_arch(arch, m, &req.opts)?;
@@ -675,6 +676,7 @@ fn answer<'c>(arch: &str, req: &Request, tok: &Tokenizer, sess: &mut GpuSession<
     }
     // read the prompt, reusing the session's state when it holds an exact prefix of it
     let t0 = Instant::now();
+    let t_before = t_answer.elapsed().as_secs_f64();
     let have = sess.tokens().len();
     // the same ids with other pictures behind them are not the same prompt: the pictures before `have` must be the ones in the session
     let same_pics = spans.iter().filter(|s| s.0 < have).map(|s| (s.0, s.1, s.2)).eq(pics.cur.iter().filter(|c| c.0 < have).copied());
@@ -771,7 +773,10 @@ fn answer<'c>(arch: &str, req: &Request, tok: &Tokenizer, sess: &mut GpuSession<
     // MAX_BATCH tokens at a time through the layers (`step_batch`), a chunk ending where the snapshot goes
     // a long prompt borrows the tail of the VRAM expert cache as staging and reads in big chunks; a short one, 64 at a time
     sess.hint_prompt(unread.len());
-    let mut lent = unread.len() >= 128 && !std::env::var("SHADOW_NO_LEND").is_ok_and(|v| v == "1") && sess.lend_cache(unread.len() >= shadow_cuda::session::LONG_PROMPT);
+    let t_lend0 = Instant::now();
+    let mut lent = unread.len() >= 128 && !std::env::var("SHADOW_NO_LEND").is_ok_and(|v| v == "1") && sess.lend_cache(unread.len() >= shadow_cuda::session::long_prompt());
+    let t_lend = t_lend0.elapsed().as_secs_f64();
+    let t_passes0 = Instant::now();
     let chunk = std::env::var("SHADOW_PREFILL_CHUNK").ok().and_then(|v| v.parse().ok())
         .unwrap_or(if lent { sess.batch_rows() } else { 64usize }).clamp(1, sess.batch_rows());
     let mut i = 0;
@@ -801,9 +806,13 @@ fn answer<'c>(arch: &str, req: &Request, tok: &Tokenizer, sess: &mut GpuSession<
             }
         }
     }
+    let t_passes = t_passes0.elapsed().as_secs_f64();
+    let t_restore0 = Instant::now();
     if lent {
         sess.restore_cache();
     }
+    let t_restore = t_restore0.elapsed().as_secs_f64();
+    let t_snap0 = Instant::now();
     let budget = conv_budget(prefix.disk.is_some());
     if spans.is_empty() && ids.len() >= CONV_MIN && budget > 0 && sess.tokens().len() == ids.len() {
         // the conversation's state as of this prompt (before the reply): a later request that starts with these tokens restores it.  An older snapshot of the same
@@ -842,6 +851,10 @@ fn answer<'c>(arch: &str, req: &Request, tok: &Tokenizer, sess: &mut GpuSession<
     }
     PREFILL.0.store(unread.len(), Relaxed);
     let prompt_ms = t0.elapsed().as_secs_f64() * 1e3;
+    if shadow_cuda::session::phases_on() {
+        eprintln!("SHADOW_PHASES answer: before the prompt (render, encode, fit_context, restores) {:.3} s; lend_cache {:.3} s; passes {:.3} s; restore_cache {:.3} s; conversation snapshot {:.3} s; prompt_ms {:.3} s for {} tokens",
+                  t_before, t_lend, t_passes, t_restore, t_snap0.elapsed().as_secs_f64(), prompt_ms / 1e3, unread.len());
+    }
 
     let t1 = Instant::now();
     // thinking on: the answer opens inside the think block

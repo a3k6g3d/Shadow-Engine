@@ -10,6 +10,11 @@ Prompt reading with `--tensor-prompt` (the default fast mode) is about 5% / 11% 
 - **`glob` tool**: real patterns (`*`, `**`, `?`, folders); it used to match a substring of the file name, so `**/*.html` found nothing. **`grep` tool**: regexes as its description says (`busy|telemetry`); literal text still matches.
 - **"N pictures sent but the prompt has M picture slots"**: literal special-token text in a message (a fetched page that mentions `<|image_pad|>`) is defanged with a zero-width space, only for the model's real special tokens, so it no longer becomes a picture slot or a fake turn.
 - Kernel-signature drift test: the parser skips `__launch_bounds__(N)`; it had been failing since 2026-11-05.
+### Changed (2026-11-07, prompt path)
+- Prompts of 512-1,023 tokens now use the single big pass (`LONG_PROMPT` 1,024 -> 512, `SHADOW_LONG_PROMPT=n`): a 1,000-token prompt reads in ~4.1 s instead of ~7.7 s, 700 tokens in 4.0 s instead of 5.3 s; below 512 nothing changes.
+- CUDA graphs for the prompt path are off by default (`SHADOW_BATCH_GRAPHS=1` on): 15k-token prompts +10% (1,292 against 1,174 tok/s, A-B-B-A), 0.5k-9.6k ties.
+- `SHADOW_PHASES=1` prints the wall-clock phases of a prompt (rows, layers, lend, restore, snapshot) on stderr.
+
 ### Removed
 - **Flint** (`RecursiveSI/flint`, NVFP4) is no longer part of this build: its CPU and GPU forward paths, chat template, pre-tokenizer, NVFP4 kernels, tests and fixtures. A Flint file is refused with a clear message; `shadow inspect` still reads it. It stays in git history (tag `pre-flint-removal`) and will be tested on tandem.cpp later (docs/STATUS.md 57).
 ### Changed
