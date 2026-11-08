@@ -1,6 +1,6 @@
 # Plan: beat Strata on prompt speed (2026-11-07)
 
-Supersedes the numbers of `PLAN_EXCEED_STRATA.md` (2026-11-05) and `PLAN_INT8_MMQ.md`; their rules still apply: **measure, and what loses stays opt-in; every experiment gets a dated STATUS entry with its numbers, wins and losses alike; a tie is a loss; every model load under `tools/run_capped.ps1`; the tier stays 36 GiB unless the user says otherwise; the DRAM is at its stable max.**
+Supersedes the numbers of `PLAN_EXCEED_STRATA.md` (2026-11-05) and `PLAN_INT8_MMQ.md`; their rules still apply, **except the tie rule, changed by the user on 2026-11-08: a tie or better goes on by default** (a tie = no loss beyond the measured noise in A-B-B-A, with the output unchanged or its gates passing and no regression in decode, memory or VRAM; a measured loss stays opt-in; small wins are meant to add up): **measure, and what loses stays opt-in; every experiment gets a dated STATUS entry with its numbers, wins and losses alike; every model load under `tools/run_capped.ps1`; the tier stays 36 GiB unless the user says otherwise; the DRAM is at its stable max.**
 
 ## 1. Where we are (measured, same PC, same model files)
 
@@ -20,7 +20,7 @@ Shadow's 15k prompt (Nsight Systems, graphs off, STATUS 44-50), kernel share of 
 - **9.7k:** <= 5.3 s. **3k:** <= 2.4 s.
 - **3k cannot be won with kernels.** A 3k prompt touches most experts; the 11 GiB that are not in the 36 GiB tier come off the SSD at 2.4 GB/s (4-5 s) before any compute; Strata reads nothing. It needs one of: a bigger tier (the user's call: Strata runs with 3-4 GiB of RAM free), CPU compute of the cold experts (Strata does it for chunks <= 3,072 tokens), a better placement of the hot experts for short prompts, or a faster read path (direct I/O crashed, STATUS 19-20). **Decision for the user at the end of Phase 2; not assumed.**
 
-## 3. Phases (each ends with its gate; a lever below 3% of kernel time, or a tie, stays opt-in)
+## 3. Phases (each ends with its gate; a lever below 3% of kernel time is still worth taking when it is a tie or better and passes the gates: the tie rule changed 2026-11-08, see the top)
 
 **Phase 0: remove Flint (user's decision 2026-11-07; it will be tested on tandem.cpp later).** The audit: `arch == "flint"` paths in `shadow-model` (`forward.rs`: CPU `step_flint`, `attention_flint`, `mlp_flint`, `moe_flint`, sigmoid routing; `chat.rs`: `render_flint`, its tool-call format; `tokenizer.rs`), `shadow-cuda` (`session.rs`: `step_flint_opt`, `attention_flint`, `mlp_flint`, ~26 `is_flint` branches in the MoE path; `moe_combine_flint`, `attention_sinks_heads`, the NVFP4 kernels `matvec_*_nvfp4`, `dequant_nvfp4`), tests (`crates/shadow/tests/reference.rs`, `tokenizer_fixture.rs`, the NVFP4 dequant tests), fixtures (`eval/fixtures/*flint*`, `reference_flint_gguf`, `profiles/flint-routing.shrc`, `tools/make_reference_fixture_flint.py`), README / docs mentions (history stays). Keep the GGUF type table so `shadow inspect` still reads a Flint file. Everything stays in git history (tag `pre-flint-removal`). *Gate:* build with no new warnings, drift + workspace tests green, `--exact` hash 162a8e07 and `quality_test` 12/12, prompt speed unchanged (a deletion), `shadow serve` on a Flint file refuses with a clear message.
 
