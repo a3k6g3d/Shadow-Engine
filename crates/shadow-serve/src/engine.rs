@@ -568,7 +568,7 @@ fn fit_context(arch: &str, messages: &[Message], opts: &Options, images: &[Vec<u
                 .unwrap_or(&m.content)
                 .trim();
             let preview = summarize_turn_text(clean, 160);
-            m.content = format!("[earlier tool output ({} chars): {preview}]", clean.len());
+            m.content = format!("[earlier tool output ({} chars), shortened to save context; it began: {preview} - call the tool again if you need more of it]", clean.len());
             changed = true;
         }
     }
@@ -660,7 +660,7 @@ fn fit_context(arch: &str, messages: &[Message], opts: &Options, images: &[Vec<u
                 .strip_suffix("</tool_response>").unwrap_or(&msgs[idx].content)
                 .trim().to_string();
             let preview = summarize_turn_text(&clean, 160);
-            msgs[idx].content = format!("[earlier tool output ({} chars): {preview}]", clean.len());
+            msgs[idx].content = format!("[earlier tool output ({} chars), shortened to save context; it began: {preview} - call the tool again if you need more of it]", clean.len());
             compacted_turns = compacted_turns.max(1);
             if encode_len(&msgs, &imgs)? <= target_prompt {
                 break;
@@ -1224,7 +1224,7 @@ OUT{k} {}
 OUTPUT{k} {}
 </tool_response>", "line_of_code ".repeat(400))));
         }
-        let cap = 4096;
+        let cap = 4600;
         let (fit, _, compacted) = fit_context("qwen35", &msgs, &opts, &[], cap, 0, &mut |m, _| Ok(render_for_arch("qwen35", m, &opts)?.len() / 3)).unwrap();
         assert!(compacted > 0);
         let tools: Vec<&Message> = fit.iter().filter(|m| m.role == Role::Tool).collect();

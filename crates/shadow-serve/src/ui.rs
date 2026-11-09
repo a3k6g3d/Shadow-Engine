@@ -1189,7 +1189,7 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
     let currentEffort = localStorage.getItem('shadow_effort') || 'medium';
     if (currentEffort === 'high') currentEffort = 'medium'; // the High level was removed from the menu
     let toolsEnabled = localStorage.getItem('shadow_tools_enabled') !== 'false';
-    const DEFAULT_PERSONA = "You are Shadow, a capable AI assistant running locally on the user's Windows PC: nothing you are told leaves this machine. Be direct and accurate, keep answers as short as the question allows, and say so when you are unsure. You can use tools: read_file, glob, grep, edit_file, write_file, cmd (PowerShell), web_search and web_fetch (use these for anything current or that you are not sure of, and cite the page), and any mcp__ tools you are given. When asked to look at, test or change files, use the tools instead of describing what you would do. If the user asks you to take a role for a task (for example 'act as a software engineer and design this'), do that for the task.";
+    const DEFAULT_PERSONA = "You are Shadow, a capable AI assistant running locally on the user's Windows PC: nothing you are told leaves this machine. Be direct and accurate, keep answers as short as the question allows, and say so when you are unsure. You can use tools: read_file, glob, grep, edit_file, write_file, cmd (PowerShell), web_search and web_fetch (use these for anything current or that you are not sure of, and cite the page), and any mcp__ tools you are given. When asked to look at, test or change files, use the tools instead of describing what you would do. If the user asks you to take a role for a task (for example 'act as a software engineer and design this'), do that for the task. Your context window is small, so tool outputs from earlier steps are shortened to a preview: after reading something you will need later, write down the facts you need (the file, the line numbers, the exact text to change) in your reply before your next tool call, do not read the same part twice, and if a shortened output is not enough read just the part you need again. Work in small steps and finish with an answer.";
     let currentPersona = localStorage.getItem('shadow_persona') || DEFAULT_PERSONA;
 
     // Elements
@@ -1835,6 +1835,7 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
       // no limit on the number of steps (the rolling context keeps the request bounded, Stop ends it); the one guard is a model stuck on the same tool call
       const MAX_SAME_CALLS = 4;
       let lastCallSig = '', sameCalls = 0, stuck = false;
+      const callCounts = new Map();   // how often each exact tool call was made in this task
 
       while (true) {
         loopTurns++;
@@ -2047,6 +2048,12 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
               scrollToBottom(false);
 
               const result = await executeLocalTool(tc.name, tc.arguments);
+              // the same call again: its result is not new - say so, or a model that lost the earlier result to the shortening reads it a third and fourth time
+              const callKey = tc.name + '|' + JSON.stringify(tc.arguments);
+              const timesCalled = (callCounts.get(callKey) || 0) + 1;
+              callCounts.set(callKey, timesCalled);
+              if (timesCalled >= 2) result.output += `
+(note: this exact call was already made ${timesCalled - 1} time(s) earlier in this task and gives the same result; use the facts you noted, or read a different part.)`;
               if (tc.name.startsWith('memory_')) loadMemory();
               if (tc.name.startsWith('mcp__browser__')) browserNote(result.output);
               toolCard.classList.remove('running');
@@ -2689,7 +2696,7 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
         const was = m.content.length;
         const raw = unwrapToolResponse(m.content).replace(/\s+/g, ' ').trim();
         const preview = raw.length > 160 ? raw.slice(0, 160) + '…' : raw;
-        m.content = `<tool_response>\n[earlier tool output (${was} chars): ${preview}]\n</tool_response>`;
+        m.content = `<tool_response>\n[earlier tool output (${was} chars), shortened to save context; it began: ${preview} - call the tool again if you need more of it]\n</tool_response>`;
         total -= was - m.content.length;
         shortenedTools++;
       }
