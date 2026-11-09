@@ -214,6 +214,10 @@ const ARGUMENT_ALIASES: &[(&str, &str, &str)] = &[
     ("read_file", "file_path", "path"), ("read_file", "filepath", "path"), ("read_file", "file", "path"),
     ("edit_file", "file_path", "path"), ("edit_file", "filepath", "path"), ("edit_file", "file", "path"),
     ("write_file", "file_path", "path"), ("write_file", "filepath", "path"), ("write_file", "file", "path"),
+    ("replace_lines", "start_line", "start"), ("replace_lines", "line_start", "start"), ("replace_lines", "end_line", "end"), ("replace_lines", "line_end", "end"),
+    ("replace_lines", "file_path", "path"), ("replace_lines", "filepath", "path"), ("replace_lines", "file", "path"),
+    ("replace_lines", "new_text", "newText"), ("replace_lines", "newtext", "newText"), ("replace_lines", "text", "newText"), ("replace_lines", "content", "newText"),
+    ("replace_lines", "expected", "expect"), ("replace_lines", "contains", "expect"),
     ("recall", "output", "id"), ("recall", "output_id", "id"), ("recall", "number", "id"), ("recall", "n", "id"),
     ("recall", "text", "query"), ("recall", "search", "query"), ("recall", "start_line", "start"), ("recall", "end_line", "end"),
     ("search", "q", "query"), ("search", "text", "query"), ("search", "question", "query"), ("search", "limit", "max_results"), ("search", "k", "max_results"),
@@ -269,6 +273,65 @@ pub fn execute_tool(inv: &ToolInvocation) -> ToolResult {
     r
 }
 
+/// `replace_lines`: lines `start`..=`end` (1-indexed, the numbers `read_file` shows) of a file become `newText` (empty: they are deleted; `start` one past the last line: it is
+/// appended).  `expect`, when given, must occur in the old lines: a line number that went stale (an earlier edit moved the lines) is refused instead of overwriting the wrong
+/// code.  The file's line endings are kept.  The answer shows the lines around the edit with their new numbers.
+fn replace_lines(name: &str, args: &Value) -> ToolResult {
+    let err = |m: String| ToolResult { name: name.to_string(), output: format!("error: {m}"), is_error: true, images: vec![] };
+    let path_str = args.get("path").and_then(Value::as_str).unwrap_or("");
+    let Some(start) = args.get("start").and_then(Value::as_u64).map(|v| v as usize) else { return err("give start, the first line to replace (1-indexed)".into()) };
+    let end_arg = args.get("end").and_then(Value::as_u64).map(|v| v as usize);
+    let Some(new_text) = args.get("newText").and_then(Value::as_str) else { return err("give newText, the replacement (an empty string deletes the lines)".into()) };
+    if path_str.is_empty() {
+        return err("missing required argument 'path'".into());
+    }
+    let p = Path::new(path_str);
+    let content = match std::fs::read_to_string(p) {
+        Ok(c) => c,
+        Err(e) => return err(format!("reading {path_str}: {e}")),
+    };
+    let crlf = content.contains("\r\n");
+    let trailing_newline = content.ends_with('\n');
+    let lines: Vec<&str> = content.lines().collect();
+    let total = lines.len();
+    let end = end_arg.unwrap_or(if start == total + 1 { total } else { start });   // one line by default; nothing (an append) when start is past the last line
+    if start < 1 || start > total + 1 || end > total || end + 1 < start {
+        return err(format!("lines {start}-{end} are outside {path_str}, which has {total} lines (start may be {} to append)", total + 1));
+    }
+    let old = &lines[start - 1..end];
+    if let Some(expect) = args.get("expect").and_then(Value::as_str).filter(|e| !e.is_empty()) {
+        if !old.join("\n").contains(expect) {
+            let shown: Vec<String> = old.iter().take(20).enumerate().map(|(i, l)| format!("{:>5}| {l}", start + i)).collect();
+            return err(format!("the text you expected is not in lines {start}-{end} of {path_str} (the file may have changed since you read it); those lines are now:\n{}", shown.join("\n")));
+        }
+    }
+    let body = new_text.strip_suffix("\r\n").or_else(|| new_text.strip_suffix('\n')).unwrap_or(new_text);
+    let new_lines: Vec<&str> = if new_text.is_empty() { vec![] } else { body.split('\n').map(|l| l.strip_suffix('\r').unwrap_or(l)).collect() };
+    let mut out: Vec<&str> = Vec::with_capacity(total + new_lines.len());
+    out.extend_from_slice(&lines[..start - 1]);
+    out.extend_from_slice(&new_lines);
+    out.extend_from_slice(&lines[end..]);
+    let nl = if crlf { "\r\n" } else { "\n" };
+    let mut updated = out.join(nl);
+    if trailing_newline && !out.is_empty() {
+        updated.push_str(nl);
+    }
+    if let Err(e) = std::fs::write(p, updated) {
+        return err(format!("writing {path_str}: {e}"));
+    }
+    let delta = new_lines.len() as i64 - old.len() as i64;
+    let from = start.saturating_sub(2).max(1);
+    let to = (start + new_lines.len() + 1).min(out.len()).min(from + 39);
+    let shown: Vec<String> = (from..=to).filter(|i| *i >= 1 && *i <= out.len()).map(|i| format!("{:>5}| {}", i, out[i - 1])).collect();
+    let moved = if delta == 0 { String::new() } else { format!("; the lines after line {end} moved by {delta:+} - read again before the next edit of this file") };
+    ToolResult {
+        name: name.to_string(),
+        output: format!("replaced lines {start}-{end} ({} -> {} lines) in {path_str}{moved}\n{}", old.len(), new_lines.len(), shown.join("\n")),
+        is_error: false,
+        images: vec![],
+    }
+}
+
 fn execute_tool_inner(inv: &ToolInvocation) -> ToolResult {
     let fixed = ToolInvocation { name: inv.name.clone(), arguments: coerce_arguments(&inv.name, &inv.arguments) };
     let inv = &fixed;
@@ -309,7 +372,8 @@ fn execute_tool_inner(inv: &ToolInvocation) -> ToolResult {
         "read_file" => {
             let path_str = inv.arguments.get("path").and_then(Value::as_str).unwrap_or("");
             let start = inv.arguments.get("start").and_then(Value::as_u64).unwrap_or(1) as usize;
-            let end = inv.arguments.get("end").and_then(Value::as_u64).unwrap_or(400) as usize;
+            // 120 lines from `start` unless `end` is given (the old default was line 400, whatever `start` was: a read from line 2415 returned one line)
+            let end = inv.arguments.get("end").and_then(Value::as_u64).map_or(start + 119, |e| e as usize);
 
             if path_str.is_empty() {
                 return ToolResult { name: inv.name.clone(), output: "error: missing required argument 'path'".into(), is_error: true, images: vec![] };
@@ -348,7 +412,7 @@ fn execute_tool_inner(inv: &ToolInvocation) -> ToolResult {
             let id = inv.arguments.get("id").and_then(Value::as_u64);
             let query = inv.arguments.get("query").and_then(Value::as_str).unwrap_or("").trim().to_string();
             let start = inv.arguments.get("start").and_then(Value::as_u64).unwrap_or(1) as usize;
-            let end = inv.arguments.get("end").and_then(Value::as_u64).unwrap_or(300) as usize;
+            let end = inv.arguments.get("end").and_then(Value::as_u64).map_or(start + 99, |e| e as usize);   // 100 lines from `start` unless `end` is given
             let out = match (id, query.is_empty()) {
                 (None, true) => return ToolResult { name: inv.name.clone(), output: "error: give the output's number (id), a text to search for (query), or both".into(), is_error: true, images: vec![] },
                 (None, false) => {
@@ -523,6 +587,8 @@ fn execute_tool_inner(inv: &ToolInvocation) -> ToolResult {
             }
         }
 
+        "replace_lines" => replace_lines(&inv.name, &inv.arguments),
+
         "write_file" => {
             let path_str = inv.arguments.get("path").and_then(Value::as_str).unwrap_or("");
             let content = inv.arguments.get("content").and_then(Value::as_str).unwrap_or("");
@@ -658,7 +724,7 @@ fn builtin_tool_definitions() -> Value {
         },
         {
             "name": "read_file",
-            "description": "Read file contents with line numbers on Windows.",
+            "description": "Read file contents with line numbers on Windows: 120 lines from start unless end is given.",
             "input_schema": {
                 "type": "object",
                 "properties": {
@@ -678,7 +744,7 @@ fn builtin_tool_definitions() -> Value {
                     "id": { "type": "integer", "description": "The output's number, as in '(output #12)' or 'earlier tool output #12'" },
                     "message": { "type": "integer", "description": "The number of an earlier message of the conversation, as in 'messages m3-m9' of a summary or 'recall with message 14'" },
                     "start": { "type": "integer", "description": "First line to show (1-indexed)" },
-                    "end": { "type": "integer", "description": "Last line to show (inclusive)" },
+                    "end": { "type": "integer", "description": "Last line to show (inclusive; 100 lines from start by default)" },
                     "query": { "type": "string", "description": "Show only the lines containing this text (in one output with id, in all of them without)" }
                 }
             }
@@ -737,6 +803,21 @@ fn builtin_tool_definitions() -> Value {
             }
         },
         {
+            "name": "replace_lines",
+            "description": "Replace lines start..end (inclusive, 1-indexed, the numbers read_file shows) of a file with newText: no need to repeat the old text. An empty newText deletes the lines; start one past the last line appends. Give expect, a short piece of text that must be in the old lines, so a stale line number cannot overwrite the wrong code. The lines after the edit move: read the file again before the next edit of it.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string", "description": "Path to the file to modify" },
+                    "start": { "type": "integer", "description": "First line to replace (1-indexed)" },
+                    "end": { "type": "integer", "description": "Last line to replace (inclusive; default start)" },
+                    "newText": { "type": "string", "description": "The replacement text (may be several lines; empty deletes)" },
+                    "expect": { "type": "string", "description": "Text that must occur in the old lines (guards against a stale line number)" }
+                },
+                "required": ["path", "start", "newText"]
+            }
+        },
+        {
             "name": "write_file",
             "description": "Write or overwrite a file on Windows.",
             "input_schema": {
@@ -775,6 +856,67 @@ mod tests {
         assert_eq!(a["path"], json!("C:\\x.txt"));
         assert_eq!(coerce_arguments("read_file", &json!({"start": "abc"}))["start"], json!("abc"));
         assert_eq!(coerce_arguments("nope", &json!({"a": "1"}))["a"], json!("1"));
+    }
+
+    #[test]
+    fn replace_lines_edits_by_line_number_and_refuses_a_stale_one() {
+        let dir = std::env::temp_dir().join(format!("shadow_replace_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("a.txt");
+        let path = f.to_str().unwrap();
+        let call = |args: Value| execute_tool(&ToolInvocation { name: "replace_lines".into(), arguments: args });
+        let text = |s: &str| std::fs::write(&f, s).unwrap();
+        // two lines replace one: the answer shows the new numbers and says the rest moved
+        text("one\ntwo\nthree\nfour\nfive\n");
+        let r = call(json!({"path": path, "start": 3, "end": 3, "newText": "THREE-A\nTHREE-B", "expect": "three"}));
+        assert!(!r.is_error && r.output.contains("(1 -> 2 lines)") && r.output.contains("moved by +1") && r.output.contains("    3| THREE-A") && r.output.contains("    4| THREE-B"), "{}", r.output);
+        assert_eq!(std::fs::read_to_string(&f).unwrap(), "one\ntwo\nTHREE-A\nTHREE-B\nfour\nfive\n");
+        // a stale line number: the expected text is not there, the file is untouched and the current lines are shown
+        let r = call(json!({"path": path, "start": 3, "end": 3, "newText": "X", "expect": "three"}));
+        assert!(r.is_error && r.output.contains("not in lines 3-3") && r.output.contains("THREE-A"), "{}", r.output);
+        assert_eq!(std::fs::read_to_string(&f).unwrap(), "one\ntwo\nTHREE-A\nTHREE-B\nfour\nfive\n");
+        // a range, replaced by one line (the argument names a model might use are taken)
+        let r = call(json!({"file_path": path, "start_line": 2, "end_line": 4, "new_text": "MID"}));
+        assert!(!r.is_error && r.output.contains("(3 -> 1 lines)") && r.output.contains("moved by -2"), "{}", r.output);
+        assert_eq!(std::fs::read_to_string(&f).unwrap(), "one\nMID\nfour\nfive\n");
+        // delete (an empty newText) and append (one past the last line)
+        assert!(!call(json!({"path": path, "start": 2, "end": 2, "newText": ""})).is_error);
+        assert_eq!(std::fs::read_to_string(&f).unwrap(), "one\nfour\nfive\n");
+        assert!(!call(json!({"path": path, "start": 4, "newText": "six\n"})).is_error);
+        assert_eq!(std::fs::read_to_string(&f).unwrap(), "one\nfour\nfive\nsix\n");
+        // out of range, and a missing newText (never read as "delete")
+        assert!(call(json!({"path": path, "start": 9, "newText": "x"})).output.contains("outside"));
+        assert!(call(json!({"path": path, "start": 1, "end": 7, "newText": "x"})).is_error);
+        let r = call(json!({"path": path, "start": 1}));
+        assert!(r.is_error && r.output.contains("newText"), "{}", r.output);
+        assert_eq!(std::fs::read_to_string(&f).unwrap(), "one\nfour\nfive\nsix\n");
+        // the line endings stay as they were
+        text("a\r\nb\r\nc\r\n");
+        assert!(!call(json!({"path": path, "start": 2, "newText": "B1\nB2"})).is_error);
+        assert_eq!(std::fs::read_to_string(&f).unwrap(), "a\r\nB1\r\nB2\r\nc\r\n");
+        // no trailing newline stays none
+        text("x\ny");
+        assert!(!call(json!({"path": path, "start": 2, "newText": "Y"})).is_error);
+        assert_eq!(std::fs::read_to_string(&f).unwrap(), "x\nY");
+        let _ = std::fs::remove_file(&f);
+        let _ = std::fs::remove_dir(&dir);
+    }
+
+    #[test]
+    fn a_read_from_a_line_returns_120_lines_from_there_and_recall_100() {
+        let dir = std::env::temp_dir().join(format!("shadow_defaults_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("long.txt");
+        std::fs::write(&f, (1..=900).map(|i| format!("line {i} of nine hundred with some padding words\n")).collect::<String>()).unwrap();
+        let r = execute_tool(&ToolInvocation { name: "read_file".into(), arguments: json!({"path": f.to_str().unwrap(), "start": 500}) });
+        assert!(r.output.contains("  500| line 500 ") && r.output.contains("  619| line 619 ") && !r.output.contains("  620| line 620"), "{}", &r.output[..300.min(r.output.len())]);
+        assert!(r.output.contains("ask again with start=620"), "{}", r.output.lines().last().unwrap_or(""));
+        let first = execute_tool(&ToolInvocation { name: "read_file".into(), arguments: json!({"path": f.to_str().unwrap()}) });
+        let id: u64 = first.output.strip_prefix("(output #").and_then(|t| t.split(')').next()).and_then(|n| n.parse().ok()).unwrap();
+        let rc = execute_tool(&ToolInvocation { name: "recall".into(), arguments: json!({"id": id, "start": 10}) });
+        assert!(rc.output.contains("lines 10-109 of") && rc.output.contains("more: ask again with start=110"), "{}", rc.output.lines().next().unwrap_or(""));
+        let _ = std::fs::remove_file(&f);
+        let _ = std::fs::remove_dir(&dir);
     }
 
     #[test]

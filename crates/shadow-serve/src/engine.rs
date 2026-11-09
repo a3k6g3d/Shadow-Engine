@@ -599,8 +599,23 @@ fn fit_context(arch: &str, messages: &[Message], opts: &Options, images: &[Vec<u
     // Stage 1: Compact older Role::Tool outputs (except the trailing tool outputs from the active step)
     let last_non_tool = msgs.iter().rposition(|m| m.role != shadow_model::chat::Role::Tool).unwrap_or(0);
     let mut changed = false;
+    // the working set: the newest tool outputs stay whole while they fit a budget (30% of the window, in characters), the last step's results always: one edit often needs
+    // more than the last read, and stage 2b (below) still shrinks them, oldest first, when the prompt does not fit otherwise
+    let ws_budget = cap * 3 * 30 / 100;
+    let mut keep_whole = std::collections::HashSet::new();
+    let mut ws_used = 0usize;
+    for (idx, m) in msgs.iter().enumerate().rev() {
+        if m.role != shadow_model::chat::Role::Tool {
+            continue;
+        }
+        if idx < last_non_tool && ws_used + m.content.len() > ws_budget {
+            break;
+        }
+        ws_used += m.content.len();
+        keep_whole.insert(idx);
+    }
     for (idx, m) in msgs.iter_mut().enumerate() {
-        if idx < last_non_tool && m.role == shadow_model::chat::Role::Tool && m.content.len() > 280 {
+        if idx < last_non_tool && m.role == shadow_model::chat::Role::Tool && m.content.len() > 280 && !keep_whole.contains(&idx) {
             let clean = m.content
                 .trim()
                 .strip_prefix("<tool_response>")
@@ -1267,9 +1282,28 @@ mod tests {
         assert_eq!(fit_msgs[0].role, Role::System);
         assert_eq!(fit_msgs[0].content, "You are Shadow, an assistant on Windows.");
         assert!(fit_msgs[1].content.contains("[Earlier conversation summary"), "expected rolling summary in first user message");
-        assert_eq!(fit_msgs.last().unwrap().content, "What did we find in the latest turns?");
+        // the question is the last message (when every earlier turn is folded the summary is written in front of it)
+        assert!(fit_msgs.last().unwrap().content.ends_with("What did we find in the latest turns?"));
         let final_rendered = render_for_arch("qwen35", &fit_msgs, &opts).unwrap();
         assert!(final_rendered.len() / 3 + 512 <= cap, "expected compacted prompt to fit comfortably within cap");
+    }
+
+    #[test]
+    fn the_newest_tool_outputs_stay_whole_within_a_budget_and_older_ones_shrink() {
+        let opts = Options::default();
+        let mut msgs = vec![Message::new(Role::System, "You are Shadow."), Message::new(Role::User, "Edit the code.")];
+        for k in 1..=6 {
+            msgs.push(Message::new(Role::Assistant, &format!("Step {k}.\n<tool_call>\n<function=read_file>\n<parameter=path>\na.rs\n</parameter>\n</function>\n</tool_call>")));
+            msgs.push(Message::new(Role::Tool, &format!("<tool_response>\nOUT{k} {}\n</tool_response>", "x".repeat(3600))));
+        }
+        let cap = 9000;
+        let (fit, _, compacted) = fit_context("qwen35", &msgs, &opts, &[], cap, 0, &mut |m, _| Ok(render_for_arch("qwen35", m, &opts)?.len() / 3)).unwrap();
+        assert!(compacted > 0);
+        let tools: Vec<&Message> = fit.iter().filter(|m| m.role == Role::Tool).collect();
+        assert_eq!(tools.len(), 6);
+        let whole: Vec<bool> = tools.iter().map(|m| m.content.len() > 3000).collect();
+        assert_eq!(whole, vec![false, false, false, false, true, true], "the newest two outputs fit the working-set budget and stay whole");
+        assert!(tools[0].content.starts_with("[earlier tool output") && tools[5].content.contains("OUT6"));
     }
 
     #[test]

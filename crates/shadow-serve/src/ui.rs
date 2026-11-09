@@ -1203,7 +1203,7 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
     let currentEffort = localStorage.getItem('shadow_effort') || 'medium';
     if (currentEffort === 'high') currentEffort = 'medium'; // the High level was removed from the menu
     let toolsEnabled = localStorage.getItem('shadow_tools_enabled') !== 'false';
-    const DEFAULT_PERSONA = "You are Shadow, a capable AI assistant running locally on the user's Windows PC: nothing you are told leaves this machine. Be direct and accurate, keep answers as short as the question allows, and say so when you are unsure. You can use tools: read_file, glob, grep, edit_file, write_file, cmd (PowerShell), web_search and web_fetch (use these for anything current or that you are not sure of, and cite the page), and any mcp__ tools you are given. When asked to look at, test or change files, use the tools instead of describing what you would do. If the user asks you to take a role for a task (for example 'act as a software engineer and design this'), do that for the task. Your context window is small. Earlier tool outputs are shortened to a preview that says how to read them again (recall with id=N or message=N, optionally a line range or a text to search for), old turns become one-line summaries that name their messages (recall with message=N), and recall with only a text searches everything earlier (search finds files and earlier outputs by meaning, when you do not know the exact words). Keep pinned notes with the notes tool (the plan, the decisions, the facts you will need with file and line numbers): they are shown to you at the end of every request and never shortened. After reading something you will need later, put the facts in your notes, and do not read the same part twice. Work in small steps and finish with an answer.";
+    const DEFAULT_PERSONA = "You are Shadow, a capable AI assistant running locally on the user's Windows PC: nothing you are told leaves this machine. Be direct and accurate, keep answers as short as the question allows, and say so when you are unsure. You can use tools: read_file, glob, grep, edit_file, write_file, cmd (PowerShell), web_search and web_fetch (use these for anything current or that you are not sure of, and cite the page), and any mcp__ tools you are given. When asked to look at, test or change files, use the tools instead of describing what you would do. If the user asks you to take a role for a task (for example 'act as a software engineer and design this'), do that for the task. Your context window is small. Earlier tool outputs are shortened to a preview that says how to read them again (recall with id=N or message=N, optionally a line range or a text to search for), old turns become one-line summaries that name their messages (recall with message=N), and recall with only a text searches everything earlier (search finds files and earlier outputs by meaning, when you do not know the exact words). Keep pinned notes with the notes tool (the plan, the decisions, the facts you will need with file and line numbers): they are shown to you at the end of every request and never shortened. To change code: read just the lines you need with read_file (about 100), then replace them by line number with replace_lines (give expect, a piece of the old text, so a stale number cannot overwrite the wrong lines), or use edit_file with the exact old text. After reading something you will need later, put the facts in your notes, and do not read the same part twice; after about eight reads in a row, stop reading, save your notes and make the edit. Work in small steps and finish with an answer.";
     let currentPersona = localStorage.getItem('shadow_persona') || DEFAULT_PERSONA;
 
     // Elements
@@ -1582,7 +1582,7 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
           const hit = L.map((l, i) => [i + 1, l]).filter(x => x[1].toLowerCase().includes(q)).slice(0, 120).map(x => String(x[0]).padStart(5) + '| ' + x[1]);
           return { name: 'recall', output: `message m${n} (${m.role}), the lines containing "${args.query}" (of ${L.length}):\n${hit.join('\n')}`, is_error: false };
         }
-        const s0 = Math.max(1, Math.min(Number(args.start) || 1, L.length)), e0 = Math.max(s0, Math.min(Number(args.end) || 300, L.length));
+        const s0 = Math.max(1, Math.min(Number(args.start) || 1, L.length)), e0 = Math.max(s0, Math.min(Number(args.end) || s0 + 99, L.length));
         let out = `message m${n} (${m.role}), lines ${s0}-${e0} of ${L.length}:\n` + L.slice(s0 - 1, e0).map((l, i) => String(s0 + i).padStart(5) + '| ' + l).join('\n');
         if (e0 < L.length) out += `\n(more: ask again with start=${e0 + 1})`;
         return { name: 'recall', output: out.length > 12000 ? out.slice(0, 12000) + '\n(clipped: ask for a line range)' : out, is_error: false };
@@ -1944,6 +1944,7 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
       const MAX_SAME_CALLS = 4;
       let lastCallSig = '', sameCalls = 0, stuck = false;
       const callCounts = new Map();   // how often each exact tool call was made in this task
+      let readStreak = 0;             // read-only calls since the last notes / edit
 
       while (true) {
         loopTurns++;
@@ -2160,6 +2161,9 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
               const callKey = tc.name + '|' + JSON.stringify(tc.arguments);
               const timesCalled = (callCounts.get(callKey) || 0) + 1;
               callCounts.set(callKey, timesCalled);
+              readStreak = readOnlyStreak(tc.name, readStreak);
+              const treadmill = treadmillNote(readStreak);
+              if (treadmill) result.output += '\n' + treadmill;
               if (timesCalled >= 2) result.output += `
 (note: this exact call was already made ${timesCalled - 1} time(s) earlier in this task and gives the same result; use the facts you noted, or read a different part.)`;
               if (tc.name.startsWith('memory_')) loadMemory();
@@ -2800,10 +2804,21 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
       let lastNonTool = cloned.length - 1;
       while (lastNonTool > 0 && cloned[lastNonTool].role === 'tool') lastNonTool--;
       let shortenedTools = 0;
+      // the working set: the newest tool outputs stay whole while they fit a budget (30% of the room) - the last step's results always - so that one edit can use more than
+      // the last read (with one output whole, a model that needs two sources recalls the first again and again)
+      const keepWhole = new Set();
+      let wsUsed = 0;
+      for (let i = cloned.length - 1; i >= 0; i--) {
+        if (cloned[i].role !== 'tool') continue;
+        const sz = size(cloned[i]);
+        if (i < lastNonTool && wsUsed + sz > room * 0.3) break;
+        wsUsed += sz;
+        keepWhole.add(i);
+      }
       for (let i = 0; i < lastNonTool; i++) {
         if (total <= room * 0.65) break;
         const m = cloned[i];
-        if (m.role !== 'tool' || typeof m.content !== 'string' || m.content.length < 400) continue;
+        if (m.role !== 'tool' || typeof m.content !== 'string' || m.content.length < 400 || keepWhole.has(i)) continue;
         const was = m.content.length;
         const unwrapped = unwrapToolResponse(m.content);
         const num = /^\(output #(\d+)\)\s*/.exec(unwrapped);   // the server's log of tool outputs: `recall` reads that one again
@@ -2909,6 +2924,19 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
         timingInfo.textContent = `Rolling context active: ${parts.join(', ')} (0 B extra RAM)`;
       }
       return cloned;
+    }
+
+    // ---- the read-only treadmill: a model that has read, lost the text to the shortening, and reads again never reaches an edit (one saved run: 132 calls, 75 recalls, 2 notes, 0 edits)
+    const READ_ONLY_TOOLS = new Set(['read_file', 'grep', 'glob', 'recall', 'search']);
+    const PROGRESS_TOOLS = new Set(['notes', 'edit_file', 'write_file', 'replace_lines']);
+    function readOnlyStreak(name, streak) {
+      if (PROGRESS_TOOLS.has(name)) return 0;
+      return READ_ONLY_TOOLS.has(name) ? streak + 1 : streak;
+    }
+    function treadmillNote(streak) {
+      if (streak === 8) return `(note: ${streak} read-only calls in a row without saving notes or editing. What you have read drops out of view a few steps later: write the facts you need into the notes tool now - file, line numbers, the exact text to change - then make the first edit. Read more only for something you cannot write down yet.)`;
+      if (streak >= 14 && (streak - 14) % 4 === 0) return `(note: ${streak} read-only calls in a row. Stop reading. In your next step write your notes and change something: a first small edit with replace_lines or edit_file is worth more than another read.)`;
+      return '';
     }
 
     // ---- queued messages: typed while a reply is being written, sent in order when it ends (each one needs the one before it answered)

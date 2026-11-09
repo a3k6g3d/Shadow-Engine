@@ -9,8 +9,13 @@ function grab(name) {
   for (; k < ui.length; k++) { if (ui[k] === '{') d++; else if (ui[k] === '}') { d--; if (d === 0) break; } }
   return ui.slice(i, k + 1);
 }
-const names = ['runNotesTool', 'withNotes', 'recallMessages', 'buildContextMessages', 'parseToolCallsFromText', 'stripToolCalls', 'messageText', 'unwrapToolResponse'];
-const src = names.map(grab).join('\n');
+const names = ['readOnlyStreak', 'treadmillNote', 'runNotesTool', 'withNotes', 'recallMessages', 'buildContextMessages', 'parseToolCallsFromText', 'stripToolCalls', 'messageText', 'unwrapToolResponse'];
+function grabConst(name) {
+  const i = ui.indexOf('const ' + name + ' =');
+  if (i < 0) throw new Error('no ' + name);
+  return ui.slice(i, ui.indexOf(';', i) + 1);
+}
+const src = ['READ_ONLY_TOOLS', 'PROGRESS_TOOLS'].map(grabConst).join('\n') + '\n' + names.map(grab).join('\n');
 const factory = new Function('state', `
   const NOTES_MAX = 6000;
   let scratchpad = state.scratchpad;
@@ -19,7 +24,7 @@ const factory = new Function('state', `
   const renderNotes = () => {}, saveCurrent = () => {};
   const timingInfo = { textContent: '' }, document = { getElementById: () => ({}) };
   ${src}
-  return { runNotesTool, withNotes, recallMessages, buildContextMessages, getNotes: () => scratchpad, setNotes: v => { scratchpad = v; } };
+  return { readOnlyStreak, treadmillNote, runNotesTool, withNotes, recallMessages, buildContextMessages, getNotes: () => scratchpad, setNotes: v => { scratchpad = v; } };
 `);
 let fails = 0;
 const ok = (c, m) => { if (!c) { fails++; console.log('FAIL:', m); } else console.log('ok:  ', m); };
@@ -109,5 +114,36 @@ ok(foldedLong.reduce((n, m) => n + sz(m), 0) < room * 0.8, 'the 260-step run fit
 // a short run is left alone
 const small = run.slice(0, 7);
 ok(JSON.stringify(g.buildContextMessages(small)) === JSON.stringify(small), 'a short run is not touched');
+
+// ---- the working set: the newest tool outputs stay whole within a budget, older ones shrink
+const NL2 = String.fromCharCode(10);
+const ws = [{ role: 'user', content: 'Edit the code.' }];
+for (let k = 1; k <= 10; k++) {
+  ws.push({ role: 'assistant', content: ['Step ' + k + '.', '<tool_call>', '<function=read_file>', '<parameter=path>', 'a.rs', '</parameter>', '</function>', '</tool_call>'].join(NL2) });
+  ws.push({ role: 'tool', content: ['<tool_response>', '(output #' + k + ')', 'x'.repeat(4200), '</tool_response>'].join(NL2) });
+}
+const wsOut = factory({ scratchpad: '', history: ws, serverCtx: 14000 }).buildContextMessages(ws);
+const wsTools = wsOut.filter(m => m.role === 'tool');
+const wsWhole = wsTools.map(m => m.content.length > 4000);
+ok(wsWhole.length === 10 && wsWhole[9] && wsWhole[8], 'the newest two tool outputs stay whole (a working set of more than one)');
+ok(!wsWhole[8 - 1] || wsTools.slice(0, 7).some(m => m.content.startsWith('<tool_response>' + NL2 + '[earlier tool output')), 'older outputs shrink to previews');
+ok(wsTools[0].content.includes('[earlier tool output #1 '), 'the oldest output is a preview that names its number');
+const wsBudget = Math.max(6000, (14000 - 3800) * 3) * 0.3;
+ok(wsTools.filter(m => m.content.length > 4000).length * 4300 <= wsBudget + 4300 * 1 + 1, 'the whole outputs fit the budget (the last step always stays)');
+
+// ---- the read-only treadmill: a note after 8 and again from 14, reset by notes or an edit
+const tm = factory({ scratchpad: '', history: [], serverCtx: 25600 });
+let streak = 0;
+const notes = [];
+for (let i = 1; i <= 20; i++) {
+  streak = tm.readOnlyStreak(i % 2 ? 'read_file' : 'recall', streak);
+  const n = tm.treadmillNote(streak);
+  if (n) notes.push([streak, n.slice(0, 40)]);
+}
+ok(streak === 20 && JSON.stringify(notes.map(x => x[0])) === JSON.stringify([8, 14, 18]), 'notes at 8, then 14 and every 4 after: ' + JSON.stringify(notes.map(x => x[0])));
+ok(/read-only calls in a row without saving notes or editing/.test(notes[0][1] + tm.treadmillNote(8)) && /Stop reading/.test(tm.treadmillNote(14)), 'the first note asks for notes and an edit, the second says stop reading');
+ok(tm.readOnlyStreak('notes', 12) === 0 && tm.readOnlyStreak('replace_lines', 12) === 0 && tm.readOnlyStreak('edit_file', 12) === 0, 'notes and edits reset the streak');
+ok(tm.readOnlyStreak('cmd', 5) === 5 && tm.readOnlyStreak('web_fetch', 5) === 5, 'other tools neither add nor reset');
+ok(tm.treadmillNote(7) === '' && tm.treadmillNote(9) === '' && tm.treadmillNote(15) === '', 'no note in between');
 console.log(fails ? `${fails} FAILED` : 'all passed');
 process.exit(fails ? 1 : 0);
