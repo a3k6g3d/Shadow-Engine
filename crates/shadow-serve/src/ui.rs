@@ -2093,8 +2093,19 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
       }
 
       const dt = (performance.now() - t0) / 1000;
+      // the loop ran out of steps while the model was still using tools (the history ends with tool results, no answer): say so instead of ending silently
+      const hitCap = !failed && loopTurns >= MAX_AGENT_TURNS && history.length > 0 && history[history.length - 1].role === 'tool';
+      if (hitCap) {
+        const capRow = document.createElement('div');
+        capRow.className = 'msg-row assistant';
+        capRow.innerHTML = `<div class="avatar">S</div><div class="bubble"><div class="msg-content"><span style="opacity:0.8;">Stopped after ${MAX_AGENT_TURNS} steps (the limit for one message) without a final answer. Send "continue" and I will carry on from here.</span></div></div>`;
+        messagesEl.appendChild(capRow);
+        scrollToBottom(false);
+      }
       if (failed) {
         timingInfo.textContent = 'Failed - nothing was generated';
+      } else if (hitCap) {
+        timingInfo.textContent = `Stopped at the ${MAX_AGENT_TURNS}-step limit after ${dt.toFixed(2)}s`;
       } else if (timingInfo.textContent !== 'Generation stopped by user') {
         timingInfo.textContent = `Completed in ${dt.toFixed(2)}s`;
       }
