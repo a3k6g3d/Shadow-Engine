@@ -115,6 +115,82 @@ const MAX_MCP_OUTPUT_CHARS: usize = 12_000;
 
 /// The model writes every parameter as text (`<parameter=a>17</parameter>`); a tool's schema says which are numbers, booleans, lists or objects.
 /// Text that parses as the declared type becomes that type (the rest is left as it is, for the tool to refuse).
+/// The session's log of tool outputs, on disk: every output of a native tool longer than `LOGGED_MIN` characters is written to `<cache>/s<start time>/<n>.txt` and starts with
+/// `(output #n)`, so that when the conversation shortens it to a preview (the window is small) the model can read it again with `recall` instead of calling the tool again -
+/// or not being able to (docs/STATUS.md 76).  A session is a server run; the newest `KEEP_SESSIONS` are kept.
+mod toollog {
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::OnceLock;
+
+    pub const LOGGED_MIN: usize = 280;
+    const KEEP_SESSIONS: usize = 6;
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    static DIR: OnceLock<PathBuf> = OnceLock::new();
+
+    fn root() -> PathBuf {
+        if let Some(d) = std::env::var_os("SHADOW_TOOL_LOG_DIR") {
+            return PathBuf::from(d);
+        }
+        if cfg!(test) {
+            return std::env::temp_dir().join(format!("shadow-toollog-test-{}", std::process::id()));
+        }
+        std::env::var_os("LOCALAPPDATA").map_or_else(|| std::env::temp_dir().join("shadow-toolcache"), |a| PathBuf::from(a).join("Shadow").join("toolcache"))
+    }
+
+    fn dir() -> &'static PathBuf {
+        DIR.get_or_init(|| {
+            let r = root();
+            let _ = std::fs::create_dir_all(&r);
+            // older sessions go (only folders this module made: s<digits>)
+            let mut old: Vec<(u64, PathBuf)> = std::fs::read_dir(&r).into_iter().flatten().flatten()
+                .filter_map(|e| {
+                    let n = e.file_name().to_string_lossy().to_string();
+                    n.strip_prefix('s').and_then(|d| d.parse::<u64>().ok()).filter(|_| e.path().is_dir()).map(|t| (t, e.path()))
+                }).collect();
+            old.sort();
+            while old.len() >= KEEP_SESSIONS {
+                let _ = std::fs::remove_dir_all(old.remove(0).1);
+            }
+            let t = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
+            let d = r.join(format!("s{t}"));
+            let _ = std::fs::create_dir_all(&d);
+            d
+        })
+    }
+
+    /// Writes one output to the log; its number.
+    pub fn save(text: &str) -> Option<u64> {
+        let id = NEXT.fetch_add(1, Ordering::Relaxed);
+        std::fs::write(dir().join(format!("{id}.txt")), text).ok().map(|_| id)
+    }
+
+    pub fn load(id: u64) -> Option<String> {
+        std::fs::read_to_string(dir().join(format!("{id}.txt"))).ok()
+    }
+
+    /// Lines containing `query` (any case) in every logged output: (output number, line number, line), at most `max`.
+    pub fn search(query: &str, max: usize) -> Vec<(u64, usize, String)> {
+        let q = query.to_lowercase();
+        let mut ids: Vec<u64> = std::fs::read_dir(dir()).into_iter().flatten().flatten()
+            .filter_map(|e| e.file_name().to_string_lossy().strip_suffix(".txt").and_then(|n| n.parse().ok())).collect();
+        ids.sort_unstable();
+        let mut out = vec![];
+        for id in ids {
+            let Some(text) = load(id) else { continue };
+            for (i, l) in text.lines().enumerate() {
+                if l.to_lowercase().contains(&q) {
+                    out.push((id, i + 1, l.chars().take(200).collect()));
+                    if out.len() >= max {
+                        return out;
+                    }
+                }
+            }
+        }
+        out
+    }
+}
+
 /// The properties of one of the native tools' schemas (empty for a tool that is not one of them).
 fn tool_props(name: &str) -> serde_json::Map<String, Value> {
     let defs = tool_definitions();
@@ -130,6 +206,8 @@ const ARGUMENT_ALIASES: &[(&str, &str, &str)] = &[
     ("read_file", "file_path", "path"), ("read_file", "filepath", "path"), ("read_file", "file", "path"),
     ("edit_file", "file_path", "path"), ("edit_file", "filepath", "path"), ("edit_file", "file", "path"),
     ("write_file", "file_path", "path"), ("write_file", "filepath", "path"), ("write_file", "file", "path"),
+    ("recall", "output", "id"), ("recall", "output_id", "id"), ("recall", "number", "id"), ("recall", "n", "id"),
+    ("recall", "text", "query"), ("recall", "search", "query"), ("recall", "start_line", "start"), ("recall", "end_line", "end"),
 ];
 
 pub fn coerce_arguments(name: &str, arguments: &Value) -> Value {
@@ -162,6 +240,12 @@ pub fn coerce_arguments(name: &str, arguments: &Value) -> Value {
 
 pub fn execute_tool(inv: &ToolInvocation) -> ToolResult {
     let mut r = execute_tool_inner(inv);
+    // a long output goes to the session's log and says its number (`recall` reads it again once the conversation has shortened it)
+    if !r.is_error && inv.name != "recall" && r.output.chars().count() > toollog::LOGGED_MIN {
+        if let Some(id) = toollog::save(&r.output) {
+            r.output = format!("(output #{id})\n{}", r.output);
+        }
+    }
     // an argument the tool does not have is ignored: say so, or the model goes on calling with a name that does nothing
     let props = tool_props(&inv.name);
     if let (false, Some(obj)) = (props.is_empty(), coerce_arguments(&inv.name, &inv.arguments).as_object()) {
@@ -248,6 +332,49 @@ fn execute_tool_inner(inv: &ToolInvocation) -> ToolResult {
                 }
                 Err(e) => ToolResult { name: inv.name.clone(), output: format!("error reading file: {e}"), is_error: true, images: vec![] },
             }
+        }
+
+        "recall" => {
+            let id = inv.arguments.get("id").and_then(Value::as_u64);
+            let query = inv.arguments.get("query").and_then(Value::as_str).unwrap_or("").trim().to_string();
+            let start = inv.arguments.get("start").and_then(Value::as_u64).unwrap_or(1) as usize;
+            let end = inv.arguments.get("end").and_then(Value::as_u64).unwrap_or(300) as usize;
+            let out = match (id, query.is_empty()) {
+                (None, true) => return ToolResult { name: inv.name.clone(), output: "error: give the output's number (id), a text to search for (query), or both".into(), is_error: true, images: vec![] },
+                (None, false) => {
+                    let hits = toollog::search(&query, 60);
+                    if hits.is_empty() {
+                        format!("no line of an earlier output of this session contains \"{query}\"")
+                    } else {
+                        hits.iter().map(|(n, l, t)| format!("#{n}:{l}| {t}")).collect::<Vec<_>>().join("\n") + "\n(read one with recall id=N, start=, end=)"
+                    }
+                }
+                (Some(n), _) => match toollog::load(n) {
+                    None => return ToolResult { name: inv.name.clone(), output: format!("error: no output #{n} in this session's log (it holds the outputs since the server started)"), is_error: true, images: vec![] },
+                    Some(text) => {
+                        let body = text.strip_prefix(&format!("(output #{n})\n")).unwrap_or(&text);
+                        let lines: Vec<&str> = body.lines().collect();
+                        let total = lines.len();
+                        if !query.is_empty() {
+                            let q = query.to_lowercase();
+                            let hits: Vec<String> = lines.iter().enumerate().filter(|(_, l)| l.to_lowercase().contains(&q)).take(120).map(|(i, l)| format!("{:>5}| {l}", i + 1)).collect();
+                            format!("output #{n}, the lines containing \"{query}\" (of {total}):\n{}", hits.join("\n"))
+                        } else {
+                            let s_idx = start.max(1).min(total.max(1));
+                            let e_idx = end.min(total).max(s_idx);
+                            let mut o = format!("output #{n}, lines {s_idx}-{e_idx} of {total}:\n");
+                            for i in s_idx..=e_idx.min(total) {
+                                o.push_str(&format!("{:>5}| {}\n", i, lines[i - 1]));
+                            }
+                            if e_idx < total {
+                                o.push_str(&format!("(more: ask again with start={})\n", e_idx + 1));
+                            }
+                            o
+                        }
+                    }
+                },
+            };
+            ToolResult { name: inv.name.clone(), output: tail_clip(out), is_error: false, images: vec![] }
         }
 
         "glob" => {
@@ -528,6 +655,19 @@ fn builtin_tool_definitions() -> Value {
             }
         },
         {
+            "name": "recall",
+            "description": "Read again an earlier tool output of this conversation (the conversation shortens old outputs to a preview that names their number): by its number, optionally a line range or only the lines containing a text; with only a text, search every earlier output.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "id": { "type": "integer", "description": "The output's number, as in '(output #12)' or 'earlier tool output #12'" },
+                    "start": { "type": "integer", "description": "First line to show (1-indexed)" },
+                    "end": { "type": "integer", "description": "Last line to show (inclusive)" },
+                    "query": { "type": "string", "description": "Show only the lines containing this text (in one output with id, in all of them without)" }
+                }
+            }
+        },
+        {
             "name": "glob",
             "description": "Find files matching pattern under a folder on Windows.",
             "input_schema": {
@@ -606,6 +746,35 @@ mod tests {
         assert_eq!(a["path"], json!("C:\\x.txt"));
         assert_eq!(coerce_arguments("read_file", &json!({"start": "abc"}))["start"], json!("abc"));
         assert_eq!(coerce_arguments("nope", &json!({"a": "1"}))["a"], json!("1"));
+    }
+
+    #[test]
+    fn long_outputs_are_logged_and_recall_reads_them_again() {
+        let dir = std::env::temp_dir().join(format!("shadow_recall_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("big.txt");
+        let text: String = (1..=120).map(|i| format!("line number {i} of the file with some padding text\n")).collect();
+        std::fs::write(&f, &text).unwrap();
+        let r = execute_tool(&ToolInvocation { name: "read_file".into(), arguments: json!({"path": f.to_str().unwrap(), "start": 1, "end": 120}) });
+        let id: u64 = r.output.strip_prefix("(output #").and_then(|t| t.split(')').next()).and_then(|n| n.parse().ok()).expect("a long output names its number");
+        // a short output is not logged
+        let short = execute_tool(&ToolInvocation { name: "cmd".into(), arguments: json!({"command": "echo hi"}) });
+        assert!(!short.output.starts_with("(output #"), "{}", short.output);
+        // recall by number and line range
+        let a = execute_tool(&ToolInvocation { name: "recall".into(), arguments: json!({"id": id, "start_line": 40, "end_line": 42}) });
+        assert!(a.output.contains("lines 40-42 of") && a.output.contains("line number 40 of") && a.output.contains("line number 42 of") && !a.output.contains("line number 43 "), "{}", a.output);
+        assert!(!a.output.contains("ignored unknown"), "{}", a.output);
+        // only the lines with a text, in one output and across all of them
+        let b = execute_tool(&ToolInvocation { name: "recall".into(), arguments: json!({"id": id, "query": "NUMBER 77 "}) });
+        assert!(b.output.contains("line number 77 of") && !b.output.contains("line number 78"), "{}", b.output);
+        let c = execute_tool(&ToolInvocation { name: "recall".into(), arguments: json!({"query": "number 99 of"}) });
+        assert!(c.output.contains(&format!("#{id}:99|")), "{}", c.output);
+        // an output that is not there, and a call with nothing to go on
+        let d = execute_tool(&ToolInvocation { name: "recall".into(), arguments: json!({"id": 999_999}) });
+        assert!(d.is_error && d.output.contains("no output #999999"), "{}", d.output);
+        assert!(execute_tool(&ToolInvocation { name: "recall".into(), arguments: json!({}) }).is_error);
+        let _ = std::fs::remove_file(&f);
+        let _ = std::fs::remove_dir(&dir);
     }
 
     #[test]

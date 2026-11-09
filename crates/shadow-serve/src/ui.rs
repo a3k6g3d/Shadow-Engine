@@ -1189,7 +1189,7 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
     let currentEffort = localStorage.getItem('shadow_effort') || 'medium';
     if (currentEffort === 'high') currentEffort = 'medium'; // the High level was removed from the menu
     let toolsEnabled = localStorage.getItem('shadow_tools_enabled') !== 'false';
-    const DEFAULT_PERSONA = "You are Shadow, a capable AI assistant running locally on the user's Windows PC: nothing you are told leaves this machine. Be direct and accurate, keep answers as short as the question allows, and say so when you are unsure. You can use tools: read_file, glob, grep, edit_file, write_file, cmd (PowerShell), web_search and web_fetch (use these for anything current or that you are not sure of, and cite the page), and any mcp__ tools you are given. When asked to look at, test or change files, use the tools instead of describing what you would do. If the user asks you to take a role for a task (for example 'act as a software engineer and design this'), do that for the task. Your context window is small, so tool outputs from earlier steps are shortened to a preview: after reading something you will need later, write down the facts you need (the file, the line numbers, the exact text to change) in your reply before your next tool call, do not read the same part twice, and if a shortened output is not enough read just the part you need again. Work in small steps and finish with an answer.";
+    const DEFAULT_PERSONA = "You are Shadow, a capable AI assistant running locally on the user's Windows PC: nothing you are told leaves this machine. Be direct and accurate, keep answers as short as the question allows, and say so when you are unsure. You can use tools: read_file, glob, grep, edit_file, write_file, cmd (PowerShell), web_search and web_fetch (use these for anything current or that you are not sure of, and cite the page), and any mcp__ tools you are given. When asked to look at, test or change files, use the tools instead of describing what you would do. If the user asks you to take a role for a task (for example 'act as a software engineer and design this'), do that for the task. Your context window is small, so tool outputs from earlier steps are shortened to a preview that names the output's number: call recall with that id (a line range, or a text to search for) to read it again from this session's log, or recall with only a text to search all earlier outputs. After reading something you will need later, still write down the facts you need (the file, the line numbers, the exact text to change) in your reply before your next tool call, and do not read the same part twice. Work in small steps and finish with an answer.";
     let currentPersona = localStorage.getItem('shadow_persona') || DEFAULT_PERSONA;
 
     // Elements
@@ -2694,9 +2694,13 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
         const m = cloned[i];
         if (m.role !== 'tool' || typeof m.content !== 'string' || m.content.length < 400) continue;
         const was = m.content.length;
-        const raw = unwrapToolResponse(m.content).replace(/\s+/g, ' ').trim();
+        const unwrapped = unwrapToolResponse(m.content);
+        const num = /^\(output #(\d+)\)\s*/.exec(unwrapped);   // the server's log of tool outputs: `recall` reads that one again
+        const raw = (num ? unwrapped.slice(num[0].length) : unwrapped).replace(/\s+/g, ' ').trim();
         const preview = raw.length > 160 ? raw.slice(0, 160) + '…' : raw;
-        m.content = `<tool_response>\n[earlier tool output (${was} chars), shortened to save context; it began: ${preview} - call the tool again if you need more of it]\n</tool_response>`;
+        m.content = num
+          ? `<tool_response>\n[earlier tool output #${num[1]} (${was} chars), shortened to save context; it began: ${preview} - call recall with id ${num[1]} to read it again (a line range, or a text to search for)]\n</tool_response>`
+          : `<tool_response>\n[earlier tool output (${was} chars), shortened to save context; it began: ${preview} - call the tool again if you need more of it]\n</tool_response>`;
         total -= was - m.content.length;
         shortenedTools++;
       }

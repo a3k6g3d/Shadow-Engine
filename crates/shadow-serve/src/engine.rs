@@ -500,6 +500,22 @@ fn middle_truncate(s: &str, max_chars: usize) -> String {
 }
 
 /// Clean assistant prose for rolling conversation summary (strips `<tool_call>` blocks and `<think>` tags).
+/// What an older tool output becomes when the window is short: where it began, and how to get it back.  An output the session's log holds (it starts `(output #12)`)
+/// is read again with `recall`; one without a number (an older chat, an MCP tool) by calling the tool again.
+fn shortened_tool_output(clean: &str) -> String {
+    let numbered = clean.strip_prefix("(output #").and_then(|r| r.split_once(')')).filter(|(n, _)| !n.is_empty() && n.chars().all(|c| c.is_ascii_digit()));
+    match numbered {
+        Some((n, tail)) => {
+            let preview = summarize_turn_text(tail.trim_start(), 160);
+            format!("[earlier tool output #{n} ({} chars), shortened to save context; it began: {preview} - call recall with id {n} to read it again (a line range, or a text to search for)]", clean.len())
+        }
+        None => {
+            let preview = summarize_turn_text(clean, 160);
+            format!("[earlier tool output ({} chars), shortened to save context; it began: {preview} - call the tool again if you need more of it]", clean.len())
+        }
+    }
+}
+
 fn summarize_turn_text(s: &str, max_chars: usize) -> String {
     let mut clean = s.to_string();
     while let Some(start) = clean.find("<tool_call>") {
@@ -567,8 +583,7 @@ fn fit_context(arch: &str, messages: &[Message], opts: &Options, images: &[Vec<u
                 .strip_suffix("</tool_response>")
                 .unwrap_or(&m.content)
                 .trim();
-            let preview = summarize_turn_text(clean, 160);
-            m.content = format!("[earlier tool output ({} chars), shortened to save context; it began: {preview} - call the tool again if you need more of it]", clean.len());
+            m.content = shortened_tool_output(clean);
             changed = true;
         }
     }
@@ -659,8 +674,7 @@ fn fit_context(arch: &str, messages: &[Message], opts: &Options, images: &[Vec<u
                 .strip_prefix("<tool_response>").unwrap_or(&msgs[idx].content)
                 .strip_suffix("</tool_response>").unwrap_or(&msgs[idx].content)
                 .trim().to_string();
-            let preview = summarize_turn_text(&clean, 160);
-            msgs[idx].content = format!("[earlier tool output ({} chars), shortened to save context; it began: {preview} - call the tool again if you need more of it]", clean.len());
+            msgs[idx].content = shortened_tool_output(&clean);
             compacted_turns = compacted_turns.max(1);
             if encode_len(&msgs, &imgs)? <= target_prompt {
                 break;
@@ -1189,6 +1203,16 @@ mod tests {
         assert_eq!(fit_msgs.last().unwrap().content, "What did we find in the latest turns?");
         let final_rendered = render_for_arch("qwen35", &fit_msgs, &opts).unwrap();
         assert!(final_rendered.len() / 3 + 512 <= cap, "expected compacted prompt to fit comfortably within cap");
+    }
+
+    #[test]
+    fn a_shortened_tool_output_names_its_number_for_recall() {
+        let a = shortened_tool_output("(output #12)\nline one of the file\nline two");
+        assert!(a.starts_with("[earlier tool output #12 (") && a.contains("it began: line one of the file") && a.contains("recall with id 12") && !a.contains("(output #12)"), "{a}");
+        let b = shortened_tool_output("plain output with no number");
+        assert!(b.starts_with("[earlier tool output (") && b.contains("call the tool again"), "{b}");
+        // not a number: left as it is
+        assert!(shortened_tool_output("(output #x)\nabc").contains("call the tool again"));
     }
 
     #[test]
