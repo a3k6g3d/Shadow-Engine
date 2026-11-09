@@ -10,6 +10,7 @@ pub mod engine;
 pub mod mcp;
 pub mod memory;
 pub mod orchestrator;
+pub mod semsearch;
 pub mod telemetry;
 pub mod ui;
 pub mod webtools;

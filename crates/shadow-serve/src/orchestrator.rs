@@ -169,6 +169,14 @@ mod toollog {
         std::fs::read_to_string(dir().join(format!("{id}.txt"))).ok()
     }
 
+    /// The numbers of the logged outputs, in order.
+    pub fn ids() -> Vec<u64> {
+        let mut ids: Vec<u64> = std::fs::read_dir(dir()).into_iter().flatten().flatten()
+            .filter_map(|e| e.file_name().to_string_lossy().strip_suffix(".txt").and_then(|n| n.parse().ok())).collect();
+        ids.sort_unstable();
+        ids
+    }
+
     /// Lines containing `query` (any case) in every logged output: (output number, line number, line), at most `max`.
     pub fn search(query: &str, max: usize) -> Vec<(u64, usize, String)> {
         let q = query.to_lowercase();
@@ -208,6 +216,8 @@ const ARGUMENT_ALIASES: &[(&str, &str, &str)] = &[
     ("write_file", "file_path", "path"), ("write_file", "filepath", "path"), ("write_file", "file", "path"),
     ("recall", "output", "id"), ("recall", "output_id", "id"), ("recall", "number", "id"), ("recall", "n", "id"),
     ("recall", "text", "query"), ("recall", "search", "query"), ("recall", "start_line", "start"), ("recall", "end_line", "end"),
+    ("search", "q", "query"), ("search", "text", "query"), ("search", "question", "query"), ("search", "limit", "max_results"), ("search", "k", "max_results"),
+    ("search", "folder", "path"), ("search", "directory", "path"),
 ];
 
 pub fn coerce_arguments(name: &str, arguments: &Value) -> Value {
@@ -241,7 +251,7 @@ pub fn coerce_arguments(name: &str, arguments: &Value) -> Value {
 pub fn execute_tool(inv: &ToolInvocation) -> ToolResult {
     let mut r = execute_tool_inner(inv);
     // a long output goes to the session's log and says its number (`recall` reads it again once the conversation has shortened it)
-    if !r.is_error && inv.name != "recall" && r.output.chars().count() > toollog::LOGGED_MIN {
+    if !r.is_error && inv.name != "recall" && inv.name != "search" && r.output.chars().count() > toollog::LOGGED_MIN {
         if let Some(id) = toollog::save(&r.output) {
             r.output = format!("(output #{id})\n{}", r.output);
         }
@@ -376,6 +386,11 @@ fn execute_tool_inner(inv: &ToolInvocation) -> ToolResult {
             };
             ToolResult { name: inv.name.clone(), output: tail_clip(out), is_error: false, images: vec![] }
         }
+
+        "search" => match crate::semsearch::tool(&inv.arguments, &toollog::ids(), &toollog::load) {
+            Ok(s) => ToolResult { name: inv.name.clone(), output: tail_clip(s), is_error: false, images: vec![] },
+            Err(e) => ToolResult { name: inv.name.clone(), output: format!("error: {e}"), is_error: true, images: vec![] },
+        },
 
         "glob" => {
             let pattern = inv.arguments.get("pattern").and_then(Value::as_str).unwrap_or("*");
@@ -666,6 +681,19 @@ fn builtin_tool_definitions() -> Value {
                     "end": { "type": "integer", "description": "Last line to show (inclusive)" },
                     "query": { "type": "string", "description": "Show only the lines containing this text (in one output with id, in all of them without)" }
                 }
+            }
+        },
+        {
+            "name": "search",
+            "description": "Search the project's files and this session's earlier tool outputs by MEANING, not by exact text (use grep for exact text): describe what you are looking for in a sentence. Returns the best matching pieces with file, line and a score. The index is built in the background the first time and kept on disk.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "query": { "type": "string", "description": "What you are looking for, in words" },
+                    "max_results": { "type": "integer", "description": "How many pieces to return (default 6, at most 15)" },
+                    "path": { "type": "string", "description": "Only under this folder or file (relative to the working folder)" }
+                },
+                "required": ["query"]
             }
         },
         {
