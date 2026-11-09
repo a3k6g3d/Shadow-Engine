@@ -656,11 +656,12 @@ fn builtin_tool_definitions() -> Value {
         },
         {
             "name": "recall",
-            "description": "Read again an earlier tool output of this conversation (the conversation shortens old outputs to a preview that names their number): by its number, optionally a line range or only the lines containing a text; with only a text, search every earlier output.",
+            "description": "Read again something earlier in this conversation that was shortened: a tool output by its number (id) or any message by its number (message), optionally a line range or only the lines containing a text; with only a text, search every earlier message and tool output.",
             "input_schema": {
                 "type": "object",
                 "properties": {
                     "id": { "type": "integer", "description": "The output's number, as in '(output #12)' or 'earlier tool output #12'" },
+                    "message": { "type": "integer", "description": "The number of an earlier message of the conversation, as in 'messages m3-m9' of a summary or 'recall with message 14'" },
                     "start": { "type": "integer", "description": "First line to show (1-indexed)" },
                     "end": { "type": "integer", "description": "Last line to show (inclusive)" },
                     "query": { "type": "string", "description": "Show only the lines containing this text (in one output with id, in all of them without)" }

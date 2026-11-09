@@ -225,6 +225,10 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
     /* Queued messages */
     #queue-bar { max-width: 880px; width: 100%; margin: 0 auto 0.5rem; display: flex; flex-direction: column; gap: 0.3rem; }
     #queue-bar:empty { display: none; }
+    #notes-box { max-width: 880px; width: 100%; margin: 0 auto 0.5rem; display: none; }
+    #notes-box.open { display: block; }
+    #notes-text { width: 100%; box-sizing: border-box; min-height: 5rem; max-height: 14rem; resize: vertical; background: var(--surface-hover); color: var(--text); border: 1px solid var(--border); border-radius: 0.6rem; padding: 0.5rem 0.7rem; font: inherit; font-size: 0.82rem; }
+    #notes-hint { font-size: 0.74rem; color: var(--text-muted); margin: 0.15rem 0.2rem 0; }
     .q-item { display: flex; align-items: center; gap: 0.6rem; background: var(--surface-hover); border: 1px dashed var(--border); border-radius: 0.6rem; padding: 0.35rem 0.7rem; font-size: 0.82rem; color: var(--text-muted); }
     .q-item .n { color: var(--accent); font-weight: 700; }
     .q-item .t { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text); }
@@ -1070,6 +1074,10 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
       </div>
 
       <div id="input-pane">
+        <div id="notes-box">
+          <textarea id="notes-text" placeholder="Pinned notes for this chat: the plan, decisions, key facts. Shadow sees them at the end of every request and can change them with its notes tool."></textarea>
+          <div id="notes-hint"></div>
+        </div>
         <div id="queue-bar"></div>
         <div id="attach-tray"></div>
         <div class="input-box">
@@ -1145,6 +1153,12 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
               <span id="tools-btn-label">Windows Tools: ON</span>
             </button>
 
+            <!-- Pinned notes -->
+            <button class="menu-pill-btn" id="notes-toggle-btn" onclick="toggleNotes()" title="Pinned notes for this chat: shown to Shadow at the end of every request, never shortened">
+              <span>📝</span>
+              <span id="notes-btn-label">Notes</span>
+            </button>
+
           </div>
 
           <span id="timing-info">Ready</span>
@@ -1189,7 +1203,7 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
     let currentEffort = localStorage.getItem('shadow_effort') || 'medium';
     if (currentEffort === 'high') currentEffort = 'medium'; // the High level was removed from the menu
     let toolsEnabled = localStorage.getItem('shadow_tools_enabled') !== 'false';
-    const DEFAULT_PERSONA = "You are Shadow, a capable AI assistant running locally on the user's Windows PC: nothing you are told leaves this machine. Be direct and accurate, keep answers as short as the question allows, and say so when you are unsure. You can use tools: read_file, glob, grep, edit_file, write_file, cmd (PowerShell), web_search and web_fetch (use these for anything current or that you are not sure of, and cite the page), and any mcp__ tools you are given. When asked to look at, test or change files, use the tools instead of describing what you would do. If the user asks you to take a role for a task (for example 'act as a software engineer and design this'), do that for the task. Your context window is small, so tool outputs from earlier steps are shortened to a preview that names the output's number: call recall with that id (a line range, or a text to search for) to read it again from this session's log, or recall with only a text to search all earlier outputs. After reading something you will need later, still write down the facts you need (the file, the line numbers, the exact text to change) in your reply before your next tool call, and do not read the same part twice. Work in small steps and finish with an answer.";
+    const DEFAULT_PERSONA = "You are Shadow, a capable AI assistant running locally on the user's Windows PC: nothing you are told leaves this machine. Be direct and accurate, keep answers as short as the question allows, and say so when you are unsure. You can use tools: read_file, glob, grep, edit_file, write_file, cmd (PowerShell), web_search and web_fetch (use these for anything current or that you are not sure of, and cite the page), and any mcp__ tools you are given. When asked to look at, test or change files, use the tools instead of describing what you would do. If the user asks you to take a role for a task (for example 'act as a software engineer and design this'), do that for the task. Your context window is small. Earlier tool outputs are shortened to a preview that says how to read them again (recall with id=N or message=N, optionally a line range or a text to search for), old turns become one-line summaries that name their messages (recall with message=N), and recall with only a text searches everything earlier. Keep pinned notes with the notes tool (the plan, the decisions, the facts you will need with file and line numbers): they are shown to you at the end of every request and never shortened. After reading something you will need later, put the facts in your notes, and do not read the same part twice. Work in small steps and finish with an answer.";
     let currentPersona = localStorage.getItem('shadow_persona') || DEFAULT_PERSONA;
 
     // Elements
@@ -1270,12 +1284,61 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
       }
     });
 
+    // ---- Pinned notes (a scratchpad that survives the shortening of a long run): kept with the chat, shown to the model at the END of every request (the start of the prompt
+    // stays the same, so the server's cached prompt is reused), changed by the model with the `notes` tool or by the user in the box above the input.
+    const NOTES_MAX = 6000;
+    let scratchpad = '';
+    const NOTES_TOOL = {
+      name: 'notes',
+      description: 'Your pinned notes for this task: they are shown to you at the end of every request and are never shortened, unlike earlier tool outputs. Keep the plan, the decisions and the facts you will need (file, line numbers, exact text to change). With text they are replaced, with append a line is added, with neither they are returned. At most ' + NOTES_MAX + ' characters.',
+      input_schema: { type: 'object', properties: {
+        text: { type: 'string', description: 'The new notes in full (replaces the old ones)' },
+        append: { type: 'string', description: 'Text to add at the end of the notes' } } }
+    };
+    function renderNotes() {
+      const t = document.getElementById('notes-text');
+      if (document.activeElement !== t) t.value = scratchpad;
+      document.getElementById('notes-btn-label').textContent = scratchpad ? `Notes (${scratchpad.length})` : 'Notes';
+      document.getElementById('notes-hint').textContent = `${scratchpad.length} of ${NOTES_MAX} characters`;
+    }
+    function toggleNotes() { document.getElementById('notes-box').classList.toggle('open'); renderNotes(); }
+    document.getElementById('notes-text').addEventListener('input', e => { scratchpad = e.target.value.slice(0, NOTES_MAX); renderNotes(); saveCurrent(); });
+    function runNotesTool(args) {
+      const a = args || {};
+      let next = scratchpad;
+      if (typeof a.text === 'string') next = a.text;
+      else if (typeof a.append === 'string' && a.append.trim()) next = scratchpad ? scratchpad.replace(/\s+$/, '') + '\n' + a.append : a.append;
+      else return { name: 'notes', output: scratchpad ? `Your notes (${scratchpad.length} characters):\n${scratchpad}` : 'Your notes are empty.', is_error: false };
+      if (next.length > NOTES_MAX) return { name: 'notes', output: `error: the notes would be ${next.length} characters, the limit is ${NOTES_MAX}: shorten them (keep the facts you still need) and send them again with text`, is_error: true };
+      scratchpad = next;
+      renderNotes();
+      saveCurrent();
+      return { name: 'notes', output: `Notes saved (${scratchpad.length} of ${NOTES_MAX} characters).`, is_error: false };
+    }
+    // the notes at the end of the last message (inside the tool response when it is one): only the tail of the prompt changes when the notes do
+    function withNotes(msgs) {
+      if (!scratchpad.trim() || !msgs.length) return msgs;
+      const block = `\n\n[Your notes so far - pinned, never shortened; change them with the notes tool]\n${scratchpad}`;
+      const last = msgs[msgs.length - 1];
+      let c = last.content;
+      if (typeof c === 'string') {
+        const close = '\n</tool_response>';
+        c = last.role === 'tool' && c.endsWith(close) ? c.slice(0, -close.length) + block + close : c + block;
+      } else if (Array.isArray(c)) {
+        const parts = c.map(p => ({ ...p }));
+        const ti = parts.map(p => p.type).lastIndexOf('text');
+        if (ti >= 0) parts[ti].text += block; else parts.push({ type: 'text', text: block.trim() });
+        c = parts;
+      }
+      return [...msgs.slice(0, -1), { ...last, content: c }];
+    }
+
     // Load tool schemas from server
     async function loadTools() {
       try {
         const res = await fetch('/v1/tools');
         if (res.ok) {
-          availableTools = await res.json();
+          availableTools = (await res.json()).concat([NOTES_TOOL]);
         }
       } catch (_) {}
     }
@@ -1501,7 +1564,50 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
     }
 
     // Execute tool on Windows via /v1/tools/execute
+    // `recall` of an earlier MESSAGE (the page holds every message in full; the server only the tool outputs): read it again, or search all messages
+    function recallMessages(args) {
+      const lines = t => String(t).split(/\r?\n/);
+      const body = m => {
+        let t = messageText(m);
+        if (m.role === 'tool') t = unwrapToolResponse(t).replace(/^\(output #\d+\)\s*/, '');
+        return t;
+      };
+      if (args.message !== undefined && args.message !== null && args.message !== '') {
+        const n = Number(String(args.message).replace(/^m/i, ''));
+        const m = Number.isInteger(n) ? history[n] : undefined;
+        if (!m) return { name: 'recall', output: `error: no message m${args.message} in this conversation (it has m0 to m${history.length - 1})`, is_error: true };
+        const L = lines(body(m));
+        const q = (args.query || '').toString().trim().toLowerCase();
+        if (q) {
+          const hit = L.map((l, i) => [i + 1, l]).filter(x => x[1].toLowerCase().includes(q)).slice(0, 120).map(x => String(x[0]).padStart(5) + '| ' + x[1]);
+          return { name: 'recall', output: `message m${n} (${m.role}), the lines containing "${args.query}" (of ${L.length}):\n${hit.join('\n')}`, is_error: false };
+        }
+        const s0 = Math.max(1, Math.min(Number(args.start) || 1, L.length)), e0 = Math.max(s0, Math.min(Number(args.end) || 300, L.length));
+        let out = `message m${n} (${m.role}), lines ${s0}-${e0} of ${L.length}:\n` + L.slice(s0 - 1, e0).map((l, i) => String(s0 + i).padStart(5) + '| ' + l).join('\n');
+        if (e0 < L.length) out += `\n(more: ask again with start=${e0 + 1})`;
+        return { name: 'recall', output: out.length > 12000 ? out.slice(0, 12000) + '\n(clipped: ask for a line range)' : out, is_error: false };
+      }
+      const q = String(args.query || '').trim().toLowerCase();
+      const hits = [];
+      history.forEach((m, i) => { lines(body(m)).forEach((l, j) => { if (hits.length < 40 && l.toLowerCase().includes(q)) hits.push(`m${i}:${j + 1}| ${l.slice(0, 200)}`); }); });
+      return { name: 'recall', output: hits.length ? hits.join('\n') + '\n(read one with recall message=N, start=, end=)' : '', is_error: false, hits: hits.length };
+    }
     async function executeLocalTool(name, args) {
+      if (name === 'notes') return runNotesTool(args);
+      if (name === 'recall' && args && typeof args === 'object') {
+        const noId = args.id === undefined || args.id === null || args.id === '';
+        if (args.message !== undefined && args.message !== null && args.message !== '') return recallMessages(args);
+        if (noId && String(args.query || '').trim()) {
+          // a text alone: the messages here, and the tool outputs of the session's log on the server
+          const mine = recallMessages(args);
+          const theirs = await executeLocalToolRemote(name, args);
+          const parts = [mine.output && 'In the conversation:\n' + mine.output, theirs.output && !theirs.is_error && 'In earlier tool outputs:\n' + theirs.output].filter(Boolean);
+          return { name, output: parts.length ? parts.join('\n\n') : `nothing earlier contains "${args.query}"`, is_error: false };
+        }
+      }
+      return executeLocalToolRemote(name, args);
+    }
+    async function executeLocalToolRemote(name, args) {
       try {
         const res = await fetch('/v1/tools/execute', {
           method: 'POST',
@@ -1771,6 +1877,8 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
       renderQueue();
       renderChatList();
       history.length = 0;
+      scratchpad = '';
+      renderNotes();
       attachments.length = 0;
       renderTray();
       messagesEl.innerHTML = welcomeHTML;
@@ -1882,7 +1990,7 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
         const payloadMessages = [];
         const sys = systemPrompt();
         if (sys) payloadMessages.push({ role: 'system', content: sys });
-        payloadMessages.push(...buildContextMessages(history));
+        payloadMessages.push(...withNotes(buildContextMessages(history)));
 
         const requestBody = {
           messages: payloadMessages,
@@ -2244,6 +2352,7 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
       let c = chats.find(x => x.id === currentChatId);
       if (!c) { c = { id: 'c' + Date.now().toString(36), title: '', ts: 0, history: [] }; chats.push(c); currentChatId = c.id; }
       c.history = JSON.parse(JSON.stringify(history));
+      c.notes = scratchpad;
       c.ts = Date.now();
       c.title = chatTitle(c.history);
       persistChats();
@@ -2329,6 +2438,8 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
       frozenMemory = null;
       history.length = 0;
       history.push(...JSON.parse(JSON.stringify(c.history)));
+      scratchpad = c.notes || '';
+      renderNotes();
       attachments.length = 0;
       renderTray();
       messagesEl.innerHTML = '';
@@ -2700,7 +2811,7 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
         const preview = raw.length > 160 ? raw.slice(0, 160) + '…' : raw;
         m.content = num
           ? `<tool_response>\n[earlier tool output #${num[1]} (${was} chars), shortened to save context; it began: ${preview} - call recall with id ${num[1]} to read it again (a line range, or a text to search for)]\n</tool_response>`
-          : `<tool_response>\n[earlier tool output (${was} chars), shortened to save context; it began: ${preview} - call the tool again if you need more of it]\n</tool_response>`;
+          : `<tool_response>\n[earlier tool output (${was} chars), shortened to save context; it began: ${preview} - call recall with message ${i} to read it in full]\n</tool_response>`;
         total -= was - m.content.length;
         shortenedTools++;
       }
@@ -2708,6 +2819,7 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
       // Stage 2: Fold oldest user/assistant/tool turn groups into a bounded rolling summary
       const bullets = [];
       let foldedTurns = 0;
+      let base = 0;   // the number of `hist` of the first message still in `cloned` (the fold takes messages off the front)
       while (cloned.length > 2 && total > room * 0.72) {
         let nextUser = 1;
         while (nextUser < cloned.length && cloned[nextUser].role !== 'user') nextUser++;
@@ -2715,6 +2827,8 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
         if (remainingUsers === 0) break;
 
         const group = cloned.splice(0, nextUser);
+        const firstMsg = base;
+        base += group.length;
         let uTxt = '', aTxt = '';
         const tNames = [];
         for (const gm of group) {
@@ -2730,12 +2844,12 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
         }
         foldedTurns++;
         const toolNote = tNames.length ? ` (tools: ${tNames.join(', ')})` : '';
-        bullets.push(`- Turn ${foldedTurns}: User: "${uTxt}" -> Assistant${toolNote}: "${aTxt}"`);
+        bullets.push(`- Turn ${foldedTurns} (messages m${firstMsg}-m${base - 1}): User: "${uTxt}" -> Assistant${toolNote}: "${aTxt}"`);
         if (bullets.length > 12) bullets.shift();
       }
 
       if (foldedTurns > 0 && cloned.length > 0 && cloned[0].role === 'user') {
-        const prefix = `[Earlier conversation summary — ${foldedTurns} earlier turn(s) compacted to fit context window]\n${bullets.join('\n')}\n\n[Current message]\n`;
+        const prefix = `[Earlier conversation summary — ${foldedTurns} earlier turn(s) compacted to fit context window; read one in full with recall message=N, or search them with recall query=...]\n${bullets.join('\n')}\n\n[Current message]\n`;
         if (Array.isArray(cloned[0].content)) {
           cloned[0].content = cloned[0].content.map(p => p.type === 'text' ? { ...p, text: prefix + p.text } : p);
         } else {
