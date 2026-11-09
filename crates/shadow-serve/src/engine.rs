@@ -455,6 +455,16 @@ fn argmax(v: &[f32]) -> u32 {
     v.iter().enumerate().max_by(|a, b| a.1.partial_cmp(b.1).unwrap()).map(|(i, _)| i as u32).unwrap()
 }
 
+/// The thinking budget by effort (the menu says Low ~1k, Medium ~4k): past it the think block is closed for the model.
+fn thinking_budget(effort: shadow_model::chat::Effort) -> usize {
+    match effort {
+        shadow_model::chat::Effort::Low => 1_000,
+        shadow_model::chat::Effort::Medium => 4_000,
+        shadow_model::chat::Effort::High => 8_000,
+        shadow_model::chat::Effort::XHigh => 12_000,
+    }
+}
+
 /// Whether the generated tokens end in a loop: the last `p` tokens repeated back to back at least `min_reps` times and over at least `min_total` tokens in all (a period of 8..=400
 /// tokens: a sentence said again and again; a shorter period needs more repeats, so a few repeated words or a table of similar rows is not one).  Greedy decoding with a
 /// long, shortened history falls into these; the thinking budget used to be the only way out (STATUS 72).  Returns the period.
@@ -529,7 +539,10 @@ fn fit_context(arch: &str, messages: &[Message], opts: &Options, images: &[Vec<u
     let min_reply = if req_max_tokens > 0 {
         req_max_tokens.min(cap / 2).max(64)
     } else {
-        2048.min(cap / 4).max(128)
+        // no limit asked for: room for the thinking this effort may spend (its budget) and an answer of 2,048 after it - the old 2,048 alone let a reply that thought for
+        // 4,000 tokens and went on run into the end of the window ("the conversation has no room left" after 5,427 tokens, STATUS 74) - but never more than a third of it
+        let thinks = if opts.thinking == Some(false) { 0 } else { thinking_budget(opts.effort) };
+        (2048 + thinks).min(cap / 3).max(128)
     };
     let target_prompt = cap.saturating_sub(min_reply + 8);
 
@@ -932,13 +945,7 @@ fn answer<'c>(arch: &str, req: &Request, tok: &Tokenizer, sess: &mut GpuSession<
     let think_budget = if max_tokens < 1500 {
         usize::MAX
     } else {
-        let by_effort = match req.opts.effort {
-            shadow_model::chat::Effort::Low => 1_000,
-            shadow_model::chat::Effort::Medium => 4_000,
-            shadow_model::chat::Effort::High => 8_000,
-            shadow_model::chat::Effort::XHigh => 12_000,
-        };
-        by_effort.min(max_tokens - 1_200)
+        thinking_budget(req.opts.effort).min(max_tokens - 1_200)
     };
     let mut forced = false;
     // the loop guard: while it thinks, the generated tokens are looked at every 32 tokens, and a reply that has fallen into repeating the same stretch gets its think block
@@ -1182,6 +1189,28 @@ mod tests {
         assert_eq!(fit_msgs.last().unwrap().content, "What did we find in the latest turns?");
         let final_rendered = render_for_arch("qwen35", &fit_msgs, &opts).unwrap();
         assert!(final_rendered.len() / 3 + 512 <= cap, "expected compacted prompt to fit comfortably within cap");
+    }
+
+    #[test]
+    fn a_thinking_reply_is_left_room_for_its_thinking() {
+        // a prompt that leaves 2,048 tokens but not the thinking budget: compacted when thinking is on, left alone when it is off
+        let mut msgs = vec![Message::new(Role::System, "You are Shadow."), Message::new(Role::User, "Read the code.")];
+        for k in 1..=5 {
+            msgs.push(Message::new(Role::Assistant, &format!("Step {k}. <tool_call><function=read_file><parameter=path>a.rs</parameter></function></tool_call>")));
+            msgs.push(Message::new(Role::Tool, &format!("<tool_response>
+OUT{k} {}
+</tool_response>", "code_line_xx ".repeat(900))));
+        }
+        let cap = 24_000;
+        let count = |m: &[Message], o: &Options| render_for_arch("qwen35", m, o).unwrap().len() / 3;
+        let on = Options::default();
+        let off = Options { thinking: Some(false), ..Options::default() };
+        let n_on = count(&msgs, &on);
+        assert!(n_on > cap - 6056 + 100 && n_on < cap - 2056 - 100, "the fixture sits between the two reserves: {n_on} tokens");
+        let (_, _, c_on) = fit_context("qwen35", &msgs, &on, &[], cap, 0, &mut |m, _| Ok(count(m, &on))).unwrap();
+        let (_, _, c_off) = fit_context("qwen35", &msgs, &off, &[], cap, 0, &mut |m, _| Ok(count(m, &off))).unwrap();
+        assert!(c_on > 0, "with thinking on the prompt is shrunk to leave room for it");
+        assert_eq!(c_off, 0, "with thinking off the old 2,048 reserve holds");
     }
 
     #[test]
