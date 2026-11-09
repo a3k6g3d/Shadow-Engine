@@ -455,6 +455,27 @@ fn argmax(v: &[f32]) -> u32 {
     v.iter().enumerate().max_by(|a, b| a.1.partial_cmp(b.1).unwrap()).map(|(i, _)| i as u32).unwrap()
 }
 
+/// Whether the generated tokens end in a loop: the last `p` tokens repeated back to back at least `min_reps` times and over at least `min_total` tokens in all (a period of 8..=400
+/// tokens: a sentence said again and again; a shorter period needs more repeats, so a few repeated words or a table of similar rows is not one).  Greedy decoding with a
+/// long, shortened history falls into these; the thinking budget used to be the only way out (STATUS 72).  Returns the period.
+fn repeating_tail(made: &[u32], min_reps: usize, min_total: usize) -> Option<usize> {
+    let len = made.len();
+    for p in 8..=400usize {
+        let reps = min_reps.max(min_total.div_ceil(p));
+        if len < p * reps {
+            if len < p * min_reps {
+                break;
+            }
+            continue;
+        }
+        let unit = &made[len - p..];
+        if (1..reps).all(|r| &made[len - (r + 1) * p..len - r * p] == unit) {
+            return Some(p);
+        }
+    }
+    None
+}
+
 /// Truncate UTF-8 string safely around a character budget, keeping head and tail.
 fn middle_truncate(s: &str, max_chars: usize) -> String {
     let n = s.chars().count();
@@ -900,10 +921,42 @@ fn answer<'c>(arch: &str, req: &Request, tok: &Tokenizer, sess: &mut GpuSession<
         by_effort.min(max_tokens - 1_200)
     };
     let mut forced = false;
+    // the loop guard: while it thinks, the generated tokens are looked at every 32 tokens, and a reply that has fallen into repeating the same stretch gets its think block
+    // closed at once instead of at the budget (a 4,000-token loop cost a minute at Medium).  Only in the fast modes (`--exact` stays bit for bit: `spec` is 0 there);
+    // `SHADOW_LOOP_GUARD=0` turns it off.
+    let loop_guard = spec > 0 && std::env::var("SHADOW_LOOP_GUARD").map_or(true, |v| v != "0");
+    let mut made: Vec<u32> = Vec::new();
+    let mut gen_checked = 0usize;
     while n < max_tokens {
-        if em.reasoning && !forced && n >= think_budget {
+        let looping = loop_guard && em.reasoning && !forced && made.len() >= gen_checked + 32 && {
+            gen_checked = made.len();
+            repeating_tail(&made, 3, 96).is_some()
+        };
+        // in the answer (or a reply without thinking) a loop is cut off, with a visible note: the same stretch at least 5 times over 240 tokens (the bar is higher than for
+        // thinking: an answer may repeat itself on purpose, a table, a list of similar blocks); without it a reply that loops runs until the context is full
+        if loop_guard && !em.reasoning && made.len() >= gen_checked + 64 {
+            gen_checked = made.len();
+            if repeating_tail(&made, 5, 240).is_some() {
+                eprintln!("shadow serve: the reply started repeating itself after {n} tokens: it is stopped");
+                for t in tok.encode("
+
+[Stopped: the reply was repeating itself.]", true) {
+                    n += 1;
+                    if !em.push(tok, t, think_end, &req.tx) {
+                        break;
+                    }
+                }
+                finish = "stop";
+                break;
+            }
+        }
+        if em.reasoning && !forced && (n >= think_budget || looping) {
             forced = true;
-            let closer = tok.encode("\n\nThat is enough thinking: the answer now.\n</think>\n\n", true);
+            if looping {
+                eprintln!("shadow serve: the reply started repeating itself after {n} tokens of thinking: the think block is closed");
+            }
+            let closer = tok.encode(if looping { "\n\nI am repeating myself, so that is enough thinking: the answer now.\n</think>\n\n" }
+                                    else { "\n\nThat is enough thinking: the answer now.\n</think>\n\n" }, true);
             let mut gone = false;
             for &t in &closer {
                 n += 1;
@@ -928,6 +981,9 @@ fn answer<'c>(arch: &str, req: &Request, tok: &Tokenizer, sess: &mut GpuSession<
             break;
         }
         n += 1;
+        if loop_guard {
+            made.push(next);
+        }
         if !em.push(tok, next, think_end, &req.tx) {
             finish = "cancelled"; // the client went away
             *last_logits = sess.step(next);
@@ -976,6 +1032,9 @@ fn answer<'c>(arch: &str, req: &Request, tok: &Tokenizer, sess: &mut GpuSession<
                 keep += 1;
                 spec_pos[i.min(7)].1 += 1;
                 hist.push(d);
+                if loop_guard {
+                    made.push(d);
+                }
                 if !em.push(tok, d, think_end, &req.tx) {
                     cancelled = true;
                     break;
@@ -1020,6 +1079,40 @@ fn answer<'c>(arch: &str, req: &Request, tok: &Tokenizer, sess: &mut GpuSession<
 mod tests {
     use super::*;
     use shadow_model::chat::Role;
+
+    #[test]
+    fn repeating_tail_finds_a_sentence_said_again_and_again_and_nothing_else() {
+        // 40 distinct tokens, then a 35-token "sentence" three times: a loop of period 35
+        let mut v: Vec<u32> = (1000..1040).collect();
+        let unit: Vec<u32> = (0..35).map(|i| 5000 + i).collect();
+        for _ in 0..2 {
+            v.extend_from_slice(&unit);
+        }
+        assert_eq!(repeating_tail(&v, 3, 96), None); // twice is not a loop
+        v.extend_from_slice(&unit);
+        assert_eq!(repeating_tail(&v, 3, 96), Some(35));
+        assert_eq!(repeating_tail(&v, 5, 240), None); // the answer's bar is higher: 3 x 35 tokens is not enough
+        for _ in 0..4 {
+            v.extend_from_slice(&unit);
+        }
+        assert_eq!(repeating_tail(&v, 5, 240), Some(35));
+        // a short period needs more repeats: 8 tokens x3 is not a loop, x12 is
+        let u8_: Vec<u32> = (0..8).map(|i| 7000 + i).collect();
+        let mut w: Vec<u32> = (1..50).collect();
+        for _ in 0..3 {
+            w.extend_from_slice(&u8_);
+        }
+        assert_eq!(repeating_tail(&w, 3, 96), None);
+        for _ in 0..9 {
+            w.extend_from_slice(&u8_);
+        }
+        assert_eq!(repeating_tail(&w, 3, 96), Some(8));
+        // ordinary text (no repeats), and a short list, are left alone
+        let plain: Vec<u32> = (0..2000).map(|i| (i * 7919 % 10007) as u32).collect();
+        assert_eq!(repeating_tail(&plain, 3, 96), None);
+        assert_eq!(repeating_tail(&plain, 5, 240), None);
+        assert_eq!(repeating_tail(&[1, 2, 3], 3, 96), None);
+    }
 
     #[test]
     fn a_tool_call_opened_inside_the_think_block_leaves_it() {
