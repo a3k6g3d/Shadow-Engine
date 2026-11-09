@@ -115,13 +115,36 @@ const MAX_MCP_OUTPUT_CHARS: usize = 12_000;
 
 /// The model writes every parameter as text (`<parameter=a>17</parameter>`); a tool's schema says which are numbers, booleans, lists or objects.
 /// Text that parses as the declared type becomes that type (the rest is left as it is, for the tool to refuse).
-pub fn coerce_arguments(name: &str, arguments: &Value) -> Value {
+/// The properties of one of the native tools' schemas (empty for a tool that is not one of them).
+fn tool_props(name: &str) -> serde_json::Map<String, Value> {
     let defs = tool_definitions();
-    let props = defs.as_array().and_then(|a| a.iter().find(|d| d.get("name").and_then(Value::as_str) == Some(name)))
-        .and_then(|d| d.pointer("/input_schema/properties")).and_then(Value::as_object).cloned().unwrap_or_default();
+    defs.as_array().and_then(|a| a.iter().find(|d| d.get("name").and_then(Value::as_str) == Some(name)))
+        .and_then(|d| d.pointer("/input_schema/properties")).and_then(Value::as_object).cloned().unwrap_or_default()
+}
+
+/// Other names a model gives a tool's arguments (it knows `start_line` / `end_line` / `file_path` from other tools): (tool, the name it used, ours).  Without these `read_file`
+/// ignored `start_line` and always answered with lines 1-400, and the model read the top of the same file again and again (docs/STATUS.md 73).
+const ARGUMENT_ALIASES: &[(&str, &str, &str)] = &[
+    ("read_file", "start_line", "start"), ("read_file", "line_start", "start"), ("read_file", "startLine", "start"), ("read_file", "from_line", "start"),
+    ("read_file", "end_line", "end"), ("read_file", "line_end", "end"), ("read_file", "endLine", "end"), ("read_file", "to_line", "end"),
+    ("read_file", "file_path", "path"), ("read_file", "filepath", "path"), ("read_file", "file", "path"),
+    ("edit_file", "file_path", "path"), ("edit_file", "filepath", "path"), ("edit_file", "file", "path"),
+    ("write_file", "file_path", "path"), ("write_file", "filepath", "path"), ("write_file", "file", "path"),
+];
+
+pub fn coerce_arguments(name: &str, arguments: &Value) -> Value {
+    let props = tool_props(name);
     let Some(obj) = arguments.as_object() else { return arguments.clone() };
+    let mut obj = obj.clone();
+    for (tool, from, to) in ARGUMENT_ALIASES {
+        if *tool == name && !obj.contains_key(*to) && props.contains_key(*to) {
+            if let Some(v) = obj.remove(*from) {
+                obj.insert((*to).to_string(), v);
+            }
+        }
+    }
     let mut out = obj.clone();
-    for (k, v) in obj {
+    for (k, v) in &obj {
         let (Some(s), Some(ty)) = (v.as_str(), props.get(k).and_then(|p| p.get("type")).and_then(Value::as_str)) else { continue };
         let parsed = match ty {
             "integer" => s.trim().parse::<i64>().ok().map(Value::from),
@@ -138,6 +161,21 @@ pub fn coerce_arguments(name: &str, arguments: &Value) -> Value {
 }
 
 pub fn execute_tool(inv: &ToolInvocation) -> ToolResult {
+    let mut r = execute_tool_inner(inv);
+    // an argument the tool does not have is ignored: say so, or the model goes on calling with a name that does nothing
+    let props = tool_props(&inv.name);
+    if let (false, Some(obj)) = (props.is_empty(), coerce_arguments(&inv.name, &inv.arguments).as_object()) {
+        let unknown: Vec<&str> = obj.keys().map(String::as_str).filter(|k| !props.contains_key(*k)).collect();
+        if !unknown.is_empty() {
+            let known: Vec<&str> = props.keys().map(String::as_str).collect();
+            r.output.push_str(&format!("
+(note: ignored unknown argument(s) {}; this tool's arguments are: {})", unknown.join(", "), known.join(", ")));
+        }
+    }
+    r
+}
+
+fn execute_tool_inner(inv: &ToolInvocation) -> ToolResult {
     let fixed = ToolInvocation { name: inv.name.clone(), arguments: coerce_arguments(&inv.name, &inv.arguments) };
     let inv = &fixed;
     match inv.name.as_str() {
@@ -568,6 +606,34 @@ mod tests {
         assert_eq!(a["path"], json!("C:\\x.txt"));
         assert_eq!(coerce_arguments("read_file", &json!({"start": "abc"}))["start"], json!("abc"));
         assert_eq!(coerce_arguments("nope", &json!({"a": "1"}))["a"], json!("1"));
+    }
+
+    #[test]
+    fn the_names_a_model_uses_for_line_ranges_are_taken_and_unknown_ones_are_reported() {
+        // start_line / end_line / file_path are ours under other names; our own name wins when both are given
+        let a = coerce_arguments("read_file", &json!({"file_path": "a.rs", "start_line": 2415, "end_line": "2530"}));
+        assert_eq!((a["path"].clone(), a["start"].clone(), a["end"].clone()), (json!("a.rs"), json!(2415), json!(2530)));
+        assert!(a.get("start_line").is_none() && a.get("file_path").is_none());
+        let b = coerce_arguments("read_file", &json!({"path": "a.rs", "start": 3, "start_line": 9}));
+        assert_eq!(b["start"], json!(3));
+        // a read of the 3rd..4th line of a real file starts at the 3rd
+        let dir = std::env::temp_dir().join(format!("shadow_alias_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("t.txt");
+        std::fs::write(&f, "one
+two
+three
+four
+five
+").unwrap();
+        let r = execute_tool(&ToolInvocation { name: "read_file".into(), arguments: json!({"file_path": f.to_str().unwrap(), "start_line": 3, "end_line": 4}) });
+        assert!(r.output.contains("    3| three") && r.output.contains("    4| four") && !r.output.contains("| one"), "{}", r.output);
+        assert!(!r.output.contains("ignored unknown"), "{}", r.output);
+        // an argument that means nothing to the tool is reported in the result
+        let r = execute_tool(&ToolInvocation { name: "read_file".into(), arguments: json!({"path": f.to_str().unwrap(), "lines": "3-4"}) });
+        assert!(r.output.contains("ignored unknown argument(s) lines") && r.output.contains("path"), "{}", r.output);
+        let _ = std::fs::remove_file(&f);
+        let _ = std::fs::remove_dir(&dir);
     }
 
     #[test]

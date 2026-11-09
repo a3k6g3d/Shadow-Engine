@@ -635,6 +635,26 @@ fn fit_context(arch: &str, messages: &[Message], opts: &Options, images: &[Vec<u
         }
     }
 
+    // Stage 2b: still over (one long agent run: a single user message, so nothing to fold, and the tool outputs of the active step are kept by stage 1): shrink those to
+    // previews too, oldest first, the newest tool output whole - otherwise the reply is left a handful of tokens ("the conversation has no room left" after 66 tokens)
+    if encode_len(&msgs, &imgs)? > target_prompt {
+        let tools: Vec<usize> = msgs.iter().enumerate()
+            .filter(|(_, m)| m.role == shadow_model::chat::Role::Tool && m.content.len() > 280 && !m.content.starts_with("[earlier tool output"))
+            .map(|(i, _)| i).collect();
+        for &idx in tools.iter().take(tools.len().saturating_sub(1)) {
+            let clean = msgs[idx].content.trim()
+                .strip_prefix("<tool_response>").unwrap_or(&msgs[idx].content)
+                .strip_suffix("</tool_response>").unwrap_or(&msgs[idx].content)
+                .trim().to_string();
+            let preview = summarize_turn_text(&clean, 160);
+            msgs[idx].content = format!("[earlier tool output ({} chars): {preview}]", clean.len());
+            compacted_turns = compacted_turns.max(1);
+            if encode_len(&msgs, &imgs)? <= target_prompt {
+                break;
+            }
+        }
+    }
+
     // Stage 3: If still over target_prompt (e.g. a huge single message or tool output in the active turn), middle-truncate non-system messages
     let mut pass = 0;
     while encode_len(&msgs, &imgs)? > target_prompt && pass < 6 {
@@ -1162,6 +1182,27 @@ mod tests {
         assert_eq!(fit_msgs.last().unwrap().content, "What did we find in the latest turns?");
         let final_rendered = render_for_arch("qwen35", &fit_msgs, &opts).unwrap();
         assert!(final_rendered.len() / 3 + 512 <= cap, "expected compacted prompt to fit comfortably within cap");
+    }
+
+    #[test]
+    fn one_long_agent_run_shrinks_its_own_older_tool_outputs_and_keeps_the_newest() {
+        // a single user message and six big tool outputs in one run: nothing to fold, so the older outputs shrink to previews and the last stays whole
+        let opts = Options::default();
+        let mut msgs = vec![Message::new(Role::System, "You are Shadow."), Message::new(Role::User, "Read the code and explain it.")];
+        for k in 1..=6 {
+            msgs.push(Message::new(Role::Assistant, &format!("Step {k}. <tool_call><function=read_file><parameter=path>a.rs</parameter></function></tool_call>")));
+            msgs.push(Message::new(Role::Tool, &format!("<tool_response>
+OUTPUT{k} {}
+</tool_response>", "line_of_code ".repeat(400))));
+        }
+        let cap = 4096;
+        let (fit, _, compacted) = fit_context("qwen35", &msgs, &opts, &[], cap, 0, &mut |m, _| Ok(render_for_arch("qwen35", m, &opts)?.len() / 3)).unwrap();
+        assert!(compacted > 0);
+        let tools: Vec<&Message> = fit.iter().filter(|m| m.role == Role::Tool).collect();
+        assert!(tools.last().unwrap().content.contains("OUTPUT6") && tools.last().unwrap().content.len() > 4000, "the newest tool output stays whole");
+        assert!(tools[0].content.starts_with("[earlier tool output"), "an older one is a preview: {}", &tools[0].content[..60.min(tools[0].content.len())]);
+        let n = render_for_arch("qwen35", &fit, &opts).unwrap().len() / 3;
+        assert!(n + 2048.min(cap / 4) + 8 <= cap + 64, "the prompt leaves room for the reply: {n} tokens of {cap}");
     }
 }
 
