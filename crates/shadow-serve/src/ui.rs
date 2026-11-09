@@ -1832,9 +1832,11 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
 
       const t0 = performance.now();
       let loopTurns = 0;
-      const MAX_AGENT_TURNS = 14;
+      // no limit on the number of steps (the rolling context keeps the request bounded, Stop ends it); the one guard is a model stuck on the same tool call
+      const MAX_SAME_CALLS = 4;
+      let lastCallSig = '', sameCalls = 0, stuck = false;
 
-      while (loopTurns < MAX_AGENT_TURNS) {
+      while (true) {
         loopTurns++;
 
         // Assistant Skeleton
@@ -2027,6 +2029,9 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
 
           if (toolsEnabled && toolCalls.length > 0) {
             history.push({ role: 'assistant', content: rawContent });
+            const callSig = JSON.stringify(toolCalls.map(tc => [tc.name, tc.arguments]));
+            sameCalls = callSig === lastCallSig ? sameCalls + 1 : 1;
+            lastCallSig = callSig;
 
             for (const tc of toolCalls) {
               const argSummary = formatToolArgsSummary(tc.arguments);
@@ -2055,6 +2060,8 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
                 content: `<tool_response>\n${result.output}\n</tool_response>`
               });
             }
+            // the same call again and again: the model is stuck, not working - stop and say so (the history keeps the results, "continue" resumes)
+            if (sameCalls >= MAX_SAME_CALLS) { stuck = true; break; }
             // Loop continues to let Shadow formulate final answer using the tool output
             continue;
           } else {
@@ -2093,19 +2100,19 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
       }
 
       const dt = (performance.now() - t0) / 1000;
-      // the loop ran out of steps while the model was still using tools (the history ends with tool results, no answer): say so instead of ending silently
-      const hitCap = !failed && loopTurns >= MAX_AGENT_TURNS && history.length > 0 && history[history.length - 1].role === 'tool';
-      if (hitCap) {
+      // stopped because the model kept making the same tool call (the history ends with tool results, no answer): say so instead of ending silently
+      const hitStuck = !failed && stuck;
+      if (hitStuck) {
         const capRow = document.createElement('div');
         capRow.className = 'msg-row assistant';
-        capRow.innerHTML = `<div class="avatar">S</div><div class="bubble"><div class="msg-content"><span style="opacity:0.8;">Stopped after ${MAX_AGENT_TURNS} steps (the limit for one message) without a final answer. Send "continue" and I will carry on from here.</span></div></div>`;
+        capRow.innerHTML = `<div class="avatar">S</div><div class="bubble"><div class="msg-content"><span style="opacity:0.8;">Stopped: the same tool call ${MAX_SAME_CALLS} times in a row, with nothing new. Tell me what to try instead, or send "continue" to let it go on.</span></div></div>`;
         messagesEl.appendChild(capRow);
         scrollToBottom(false);
       }
       if (failed) {
         timingInfo.textContent = 'Failed - nothing was generated';
-      } else if (hitCap) {
-        timingInfo.textContent = `Stopped at the ${MAX_AGENT_TURNS}-step limit after ${dt.toFixed(2)}s`;
+      } else if (hitStuck) {
+        timingInfo.textContent = `Stopped after ${dt.toFixed(2)}s: the same tool call ${MAX_SAME_CALLS} times in a row`;
       } else if (timingInfo.textContent !== 'Generation stopped by user') {
         timingInfo.textContent = `Completed in ${dt.toFixed(2)}s`;
       }
