@@ -783,7 +783,12 @@ fn answer<'c>(arch: &str, req: &Request, tok: &Tokenizer, sess: &mut GpuSession<
     while i < unread.len() {
         let mut end = (i + chunk).min(unread.len());
         if let Some(at) = snap_at.map(|s| s - cached).filter(|&at| i < at && at < end) {
-            end = at;
+            // a snapshot point only a few tokens in would make a chunk of <= MAX_VERIFY tokens, which ends the lend below and sends the rest of the prompt through the
+            // non-staged path in one giant chunk (tens of thousands of single-token-class cache misses: the server looked hung at "Reading your message: 6 / 16,119",
+            // docs/STATUS.md 70): skip that snapshot this time (it is only a start for the next conversation)
+            if !(lent && at - i <= shadow_cuda::session::MAX_VERIFY) {
+                end = at;
+            }
         }
         // a few tokens (the tail of a prompt, or after a snapshot point) take the non-staged path, which needs slots of the cache in every layer: the lend is over
         // (it would end here anyway: the evicted experts are read back either way).  With the lend at 99% of the arena most layers have no slot left, and the pass died with

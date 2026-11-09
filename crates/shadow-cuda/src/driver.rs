@@ -126,6 +126,13 @@ static API: OnceLock<Result<Api, String>> = OnceLock::new();
 /// a failure, and callers say so out loud.
 pub fn api() -> Result<&'static Api, String> {
     API.get_or_init(|| {
+        // Load every kernel of a module when the module is loaded, not when the kernel first runs: the driver's lazy loading takes device memory for a kernel's code at its first
+        // launch, in the middle of a long prompt, where the engine has left almost no VRAM free (~100 MiB); a few tens of KB more kernel code (STATUS 69) then made the 20k-token
+        // gates die with CUDA_ERROR_OUT_OF_MEMORY at a memcpy or memset.  Costs about 2 expert-cache slots (4 MiB) and nothing at run time (docs/STATUS.md 70).
+        // `CUDA_MODULE_LOADING` set by the user wins.
+        if std::env::var_os("CUDA_MODULE_LOADING").is_none() {
+            std::env::set_var("CUDA_MODULE_LOADING", "EAGER");
+        }
         let lib = Dylib::open(std::path::Path::new("nvcuda.dll"))?;
         let api = Api::load(lib)?;
         // SAFETY: flags must be 0.
