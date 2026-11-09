@@ -516,6 +516,31 @@ fn shortened_tool_output(clean: &str) -> String {
     }
 }
 
+/// One line for a step of an agent run (an assistant message and the tool results that answer it): the calls with their main argument, the numbers of the logged outputs
+/// (`recall id=N` reads one again) and the start of the model's own note.
+fn step_line(step: &[Message]) -> String {
+    let (note, calls) = shadow_model::chat::parse_tool_calls(&step[0].content);
+    let desc: Vec<String> = calls.iter().map(|c| {
+        let arg = |k: &str| c.arguments.iter().find(|(n, _)| n == k).map(|(_, v)| v.replace(char::is_whitespace, " ").chars().take(60).collect::<String>());
+        let main = ["path", "pattern", "command", "query", "url", "text"].iter().find_map(|k| arg(k)).unwrap_or_default();
+        let range = match (arg("start"), arg("end")) {
+            (None, None) => String::new(),
+            (s, e) => format!(" {}-{}", s.unwrap_or_default(), e.unwrap_or_default()),
+        };
+        format!("{}({main}{range})", c.name)
+    }).collect();
+    let ids: Vec<String> = step[1..].iter().filter_map(|t| {
+        let at = t.content.find("output #")? + "output #".len();
+        let n: String = t.content[at..].chars().take_while(|c| c.is_ascii_digit()).collect();
+        (!n.is_empty()).then(|| format!("#{n}"))
+    }).collect();
+    let note: String = summarize_turn_text(&note, 80);
+    let line = format!("- {}{}{}", if desc.is_empty() { "a reply".to_string() } else { desc.join(", ") },
+                       if ids.is_empty() { String::new() } else { format!(" -> output {}", ids.join(",")) },
+                       if note.is_empty() { String::new() } else { format!(" | {note}") });
+    line.chars().take(260).collect()
+}
+
 fn summarize_turn_text(s: &str, max_chars: usize) -> String {
     let mut clean = s.to_string();
     while let Some(start) = clean.find("<tool_call>") {
@@ -678,6 +703,48 @@ fn fit_context(arch: &str, messages: &[Message], opts: &Options, images: &[Vec<u
             compacted_turns = compacted_turns.max(1);
             if encode_len(&msgs, &imgs)? <= target_prompt {
                 break;
+            }
+        }
+    }
+
+    // Stage 2c: still over, one long agent run, and a client that did not fold it (the chat page does, with message numbers): the oldest STEPS - an assistant message and its
+    // tool results - become one line each at the start of the task message, the last 8 messages stay whole (STATUS 79: 85 steps left the reply 560 tokens)
+    if encode_len(&msgs, &imgs)? > target_prompt {
+        let first_user = msgs.iter().position(|m| m.role == shadow_model::chat::Role::User);
+        if let Some(u) = first_user.filter(|u| msgs.len() > u + 12) {
+            let mut lines: Vec<String> = Vec::new();
+            let mut at = u + 1;
+            loop {
+                if msgs[at].role != shadow_model::chat::Role::Assistant || at + 8 >= msgs.len() {
+                    break;
+                }
+                let mut end = at + 1;
+                while end < msgs.len() && msgs[end].role == shadow_model::chat::Role::Tool {
+                    end += 1;
+                }
+                if end + 8 > msgs.len() {
+                    break;
+                }
+                lines.push(step_line(&msgs[at..end]));
+                at = end;
+                // measure every 8 steps: folding is cheap, encoding the prompt is not
+                if lines.len() % 8 == 0 {
+                    let mut probe = msgs.clone();
+                    probe.drain(u + 1..at);
+                    if encode_len(&probe, &imgs)? <= target_prompt {
+                        break;
+                    }
+                }
+            }
+            if !lines.is_empty() {
+                msgs.drain(u + 1..at);
+                if lines.len() > 40 {
+                    let old = lines.len() - 40;
+                    lines.drain(..old);
+                    lines.insert(0, format!("- {old} earlier steps (folded together)"));
+                }
+                msgs[u].content = format!("[Earlier steps of this task, shortened to fit the context window: one line each; read a tool output again with recall id=N]\n{}\n\n[The task]\n{}", lines.join("\n"), msgs[u].content);
+                compacted_turns = compacted_turns.max(1);
             }
         }
     }
@@ -1203,6 +1270,29 @@ mod tests {
         assert_eq!(fit_msgs.last().unwrap().content, "What did we find in the latest turns?");
         let final_rendered = render_for_arch("qwen35", &fit_msgs, &opts).unwrap();
         assert!(final_rendered.len() / 3 + 512 <= cap, "expected compacted prompt to fit comfortably within cap");
+    }
+
+    #[test]
+    fn a_long_run_with_one_user_message_folds_its_oldest_steps_into_lines() {
+        let opts = Options::default();
+        let mut msgs = vec![Message::new(Role::System, "You are Shadow."), Message::new(Role::User, "Improve the dashboard.")];
+        for k in 1..=70 {
+            msgs.push(Message::new(Role::Assistant, &format!("Step {k}: reading.\n<tool_call>\n<function=read_file>\n<parameter=path>\nsrc/ui.rs\n</parameter>\n<parameter=start>\n{}\n</parameter>\n<parameter=end>\n{}\n</parameter>\n</function>\n</tool_call>", k * 10, k * 10 + 40)));
+            msgs.push(Message::new(Role::Tool, &format!("<tool_response>\n(output #{k})\n{}\n</tool_response>", "code line ".repeat(120))));
+        }
+        let cap = 6000;
+        let count = |m: &[Message]| render_for_arch("qwen35", m, &opts).unwrap().len() / 3;
+        assert!(count(&msgs) > cap * 3, "the fixture is far over the window: {}", count(&msgs));
+        let (fit, _, compacted) = fit_context("qwen35", &msgs, &opts, &[], cap, 0, &mut |m, _| Ok(count(m))).unwrap();
+        assert!(compacted > 0);
+        let task = &fit.iter().find(|m| m.role == Role::User).unwrap().content;
+        assert!(task.contains("[Earlier steps of this task") && task.contains("[The task]\nImprove the dashboard."), "{}", &task[..200.min(task.len())]);
+        // 56 steps fold (the first 16 lines merge into one, the newest 40 stay), the 14 newest steps stay whole
+        assert!(task.contains("- 16 earlier steps (folded together)"), "{task}");
+        assert!(task.contains("- read_file(src/ui.rs 170-210) -> output #17 | Step 17: reading."), "{task}");
+        assert!(fit.last().unwrap().content.contains("(output #70)") || fit.last().unwrap().content.contains("output #70"), "the newest step is kept");
+        assert!(fit[2].role == Role::Assistant && fit.len() < msgs.len() / 2, "the first message after the task is a step: {} of {}", fit.len(), msgs.len());
+        assert!(count(&fit) + 2048.min(cap / 3) + 8 <= cap + cap / 10, "it fits with room for a reply: {} of {cap}", count(&fit));
     }
 
     #[test]

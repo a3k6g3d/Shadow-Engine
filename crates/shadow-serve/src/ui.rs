@@ -2848,8 +2848,52 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
         if (bullets.length > 12) bullets.shift();
       }
 
-      if (foldedTurns > 0 && cloned.length > 0 && cloned[0].role === 'user') {
-        const prefix = `[Earlier conversation summary — ${foldedTurns} earlier turn(s) compacted to fit context window; read one in full with recall message=N, or search them with recall query=...]\n${bullets.join('\n')}\n\n[Current message]\n`;
+      // Stage 2b: one long agent run (a single user message: nothing above could fold it) - its oldest STEPS (an assistant message and the tool results that answer it) become one
+      // line each, the recent ones stay whole: each step costs a message of its own and a preview per tool result even after stage 1, and 85 steps filled the window and left the
+      // reply 560 tokens.  The line names the messages (recall message=N), the calls, the numbers of their outputs (recall id=N) and the start of the model's own note.
+      const stepLines = [];
+      let foldedSteps = 0;
+      if (cloned.length > 12 && total > room * 0.7 && cloned[0].role === 'user') {
+        const KEEP_TAIL = 8;                       // messages at the end that are never folded
+        let at = 1;                                // the first message that is still whole (an assistant message: a step starts there)
+        while (at < cloned.length - KEEP_TAIL && cloned[at].role === 'assistant' && total > room * 0.55) {
+          let end = at + 1;
+          while (end < cloned.length && cloned[end].role === 'tool') end++;
+          if (end > cloned.length - KEEP_TAIL) break;
+          const grp = cloned.slice(at, end);
+          const calls = parseToolCallsFromText(messageText(grp[0]));
+          const desc = calls.map(c => {
+            const a = c.arguments || {};
+            const key = ['path', 'pattern', 'command', 'query', 'url', 'text'].find(k => a[k] !== undefined);
+            const val = key ? String(a[key]).replace(/\s+/g, ' ').slice(0, 60) : '';
+            const range = (a.start || a.end) ? ` ${a.start || ''}-${a.end || ''}` : '';
+            return `${c.name}(${val}${range})`;
+          }).join(', ') || 'a reply';
+          const ids = grp.slice(1).map(t => /output #(\d+)/.exec(messageText(t))).filter(Boolean).map(x => '#' + x[1]);
+          const note = stripToolCalls(messageText(grp[0])).replace(/\s+/g, ' ').trim().slice(0, 80);
+          stepLines.push(`- m${base + at}-m${base + end - 1}: ${desc}${ids.length ? ' -> output ' + ids.join(',') : ''}${note ? ' | ' + note : ''}`.slice(0, 260));
+          for (const gm of grp) total -= size(gm);
+          at = end;
+        }
+        if (at > 1) {
+          cloned.splice(1, at - 1);
+          foldedSteps = stepLines.length;
+          base += at - 1;
+          // a lot of steps: the oldest lines merge into one (what was done, by tool), the newest 40 stay
+          if (stepLines.length > 40) {
+            const old = stepLines.splice(0, stepLines.length - 40);
+            const counts = {};
+            for (const l of old) for (const m of l.matchAll(/(\w+)\(/g)) counts[m[1]] = (counts[m[1]] || 0) + 1;
+            const first = /^- (m\d+)-/.exec(old[0]), last = /^- m\d+-(m\d+)/.exec(old[old.length - 1]);
+            stepLines.unshift(`- ${first ? first[1] : 'm?'}-${last ? last[1] : 'm?'}: ${old.length} earlier steps (${Object.entries(counts).map(([k, v]) => k + 'x' + v).join(', ')}); search them with recall query=...`);
+          }
+          total += stepLines.join('\n').length + 300;
+        }
+      }
+
+      if ((foldedTurns > 0 || foldedSteps > 0) && cloned.length > 0 && cloned[0].role === 'user') {
+        const stepsPart = foldedSteps > 0 ? `[Earlier steps of this task, shortened to fit the context window: one line each; read a step in full with recall message=N, a tool output with recall id=N; your pinned notes hold what you decided]\n${stepLines.join('\n')}\n\n` : '';
+        const prefix = stepsPart + (foldedTurns > 0 ? `[Earlier conversation summary — ${foldedTurns} earlier turn(s) compacted to fit context window; read one in full with recall message=N, or search them with recall query=...]\n${bullets.join('\n')}\n\n[Current message]\n` : '[The task]\n');
         if (Array.isArray(cloned[0].content)) {
           cloned[0].content = cloned[0].content.map(p => p.type === 'text' ? { ...p, text: prefix + p.text } : p);
         } else {
@@ -2857,9 +2901,10 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
         }
       }
 
-      if (foldedTurns > 0 || shortenedTools > 0) {
+      if (foldedTurns > 0 || shortenedTools > 0 || foldedSteps > 0) {
         const parts = [];
         if (foldedTurns > 0) parts.push(`${foldedTurns} earlier turn${foldedTurns > 1 ? 's' : ''} summarized`);
+        if (foldedSteps > 0) parts.push(`${foldedSteps} earlier step${foldedSteps > 1 ? 's' : ''} folded`);
         if (shortenedTools > 0) parts.push(`${shortenedTools} tool output${shortenedTools > 1 ? 's' : ''} compacted`);
         timingInfo.textContent = `Rolling context active: ${parts.join(', ')} (0 B extra RAM)`;
       }
