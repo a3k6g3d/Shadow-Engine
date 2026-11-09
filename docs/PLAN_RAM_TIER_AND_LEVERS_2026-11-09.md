@@ -17,7 +17,7 @@ So a 15k prompt cannot go below ~1.8 s (one pass of experts over PCIe) + 15k x 0
 
 ## 2. The facts the plan rests on
 
-- RAM 63.8 GiB. The live server (tier 36 GiB): **working set 40.7 GiB, so 4.7 GiB beyond the tier**; 8.1 GiB available with the user's other programs running (they use 11-15 GiB). The floor is 3 GiB by default in the launcher, 4 GiB by the rule in memory (the PC has frozen hard at 0.4 GiB free); Strata at tier 45 dipped to 3.61 GiB available when measured (3 GiB floor, user-approved test).
+- RAM 63.8 GiB. The live server (tier 36 GiB): **working set 40.7 GiB, so 4.7 GiB beyond the tier**; 8.1 GiB available with the user's other programs running (they use 11-15 GiB). The floor is 3 GiB by default in the launcher, 4 GiB by the rule in memory. **Where the floor comes from, exactly:** the user once saw the PC freeze at about 0.4 GiB free, and the cause was never recorded (it may have been an outside program, Windows itself, or an engine); the only low-RAM event documented in this repository is 2026-10-26, when an uncapped llama.cpp mmap load of the older, larger model took available RAM from 55 to 0.73 GiB in 49 s and the watchdog killed it before any freeze. So the repository does not show that 1-3 GiB free is unsafe on this PC, only that 0.4 GiB once was and that a pinned tier cannot be paged out. Strata at tier 45 dipped to 3.61 GiB available when measured (3 GiB floor, user-approved test), with no freeze.
 - The tier is **one `PinnedRegion`** (one `VirtualAlloc` + `cuMemHostRegister`, `RamTier::fill`, `session.rs`): it cannot give memory back while the server runs.
 - Live chat (uptime 992 s): VRAM expert-cache hit rate 79.8%; of the misses 1.65 M came from the RAM tier and **0.32 M (16.3%) from the SSD**.
 - A 3k prompt: 4.5 s, of which ~2.4 s is the SSD term (tier 36); Strata 2.4 s reads nothing from disk.
@@ -28,7 +28,7 @@ So a 15k prompt cannot go below ~1.8 s (one pass of experts over PCIe) + 15k x 0
 
 | # | lever | what Strata does | expected gain (range, not a promise) | effort | risk |
 |---|---|---|---|---|---|
-| L1 | **RAM tier 36 -> 43-45 GiB** | 45 | 3k: 4.5 -> ~3.0 s; 9.6k: -0.3..-0.8 s; live decode: SSD misses 16% -> ~4%; first pass after a restart | medium | **RAM floor** (the PC froze at 0.4 GiB free) |
+| L1 | **RAM tier 36 -> 43-45 GiB** | 45 | 3k: 4.5 -> ~3.0 s; 9.6k: -0.3..-0.8 s; live decode: SSD misses 16% -> ~4%; first pass after a restart | medium | the RAM floor (section 2: the one reported freeze has no recorded cause) |
 | L2 | the 4.7 GiB of RAM beyond the tier -> <= 2 GiB | (its overhead is ~1.5 GiB) | pays for ~2.7 GiB of tier | small-medium | none |
 | L3 | **int8 fused MoE** on the tensor cores (IQ2_S, IQ3_XXS, IQ3_S, IQ4_NL; Q2_0 stays ours) | `moe_fused_iq.cu` | MoE products -40..-55% of their time = 15k: -1.4..-1.9 s (of 10.8) | large | numerics (int8 is an inexact fast mode: fidelity gates) |
 | L4 | CPU share of cold experts for short chunks | on since Strata 0.1.41 | agent steps (100-1,000 tokens): -20..-35% **only while experts are cold**; mostly moot at tier 45 | large | CPU contention |
@@ -38,6 +38,7 @@ So a 15k prompt cannot go below ~1.8 s (one pass of experts over PCIe) + 15k x 0
 ## 4. Phases and gates (each ends with a STATUS entry; tie or better goes default; every model load under `tools/run_capped.ps1`, floor never below the user-approved value)
 
 **Phase A - make a bigger tier safe (L2 + the safety half of L1).**
+- A0. **A RAM black box**: while serving, log system available RAM every second and, whenever it falls under 3 GiB, the five biggest processes by working set (Shadow's own working set and pinned tier included) to a rolling file next to the tool-output log. Cheap, and it settles the question above: the next low-RAM event is recorded with its cause (an outside program, Windows, or Shadow), so the floor can be chosen from evidence.
 - A1. Audit the 4.7 GiB: for each component switch it off or measure it (stage pipeline regions 1.33 GiB, conversation snapshot host buffers, drafter weights if a host copy stays, the embedding table, mapped file pages, KV-lend host side) and write the table. Gate: a table that adds up to within 0.3 GiB.
 - A2. Cut it to <= 2 GiB without a speed loss (A-B-B-A at 9.6k / 15k). Gate: working set minus tier <= 2.0 GiB.
 - A3. **Build the tier from 1 GiB chunks, each registered on its own**, so a watchdog can release the tail chunk(s) when available RAM falls under floor + 0.5 GiB for 2 s (unregister, free, mark those experts file-only, refill later when RAM returns). Gate: a test that allocates a 6 GiB hog while serving: the tier shrinks, nothing freezes, available never drops below the floor, the answers stay correct.
@@ -61,7 +62,7 @@ Parity with Strata's 11-08 numbers is reachable at every length; matching its 11
 
 ## 6. Decisions needed from the user
 
-1. **Floor policy at a high tier**: keep 4 GiB (tier ~42-43 with the usual programs open), or approve 3.5 GiB for tier 45 once the watchdog (A3) exists.
+1. **Floor policy at a high tier**: keep 4 GiB (tier ~42-43 with the usual programs open), or approve 3.5 GiB for tier 45 once the watchdog (A3) exists; or decide after the black box (A0) has run for a while and shown what actually consumes RAM on this PC. The watchdog reacts to a drop whatever its cause, so the plan does not depend on knowing it.
 2. Whether to close memory-heavy programs while Shadow serves (needed only for 45).
 3. Go-ahead for Phase C (the largest piece of engineering; several sessions).
 4. Accept the target as "parity with Strata, then ahead where its design allows", not 10x.
