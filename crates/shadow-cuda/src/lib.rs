@@ -13,6 +13,7 @@ pub mod mmq;
 pub mod mtp;
 pub mod nvrtc;
 pub mod pinned;
+pub mod rambox;
 pub mod session;
 pub mod sha256;
 

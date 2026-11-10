@@ -891,6 +891,8 @@ impl Tiers {
             let mib: usize = v.parse().map_err(|_| format!("--vram-reserve-mib: not a number: {v}"))?;
             VRAM_RESERVE_SET.store(mib << 20, std::sync::atomic::Ordering::Relaxed);
         }
+        // the RAM black box: available RAM every second, and what held it when it ran low (rambox.rs; SHADOW_RAM_BOX=0 turns it off)
+        crate::rambox::start(crate::rambox::default_dir());
         if let Some(g) = gib("--ram-floor-gib")? {
             crate::pinned::set_ram_floor(g as u64);
             if (g as u64) < crate::pinned::RAM_FLOOR {

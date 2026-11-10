@@ -15,6 +15,13 @@ pub const RAM_FLOOR: u64 = 4 << 30;
 
 static FLOOR: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(RAM_FLOOR);
 
+/// Bytes of pinned host memory this process holds right now (the RAM tier, the stage buffers, ...): the RAM black box logs it beside the available RAM.
+static PINNED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+pub fn pinned_bytes() -> u64 {
+    PINNED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// The floor in force: `RAM_FLOOR` unless `set_ram_floor` changed it.
 pub fn ram_floor() -> u64 {
     FLOOR.load(std::sync::atomic::Ordering::Relaxed)
@@ -131,6 +138,7 @@ impl<'c> PinnedRegion<'c> {
                 return Err(format!("cuMemHostRegister of {len} bytes failed ({code})")); // r frees it
             }
             r.len = len;
+            PINNED.fetch_add(len as u64, std::sync::atomic::Ordering::Relaxed);
             let mut dptr = 0u64;
             let dcode = unsafe { (ctx.api.cuMemHostGetDevicePointer)(&mut dptr, base as *mut c_void, 0) };
             if dcode != 0 {
@@ -178,6 +186,9 @@ impl Drop for PinnedRegion<'_> {
         unsafe {
             if self.len > 0 && self.ctx.bind().is_ok() {
                 (self.ctx.api.cuMemHostUnregister)(self.base as *mut c_void);
+            }
+            if self.len > 0 {
+                PINNED.fetch_sub(self.len as u64, std::sync::atomic::Ordering::Relaxed);
             }
             win::VirtualFree(self.base as *mut c_void, 0, win::MEM_RELEASE);
         }
