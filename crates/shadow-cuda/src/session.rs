@@ -1851,15 +1851,25 @@ impl<'c, 'm> GpuSession<'c, 'm> {
     /// (docs/STATUS.md, Phase A3).  Costs one atomic load when there is no request.
     fn ram_pressure_poll(&mut self) {
         let want = crate::pinned::take_trim_request();
-        if want == 0 || self.ram.region.is_none() {
+        if want == 0 {
             return;
         }
+        self.release_ram(want as usize, "under RAM pressure");
+    }
+
+    /// Gives the RAM tier's last chunks back to the OS - at least `bytes`, whole chunks - for the caller that needs the room (the watchdog; a picture's encoder, whose helper takes
+    /// ~1.8 GiB above the floor): the experts in them are served from the file afterwards.  Only between steps and batches (the caller owns the session).  Returns the bytes released.
+    pub fn release_ram(&mut self, bytes: usize, why: &str) -> usize {
+        if bytes == 0 || self.ram.region.is_none() {
+            return 0;
+        }
         let avail0 = crate::pinned::available_ram();
-        let (freed, dropped) = self.ram.trim(self.ctx, want as usize);
+        let (freed, dropped) = self.ram.trim(self.ctx, bytes);
         crate::pinned::note_trimmed(freed as u64);
         let g = |b: u64| b as f64 / (1u64 << 30) as f64;
-        eprintln!("RAM tier: gave back {:.0} GiB under RAM pressure ({dropped} experts dropped; tier now {:.0} GiB, {} experts); available RAM {:.2} -> {:.2} GiB",
+        eprintln!("RAM tier: gave back {:.0} GiB {why} ({dropped} experts dropped; tier now {:.0} GiB, {} experts); available RAM {:.2} -> {:.2} GiB",
                   g(freed as u64), g(self.ram.region.as_ref().map_or(0, |r| r.len()) as u64), self.ram.at.len(), g(avail0), g(crate::pinned::available_ram()));
+        freed
     }
 
     /// (bytes, experts) the RAM tier has given back under RAM pressure.

@@ -1001,6 +1001,19 @@ fn answer<'c>(arch: &str, req: &Request, tok: &Tokenizer, sess: &mut GpuSession<
                     }
                 }
                 Err(e) => eprintln!("shadow serve: conversation snapshot failed ({e})"),
+    // a picture's encoder helper needs ~1.8 GiB above the RAM floor; the big RAM tier (up to 45 GiB) can leave less than that free, and a refused picture is worse than a smaller tier:
+    // the tier gives back whole chunks to make the room (it does not grow back until the next start)
+    if pics.enc.is_none() && req.images.iter().any(|im| !pics.cache.contains_key(&fnv(im))) {
+        let need = shadow_cuda::pinned::ram_floor() + (1800u64 << 20) + (256 << 20);
+        let free = shadow_cuda::pinned::available_ram();
+        if free < need {
+            let want = (need - free).next_multiple_of(shadow_cuda::pinned::CHUNK as u64) as usize;
+            let freed = sess.release_ram(want, "to make room for a picture's encoder");
+            if freed == 0 {
+                eprintln!("shadow serve: a picture needs {:.1} GiB free and {:.1} is: the RAM tier has nothing to give back", need as f64 / (1u64 << 30) as f64, free as f64 / (1u64 << 30) as f64);
+            }
+        }
+    }
             }
         }
     }
