@@ -424,6 +424,8 @@ pub struct GpuSession<'c, 'm> {
     /// llama.cpp's int8 MMQ products for the quantized dense projections of a long prompt (`mmq.rs`, `SHADOW_MMQ=0` off), and the buffer for the quantized activations
     mmq: Option<crate::mmq::Mmq>,
     mmq_y: DeviceBuffer<'c>,
+    /// Strata's fused int8 experts for the width-class planner's phases (`fused.rs`, opt-in `SHADOW_FUSED_MOE=1`, with `--tensor-prompt`)
+    fused: Option<crate::fused::Fused>,
     /// with `--tensor-prompt` (`SHADOW_PREFILL_DEVPLAN=0` off): a long prompt's MoE is routed and planned on the device (`dev_plan`); these are its scratch buffers:
     /// each token's chosen experts, the users of each expert, each expert's first group, and the host's per-layer expert tables (copied flags, addresses)
     /// the residual streams of every row of a pass bigger than `rows` (see `sub_rows_cap`), one buffer of `rows` rows a part (carved wherever the lent ranges have room:
@@ -1469,6 +1471,7 @@ impl<'c, 'm> GpuSession<'c, 'm> {
         };
         let dscr = a(BIG_BATCH.div_ceil(64) * c.ssm_v_heads * 8448)?;
         let mmq = if tiers.tensor_prompt { crate::mmq::Mmq::load() } else { None };
+        let fused = if tiers.tensor_prompt { crate::fused::Fused::load() } else { None };
         // the largest input a projection takes is the attention output's (n_head * head_dim) or the SSM output's, for the rows of a sub-chunk
         let mmq_y = a(mmq.as_ref().map_or(1, |q| q.y_bytes((c.n_head * c.head_dim).max(c.ssm_v_heads * c.ssm_head_dim).max(c.hidden), sub_rows_cap().max(MAX_BATCH)).div_ceil(4)))?;
         let (dp_tidx, dp_cnt, dp_gstart, dp_copied, dp_eaddr, dp_lay) = (a(BIG_BATCH_MAX * 16)?, a(1024)?, a(3072)?, a(256)?, a(6144)?, a(32)?);
@@ -1737,7 +1740,7 @@ impl<'c, 'm> GpuSession<'c, 'm> {
             None
         };
         let mut s = GpuSession {
-            ctx, m, mvp, fw, w, v, b, bb, replay, dscr, mmq, mmq_y,
+            ctx, m, mvp, fw, w, v, b, bb, replay, dscr, mmq, mmq_y, fused,
             rparts: Vec::new(), bb_sig: 0, logits_last: false, sub_last: true, sub_first: true,
             devplan: tiers.tensor_prompt && !std::env::var("SHADOW_PREFILL_DEVPLAN").is_ok_and(|v| v == "0"), dp_tidx, dp_cnt, dp_gstart, dp_copied, dp_eaddr, dp_lay, kv_regions, kv_extra: None, kv_extra_reg, prompt_hint: 0, kv_rows: 0, kv_halves: false, router_bias: std::env::var("SHADOW_ROUTER_BIAS").ok().and_then(|v| v.parse().ok()).unwrap_or(0.0), batch_scratch, delta, attn, ple_state, tokens: vec![], pictures: vec![], rope_tab: None, rope_on: false, cap, trace: None, stop_after: None,
             resident_bytes, expert_uploads: 0, cache, ram, copy_stream, copy_stream2, copy_ev2, copy_event, staging,
@@ -5063,9 +5066,66 @@ impl<'c, 'm> GpuSession<'c, 'm> {
             && !self.moe_gate_up_wanted(&infos[0])
     }
 
+    /// Phase `ph` (0: the resident experts, 1: the copied ones) of the layer's routed experts on Strata's fused int8 kernels (`fused.rs`, `SHADOW_FUSED_MOE=1`) instead of the grouped
+    /// gate/up, SwiGLU and grouped down launches: the layer's input quantized to int8, the routing ids masked to this phase's experts, grouped on the device (`sf_group`), then one
+    /// set of launches per 128 experts reading each expert's blob through the planner's address table (`dp_eaddr`: gate rows, up rows, down rows are one blob in a cache slot or a
+    /// stage half) and storing the down products at their pairs' rows of `bb.eo`, where the combine reads them.  False when the layer is not covered (formats, shapes, buffers).
+    fn fused_experts(&self, ph: usize, m: usize, infos: &[TensorInfo]) -> bool {
+        let Some(fu) = self.fused.as_ref() else { return false };
+        let c = &self.m.cfg;
+        let (h, ff, k, ne) = (c.hidden, c.expert_ff, c.n_expert_used, c.n_expert);
+        let (gate, up, down) = (&infos[0], &infos[1], &infos[2]);
+        // what the fused kernels did, once per kind of layer: taken, or why not (`SHADOW_FUSED_MOE=1` prints these)
+        static SEEN: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+        let note = |what: String| {
+            let mut s = SEEN.lock().unwrap();
+            if !s.contains(&what) {
+                eprintln!("fused experts: {what}");
+                s.push(what);
+            }
+        };
+        let (Some(gt), Some(dt)) = (crate::fused::Fused::gu_type(&gate.ty.name()), crate::fused::Fused::d_type(&down.ty.name())) else {
+            note(format!("not taken: gate/up {} + down {} (phase {ph})", gate.ty.name(), down.ty.name()));
+            return false;
+        };
+        if gate.ty != up.ty || gate.dims != up.dims || h != 2560 || ff != 640 || gate.dims[0] as usize != h || gate.dims[1] as usize != ff || down.dims[0] as usize != ff
+            || down.dims[1] as usize != h || !fu.supported(gt, dt) {
+            note(format!("not taken: shapes/support for {} + {}", gate.ty.name(), down.ty.name()));
+            return false;
+        }
+        let (Some((gqk, gqb)), Some((dqk, dqb))) = (gate.ty.block(), down.ty.block()) else { return false };
+        let (gu_row, d_row) = (h as u64 / gqk * gqb, ff as u64 / dqk * dqb);
+        let geom = crate::fused::Geom { gu_type: gt, d_type: dt, gu_row, d_row, up_off: gu_row * ff as u64, down_off: 2 * gu_row * ff as u64 };
+        let bb = &self.bb;
+        let n = m * k;
+        let al = |x: usize| x.next_multiple_of(256);
+        let (xa_b, sc_b, id_b) = (al(fu.act_bytes(m, h)), al(fu.group_bytes(n, ne)), al(n * 4));
+        // the quantized input, the grouping tables and the id lists live in bb.eg (the gate/up outputs, dead here), the int8 H in bb.act (the SwiGLU output, dead here)
+        if xa_b + sc_b + 3 * id_b > bb.eg.bytes || fu.act_bytes(n, ff) > bb.act.bytes {
+            note(format!("not taken: {m} rows need {} bytes in bb.eg ({}) and {} in bb.act ({})", xa_b + sc_b + 3 * id_b, bb.eg.bytes, fu.act_bytes(n, ff), bb.act.bytes));
+            return false;
+        }
+        note(format!("taken: gate/up {} + down {}, phase {ph}", gate.ty.name(), down.ty.name()));
+        let (xa, sc) = (bb.eg.ptr, bb.eg.ptr + xa_b as u64);
+        let (ids2, slot, src) = (sc + sc_b as u64, sc + (sc_b + id_b) as u64, sc + (sc_b + 2 * id_b) as u64);
+        let stream = self.ls().map_or(0, |s| s.raw() as u64);
+        // SAFETY: every address is inside this session's buffers with the sizes checked above (`dp_tidx`: m * k expert ids, `dp_copied`: a byte an expert, `dp_eaddr`: ne blob addresses
+        // first); `bb.eo` holds `rows * k` rows of `hidden` floats, 256-aligned, and the down products go to the rows of the pairs they belong to.
+        unsafe {
+            fu.quantize(bb.u.ptr, m, h, xa, stream);
+            fu.mask(self.dp_tidx.ptr, n, self.dp_copied.ptr, ph as i32, ids2, stream);
+            fu.group(ids2, n, k, ne, sc, slot, src, stream);
+            fu.experts(self.dp_eaddr.ptr, &geom, ne, n, sc, xa, src, bb.act.ptr, bb.eo.ptr, stream);
+        }
+        true
+    }
+
     /// Phase `ph` of the width-class plan (0: the resident experts, 1: the copied ones) for the pass's m rows: per class gate + up grouped, then SwiGLU over the rows, then per class
     /// down into bb.eo row (token, rank).  A class's grid holds its capacity of groups; the empty ones (count 0) leave at once.
     fn routed_buckets(&self, lay: &BucketLayout, ph: usize, m: usize, infos: &[TensorInfo]) {
+        if self.fused_experts(ph, m, infos) {
+            return;
+        }
         let c = &self.m.cfg;
         let (h, ff, k) = (c.hidden, c.expert_ff, c.n_expert_used);
         let bb = &self.bb;

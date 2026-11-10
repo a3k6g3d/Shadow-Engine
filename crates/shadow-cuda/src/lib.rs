@@ -9,6 +9,7 @@ pub mod dylib;
 pub mod fileview;
 pub mod kernels;
 pub mod kvvmm;
+pub mod fused;
 pub mod mmq;
 pub mod mtp;
 pub mod nvrtc;
