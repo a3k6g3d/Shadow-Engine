@@ -88,18 +88,24 @@ impl Fused {
         Some(f)
     }
 
-    /// The ggml type number of a quantization the kernels read (by `TensorInfo::ty.name()`): gate/up IQ2_S / IQ3_XXS / IQ3_S, down IQ4_NL.
+    /// The ggml type number of a gate/up quantization the kernels read (by `TensorInfo::ty.name()`): IQ2_S, IQ3_XXS, IQ3_S, IQ4_XS.
     pub fn gu_type(name: &str) -> Option<i32> {
         match name {
             "IQ3_XXS" => Some(18),
             "IQ3_S" => Some(21),
             "IQ2_S" => Some(22),
+            "IQ4_XS" => Some(23),
             _ => None,
         }
     }
 
+    /// The same for the down projection: IQ4_NL, Q2_0 (upstream ggml's type 42, the one this model's GGUF holds: an f16 scale and 64 two-bit codes in 18 bytes).
     pub fn d_type(name: &str) -> Option<i32> {
-        (name == "IQ4_NL").then_some(20)
+        match name {
+            "IQ4_NL" => Some(20),
+            "Q2_0" => Some(42),
+            _ => None,
+        }
     }
 
     pub fn supported(&self, gu: i32, d: i32) -> bool {
