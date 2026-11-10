@@ -1,6 +1,7 @@
 //! Strata 0.1.44's fused int8 tensor-core MoE kernels (MIT) behind `shadow_fused.dll` (native/fused, built by `build.bat` with nvcc), loaded at run time like `shadow_mmq.dll`.
 //! For the grouped experts of a long prompt: gate/up + SwiGLU + int8 H + down in a few launches, 38-43% less time a layer than Shadow's own grouped kernels in the standalone
-//! harness (docs/STATUS.md 86).  Opt-in: `SHADOW_FUSED_MOE=1`; `SHADOW_FUSED_DLL=path` names the DLL.  Inexact (int8 activations and H), so never with `--exact`.
+//! harness (docs/STATUS.md 86), a 15k prompt -8.8% (87, 88); on by default when the DLL is there (89); `SHADOW_FUSED_MOE=0` turns it off, `SHADOW_FUSED_DLL=path` names the DLL.
+//! Inexact (int8 activations and H), so never with `--exact` (the session loads it only with `--tensor-prompt`).
 
 use crate::dylib::Dylib;
 use std::path::PathBuf;
@@ -35,11 +36,12 @@ pub struct Geom {
 }
 
 impl Fused {
-    /// The DLL beside the executable, in `native/fused` of the checkout, or named by `SHADOW_FUSED_DLL`; None unless `SHADOW_FUSED_MOE=1` and it loads.
+    /// The DLL beside the executable, in `native/fused` of the checkout, or named by `SHADOW_FUSED_DLL`; None when `SHADOW_FUSED_MOE=0`, absent or unloadable.
     pub fn load() -> Option<Fused> {
-        if !std::env::var("SHADOW_FUSED_MOE").is_ok_and(|v| v == "1") {
+        if std::env::var("SHADOW_FUSED_MOE").is_ok_and(|v| v == "0") {
             return None;
         }
+        let asked = std::env::var("SHADOW_FUSED_MOE").is_ok_and(|v| v == "1");
         let mut cands: Vec<PathBuf> = Vec::new();
         if let Ok(p) = std::env::var("SHADOW_FUSED_DLL") {
             cands.push(PathBuf::from(p));
@@ -54,7 +56,9 @@ impl Fused {
         }
         let path = cands.into_iter().find(|p| p.is_file());
         let Some(path) = path else {
-            eprintln!("fused: SHADOW_FUSED_MOE=1 but shadow_fused.dll was not found (native/fused/build.bat builds it)");
+            if asked {
+                eprintln!("fused: SHADOW_FUSED_MOE=1 but shadow_fused.dll was not found (native/fused/build.bat builds it)");
+            }
             return None;
         };
         let lib = match Dylib::open(&path) {

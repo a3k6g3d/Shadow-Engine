@@ -424,7 +424,7 @@ pub struct GpuSession<'c, 'm> {
     /// llama.cpp's int8 MMQ products for the quantized dense projections of a long prompt (`mmq.rs`, `SHADOW_MMQ=0` off), and the buffer for the quantized activations
     mmq: Option<crate::mmq::Mmq>,
     mmq_y: DeviceBuffer<'c>,
-    /// Strata's fused int8 experts for the width-class planner's phases (`fused.rs`, opt-in `SHADOW_FUSED_MOE=1`, with `--tensor-prompt`)
+    /// Strata's fused int8 experts for the width-class planner's phases (`fused.rs`, on by default with `--tensor-prompt` when `native/fused/shadow_fused.dll` is built; `SHADOW_FUSED_MOE=0` off)
     fused: Option<crate::fused::Fused>,
     /// with `--tensor-prompt` (`SHADOW_PREFILL_DEVPLAN=0` off): a long prompt's MoE is routed and planned on the device (`dev_plan`); these are its scratch buffers:
     /// each token's chosen experts, the users of each expert, each expert's first group, and the host's per-layer expert tables (copied flags, addresses)
@@ -5066,7 +5066,7 @@ impl<'c, 'm> GpuSession<'c, 'm> {
             && !self.moe_gate_up_wanted(&infos[0])
     }
 
-    /// Phase `ph` (0: the resident experts, 1: the copied ones) of the layer's routed experts on Strata's fused int8 kernels (`fused.rs`, `SHADOW_FUSED_MOE=1`) instead of the grouped
+    /// Phase `ph` (0: the resident experts, 1: the copied ones) of the layer's routed experts on Strata's fused int8 kernels (`fused.rs`, `SHADOW_FUSED_MOE=0` turns it off) instead of the grouped
     /// gate/up, SwiGLU and grouped down launches: the layer's input quantized to int8, the routing ids masked to this phase's experts, grouped on the device (`sf_group`), then one
     /// set of launches per 128 experts reading each expert's blob through the planner's address table (`dp_eaddr`: gate rows, up rows, down rows are one blob in a cache slot or a
     /// stage half) and storing the down products at their pairs' rows of `bb.eo`, where the combine reads them.  False when the layer is not covered (formats, shapes, buffers).
@@ -5075,7 +5075,7 @@ impl<'c, 'm> GpuSession<'c, 'm> {
         let c = &self.m.cfg;
         let (h, ff, k, ne) = (c.hidden, c.expert_ff, c.n_expert_used, c.n_expert);
         let (gate, up, down) = (&infos[0], &infos[1], &infos[2]);
-        // what the fused kernels did, once per kind of layer: taken, or why not (`SHADOW_FUSED_MOE=1` prints these)
+        // what the fused kernels did, once per kind of layer: taken, or why not (printed when the fused kernels are loaded)
         static SEEN: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
         let note = |what: String| {
             let mut s = SEEN.lock().unwrap();
