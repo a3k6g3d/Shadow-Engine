@@ -893,6 +893,7 @@ impl Tiers {
         }
         // the RAM black box: available RAM every second, and what held it when it ran low (rambox.rs; SHADOW_RAM_BOX=0 turns it off)
         crate::rambox::start(crate::rambox::default_dir());
+        crate::pinned::start_watchdog(); // gives pinned tier chunks back when available RAM falls under the floor (SHADOW_RAM_WATCHDOG=0 off)
         crate::pinned::ram_map("the tier flags are read (the server has just started)");
         if let Some(g) = gib("--ram-floor-gib")? {
             crate::pinned::set_ram_floor(g as u64);
@@ -956,6 +957,11 @@ struct RamTier<'c> {
     ring_owner: Vec<Option<(usize, usize)>>,
     ring_ref: Vec<bool>,
     ring_hand: usize,
+    /// The packed size of one expert of each layer (0 for a layer without experts): what `trim` needs to tell which experts lie wholly inside what is left.
+    layer_size: Vec<usize>,
+    /// Bytes given back to the OS under RAM pressure, and experts that went with them.
+    trimmed_bytes: usize,
+    trimmed_experts: usize,
     /// Offsets in use since the copies were last waited for (a copy from them in flight, or a file read into them
     /// pending): the Clock hand must not hand them out again, even when it wraps.  Cleared by `moe` per layer.
     claimed: std::collections::HashSet<usize>,
@@ -973,6 +979,7 @@ impl<'c> RamTier<'c> {
         let mut t = RamTier {
             region: None, at: HashMap::new(), ring_by_off: HashMap::new(), ring_offs: Vec::new(),
             ring_sizes: Vec::new(), ring_owner: Vec::new(), ring_ref: Vec::new(), ring_hand: 0,
+            layer_size: Vec::new(), trimmed_bytes: 0, trimmed_experts: 0,
             claimed: Default::default(), zc_reads: 0, served: 0, drive: 0, fill_secs: 0.0,
         };
         if bytes == 0 {
@@ -982,6 +989,7 @@ impl<'c> RamTier<'c> {
         let order = order.unwrap_or_else(|| uniform_order(c.n_layer, c.n_expert));
         let names = |l: usize| ["ffn_gate_exps", "ffn_up_exps", "ffn_down_exps"].map(|r| format!("blk.{l}.{r}.weight"));
         let size = |l: usize| names(l).iter().map(|n| m.expert_bytes(n)).sum::<usize>().next_multiple_of(256);
+        t.layer_size = (0..c.n_layer).map(|l| if c.is_moe(l) { size(l) } else { 0 }).collect();
         let pinned_set: std::collections::HashSet<(usize, usize)> = vram_pinned.iter().map(|&(l, e, _)| (l, e)).collect();
         let mut chosen = Vec::new();
         let mut total = 0usize;
@@ -990,6 +998,7 @@ impl<'c> RamTier<'c> {
                 continue;
             }
             let s = size(l);
+            total = PinnedRegion::fit(total, s, crate::pinned::CHUNK); // no expert across a chunk boundary: each chunk has its own device address and can be given back alone
             if total + s > bytes {
                 break;
             }
@@ -1011,7 +1020,8 @@ impl<'c> RamTier<'c> {
             t.ring_ref.push(false);
         }
         let t0 = std::time::Instant::now();
-        let mut region = PinnedRegion::new(ctx, total)?;
+        // in 1 GiB chunks, so the watchdog can give the tail back (`trim`)
+        let mut region = PinnedRegion::new_chunked(ctx, total, crate::pinned::CHUNK)?;
         let e_err = |x: crate::driver::CudaError| x.to_string();
         // First pass: if VRAM has exclusively pinned hot experts, stream them sequentially through `region` into VRAM.
         if !vram_pinned.is_empty() && arena_ptr != 0 {
@@ -1019,6 +1029,7 @@ impl<'c> RamTier<'c> {
             let mut v_off = 0usize;
             for &(l, ep, slot_off) in vram_pinned {
                 let s = size(l);
+                v_off = PinnedRegion::fit(v_off, s, crate::pinned::CHUNK);
                 if v_off + s <= total {
                     v_chosen.push((l, ep, v_off, slot_off));
                     v_off += s;
@@ -1074,6 +1085,33 @@ impl<'c> RamTier<'c> {
         t.fill_secs = t0.elapsed().as_secs_f64();
         t.region = Some(region);
         Ok(t)
+    }
+
+    /// Gives back at least `want` bytes of the tier's tail (whole chunks; `ctx` waited for first): drops every expert that is not wholly inside what is left, and the
+    /// tail slots of the promotion ring.  Returns (bytes released, experts dropped).
+    fn trim(&mut self, ctx: &Context, want: usize) -> (usize, usize) {
+        let Some(region) = self.region.as_mut() else { return (0, 0) };
+        if let Err(err) = ctx.synchronize() {
+            eprintln!("RAM tier trim: waiting for the GPU failed ({err}): not trimming");
+            return (0, 0);
+        }
+        let freed = region.shrink_by(want);
+        let new_len = region.len();
+        let before = self.at.len();
+        let layer_size = &self.layer_size;
+        self.at.retain(|&(l, _), &mut off| off + layer_size.get(l).copied().unwrap_or(usize::MAX) <= new_len);
+        let keep = self.ring_offs.iter().zip(&self.ring_sizes).take_while(|&(&o, &s)| o + s <= new_len).count();
+        self.ring_offs.truncate(keep);
+        self.ring_sizes.truncate(keep);
+        self.ring_owner.truncate(keep);
+        self.ring_ref.truncate(keep);
+        self.ring_by_off.retain(|&off, _| off < new_len);
+        self.ring_hand = if keep == 0 { 0 } else { self.ring_hand % keep };
+        self.claimed.retain(|&off| off < new_len);
+        let dropped = before - self.at.len();
+        self.trimmed_bytes += freed;
+        self.trimmed_experts += dropped;
+        (freed, dropped)
     }
 
     /// Picks a Clock victim slot in the tail promotion ring whose byte size matches `req_size`, evicting its old owner.
@@ -1806,6 +1844,26 @@ impl<'c, 'm> GpuSession<'c, 'm> {
         self.ctx.mem_info().unwrap_or((0, 0))
     }
 
+    /// The RAM watchdog's request, acted on here - between steps and batches, where no copy from or read into the tier is pending: the tier gives its last chunks back
+    /// (docs/STATUS.md, Phase A3).  Costs one atomic load when there is no request.
+    fn ram_pressure_poll(&mut self) {
+        let want = crate::pinned::take_trim_request();
+        if want == 0 || self.ram.region.is_none() {
+            return;
+        }
+        let avail0 = crate::pinned::available_ram();
+        let (freed, dropped) = self.ram.trim(self.ctx, want as usize);
+        crate::pinned::note_trimmed(freed as u64);
+        let g = |b: u64| b as f64 / (1u64 << 30) as f64;
+        eprintln!("RAM tier: gave back {:.0} GiB under RAM pressure ({dropped} experts dropped; tier now {:.0} GiB, {} experts); available RAM {:.2} -> {:.2} GiB",
+                  g(freed as u64), g(self.ram.region.as_ref().map_or(0, |r| r.len()) as u64), self.ram.at.len(), g(avail0), g(crate::pinned::available_ram()));
+    }
+
+    /// (bytes, experts) the RAM tier has given back under RAM pressure.
+    pub fn ram_tier_trimmed(&self) -> (usize, usize) {
+        (self.ram.trimmed_bytes, self.ram.trimmed_experts)
+    }
+
     pub fn ram_tier_stats(&self) -> (usize, usize, u64, u64) {
         (self.ram.at.len(), self.ram.region.as_ref().map_or(0, |r| r.len()), self.ram.served, self.ram.drive)
     }
@@ -2293,6 +2351,7 @@ impl<'c, 'm> GpuSession<'c, 'm> {
 
     // -------------------------------------------------------------------------------------------- the forward pass
     pub fn step(&mut self, token: u32) -> Vec<f32> {
+        self.ram_pressure_poll();
         let draft = if self.mtp_probe.is_some() {
             self.mtp_draft(token, 1, 0.0).first().copied()
         } else {
@@ -3114,7 +3173,7 @@ impl<'c, 'm> GpuSession<'c, 'm> {
             }
             if let Some(&off) = self.ram.at.get(&(l, e)) {
                 let region = self.ram.region.as_ref().unwrap();
-                srcs.push(region.dev_ptr + off as u64);
+                srcs.push(region.dev_addr(off));
                 host_srcs.push(region.as_slice()[off..off + total].as_ptr() as u64);
                 self.ram.served += 1;
             } else {
@@ -4011,6 +4070,7 @@ impl<'c, 'm> GpuSession<'c, 'm> {
     }
 
     fn batch(&mut self, toks: &[u32], with_logits: bool) -> Vec<Vec<f32>> {
+        self.ram_pressure_poll();
         #[cfg(windows)]
         {
             // `SHADOW_MAIN_PRIO=N`: the thread that queues a long prompt's kernels runs at THREAD_PRIORITY N (1 above normal, 2 highest), so the read workers' memcpys do not
@@ -5566,7 +5626,7 @@ impl<'c, 'm> GpuSession<'c, 'm> {
                         self.ram.ring_ref[r] = true;
                     }
                     self.ram.claimed.insert(off);
-                    hits.push((i, e, self.ram.region.as_ref().unwrap().dev_ptr + off as u64));
+                    hits.push((i, e, self.ram.region.as_ref().unwrap().dev_addr(off)));
                 }
                 None => {
                     self.cache.misses += 1;

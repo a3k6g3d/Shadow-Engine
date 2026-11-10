@@ -73,6 +73,53 @@ fn the_gpu_copies_from_pinned_memory_exactly() {
     assert!(back == r.as_slice(), "the device copy differs from the pinned source");
 }
 
+/// A region built in chunks gives its tail back chunk by chunk (Phase A3): what stays keeps its addresses and its bytes and the GPU still copies it exactly, the pinned count falls by what
+/// was released, and the released part is gone from `len`.
+#[test]
+fn a_chunked_region_gives_its_tail_back() {
+    let Some(ctx) = context() else { return };
+    let chunk = 1usize << 20;
+    let mut r = PinnedRegion::new_chunked(&ctx, 8 * chunk + 4096, chunk).expect("8 MiB and a page, in 1 MiB chunks");
+    assert_eq!(r.len(), 8 * chunk + 4096);
+    for (i, b) in r.as_mut_slice().iter_mut().enumerate() {
+        *b = (i.wrapping_mul(2654435761) >> 13) as u8;
+    }
+    assert_eq!(PinnedRegion::fit(5, 10, 16), 5);
+    assert_eq!(PinnedRegion::fit(10, 10, 16), 16, "a range that would cross goes to the next chunk");
+    assert_eq!(PinnedRegion::fit(0, 16, 16), 0);
+    // every chunk has its own device address and the GPU reads each chunk through it
+    for k in 0..8 {
+        let off = k * chunk + 4096;
+        let d = ctx.alloc(4096).unwrap();
+        let rr = unsafe { (ctx.api.cuMemcpyDtoD)(d.ptr, r.dev_addr(off), 4096) };
+        assert_eq!(rr, 0, "chunk {k}: copy through dev_addr failed");
+        let mut back = vec![0u8; 4096];
+        d.download(&mut back).unwrap();
+        assert!(back == &r.as_slice()[off..off + 4096], "chunk {k} read through its device address differs");
+    }
+    let want: Vec<u8> = r.as_slice().to_vec();
+    let base = r.as_slice().as_ptr();
+    let pinned0 = shadow_cuda::pinned::pinned_bytes();
+    // 2.5 chunks asked for: whole chunks only, from the end (the last one is the 4 KiB tail chunk): 4 KiB + 3 MiB is what it takes to reach 2.5 MiB
+    let freed = r.shrink_by(2 * chunk + chunk / 2);
+    assert_eq!(freed, 4096 + 3 * chunk, "released the tail chunk and three full ones (2.5 MiB is more than the tail and two chunks)");
+    assert_eq!(r.len(), 5 * chunk);
+    assert_eq!(r.as_slice().as_ptr(), base, "nothing moved");
+    let _ = pinned0; // (other tests pin at the same time, so the process-wide count cannot be compared exactly here)
+    assert!(r.as_slice() == &want[..5 * chunk], "the bytes that stayed changed");
+    // (a host range across two registrations is refused by the driver - hence one expert never crosses a chunk)
+    for k in 0..5 {
+        let d = ctx.alloc(chunk).unwrap();
+        d.upload(&r.as_slice()[k * chunk..(k + 1) * chunk]).unwrap();
+        let mut back = vec![0u8; chunk];
+        d.download(&mut back).unwrap();
+        assert!(back == &want[k * chunk..(k + 1) * chunk], "the GPU copy of chunk {k}, which stayed, differs");
+    }
+    assert_eq!(r.shrink_by(usize::MAX), 5 * chunk, "everything can go");
+    assert_eq!(r.len(), 0);
+    assert_eq!(r.shrink_by(1), 0);
+}
+
 /// Host-to-device bandwidth of the RAM tier's kind of memory, by copy size (`cargo test --release -p shadow-cuda --test pinned -- --ignored --nocapture`).
 #[test]
 #[ignore]
