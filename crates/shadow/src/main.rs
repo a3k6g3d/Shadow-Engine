@@ -294,13 +294,15 @@ fn fastest_defaults(rest: &[String]) -> Vec<String> {
     // that pick the next token come from those positions - 11 of 14 varied-text answers ended early (EOS), against 3 of 14
     // without it (docs/STATUS.md).  It stays an explicit opt-in.
     if !has("--ram-tier-gib") {
-        // 36 GiB measured +2.5% decode and ~+10% prompts over 30 (docs/STATUS.md), but it bottoms out near 4.5 GiB of RAM available
-        // when it starts from ~49: with less free RAM than that, the 4 GiB floor would refuse it or the watchdog would kill the run
-        let avail = shadow_cuda::pinned::available_ram() as f64 / (1u64 << 30) as f64;
-        set.extend(["--ram-tier-gib".into(), if avail >= 49.0 { "36" } else { "30" }.into()]);
-        if avail < 49.0 {
-            eprintln!("shadow serve: {avail:.1} GiB of RAM available (49 needed for the 36 GiB tier): using the 30 GiB tier");
-        }
+        // sized from the free RAM at the start (docs/STATUS.md, Phase A4): what is available less 13 GiB, whole GiB, at most 36.  36 GiB measured +2.5% decode and ~+10% prompts
+        // over 30, and it bottoms out near 4.5 GiB of RAM available when it starts from ~49 (hence the 13); the RAM watchdog gives chunks back if the PC runs lower than that
+        use shadow_cuda::pinned::{available_ram, tier_for_available, TIER_MAX, TIER_RESERVE};
+        let g = (1u64 << 30) as f64;
+        let avail = available_ram();
+        let tier = tier_for_available(avail, TIER_MAX, TIER_RESERVE);
+        eprintln!("shadow serve: {:.1} GiB of RAM available: RAM tier {:.0} GiB (available less {:.0} GiB, at most {:.0})", avail as f64 / g, tier as f64 / g,
+                  TIER_RESERVE as f64 / g, TIER_MAX as f64 / g);
+        set.extend(["--ram-tier-gib".into(), (tier >> 30).to_string()]);
     }
     if !has("--ram-floor-gib") {
         // starting from ~49 GiB, available RAM bottoms out at 4.1-5.1 GiB once the 36 GiB tier is pinned and file cache fills

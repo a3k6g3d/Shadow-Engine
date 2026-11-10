@@ -32,6 +32,23 @@ pub fn set_ram_floor(bytes: u64) {
     FLOOR.store(bytes, std::sync::atomic::Ordering::Relaxed);
 }
 
+/// The tier the launcher asks for when the user gave no `--ram-tier-gib` (docs/STATUS.md, Phase A4): the RAM available at the start less `reserve`, in whole GiB, at most
+/// `max` (the largest tier that has been measured), and 0 when under 2 GiB would be left of it (a tier that small is not worth a fill).  The fixed rule it replaces - 36 GiB from
+/// 49 GiB available, else 30 - was this with a reserve of 13 GiB: with that much left over, available RAM bottomed out at 4.1-5.1 GiB (the floor is 3), and the RAM watchdog now
+/// gives chunks back if it dips under.
+pub fn tier_for_available(available: u64, max: u64, reserve: u64) -> u64 {
+    let gib = 1u64 << 30;
+    let t = (available.saturating_sub(reserve) / gib * gib).min(max);
+    if t < 2 * gib { 0 } else { t }
+}
+
+/// RAM left over when `tier_for_available` sizes the default tier: the tier's own overhead (~4 GiB: the pinned stage buffers, the host state of a conversation), the floor,
+/// and the dip of the file cache and the desktop below the free RAM at the start (4.5 GiB seen from 49 GiB with a 36 GiB tier).
+pub const TIER_RESERVE: u64 = 13 << 30;
+
+/// The largest default tier (what has been measured on the ladder: Phase B raises it).
+pub const TIER_MAX: u64 = 36 << 30;
+
 /// What `auto` leaves available when it sizes a pinned tier: the floor plus room for what moves after the fill
 /// (the file cache, the desktop, other programs).  With a 32 GiB tier filled at ~41 GiB available, available RAM
 /// later dipped to 5.6 GiB in one of 8 runs - 2.4 GiB below what was left at the fill - so the margin is the floor
@@ -394,6 +411,18 @@ mod tests {
     fn this_process_reports_its_memory() {
         let (ws, private) = process_memory();
         assert!(ws > (1 << 20) && private > (1 << 20), "{ws} {private}");
+    }
+
+    #[test]
+    fn the_default_tier_follows_the_free_ram() {
+        let g = 1u64 << 30;
+        assert_eq!(tier_for_available(49 * g, TIER_MAX, TIER_RESERVE), 36 * g, "the old rule's point: 49 GiB free gives 36");
+        assert_eq!(tier_for_available(64 * g, TIER_MAX, TIER_RESERVE), 36 * g, "capped at what has been measured");
+        assert_eq!(tier_for_available(45 * g + g / 2, TIER_MAX, TIER_RESERVE), 32 * g, "whole GiB, rounded down");
+        assert_eq!(tier_for_available(30 * g, TIER_MAX, TIER_RESERVE), 17 * g);
+        assert_eq!(tier_for_available(14 * g, TIER_MAX, TIER_RESERVE), 0, "under 2 GiB of tier: none");
+        assert_eq!(tier_for_available(5 * g, TIER_MAX, TIER_RESERVE), 0);
+        assert_eq!(tier_for_available(0, TIER_MAX, TIER_RESERVE), 0);
     }
 
     #[test]
