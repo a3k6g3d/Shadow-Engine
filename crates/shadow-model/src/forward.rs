@@ -159,6 +159,9 @@ impl Config {
 }
 
 /// Positional reads, safe from several threads at once.
+/// `Model::load_lean` keeps dense tensors smaller than this in RAM.
+const LEAN_KEEP_BYTES: u64 = 4 << 20;
+
 pub(crate) fn read_at(f: &File, buf: &mut [u8], offset: u64) -> std::io::Result<()> {
     #[cfg(windows)]
     {
@@ -298,18 +301,36 @@ pub struct Model {
     /// Parallel reads for the routed experts that miss every tier (`experts_into_many`).
     pool: ReadPool,
     dense: HashMap<String, Vec<u8>>,
+    /// Dense tensors not held in RAM (`load_lean`): the GPU session reads each from the file when it uploads it.
+    lean: std::collections::HashSet<String>,
     ple_cache: std::sync::RwLock<HashMap<i64, Vec<f32>>>,
 }
 
 impl Model {
     /// Reads every tensor that is not a routed expert or the n-gram table into RAM (~4.1 GiB as stored).
     pub fn load(g: Gguf) -> Result<Model, String> {
+        Model::load_with(g, false)
+    }
+
+    /// Like `load`, but keeps in RAM only what host code reads (the token embedding table, `.scale` scalars and tensors under 4 MiB: norms, conv taps);
+    /// every other dense tensor is read from the file by `read_dense` when the GPU session uploads it (docs/STATUS.md, Phase A2: ~4.3 GiB of RAM saved).
+    /// The CPU forward pass needs `load`.
+    pub fn load_lean(g: Gguf) -> Result<Model, String> {
+        Model::load_with(g, true)
+    }
+
+    fn load_with(g: Gguf, lean_mode: bool) -> Result<Model, String> {
         let cfg = Config::from_gguf(&g)?;
         let files = g.shards.iter().map(|s| File::open(&s.path).map_err(|e| format!("{}: {e}", s.path.display())))
             .collect::<Result<Vec<_>, _>>()?;
         let mut dense = HashMap::new();
+        let mut lean = std::collections::HashSet::new();
         for t in &g.tensors {
             if (t.name.contains("_exps") && t.name.ends_with(".weight")) || t.name == "per_layer_token_embd.weight" {
+                continue;
+            }
+            if lean_mode && t.name != "token_embd.weight" && !t.name.ends_with(".scale") && t.nbytes() >= LEAN_KEEP_BYTES {
+                lean.insert(t.name.clone());
                 continue;
             }
             let mut b = vec![0u8; t.nbytes() as usize];
@@ -319,7 +340,7 @@ impl Model {
         let paths: Vec<_> = g.shards.iter().map(|s| s.path.clone()).collect();
         let workers = std::env::var("SHADOW_READ_WORKERS").ok().and_then(|v| v.parse::<usize>().ok()).filter(|&n| n >= 1).unwrap_or(READ_WORKERS);
         let pool = ReadPool::new(&paths, workers)?;
-        Ok(Model { g, cfg, files, pool, dense, ple_cache: std::sync::RwLock::new(HashMap::new()) })
+        Ok(Model { g, cfg, files, pool, dense, lean, ple_cache: std::sync::RwLock::new(HashMap::new()) })
     }
 
     /// The companion `.scale` f32 multiplier of a 2-D tensor (1.0 when the model has no `.scale` tensor).
@@ -329,13 +350,31 @@ impl Model {
         f32::from_le_bytes(b[..4].try_into().unwrap())
     }
 
+    /// Bytes of dense tensors held in RAM.
     pub fn dense_bytes(&self) -> usize {
         self.dense.values().map(Vec::len).sum()
     }
 
+    /// A dense tensor's info and its size in bytes, held in RAM or not.
+    pub fn dense_meta(&self, name: &str) -> (&TensorInfo, usize) {
+        let t = self.g.tensor(name).unwrap_or_else(|| panic!("no tensor {name}"));
+        (t, t.nbytes() as usize)
+    }
+
+    /// A dense tensor's bytes: borrowed when held in RAM, read from the file otherwise.
+    pub fn read_dense(&self, name: &str) -> Result<std::borrow::Cow<'_, [u8]>, String> {
+        if let Some(b) = self.dense.get(name) {
+            return Ok(std::borrow::Cow::Borrowed(b));
+        }
+        let t = self.g.tensor(name).ok_or_else(|| format!("no tensor {name}"))?;
+        let mut b = vec![0u8; t.nbytes() as usize];
+        read_at(&self.files[t.shard], &mut b, t.offset).map_err(|e| format!("{name}: {e}"))?;
+        Ok(std::borrow::Cow::Owned(b))
+    }
+
     fn mat(&self, name: &str) -> Mat<'_> {
         let t = self.g.tensor(name).unwrap_or_else(|| panic!("no tensor {name}"));
-        Mat { t, bytes: &self.dense[name] }
+        Mat { t, bytes: self.dense.get(name).unwrap_or_else(|| panic!("{name} is not held in RAM (load_lean): use read_dense")) }
     }
 
     /// A dense tensor as stored: its info and its bytes (held in RAM since `load`).
@@ -346,7 +385,7 @@ impl Model {
 
     /// The names of every dense tensor (everything but the routed experts and the n-gram table).
     pub fn dense_names(&self) -> impl Iterator<Item = &str> {
-        self.dense.keys().map(String::as_str)
+        self.dense.keys().chain(self.lean.iter()).map(String::as_str)
     }
 
     /// A small tensor, whole, as f32.

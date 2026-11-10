@@ -158,7 +158,7 @@ impl<'c, 'm> GpuSession<'c, 'm> {
         self.mtp_hc_read("hyper_connection_mixer", None, false, b.sample.ptr);
         // the head over the draft vocabulary's rows only (when its type has the row-index kernel), the pick on the GPU
         // (smallest id on a tie) and its probability there
-        let (t_out, _) = self.m.dense("output.weight");
+        let (t_out, _) = self.m.dense_meta("output.weight");
         let head_ty = t_out.ty.name().to_lowercase();
         match (&mt.draft_ids, matches!(head_ty.as_str(), "q6_k" | "q4_k" | "iq4_xs") && self.m.scale("output.weight") == 1.0) {
             (Some(d), true) => {

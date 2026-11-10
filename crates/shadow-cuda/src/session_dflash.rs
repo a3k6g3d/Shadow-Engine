@@ -220,7 +220,7 @@ impl<'c, 'm> GpuSession<'c, 'm> {
         match df.draft_ids.as_ref() {
             // the draft vocabulary's rows only, every row decoded once for all the slots
             Some((ids, n)) => {
-                let (t_out, _) = self.m.dense("output.weight");
+                let (t_out, _) = self.m.dense_meta("output.weight");
                 let head_ty = t_out.ty.name().to_lowercase();
                 // SAFETY: n rows named by ids (all < vocab) of the head as stored; hid1 holds `slots` rows of HIDDEN floats,
                 // logits slots x n floats (n <= vocab).

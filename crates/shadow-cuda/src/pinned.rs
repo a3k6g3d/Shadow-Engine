@@ -77,8 +77,24 @@ mod win {
     pub const MEM_COMMIT_RESERVE: u32 = 0x1000 | 0x2000;
     pub const MEM_RELEASE: u32 = 0x8000;
     pub const PAGE_READWRITE: u32 = 0x04;
+    #[repr(C)]
+    pub struct ProcMemCounters {
+        pub cb: u32,
+        pub page_faults: u32,
+        pub peak_working_set: usize,
+        pub working_set: usize,
+        pub quota_peak_paged: usize,
+        pub quota_paged: usize,
+        pub quota_peak_nonpaged: usize,
+        pub quota_nonpaged: usize,
+        pub pagefile: usize,
+        pub peak_pagefile: usize,
+        pub private_usage: usize,
+    }
     #[link(name = "kernel32")]
     extern "system" {
+        pub fn K32GetProcessMemoryInfo(process: *mut c_void, c: *mut ProcMemCounters, cb: u32) -> i32;
+        pub fn GetCurrentProcess() -> *mut c_void;
         pub fn GlobalMemoryStatusEx(status: *mut MemoryStatusEx) -> i32;
         pub fn VirtualAlloc(addr: *mut c_void, len: usize, typ: u32, protect: u32) -> *mut c_void;
         pub fn VirtualFree(addr: *mut c_void, len: usize, typ: u32) -> i32;
@@ -102,6 +118,36 @@ pub fn available_ram() -> u64 {
 #[cfg(not(windows))]
 pub fn available_ram() -> u64 {
     0
+}
+
+/// This process's working set and private bytes (committed memory only it uses), in bytes; (0, 0) when unknown.
+#[cfg(windows)]
+pub fn process_memory() -> (u64, u64) {
+    let mut c = win::ProcMemCounters { cb: std::mem::size_of::<win::ProcMemCounters>() as u32, page_faults: 0, peak_working_set: 0, working_set: 0, quota_peak_paged: 0, quota_paged: 0,
+                                       quota_peak_nonpaged: 0, quota_nonpaged: 0, pagefile: 0, peak_pagefile: 0, private_usage: 0 };
+    // SAFETY: the pseudo-handle of the current process and a correctly sized out-structure.
+    if unsafe { win::K32GetProcessMemoryInfo(win::GetCurrentProcess(), &mut c, c.cb) } == 0 {
+        return (0, 0);
+    }
+    (c.working_set as u64, c.private_usage as u64)
+}
+
+#[cfg(not(windows))]
+pub fn process_memory() -> (u64, u64) {
+    (0, 0)
+}
+
+/// `SHADOW_RAM_MAP=1`: one line at a loading checkpoint with where this process's RAM is (docs/STATUS.md, Phase A1): working set, private bytes, what is pinned, what is neither (heap,
+/// driver, buffers) and what the PC has available.
+pub fn ram_map(label: &str) {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var_os("SHADOW_RAM_MAP").is_some()) {
+        return;
+    }
+    let g = |b: u64| b as f64 / (1u64 << 30) as f64;
+    let (ws, private) = process_memory();
+    let pinned = pinned_bytes();
+    eprintln!("ram map: {label}: working set {:.2} GiB, private {:.2} GiB, pinned {:.2} GiB, private but not pinned {:.2} GiB, {:.2} GiB available", g(ws), g(private), g(pinned), g(private.saturating_sub(pinned)), g(available_ram()));
 }
 
 /// A page-locked host region the GPU can DMA from or read directly via zero-copy device mapping.  Unregistered and freed on drop.
@@ -198,6 +244,13 @@ impl Drop for PinnedRegion<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    fn this_process_reports_its_memory() {
+        let (ws, private) = process_memory();
+        assert!(ws > (1 << 20) && private > (1 << 20), "{ws} {private}");
+    }
 
     #[test]
     fn the_floor_is_four_gib_and_counts_the_request() {

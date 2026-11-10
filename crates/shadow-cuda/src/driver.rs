@@ -181,7 +181,9 @@ pub struct Context {
 
 impl Context {
     pub fn new(ordinal: i32) -> Result<Context, Box<dyn std::error::Error>> {
+        crate::pinned::ram_map("before the CUDA context (the model file is open and loaded)");
         let api = api()?;
+        crate::pinned::ram_map("the CUDA driver loaded and initialised");
         let mut dev = 0;
         call!(api, cuDeviceGet(&mut dev, ordinal))?;
         let mut ctx: H = std::ptr::null_mut();
@@ -208,6 +210,7 @@ impl Context {
         let sms = attr(CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT)?;
         let mut total_mem = 0usize;
         call!(api, cuDeviceTotalMem(&mut total_mem, dev))?;
+        crate::pinned::ram_map("the CUDA context made");
         Ok(Context { api, device: dev, ctx, name, cc, sms, total_mem })
     }
 

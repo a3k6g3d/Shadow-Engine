@@ -893,6 +893,7 @@ impl Tiers {
         }
         // the RAM black box: available RAM every second, and what held it when it ran low (rambox.rs; SHADOW_RAM_BOX=0 turns it off)
         crate::rambox::start(crate::rambox::default_dir());
+        crate::pinned::ram_map("the tier flags are read (the server has just started)");
         if let Some(g) = gib("--ram-floor-gib")? {
             crate::pinned::set_ram_floor(g as u64);
             if (g as u64) < crate::pinned::RAM_FLOOR {
@@ -1349,7 +1350,11 @@ impl<'c, 'm> GpuSession<'c, 'm> {
         let c = &m.cfg;
         let e = |x: crate::driver::CudaError| x.to_string();
         let vmap = std::env::var("SHADOW_VRAM_MAP").is_ok();
+        let rmap = std::env::var("SHADOW_RAM_MAP").is_ok();
         let vm = |s: &str| {
+            if rmap {
+                crate::pinned::ram_map(s);
+            }
             if vmap {
                 eprintln!("vram map: {s}: {} MiB free", ctx.mem_info().map_or(0, |x| x.0 >> 20));
             }
@@ -1366,9 +1371,9 @@ impl<'c, 'm> GpuSession<'c, 'm> {
             if name == "token_embd.weight" || name.ends_with(".scale") {
                 continue; // the embedding row is dequantized on the host; .scale scalars/vectors stay on the host
             }
-            let (_, bytes) = m.dense(name);
+            let bytes = m.read_dense(name)?; // from the RAM copy when the model keeps one, else read from the file now and dropped after the upload
             let buf = ctx.alloc(bytes.len()).map_err(e)?;
-            buf.upload(bytes).map_err(e)?;
+            buf.upload(&bytes).map_err(e)?;
             resident_bytes += bytes.len();
             w.insert(name.to_string(), buf);
             if is_small(name) {
@@ -1621,7 +1626,9 @@ impl<'c, 'm> GpuSession<'c, 'm> {
             }
         }
         let arena_ptr = arena.as_ref().map_or(0, |a| a.ptr);
+        vm("before the RAM tier");
         let ram = RamTier::fill(ctx, m, ram_bytes, tiers.order.clone(), &vram_pinned, arena_ptr)?;
+        vm("RAM tier filled");
         let mut cache = ExpertCache {
             arena, slot_offset, layer_range, evict_range, slot_bytes, arena_bytes, slots, map: HashMap::new(),
             owner: vec![None; slots], stamp: vec![0; slots], clock: 0, hits: 0, misses: 0,
@@ -2106,9 +2113,9 @@ impl<'c, 'm> GpuSession<'c, 'm> {
 
     /// y = W x for a resident dense tensor (applying the companion `.scale` scalar when present).
     fn mv(&self, name: &str, x: u64, y: u64) {
-        let (t, bytes) = self.m.dense(name);
+        let (t, nbytes) = self.m.dense_meta(name);
         let (qk, qb) = t.ty.block().unwrap();
-        let rows = bytes.len() / (t.dims[0] / qk * qb) as usize;
+        let rows = nbytes / (t.dims[0] / qk * qb) as usize;
         let wptr = self.w.get(name).unwrap_or_else(|| panic!("{name} is not resident")).ptr;
         let s = self.m.scale(name);
         self.matvec(t, wptr, rows, x, y);
@@ -2120,8 +2127,8 @@ impl<'c, 'm> GpuSession<'c, 'm> {
     /// Fuses y0 = W0 x and y1 = W1 x into a single launch when W0 and W1 share the column count, unit scale and 8-row
     /// alignment - same quant type (`PAIR_KERNELS`) or a listed pair of types (`PAIR2_KERNELS`); two `mv` otherwise.
     fn mv_pair(&self, name0: &str, y0: u64, name1: &str, y1: u64, x: u64) {
-        let (t0, b0) = self.m.dense(name0);
-        let (t1, b1) = self.m.dense(name1);
+        let (t0, b0) = self.m.dense_meta(name0);
+        let (t1, b1) = self.m.dense_meta(name1);
         let ty = t0.ty.name();
         if self.fast_order && matches!(ty.as_str(), "BF16" | "F32") {
             // the pair kernels for these types sum in the reference order
@@ -2131,8 +2138,8 @@ impl<'c, 'm> GpuSession<'c, 'm> {
         }
         let (qk, qb) = t0.ty.block().unwrap();
         let (qk1, qb1) = t1.ty.block().unwrap();
-        let r0 = b0.len() / (t0.dims[0] / qk * qb) as usize;
-        let r1 = b1.len() / (t1.dims[0] / qk1 * qb1) as usize;
+        let r0 = b0 / (t0.dims[0] / qk * qb) as usize;
+        let r1 = b1 / (t1.dims[0] / qk1 * qb1) as usize;
         let ty1 = t1.ty.name();
         let fast_ok = |t: &TensorInfo| matches!(t.ty.name().as_str(), "BF16" | "F32") || t.dims[0].is_multiple_of(8);
         if t0.ty != t1.ty && t0.dims[0] == t1.dims[0] && r0.is_multiple_of(8) && t0.dims[0].is_multiple_of(8)
@@ -4266,9 +4273,9 @@ impl<'c, 'm> GpuSession<'c, 'm> {
     /// y_j = W x_j for j < m (x_j at x + j * xs floats, y_j at y + j * ys): bit for bit what `mv` gives each input,
     /// in one launch where a matvec_cols kernel computes the same sums (`mv` per input otherwise).
     fn mv_cols(&self, name: &str, x: u64, xs: usize, y: u64, ys: usize, m: usize) {
-        let (t, bytes) = self.m.dense(name);
+        let (t, nbytes) = self.m.dense_meta(name);
         let (qk, qb) = t.ty.block().unwrap();
-        let rows = bytes.len() / (t.dims[0] / qk * qb) as usize;
+        let rows = nbytes / (t.dims[0] / qk * qb) as usize;
         let ty = t.ty.name();
         let entry = match ty.as_str() {
             _ if self.m.scale(name) != 1.0 => None,
@@ -4355,9 +4362,9 @@ impl<'c, 'm> GpuSession<'c, 'm> {
         let mut bytes = Vec::with_capacity(jobs.len() * 32);
         let mut first = 0u32;
         for (name, y, ys) in jobs {
-            let (t, b) = self.m.dense(name);
+            let (t, b) = self.m.dense_meta(name);
             let (qk, qb) = t.ty.block()?;
-            let rows = b.len() / (t.dims[0] / qk * qb) as usize;
+            let rows = b / (t.dims[0] / qk * qb) as usize;
             let ty = match t.ty.name().as_str() {
                 "Q4_K" => 0u32, "Q5_K" => 1, "Q6_K" => 2, "IQ4_XS" => 3, "BF16" => 4, "F32" => 5, "IQ4_NL" => 6,
                 _ => return None,
