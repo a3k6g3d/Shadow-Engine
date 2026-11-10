@@ -32,22 +32,45 @@ pub fn set_ram_floor(bytes: u64) {
     FLOOR.store(bytes, std::sync::atomic::Ordering::Relaxed);
 }
 
-/// The tier the launcher asks for when the user gave no `--ram-tier-gib` (docs/STATUS.md, Phase A4): the RAM available at the start less `reserve`, in whole GiB, at most
-/// `max` (the largest tier that has been measured), and 0 when under 2 GiB would be left of it (a tier that small is not worth a fill).  The fixed rule it replaces - 36 GiB from
-/// 49 GiB available, else 30 - was this with a reserve of 13 GiB: with that much left over, available RAM bottomed out at 4.1-5.1 GiB (the floor is 3), and the RAM watchdog now
-/// gives chunks back if it dips under.
-pub fn tier_for_available(available: u64, max: u64, reserve: u64) -> u64 {
-    let gib = 1u64 << 30;
-    let t = (available.saturating_sub(reserve) / gib * gib).min(max);
-    if t < 2 * gib { 0 } else { t }
+/// RAM the machine loses between the start (free RAM before the server) and its lowest point while serving, besides the tier itself, in GiB, for a tier of `tier_gib` GiB: the
+/// server's own ~1-4 GiB (STATUS 82) plus the file cache the SSD reads fill, which is smaller the bigger the tier (fewer misses).  Measured on the Phase B ladder (STATUS 85, 52.8 GiB
+/// free at the start, a 3k, a 3k and a 15k prompt, 200 tokens): 7.6 GiB at a 36 GiB tier, 6.3 at 40, 5.0 at 42, 3.8 at 44, 2.8 at 45, interpolated between; for a smaller tier it stays
+/// 7.6 (the 24 GiB tier of the Phase A4 test lost 5.8).
+pub fn tier_overhead_gib(tier_gib: u64) -> f64 {
+    const LADDER: [(f64, f64); 5] = [(36.0, 7.6), (40.0, 6.3), (42.0, 5.0), (44.0, 3.8), (45.0, 2.8)];
+    let t = tier_gib as f64;
+    if t <= LADDER[0].0 {
+        return LADDER[0].1;
+    }
+    for w in LADDER.windows(2) {
+        if t <= w[1].0 {
+            return w[0].1 + (w[1].1 - w[0].1) * (t - w[0].0) / (w[1].0 - w[0].0);
+        }
+    }
+    LADDER[4].1
 }
 
-/// RAM left over when `tier_for_available` sizes the default tier: the tier's own overhead (~4 GiB: the pinned stage buffers, the host state of a conversation), the floor,
-/// and the dip of the file cache and the desktop below the free RAM at the start (4.5 GiB seen from 49 GiB with a 36 GiB tier).
-pub const TIER_RESERVE: u64 = 13 << 30;
+/// Available RAM above the floor that the default tier still leaves at its lowest point (the ladder's 45 GiB tier left 1.5 GiB; the rule asks 1.25): the watchdog covers the rest.
+pub const TIER_SAFETY_GIB: f64 = 1.25;
 
-/// The largest default tier (what has been measured on the ladder: Phase B raises it).
-pub const TIER_MAX: u64 = 36 << 30;
+/// The largest default tier: the top of the Phase B ladder (45 GiB of a 46.8 GiB model's experts); beyond it nothing has been measured.
+pub const TIER_MAX: u64 = 45 << 30;
+
+/// The tier the launcher asks for when the user gave no `--ram-tier-gib` (docs/STATUS.md, Phase A4 and B): the biggest whole number of GiB, at most `max`, such that the free RAM at
+/// the start less the tier, its overhead (`tier_overhead_gib`) and `TIER_SAFETY_GIB` still stays above `floor`; 0 when that is under 2 GiB (not worth a fill).  From 52.8 GiB free
+/// with a 3.5 GiB floor that is 45; from 49 GiB, 36 (the rule it replaces: 36 from 49, else 30).
+pub fn tier_for_available(available: u64, max: u64, floor: u64) -> u64 {
+    let g = (1u64 << 30) as f64;
+    let (avail, floor) = (available as f64 / g, floor as f64 / g);
+    let mut t = max >> 30;
+    while t >= 2 {
+        if avail - t as f64 - tier_overhead_gib(t) - TIER_SAFETY_GIB >= floor {
+            return t << 30;
+        }
+        t -= 1;
+    }
+    0
+}
 
 /// What `auto` leaves available when it sizes a pinned tier: the floor plus room for what moves after the fill
 /// (the file cache, the desktop, other programs).  With a 32 GiB tier filled at ~41 GiB available, available RAM
@@ -416,13 +439,17 @@ mod tests {
     #[test]
     fn the_default_tier_follows_the_free_ram() {
         let g = 1u64 << 30;
-        assert_eq!(tier_for_available(49 * g, TIER_MAX, TIER_RESERVE), 36 * g, "the old rule's point: 49 GiB free gives 36");
-        assert_eq!(tier_for_available(64 * g, TIER_MAX, TIER_RESERVE), 36 * g, "capped at what has been measured");
-        assert_eq!(tier_for_available(45 * g + g / 2, TIER_MAX, TIER_RESERVE), 32 * g, "whole GiB, rounded down");
-        assert_eq!(tier_for_available(30 * g, TIER_MAX, TIER_RESERVE), 17 * g);
-        assert_eq!(tier_for_available(14 * g, TIER_MAX, TIER_RESERVE), 0, "under 2 GiB of tier: none");
-        assert_eq!(tier_for_available(5 * g, TIER_MAX, TIER_RESERVE), 0);
-        assert_eq!(tier_for_available(0, TIER_MAX, TIER_RESERVE), 0);
+        let f = 7 * g / 2; // 3.5 GiB
+        assert_eq!(tier_for_available(53 * g, TIER_MAX, f), 45 * g, "a free PC: the top of the ladder");
+        assert_eq!(tier_for_available(80 * g, TIER_MAX, f), 45 * g, "capped at what has been measured");
+        assert_eq!(tier_for_available(49 * g, TIER_MAX, f), 36 * g, "the old rule's point: 49 GiB free gave 36");
+        assert_eq!(tier_for_available(52 * g, TIER_MAX, f), 42 * g);
+        let (small, mid) = (tier_for_available(40 * g, TIER_MAX, f), tier_for_available(45 * g, TIER_MAX, f));
+        assert!(small < mid && mid < 36 * g, "{small} {mid}: less free RAM, a smaller tier");
+        assert!(small >= 24 * g, "40 GiB free still gets a sizable tier");
+        assert_eq!(tier_for_available(12 * g, TIER_MAX, f), 0, "nothing worth a fill");
+        assert_eq!(tier_for_available(0, TIER_MAX, f), 0);
+        assert!(tier_for_available(53 * g, TIER_MAX, 5 * g) < 45 * g, "a higher floor shrinks the tier");
     }
 
     #[test]

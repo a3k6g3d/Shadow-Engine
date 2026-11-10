@@ -293,20 +293,20 @@ fn fastest_defaults(rest: &[String]) -> Vec<String> {
     // NOT `--verify-resident`: it computes a verify pass's extra positions with the resident experts only, and the logits
     // that pick the next token come from those positions - 11 of 14 varied-text answers ended early (EOS), against 3 of 14
     // without it (docs/STATUS.md).  It stays an explicit opt-in.
+    // the RAM floor: 3.5 GiB unless the user passed one (docs/STATUS.md, Phase B: approved for the 45 GiB tier, and stricter than the 3 GiB it was before)
+    let floor_gib = rest.iter().position(|a| a == "--ram-floor-gib").and_then(|i| rest.get(i + 1)).and_then(|v| v.parse::<f64>().ok()).unwrap_or(3.5);
     if !has("--ram-tier-gib") {
-        // sized from the free RAM at the start (docs/STATUS.md, Phase A4): what is available less 13 GiB, whole GiB, at most 36.  36 GiB measured +2.5% decode and ~+10% prompts
-        // over 30, and it bottoms out near 4.5 GiB of RAM available when it starts from ~49 (hence the 13); the RAM watchdog gives chunks back if the PC runs lower than that
-        use shadow_cuda::pinned::{available_ram, tier_for_available, TIER_MAX, TIER_RESERVE};
+        // sized from the free RAM at the start (docs/STATUS.md, Phases A4 and B): the biggest tier, at most 45 GiB, that leaves the floor plus a margin available at the lowest
+        // point of the ladder's runs; 45 GiB measured -23% on a 3k prompt and no loss on a 15k prompt or decode against 36.  The RAM watchdog gives chunks back if the PC runs lower
+        use shadow_cuda::pinned::{available_ram, tier_for_available, TIER_MAX};
         let g = (1u64 << 30) as f64;
         let avail = available_ram();
-        let tier = tier_for_available(avail, TIER_MAX, TIER_RESERVE);
-        eprintln!("shadow serve: {:.1} GiB of RAM available: RAM tier {:.0} GiB (available less {:.0} GiB, at most {:.0})", avail as f64 / g, tier as f64 / g,
-                  TIER_RESERVE as f64 / g, TIER_MAX as f64 / g);
+        let tier = tier_for_available(avail, TIER_MAX, (floor_gib * g) as u64);
+        eprintln!("shadow serve: {:.1} GiB of RAM available, floor {floor_gib:.1}: RAM tier {:.0} GiB (at most {:.0})", avail as f64 / g, tier as f64 / g, TIER_MAX as f64 / g);
         set.extend(["--ram-tier-gib".into(), (tier >> 30).to_string()]);
     }
     if !has("--ram-floor-gib") {
-        // starting from ~49 GiB, available RAM bottoms out at 4.1-5.1 GiB once the 36 GiB tier is pinned and file cache fills
-        set.extend(["--ram-floor-gib".into(), "3".into()]);
+        set.extend(["--ram-floor-gib".into(), format!("{floor_gib}")]);
     }
     if !has("--placement") {
         // the profile of 300 varied prompts (docs/STATUS.md, 2026-10-30), else the six hash-table prompts' one
