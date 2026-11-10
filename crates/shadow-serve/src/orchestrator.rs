@@ -751,7 +751,7 @@ fn builtin_tool_definitions() -> Value {
         },
         {
             "name": "search",
-            "description": "Search the project's files and this session's earlier tool outputs by MEANING, not by exact text (use grep for exact text): describe what you are looking for in a sentence. Returns the best matching pieces with file, line and a score. The index is built in the background the first time and kept on disk.",
+            "description": "Search the project's files and this session's earlier tool outputs by KEYWORDS and by MEANING together (grep is for exact text and patterns): put in the distinctive words you expect (names, flags, identifiers - an identifier matches whole and by its parts: shadow_fused_moe, fused, moe) and, if you can, a few words of what you are after. Returns the best matching pieces with file, line and how they matched (keywords, meaning). Keyword matching works at once; the meaning part is filled in by a background index that is kept on disk, and the answer says when it is not (yet) available.",
             "input_schema": {
                 "type": "object",
                 "properties": {
