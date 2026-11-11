@@ -97,6 +97,10 @@ RAM, expert-cache hit rates, memory tiers).
 are the model tools: header and tensor listing, a metadata key, routing statistics, a tensor dequantized to f32, the
 reference comparison, perplexity.
 
+### Two graphics cards (experimental, `docs/PLAN_TWO_GPUS_2026-11-11.md`)
+
+`shadow serve MODEL --gpus 0,1 [--split N] [--peer-cache-gib G]`: the model's first `N` layers on the first card, the rest on the second, whose VRAM then holds those layers' experts (`--split` omitted: as many layers as fit; `--peer-cache-gib` caps the second card's expert cache). The engine sees one session. No drafter across two cards yet (it is dropped, speculation falls back to prompt lookup); conversation snapshots are not written to disk in this mode. **With one card, with `--gpus` absent or naming one card, with `--gpus` naming a card the driver does not see (a warning, then card 0 alone), or with `SHADOW_GPUS=1`, the whole model runs on one card exactly as before.** `shadow gpus` lists the cards and measures what the host can move through each (bandwidth, the hop between them). `--gpus 0,0` runs both stages on one card (a test mode: give both a small expert cache).
+
 ### Environment variables
 
 Defaults are right for normal use; these are for measurement and diagnosis.

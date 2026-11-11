@@ -205,3 +205,59 @@ fn verify_and_rollback_through_two_stages_equal_one_session() {
         eprintln!("verify + rollback (replayed, re-read), split at layer {split}: every logit identical");
     }
 }
+
+/// The same calls as the engine makes, on whatever `s` is: one session, or a first stage with a second attached (`attach_peer`).
+fn script<'c, 'm>(s: &mut GpuSession<'c, 'm>) -> Vec<Vec<f32>> {
+    const V: [u32; 4] = [11, 22, 33, 44];
+    const V2: [u32; 3] = [66, 77, 88];
+    let mut out = vec![];
+    out.extend(s.step_batch(&TOKENS[..2]));
+    let snap = s.snapshot(false).unwrap();
+    out.extend(s.step_batch_verify(&V));
+    s.rollback(&snap, &V[..2]).unwrap(); // replayed
+    out.push(s.step(555));
+    let snap_kv = s.snapshot(true).unwrap(); // after 5 tokens, with the KV cache
+    out.extend(s.step_batch_verify(&V2));
+    s.rollback(&snap_kv, &[66, 99]).unwrap(); // read again
+    out.push(s.step(123));
+    s.restore_conv(&snap_kv).unwrap(); // back to a conversation snapshot, as the server does
+    out.extend(s.step_batch_last(&[5, 6, 7]));
+    s.reset();
+    out.extend(s.step_batch(&TOKENS[..3])); // a new conversation
+    out
+}
+
+/// A first stage with the second attached is one session to the caller: the whole script (batches, a verify pass, both rollbacks, snapshots with and without
+/// the KV, a restore, a reset and a new conversation) gives every logit identical to one session.
+#[test]
+fn a_pair_driven_through_the_first_stage_equals_one_session() {
+    let p = std::env::var("SHADOW_MODEL").unwrap_or_else(|_| MODEL.into());
+    if !Path::new(&p).is_file() {
+        eprintln!("SKIPPED, not passed: no model at {p}");
+        return;
+    }
+    let ctx = match Context::new(0) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("SKIPPED, not passed: no card ({e})");
+            return;
+        }
+    };
+    let model = Model::load_lean(Gguf::open(Path::new(&p)).unwrap()).unwrap();
+    let n_layer = model.cfg.n_layer;
+    let want = {
+        let mut s = GpuSession::with_tiers(&ctx, &model, CAP, tiers_cached(None)).unwrap();
+        script(&mut s)
+    };
+    for split in [1usize, 24, n_layer - 1] {
+        let mut a = GpuSession::with_tiers(&ctx, &model, CAP, tiers_cached(Some((0, split)))).unwrap();
+        let b = GpuSession::with_tiers(&ctx, &model, CAP, tiers_cached(Some((split, n_layer)))).unwrap();
+        a.attach_peer(b).unwrap();
+        let got = script(&mut a);
+        assert_eq!(got.len(), want.len());
+        for (i, (g, w)) in got.iter().zip(&want).enumerate() {
+            same(g, w, &format!("split {split}, output {i}"));
+        }
+        eprintln!("the pair as one session, split at layer {split}: {} outputs, every logit identical", got.len());
+    }
+}

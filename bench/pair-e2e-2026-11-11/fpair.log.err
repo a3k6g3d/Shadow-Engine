@@ -1,0 +1,33 @@
+shadow serve: fastest-mode defaults: --tail-skip 3 --tensor-prompt --verify-rank 2 --ram-floor-gib 3.5 --placement profiles/routing-varied300.shrc --dflash models/dflash2 --spec 3 --dflash-min-p 0.5 (--exact for the exact path)
+RAM floor: 3.5 GiB (default 4): a pinned tier cannot be paged out, and this PC has frozen hard at 0.4 GiB free
+placement: profiles/routing-varied300.shrc, 34990 tokens of routing
+shadow serve: starting 2 MCP server(s) from mcp.json
+shadow serve: listening on http://127.0.0.1:8095
+shadow serve: two cards: layers 0..24 on GPU 0 (NVIDIA GeForce RTX 5070), layers 24..48 on GPU 0 (NVIDIA GeForce RTX 5070, 11.9 GiB)
+mmq: loaded J:\Shadow\native\mmq\shadow_mmq.dll (int8 tensor-core projections for the prompt path)
+fused: loaded J:\Shadow\native\fused\shadow_fused.dll (Strata's int8 fused experts for the prompt path)
+shadow serve: MCP server time: 3 tools
+shadow serve: MCP server browser: 10 tools
+mmq: loaded J:\Shadow\native\mmq\shadow_mmq.dll (int8 tensor-core projections for the prompt path)
+fused: loaded J:\Shadow\native\fused\shadow_fused.dll (Strata's int8 fused experts for the prompt path)
+shadow serve: ready in 10.6 s; expert cache: 335 slots x 1.83 MiB = 0.60 GiB; 0 hits, 0 misses (0.0% hits); 0 slice uploads; RAM tier: 4422 experts, 8.00 GiB pinned (filled in 4.7 s), misses served 0 from RAM, 0 from the file; tail skip (rank >= 3): 0 routed experts skipped; host waits per step: router 0.0 ms, copies 0.0 ms, file 0.0 ms; kernel launches per step 0, 0.0 ms of host time in them
+shadow serve: speculation: 2 passes (0 drafted by lookup), 3 of 6 drafted tokens accepted, 20 tokens in 0.9 s                    (drafting 0.00 s, checking 0.19 s, rolling back 0.00 s)
+shadow serve: draft position right/tried: 1/2 1/1 1/1 0/0 0/0 0/0 0/0 0/0
+shadow serve: speculation: 3 passes (1 drafted by lookup), 5 of 9 drafted tokens accepted, 40 tokens in 1.6 s                    (drafting 0.00 s, checking 0.22 s, rolling back 0.00 s)
+shadow serve: draft position right/tried: 2/3 2/2 1/2 0/0 0/0 0/0 0/0 0/0
+shadow serve: speculation: 3 passes (2 drafted by lookup), 8 of 9 drafted tokens accepted, 14 tokens in 0.4 s                    (drafting 0.00 s, checking 0.24 s, rolling back 0.00 s)
+shadow serve: draft position right/tried: 3/3 3/3 2/3 0/0 0/0 0/0 0/0 0/0
+shadow serve: speculation: 2 passes (0 drafted by lookup), 3 of 6 drafted tokens accepted, 40 tokens in 1.5 s                    (drafting 0.00 s, checking 0.16 s, rolling back 0.00 s)
+shadow serve: draft position right/tried: 1/2 1/1 1/1 0/0 0/0 0/0 0/0 0/0
+shadow serve: speculation: 8 passes (4 drafted by lookup), 18 of 24 drafted tokens accepted, 40 tokens in 1.2 s                    (drafting 0.00 s, checking 0.60 s, rolling back 0.00 s)
+shadow serve: draft position right/tried: 6/8 6/6 6/6 0/0 0/0 0/0 0/0 0/0
+shadow serve: speculation: 2 passes (0 drafted by lookup), 3 of 6 drafted tokens accepted, 16 tokens in 0.7 s                    (drafting 0.00 s, checking 0.20 s, rolling back 0.00 s)
+shadow serve: draft position right/tried: 1/2 1/1 1/1 0/0 0/0 0/0 0/0 0/0
+shadow serve: speculation: 2 passes (0 drafted by lookup), 0 of 6 drafted tokens accepted, 40 tokens in 1.7 s                    (drafting 0.00 s, checking 0.17 s, rolling back 0.00 s)
+shadow serve: draft position right/tried: 0/2 0/0 0/0 0/0 0/0 0/0 0/0 0/0
+shadow serve: speculation: 4 passes (1 drafted by lookup), 0 of 12 drafted tokens accepted, 40 tokens in 1.9 s                    (drafting 0.00 s, checking 0.36 s, rolling back 0.01 s)
+shadow serve: draft position right/tried: 0/4 0/0 0/0 0/0 0/0 0/0 0/0 0/0
+shadow serve: speculation: 2 passes (0 drafted by lookup), 1 of 6 drafted tokens accepted, 28 tokens in 1.2 s                    (drafting 0.00 s, checking 0.16 s, rolling back 0.00 s)
+shadow serve: draft position right/tried: 1/2 0/1 0/0 0/0 0/0 0/0 0/0 0/0
+shadow serve: speculation: 3 passes (1 drafted by lookup), 1 of 9 drafted tokens accepted, 5 tokens in 0.3 s                    (drafting 0.00 s, checking 0.27 s, rolling back 0.00 s)
+shadow serve: draft position right/tried: 1/3 0/1 0/0 0/0 0/0 0/0 0/0 0/0

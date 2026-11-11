@@ -256,13 +256,50 @@ fn conv_budget(disk: bool) -> usize {
 /// The shortest shared start worth a snapshot (~0.06 s a token to read; a restore is ~10-20 ms).
 const PREFIX_MIN: usize = 64;
 
+/// A second card for the model's last layers (`shadow serve --gpus 0,1`; docs/PLAN_TWO_GPUS_2026-11-11.md).
+#[derive(Clone, Debug)]
+pub struct PairConfig {
+    /// the second card's CUDA ordinal
+    pub ordinal: i32,
+    /// layers on the first card, `[0, split)`; the second card runs the rest.  `None`: as many layers on the second card as its VRAM holds with every expert resident
+    pub split: Option<usize>,
+    /// the second card's VRAM expert cache in bytes; `None`: all the VRAM left
+    pub peer_cache: Option<usize>,
+}
+
 pub struct Config {
     pub model: PathBuf,
     pub n_ctx: usize,
+    /// the first (or only) card's CUDA ordinal
+    pub gpu: i32,
+    /// a second card, or `None`: the whole model on `gpu`
+    pub pair: Option<PairConfig>,
     pub tiers: Tiers,
     /// Speculative decoding (`--spec K`): up to K tokens drafted by prompt lookup, checked in one `step_batch`
     /// (0: off).
     pub spec: usize,
+}
+
+/// How many of the model's last layers the second card can hold with every expert resident, as a split point: its VRAM less ~3 GiB (the head, the buffers, the
+/// driver's share) and the KV window of its attention layers, over ~1.04 GiB a layer (experts and the layer's dense weights).
+fn auto_split(model: &Model, vram: usize, n_ctx: usize) -> usize {
+    let c = &model.cfg;
+    let gib = (1u64 << 30) as f64;
+    let per = |l: usize| -> f64 {
+        ["ffn_gate_exps", "ffn_up_exps", "ffn_down_exps"].iter().filter_map(|r| model.g.tensor(&format!("blk.{l}.{r}.weight")).map(|t| t.nbytes() as f64)).sum::<f64>() + 80.0 * 1024.0 * 1024.0
+    };
+    let kv_per_layer = n_ctx as f64 * 57.0 * 1024.0 / c.n_layer as f64;
+    let mut room = vram as f64 - 3.0 * gib;
+    let mut n_peer = 0;
+    for l in (0..c.n_layer).rev() {
+        let need = per(l) + kv_per_layer;
+        if room < need {
+            break;
+        }
+        room -= need;
+        n_peer += 1;
+    }
+    c.n_layer - n_peer.max(1)
 }
 
 /// Starts the engine thread; requests go in through the returned sender.
@@ -309,9 +346,34 @@ fn run(
     crate::set_special_tokens(tok.special_strings());
     let model = Model::load_lean(g)?; // the GPU session reads the big dense weights from the file as it uploads them: ~4.3 GiB less RAM than `load`
     check_layout(&model.g, &model.cfg)?;
-    let ctx = shadow_cuda::Context::new(0).map_err(|e| format!("GPU: {e}"))?;
+    let ctx = shadow_cuda::Context::new(cfg.gpu).map_err(|e| format!("GPU: {e}"))?;
+    let ctx1 = match &cfg.pair {
+        Some(p) => Some(shadow_cuda::Context::new(p.ordinal).map_err(|e| format!("second GPU {}: {e}", p.ordinal))?),
+        None => None,
+    };
     let arch = model.cfg.arch.clone();
-    let mut sess = GpuSession::with_tiers(&ctx, &model, cfg.n_ctx, cfg.tiers)?;
+    let mut sess = match (&cfg.pair, ctx1.as_ref()) {
+        (Some(pair), Some(c1)) => {
+            let n = model.cfg.n_layer;
+            let split = pair.split.unwrap_or_else(|| auto_split(&model, c1.total_mem, cfg.n_ctx)).clamp(1, n - 1);
+            eprintln!("shadow serve: two cards: layers 0..{split} on GPU {} ({}), layers {split}..{n} on GPU {} ({}, {:.1} GiB)", cfg.gpu, ctx.name, pair.ordinal, c1.name, c1.total_mem as f64 / (1u64 << 30) as f64);
+            // no drafter across two cards yet (docs/PLAN_TWO_GPUS_2026-11-11.md, phase 3): the stages run the target model alone
+            let mut t0 = cfg.tiers.clone();
+            t0.layers = Some((0, split));
+            t0.dflash_dir = None;
+            t0.mtp_dir = None;
+            let mut t1 = t0.clone();
+            t1.layers = Some((split, n));
+            t1.ram_bytes = 0;
+            t1.ram_auto = false;
+            t1.vram_cache = pair.peer_cache;
+            let mut a = GpuSession::with_tiers(&ctx, &model, cfg.n_ctx, t0)?;
+            let b = GpuSession::with_tiers(c1, &model, cfg.n_ctx, t1)?;
+            a.attach_peer(b)?;
+            a
+        }
+        _ => GpuSession::with_tiers(&ctx, &model, cfg.n_ctx, cfg.tiers)?,
+    };
     let im_end = tok.id("<|im_end|>");
     let think_end = tok.id("</think>").or_else(|| tok.id("<|/thought|>"));
     let stops: Vec<u32> = [tok.eos, im_end].into_iter().flatten().collect();
@@ -343,7 +405,8 @@ fn run(
         snap: None,
         prev: vec![],
         convs: vec![],
-        disk: crate::convdisk::ConvDisk::open(&cfg.model),
+        // a pair's snapshots are two (not written to a file yet), and a single session's cannot restore a pair
+        disk: if cfg.pair.is_some() { None } else { crate::convdisk::ConvDisk::open(&cfg.model) },
         pending: None,
     };
     let mut pics = Pics {

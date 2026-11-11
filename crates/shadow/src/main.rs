@@ -339,6 +339,28 @@ fn fastest_defaults(rest: &[String]) -> Vec<String> {
     out
 }
 
+/// The card (and the second one, if any) `shadow serve` runs on, from `--gpus`: one ordinal or none is one card (the first, else 0); two make a pair when the driver
+/// has both, otherwise a warning says so and the first card runs alone.
+fn gpu_plan(rest: &[String]) -> (i32, Option<shadow_serve::engine::PairConfig>) {
+    let flag = |f: &str| rest.iter().position(|a| a == f).and_then(|i| rest.get(i + 1));
+    let ords: Vec<i32> = flag("--gpus").map(|v| v.split(',').filter_map(|x| x.trim().parse().ok()).collect()).unwrap_or_default();
+    let first = ords.first().copied().unwrap_or(0);
+    if ords.len() < 2 {
+        return (first, None);
+    }
+    if std::env::var("SHADOW_GPUS").is_ok_and(|v| v == "1") {
+        eprintln!("shadow serve: SHADOW_GPUS=1: one card (GPU {first})");
+        return (first, None);
+    }
+    let n = shadow_cuda::probe::list().map(|g| g.len() as i32).unwrap_or(0);
+    if ords.iter().any(|&o| o < 0 || o >= n) {
+        eprintln!("shadow serve: --gpus {} asks for two cards but the driver sees {n}: running on GPU {first} alone", flag("--gpus").unwrap());
+        return (if first >= 0 && first < n { first } else { 0 }, None);
+    }
+    let gib = |f: &str| flag(f).and_then(|v| v.parse::<f64>().ok()).map(|g| (g * (1u64 << 30) as f64) as usize);
+    (first, Some(shadow_serve::engine::PairConfig { ordinal: ords[1], split: flag("--split").and_then(|v| v.parse().ok()), peer_cache: gib("--peer-cache-gib") }))
+}
+
 /// `shadow serve MODEL [--host H] [--port P] [--ctx N] [tier flags]`: the HTTP server (shadow-serve) on the GPU
 /// session.  Port 8081 by default - 8080 is where the user's other server lives.
 fn serve(path: &std::path::Path, rest: &[String]) -> ExitCode {
@@ -401,9 +423,13 @@ fn serve(path: &std::path::Path, rest: &[String]) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    // `--gpus A[,B]`: the CUDA ordinals to use; two of them split the model's layers between two cards (`--split N`: layers on the first, else as many on the second as
+    // its VRAM holds with every expert resident; `--peer-cache-gib G`: the second card's expert cache).  Without the flag, or with one card, or when the driver
+    // does not see a second card (or `SHADOW_GPUS=1`), the whole model runs on one card exactly as before.
+    let (gpu, pair) = gpu_plan(rest);
     let cfg = shadow_serve::ServeConfig {
         engine: shadow_serve::engine::Config {
-            model: path.to_path_buf(), n_ctx: gpu_capacity(n_ctx), tiers,
+            model: path.to_path_buf(), n_ctx: gpu_capacity(n_ctx), gpu, pair, tiers,
             spec: flag("--spec").and_then(|v| v.parse().ok()).unwrap_or(0),
         },
         addr,

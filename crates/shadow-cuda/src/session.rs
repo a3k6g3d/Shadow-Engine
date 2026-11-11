@@ -486,6 +486,8 @@ pub struct GpuSession<'c, 'm> {
     layers: (usize, usize),
     layers_in: Option<Vec<f32>>,
     layers_out: Option<Vec<f32>>,
+    /// The next stage (`attach_peer`): this session then runs `0..k` and hands its residual streams on, so the pair is one session to the engine.
+    peer: Option<Box<GpuSession<'c, 'm>>>,
     /// The tokens the session held when it was last `reset` (not emptied by a second reset): the drafter's K/V ring still describes them, so a
     /// snapshot restore right after the reset can keep the positions the two share (`restore`, STATUS 98)
     reset_tokens: Vec<u32>,
@@ -651,6 +653,8 @@ pub struct Snapshot<'c> {
     nblocks: Vec<usize>,
     /// The draft layer's pending residual (and with the KV its K/V cells), when the session has one.
     mtp: Option<(Saved<'c>, bool, Option<(Saved<'c>, Saved<'c>)>)>,
+    /// The next stage's snapshot, when the session has a peer.
+    peer: Option<Box<Snapshot<'c>>>,
 }
 
 struct SnapKv<'c> {
@@ -716,6 +720,9 @@ impl Snapshot<'_> {
             put_u64(o, v.len());
             o.extend_from_slice(v);
             Ok(())
+        }
+        if self.peer.is_some() {
+            return Err("the snapshot of a pair of sessions is not written to a file yet".into());
         }
         let mut o = Vec::with_capacity(self.host_bytes() + (1 << 16));
         put_u64(&mut o, self.tokens.len());
@@ -810,7 +817,7 @@ impl Snapshot<'_> {
         } else {
             None
         };
-        Ok(Snapshot { tokens, delta, ple, kv, nblocks, mtp })
+        Ok(Snapshot { tokens, delta, ple, kv, nblocks, mtp, peer: None })
     }
 
     /// Bytes this snapshot holds in host memory (what a pool of them costs in RAM).
@@ -822,6 +829,9 @@ impl Snapshot<'_> {
         }
         for k in self.kv.iter().flatten() {
             n += h(&k.k) + h(&k.v) + h(&k.raw) + h(&k.blocks);
+        }
+        if let Some(p) = &self.peer {
+            n += p.host_bytes();
         }
         if let Some((a, _, kv)) = &self.mtp {
             n += h(a);
@@ -1829,7 +1839,7 @@ impl<'c, 'm> GpuSession<'c, 'm> {
         let mut s = GpuSession {
             ctx, m, mvp, fw, w, v, b, bb, replay, dscr, mmq, mmq_y, mmq_y_tag: std::cell::Cell::new((0, 0, 0, 0, 0)), fused,
             rparts: Vec::new(), bb_sig: 0, logits_last: false, sub_last: true, sub_first: true,
-            devplan: tiers.tensor_prompt && !std::env::var("SHADOW_PREFILL_DEVPLAN").is_ok_and(|v| v == "0"), dp_tidx, dp_cnt, dp_gstart, dp_copied, dp_eaddr, dp_lay, kv_regions, kv_extra: None, kv_extra_reg, vmm_pool: Vec::new(), prompt_hint: 0, kv_rows: 0, kv_halves: false, router_bias: std::env::var("SHADOW_ROUTER_BIAS").ok().and_then(|v| v.parse().ok()).unwrap_or(0.0), batch_scratch, delta, attn, ple_state, tokens: vec![], layers, layers_in: None, layers_out: None, reset_tokens: vec![], pictures: vec![], rope_tab: None, rope_on: false, cap, trace: None, stop_after: None,
+            devplan: tiers.tensor_prompt && !std::env::var("SHADOW_PREFILL_DEVPLAN").is_ok_and(|v| v == "0"), dp_tidx, dp_cnt, dp_gstart, dp_copied, dp_eaddr, dp_lay, kv_regions, kv_extra: None, kv_extra_reg, vmm_pool: Vec::new(), prompt_hint: 0, kv_rows: 0, kv_halves: false, router_bias: std::env::var("SHADOW_ROUTER_BIAS").ok().and_then(|v| v.parse().ok()).unwrap_or(0.0), batch_scratch, delta, attn, ple_state, tokens: vec![], layers, layers_in: None, layers_out: None, peer: None, reset_tokens: vec![], pictures: vec![], rope_tab: None, rope_on: false, cap, trace: None, stop_after: None,
             resident_bytes, expert_uploads: 0, cache, ram, copy_stream, copy_stream2, copy_ev2, copy_event, staging,
             pending: vec![], routing: RoutingCounts::new(c.n_layer, c.n_expert),
             prof: std::env::var("SHADOW_PROFILE").is_ok_and(|v| v == "1")
@@ -1984,6 +1994,9 @@ impl<'c, 'm> GpuSession<'c, 'm> {
     /// Pictures for the prompt about to be read: (first token index, rows, the rows as rows x hidden floats).  The tokens there
     /// (the `<|image_pad|>` id, which also gives their per-layer inputs) keep their ids; only their embeddings are the rows.
     pub fn set_pictures(&mut self, pics: Vec<(usize, usize, usize, std::sync::Arc<Vec<f32>>)>) {
+        if let Some(p) = self.peer.as_mut() {
+            p.set_pictures(pics.clone());
+        }
         self.pictures = pics;
         self.sync_rope_tab();
     }
@@ -2053,6 +2066,9 @@ impl<'c, 'm> GpuSession<'c, 'm> {
         if let Some(mt) = self.mtp.as_mut() {
             mt.pending = false;
         }
+        if let Some(p) = self.peer.as_mut() {
+            p.reset();
+        }
     }
 
     /// The session's state after its first `tokens().len()` tokens, on the device: every DeltaNet state and conv
@@ -2097,14 +2113,19 @@ impl<'c, 'm> GpuSession<'c, 'm> {
             }
             None => None,
         };
+        let peer = match self.peer.as_ref() {
+            Some(p) => Some(Box::new(p.snapshot_to(with_kv, host)?)),
+            None => None,
+        };
         Ok(Snapshot { tokens: self.tokens.clone(), delta, ple: copy(&self.ple_state, self.ple_state.bytes)?, kv,
-                      nblocks: self.attn.iter().map(|a| a.as_ref().map_or(0, |a| a.nblocks)).collect(), mtp })
+                      nblocks: self.attn.iter().map(|a| a.as_ref().map_or(0, |a| a.nblocks)).collect(), mtp, peer })
     }
 
     /// Takes `snap` again at the current position, into its own buffers: a speculative pass's rollback point, once per
     /// pass without allocating (a device snapshot without the KV, from this session; otherwise a new one).
     pub fn snapshot_again(&self, snap: &mut Snapshot<'c>) -> Result<(), String> {
         let reusable = snap.kv.iter().all(|k| k.is_none()) && snap.delta.len() == self.delta.len()
+            && snap.peer.is_some() == self.peer.is_some()
             && matches!(snap.ple, Saved::Dev(..))
             && match (&snap.mtp, &self.mtp) {
                 (Some((Saved::Dev(..), _, None)), Some(_)) | (None, None) => true,
@@ -2137,12 +2158,25 @@ impl<'c, 'm> GpuSession<'c, 'm> {
             d.copy_prefix_from(&mt.bufs.last_r, *n).map_err(e)?;
             *pending = mt.pending;
         }
+        if let (Some(ps), Some(p)) = (snap.peer.as_mut(), self.peer.as_ref()) {
+            p.snapshot_again(ps)?;
+        }
         Ok(())
     }
 
     /// Puts the session back to `snap`: the token list, every recurrent state, and the KV prefix if the snapshot has
     /// it.  Without the KV, the session must still hold the snapshot's tokens as its first positions.
     pub fn restore(&mut self, snap: &Snapshot<'c>) -> Result<(), String> {
+        self.restore_local(snap)?;
+        match (self.peer.as_mut(), snap.peer.as_ref()) {
+            (Some(p), Some(ps)) => p.restore(ps),
+            (None, None) => Ok(()),
+            _ => Err("restore: the snapshot and the session do not both have a second stage".into()),
+        }
+    }
+
+    /// `restore` for this session's own layers only (a pair's `rollback_replay` restores the stages one by one).
+    fn restore_local(&mut self, snap: &Snapshot<'c>) -> Result<(), String> {
         let has_kv = snap.kv.iter().any(|k| k.is_some());
         if !has_kv {
             let n = snap.tokens.len();
@@ -2532,6 +2566,31 @@ impl<'c, 'm> GpuSession<'c, 'm> {
         self.layers
     }
 
+    /// Makes `peer` (the session that owns the layers from where this one's end to the last: `Tiers::layers`) this session's second stage: from then on this one is
+    /// the whole model to its caller (steps, batches, verify passes, rollback, snapshots, restores, resets all go through both).  Two stages only.
+    pub fn attach_peer(&mut self, peer: GpuSession<'c, 'm>) -> Result<(), String> {
+        let n = self.m.cfg.n_layer;
+        if self.peer.is_some() {
+            return Err("this session already has a second stage".into());
+        }
+        if self.layers.0 != 0 || self.layers.1 >= n || peer.layers != (self.layers.1, n) {
+            return Err(format!("the stages do not cover the model: {:?} then {:?} of {n} layers", self.layers, peer.layers));
+        }
+        if self.cap != peer.cap || self.tokens != peer.tokens || peer.peer.is_some() {
+            return Err("the two stages must have the same context size and the same tokens, and the second must be the last".into());
+        }
+        if (self.cache.slots > 0) != (peer.cache.slots > 0) {
+            return Err("both stages need a VRAM expert cache, or neither (the batched path needs one)".into());
+        }
+        self.peer = Some(Box::new(peer));
+        Ok(())
+    }
+
+    /// The second stage, when there is one.
+    pub fn peer(&self) -> Option<&GpuSession<'c, 'm>> {
+        self.peer.as_deref()
+    }
+
     pub fn step_prefill(&mut self, token: u32) {
         self.step_opt(token, false);
     }
@@ -2628,6 +2687,10 @@ impl<'c, 'm> GpuSession<'c, 'm> {
             // not the last stage: the streams go to the next one
             let mut out = vec![0u8; h * cs * 4];
             self.download(self.b.r.ptr, &mut out);
+            if let Some(p) = self.peer.as_mut() {
+                p.layers_in = Some(floats(&out));
+                return p.step_opt(token, with_logits);
+            }
             self.layers_out = Some(floats(&out));
             return vec![];
         }
@@ -3017,12 +3080,15 @@ impl<'c, 'm> GpuSession<'c, 'm> {
     /// there is nothing to lend (no cache, a pinned placement).
     /// Tokens a pass can take now: `MAX_BATCH`, more while a long prompt has the cache lent.
     pub fn batch_rows(&self) -> usize {
-        self.batch_max
+        self.peer.as_ref().map_or(self.batch_max, |p| self.batch_max.min(p.batch_rows()))
     }
 
     /// The engine tells the session how many tokens the next long prompt reads (so `lend_kv` knows how much of the window it will fill).
     pub fn hint_prompt(&mut self, n: usize) {
         self.prompt_hint = n;
+        if let Some(p) = self.peer.as_mut() {
+            p.hint_prompt(n);
+        }
     }
 
     /// `SHADOW_KV_LEND=1`: hand the KV window's unfilled tail (past this prompt and 256 positions more) back to the driver and take it as one ordinary buffer for
@@ -3106,6 +3172,12 @@ impl<'c, 'm> GpuSession<'c, 'm> {
     /// `long`: a prompt long enough (`LONG_PROMPT` tokens) to pay for the layer-ahead pipeline and the big batch (which allocate pinned
     /// buffers and read the evicted experts back from the file afterwards); a shorter one lends the tail only.
     pub fn lend_cache(&mut self, long: bool) -> bool {
+        let peer = self.peer.as_mut().map(|p| p.lend_cache(long));
+        let mine = self.lend_cache_local(long);
+        mine || peer == Some(true)
+    }
+
+    fn lend_cache_local(&mut self, long: bool) -> bool {
         if self.lent.is_some() || self.cache.slots == 0 || self.cache.arena.is_none() || self.cache.layer_range != self.cache.evict_range {
             return false;
         }
@@ -3760,6 +3832,13 @@ impl<'c, 'm> GpuSession<'c, 'm> {
     /// Gives the lent cache back: the layers' ranges as they were, and the evicted entries read again from the RAM tier
     /// (the ones it holds; the rest warm up by demand).
     pub fn restore_cache(&mut self) {
+        if let Some(p) = self.peer.as_mut() {
+            p.restore_cache();
+        }
+        self.restore_cache_local();
+    }
+
+    fn restore_cache_local(&mut self) {
         let Some(lent) = self.lent.take() else { return };
         let t_restore = std::time::Instant::now();
         let n_saved = lent.saved.len();
@@ -4226,6 +4305,9 @@ impl<'c, 'm> GpuSession<'c, 'm> {
         let p0 = self.tokens.len();
         let keep = self.batches() && (2..=MAX_VERIFY.min(self.batch_max)).contains(&tokens.len());
         self.replay.on.set(keep);
+        if let Some(p) = self.peer.as_mut() {
+            p.replay.on.set(keep);
+        }
         let (t0, w0) = (std::time::Instant::now(), self.waits);
         let (n0, ns0) = {
             use std::sync::atomic::Ordering::Relaxed;
@@ -4245,6 +4327,10 @@ impl<'c, 'm> GpuSession<'c, 'm> {
         }
         self.replay.on.set(false);
         self.replay.pass = keep.then(|| (p0, tokens.to_vec()));
+        if let Some(p) = self.peer.as_mut() {
+            p.replay.on.set(false);
+            p.replay.pass = keep.then(|| (p0, tokens.to_vec()));
+        }
         out
     }
 
@@ -4347,7 +4433,15 @@ impl<'c, 'm> GpuSession<'c, 'm> {
             *p0 == snap.tokens.len() && !kept.is_empty() && kept.len() <= toks.len() && toks[..kept.len()] == *kept
                 && self.tokens.len() == p0 + toks.len()
         });
-        self.restore(snap)?;
+        self.restore_local(snap)?;
+        let peer_fits = match (self.peer.as_mut(), snap.peer.as_ref()) {
+            (Some(p), Some(ps)) => Some(p.rollback_replay(ps, kept)?),
+            (None, None) => None,
+            _ => return Err("rollback: the snapshot and the session do not both have a second stage".into()),
+        };
+        if peer_fits.is_some_and(|pf| pf != fits) {
+            return Err("rollback: the two stages disagree whether the verify pass recorded the kept tokens".into());
+        }
         if !fits {
             return Ok(false);
         }
@@ -4682,6 +4776,13 @@ impl<'c, 'm> GpuSession<'c, 'm> {
                 let mut bytes = vec![0u8; ch * 4];
                 self.download(rp(j), &mut bytes);
                 out.extend(floats(&bytes));
+            }
+            if let Some(p) = self.peer.as_mut() {
+                p.layers_in = Some(out);
+                p.logits_last = self.logits_last;
+                let logits = p.batch(toks, with_logits);
+                p.logits_last = false;
+                return logits;
             }
             self.layers_out = Some(out);
             return vec![];

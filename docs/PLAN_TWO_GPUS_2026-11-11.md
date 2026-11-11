@@ -123,6 +123,11 @@ phase 1's gate G2 passed for the single-token path, the batched path, a verify p
 KV (bit-identical logits through a two-session split at layers 1, 24, 47; STATUS 100-101). The long-prompt path, the pair as
 one session in the engine, and fast mode are the remaining work of phases 2-3.**
 
+**Update (STATUS 102): the pair is one session in the engine (`attach_peer`, `shadow serve --gpus A,B [--split N]`); on one
+card with both stages on it, `--exact` replies are 10 of 10 identical to a single-card server and the fast mode runs a
+whole conversation; `--gpus 0,1` on a one-card machine falls back to one card with a warning. What is left before the real
+pair: nothing that needs no card except the drafter across stages (phase 3) and a pinned-buffer hop.**
+
 **Phase 0a (before the card arrives, no hardware): the probe tool and the baseline.**
 `shadow gpus`: list devices (name, UUID, compute capability, VRAM, driver, PCIe gen/width now and max), and per device:
 pinned host -> device and device -> host bandwidth alone, both cards at the same time (does the chipset path hurt the CPU
