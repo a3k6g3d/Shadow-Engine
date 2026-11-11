@@ -216,7 +216,7 @@ impl<'c, 'm> GpuSession<'c, 'm> {
         self.with_rows(j0, |s| {
             s.moe_batch(l, mc, &mut logs[j0..j0 + mc], true, Some(gi));
             s.hc_write_batch(next.as_deref(), mc);
-            if s.dflash.is_some() {
+            if s.df_feat().is_some() {
                 s.df_capture(l, s.bb.r.ptr, mc);
             }
         });

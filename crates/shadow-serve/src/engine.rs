@@ -282,9 +282,11 @@ pub struct Config {
 
 /// How many of the model's last layers the second card can hold with every expert resident, as a split point: its VRAM less ~3 GiB (the head, the buffers, the
 /// driver's share) and the KV window of its attention layers, over ~1.04 GiB a layer (experts and the layer's dense weights).
-fn auto_split(model: &Model, vram: usize, n_ctx: usize) -> usize {
+fn auto_split(model: &Model, vram: usize, n_ctx: usize, extra_gib: f64) -> usize {
     let c = &model.cfg;
     let gib = (1u64 << 30) as f64;
+    let vram = vram as f64 - extra_gib * gib;
+    let vram = vram.max(0.0) as usize;
     let per = |l: usize| -> f64 {
         ["ffn_gate_exps", "ffn_up_exps", "ffn_down_exps"].iter().filter_map(|r| model.g.tensor(&format!("blk.{l}.{r}.weight")).map(|t| t.nbytes() as f64)).sum::<f64>() + 80.0 * 1024.0 * 1024.0
     };
@@ -355,14 +357,20 @@ fn run(
     let mut sess = match (&cfg.pair, ctx1.as_ref()) {
         (Some(pair), Some(c1)) => {
             let n = model.cfg.n_layer;
-            let split = pair.split.unwrap_or_else(|| auto_split(&model, c1.total_mem, cfg.n_ctx)).clamp(1, n - 1);
+            // the drafter (DFlash) lives on the second card, with the head: its weights, rings and feature buffers take ~1.5 GiB there
+            let drafter = cfg.tiers.dflash_dir.is_some();
+            let split = pair.split.unwrap_or_else(|| auto_split(&model, c1.total_mem, cfg.n_ctx, if drafter { 1.5 } else { 0.0 })).clamp(1, n - 1);
             eprintln!("shadow serve: two cards: layers 0..{split} on GPU {} ({}), layers {split}..{n} on GPU {} ({}, {:.1} GiB)", cfg.gpu, ctx.name, pair.ordinal, c1.name, c1.total_mem as f64 / (1u64 << 30) as f64);
-            // no drafter across two cards yet (docs/PLAN_TWO_GPUS_2026-11-11.md, phase 3): the stages run the target model alone
+            // the DFlash drafter runs on the second card (STATUS 103): the first keeps the features of the taps below the split and hands them on with the
+            // residual streams; the MTP head is not split (it is not the default)
             let mut t0 = cfg.tiers.clone();
             t0.layers = Some((0, split));
-            t0.dflash_dir = None;
             t0.mtp_dir = None;
+            t0.df_taps = t0.dflash_dir.is_some();
+            t0.dflash_dir = None;
             let mut t1 = t0.clone();
+            t1.df_taps = false;
+            t1.dflash_dir = cfg.tiers.dflash_dir.clone();
             t1.layers = Some((split, n));
             t1.ram_bytes = 0;
             t1.ram_auto = false;
@@ -397,7 +405,7 @@ fn run(
         s.ram_served = ram_serv;
         s.file_served = file_serv;
         s.mtp_active = sess.mtp.is_some();
-        s.dflash_active = sess.dflash.is_some();
+        s.dflash_active = sess.drafter().is_some();
         eprintln!("shadow serve: ready in {:.1} s; {}", s.load_secs, s.report);
     }
     let mut last_logits: Vec<f32> = Vec::new();
@@ -1394,7 +1402,7 @@ fn answer<'c>(
     let mut finish = "length";
     // drafts from the MTP layer when it is loaded (`--mtp DIR`, 3 a pass unless --spec says), else prompt lookup
     let has_mtp = sess.mtp.is_some();
-    let has_df = sess.dflash.is_some();
+    let has_df = sess.drafter().is_some();
     let spec = if has_df && spec == 0 {
         3
     } else if has_mtp && spec == 0 {
@@ -1419,7 +1427,7 @@ fn answer<'c>(
     // per draft position: (tried, right)
     let mut spec_pos = [(0usize, 0usize); 8];
     // `--dflash-min-p`: the DFlash chain stops after a draft the selector gives less than this
-    let df_min_p: f32 = sess.dflash.as_ref().map_or(0.0, |d| d.min_p);
+    let df_min_p: f32 = sess.drafter().map_or(0.0, |d| d.min_p);
     let mut spec_t = [0f64; 3]; // seconds drafting, checking, rolling back
     let mut snap: Option<shadow_cuda::session::Snapshot> = None;
     // A thinking budget by effort (the menu says Low ~1k, Medium ~4k): a reasoning model left alone can think until the context is full (an

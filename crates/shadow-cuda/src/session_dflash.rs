@@ -37,13 +37,56 @@ impl<'c, 'm> GpuSession<'c, 'm> {
         self.df_mv_ptr(df.ptr(name), df.tensors[name].q8, rows, cols, x, xs, y, ys, m);
     }
 
+    /// Where this stage writes the taps' features: the drafter's feature rows, or (a first stage feeding the drafter on the next one) its own copy of them.
+    pub(super) fn df_feat(&self) -> Option<u64> {
+        self.dflash.as_ref().map(|d| d.bufs.feat.ptr).or_else(|| self.tap_feat.as_ref().map(|b| b.ptr))
+    }
+
+    /// The taps below layer `hi`: they are the first slots of a feature row.
+    fn taps_below(hi: usize) -> usize {
+        TAPS.iter().filter(|&&t| t < hi).count()
+    }
+
+    /// A first stage handing on: the first `rows` feature rows' slots for the taps in its layers, row after row (`taps x HIDDEN` floats a row); `None` without a
+    /// drafter on the next stage.
+    pub(super) fn tap_feats_out(&self, rows: usize) -> Option<Vec<f32>> {
+        let buf = self.tap_feat.as_ref()?;
+        let w = Self::taps_below(self.layers.1) * HIDDEN;
+        let mut out = Vec::with_capacity(rows * w);
+        let mut bytes = vec![0u8; w * 4];
+        for j in 0..rows {
+            self.download(buf.ptr + (j * NFEAT * 4) as u64, &mut bytes);
+            out.extend(super::floats(&bytes));
+        }
+        Some(out)
+    }
+
+    /// The drafter's stage, at the start of a pass: the first stage's feature rows (`tap_feats_out`) into the first slots of its feature rows.  `own_rows` = the
+    /// rows this stage's taps are about to fill; when the first stage sent another number (its last sub-chunk was a different size) the rows do not line up and
+    /// the drafter skips this pass (`df_feat_ok`).
+    pub(super) fn feat_in_upload(&mut self, own_rows: usize) {
+        let Some(feats) = self.feat_in.take() else { return };
+        let Some(df) = self.dflash.as_ref() else { return };
+        // the first stage's width is every tap below this stage's first layer
+        let w = Self::taps_below(self.layers.0) * HIDDEN;
+        let rows = if w == 0 { 0 } else { feats.len() / w };
+        if rows != own_rows {
+            self.df_feat_ok = false;
+            return;
+        }
+        let feat = df.bufs.feat.ptr;
+        for j in 0..rows {
+            self.upload_to(feat + (j * NFEAT * 4) as u64, &super::f32s(&feats[j * w..(j + 1) * w]));
+        }
+    }
+
     /// The layer-`l` output residual of the m rows at `r` (streams h apart in each row), if `l` is one of the taps: its
     /// mean over the streams into the feature rows.
     pub(super) fn df_capture(&self, l: usize, r: u64, m: usize) {
         let Some(slot) = TAPS.iter().position(|&t| t == l) else { return };
         let c = &self.m.cfg;
         // a pipelined group writes its rows of the feature buffer, not the first ones
-        let feat = self.dflash.as_ref().unwrap().bufs.feat.ptr + (self.row_shift * NFEAT * 4) as u64;
+        let feat = self.df_feat().unwrap() + (self.row_shift * NFEAT * 4) as u64;
         // a pass of more rows than the buffers hold: the last ones (the drafter looks back WINDOW positions, `dflash_observe` takes the same)
         let skip = m.saturating_sub(DF_ROWS);
         let r = r + (skip * c.streams * c.hidden * 4) as u64;
@@ -131,6 +174,9 @@ impl<'c, 'm> GpuSession<'c, 'm> {
         if let Some(df) = self.dflash.as_mut() {
             df.broken = true;
         }
+        if let Some(p) = self.peer.as_mut() {
+            p.dflash_break();
+        }
     }
 
     /// `restore` has put the session back to a snapshot of `n_s` positions (called with the old session still in `self.tokens`; `same` =
@@ -168,6 +214,10 @@ impl<'c, 'm> GpuSession<'c, 'm> {
     /// everything before it, 16 candidates a slot from the main model's head, and the selector's best path.  Empty
     /// without features for every position so far.
     pub fn dflash_draft(&mut self, next: u32, k: usize, min_p: f32) -> Vec<u32> {
+        // a pair: the drafter is on the second stage, which holds the same tokens
+        if let Some(p) = self.peer.as_mut() {
+            return p.dflash_draft(next, k, min_p);
+        }
         let n = self.tokens.len();
         let Some(df) = self.dflash.as_ref() else { return vec![] };
         let k = k.min(BLOCK - 1).min(self.cap.saturating_sub(n + 1));

@@ -488,6 +488,13 @@ pub struct GpuSession<'c, 'm> {
     layers_out: Option<Vec<f32>>,
     /// The next stage (`attach_peer`): this session then runs `0..k` and hands its residual streams on, so the pair is one session to the engine.
     peer: Option<Box<GpuSession<'c, 'm>>>,
+    /// A first stage whose second stage has the drafter (`Tiers::df_taps`): the feature rows the taps below its last layer write (`df_capture`), laid out as the
+    /// drafter's own (`DF_ROWS` x `NFEAT`); they go to the second stage with the residual streams.
+    tap_feat: Option<DeviceBuffer<'c>>,
+    /// The second stage's side of that: the first stage's feature rows (`taps below its end` x `HIDDEN` floats a row) for the pass about to run, and whether they
+    /// match the rows this stage captures (`df_feat_ok`; when they do not the drafter skips the pass, as after any hole)
+    feat_in: Option<Vec<f32>>,
+    df_feat_ok: bool,
     /// The tokens the session held when it was last `reset` (not emptied by a second reset): the drafter's K/V ring still describes them, so a
     /// snapshot restore right after the reset can keep the positions the two share (`restore`, STATUS 98)
     reset_tokens: Vec<u32>,
@@ -880,6 +887,8 @@ pub struct Tiers {
     pub mtp_dir: Option<std::path::PathBuf>,
     /// `--dflash DIR`: the DFlash 2 drafter (models/dflash2).
     pub dflash_dir: Option<std::path::PathBuf>,
+    /// A first stage (`layers` = `0..k`) whose second stage runs the drafter: keep the feature rows of the taps below `k` for it (`attach_peer` checks).
+    pub df_taps: bool,
     /// `--dflash-min-p P`: a DFlash chain stops after a draft the selector gives less than P (default 0: all).
     pub dflash_min_p: f32,
     /// The drafter's matrices as Q8_0 (half the VRAM, ~220 more expert slots); `--dflash-bf16` keeps them BF16.
@@ -974,7 +983,7 @@ impl Tiers {
             flag(f).map_or(Ok(d), |v| v.parse().map_err(|_| format!("{f}: not a number: {v}")))
         };
         let dflash_dir = flag("--dflash").filter(|p| p.as_str() != "off").map(std::path::PathBuf::from);
-        Ok(Tiers { layers: None, vram_cache: gib("--expert-cache-gib")?, ram_bytes, ram_auto, order, mtp_dir, dflash_dir,
+        Ok(Tiers { layers: None, vram_cache: gib("--expert-cache-gib")?, ram_bytes, ram_auto, order, mtp_dir, dflash_dir, df_taps: false,
                    dflash_q8: !args.iter().any(|a| a == "--dflash-bf16"),
                    dflash_min_p: flag("--dflash-min-p").and_then(|v| v.parse().ok()).unwrap_or(0.0),
                    cpu_experts: num("--cpu-experts", 0)?, cpu_threads: num("--cpu-threads", 8)?,
@@ -1441,8 +1450,12 @@ impl<'c, 'm> GpuSession<'c, 'm> {
             return Err(format!("the layer range {}..{} is not inside 0..{}", layers.0, layers.1, c.n_layer));
         }
         let in_stage = |l: usize| l >= layers.0 && l < layers.1;
-        if tiers.layers.is_some() && (tiers.mtp_dir.is_some() || tiers.dflash_dir.is_some()) {
-            return Err("a session with a layer range has no drafter yet (docs/PLAN_TWO_GPUS_2026-11-11.md, phase 3)".into());
+        // the drafter runs on the last stage (it uses the head); a first stage only keeps the taps' features for it (`df_taps`); the MTP head is not split
+        if tiers.layers.is_some() && (tiers.mtp_dir.is_some() || (tiers.dflash_dir.is_some() && layers.1 < c.n_layer)) {
+            return Err("a session with a layer range has no MTP head, and its drafter only on the last stage (docs/PLAN_TWO_GPUS_2026-11-11.md, phase 3)".into());
+        }
+        if tiers.df_taps && !(layers.0 == 0 && layers.1 < c.n_layer) {
+            return Err("df_taps is for a first stage that is not the last".into());
         }
         let e = |x: crate::driver::CudaError| x.to_string();
         let vmap = std::env::var("SHADOW_VRAM_MAP").is_ok();
@@ -1607,6 +1620,13 @@ impl<'c, 'm> GpuSession<'c, 'm> {
                 }
             },
             None => None,
+        };
+
+        // a first stage feeding a drafter on the next one: room for the features its taps write, taken before the cache sizes itself from what is free
+        let tap_feat = if tiers.df_taps && crate::dflash::TAPS.iter().any(|&t| t < layers.1) {
+            Some(a(crate::dflash::DF_ROWS * crate::dflash::NFEAT)?)
+        } else {
+            None
         };
 
         vm("buffers and the drafter, before the expert cache");
@@ -1883,6 +1903,9 @@ impl<'c, 'm> GpuSession<'c, 'm> {
             mtp_probe: std::env::var("SHADOW_MTP_PROBE").is_ok_and(|v| v == "1").then_some((0, 0)),
             mtp,
             dflash,
+            tap_feat,
+            feat_in: None,
+            df_feat_ok: true,
             graphs: HashMap::new(),
             multi: HashMap::new(),
             fuse: tiers.fuse.or_else(|| std::env::var("SHADOW_FUSE").ok().and_then(|v| v.parse().ok())).unwrap_or(0),
@@ -2229,6 +2252,10 @@ impl<'c, 'm> GpuSession<'c, 'm> {
         let same = self.pictures.is_empty() && old.len() >= n_s && old[..n_s] == snap.tokens[..];
         self.restore(snap)?;
         self.dflash_restored(same, n_s);
+        if let Some(p) = self.peer.as_mut() {
+            // the second stage holds the same tokens (and, after a `reset`, the same old ones)
+            p.dflash_restored(same, n_s);
+        }
         Ok(())
     }
 
@@ -2582,8 +2609,20 @@ impl<'c, 'm> GpuSession<'c, 'm> {
         if (self.cache.slots > 0) != (peer.cache.slots > 0) {
             return Err("both stages need a VRAM expert cache, or neither (the batched path needs one)".into());
         }
+        if peer.dflash.is_some() && self.tap_feat.is_none() && crate::dflash::TAPS.iter().any(|&t| t < self.layers.1) {
+            return Err("the second stage has the drafter, so the first needs `Tiers::df_taps` to hand it the features of the taps below its end".into());
+        }
+        if peer.dflash.is_none() {
+            // nothing to feed (the drafter did not load, or was never asked for)
+            self.tap_feat = None;
+        }
         self.peer = Some(Box::new(peer));
         Ok(())
+    }
+
+    /// The drafter, here or on the second stage.
+    pub fn drafter(&self) -> Option<&crate::dflash::DflashModel<'c>> {
+        self.dflash.as_ref().or_else(|| self.peer.as_ref().and_then(|p| p.dflash.as_ref()))
     }
 
     /// The second stage, when there is one.
@@ -2624,6 +2663,7 @@ impl<'c, 'm> GpuSession<'c, 'm> {
             let r = self.layers_in.take().expect("a stage after the first needs the previous stage's residual streams (step_stage)");
             assert_eq!(r.len(), h * cs, "the residual streams are {} floats", h * cs);
             self.upload_to(self.b.r.ptr, &f32s(&r));
+            self.feat_in_upload(1);
         }
         self.mark("embedding");
 
@@ -2679,16 +2719,18 @@ impl<'c, 'm> GpuSession<'c, 'm> {
                 rn_ready = true;
             }
             self.rec(format!("layer{l}.out"), self.b.r.ptr, h * cs);
-            if self.dflash.is_some() {
+            if self.df_feat().is_some() {
                 self.df_capture(l, self.b.r.ptr, 1);
             }
         }
         if hi < c.n_layer {
-            // not the last stage: the streams go to the next one
+            // not the last stage: the streams go to the next one (and the drafter's features of the taps in this stage's layers)
             let mut out = vec![0u8; h * cs * 4];
             self.download(self.b.r.ptr, &mut out);
+            let feats = self.tap_feats_out(1);
             if let Some(p) = self.peer.as_mut() {
                 p.layers_in = Some(floats(&out));
+                p.feat_in = feats;
                 return p.step_opt(token, with_logits);
             }
             self.layers_out = Some(floats(&out));
@@ -4573,6 +4615,9 @@ impl<'c, 'm> GpuSession<'c, 'm> {
             for j in 0..m {
                 self.upload_to(row_ptr(j), &f32s(&r[j * ch..(j + 1) * ch]));
             }
+            // the rows this stage's own taps will fill are the last ones of the pass's last sub-chunk (`df_capture`)
+            let last = *subs.last().unwrap();
+            self.feat_in_upload(last.1.min(crate::dflash::DF_ROWS));
         } else {
             let (t, bytes) = self.m.dense("token_embd.weight");
             let (qk, qb) = t.ty.block().unwrap();
@@ -4743,7 +4788,7 @@ impl<'c, 'm> GpuSession<'c, 'm> {
                 };
                 self.hc_write_batch(next.as_deref(), m);
                 rn_ready = next.is_some();
-                if self.dflash.is_some() && (!sub_mode || si + 1 == subs.len()) {
+                if self.df_feat().is_some() && (!sub_mode || si + 1 == subs.len()) {
                     // the drafter looks back 2,048 positions: the last sub-chunk's features are the ones kept
                     self.df_capture(l, self.bb.r.ptr, m);
                 }
@@ -4777,8 +4822,10 @@ impl<'c, 'm> GpuSession<'c, 'm> {
                 self.download(rp(j), &mut bytes);
                 out.extend(floats(&bytes));
             }
+            let feats = self.tap_feats_out(m_obs.min(crate::dflash::DF_ROWS));
             if let Some(p) = self.peer.as_mut() {
                 p.layers_in = Some(out);
+                p.feat_in = feats;
                 p.logits_last = self.logits_last;
                 let logits = p.batch(toks, with_logits);
                 p.logits_last = false;
@@ -4793,9 +4840,10 @@ impl<'c, 'm> GpuSession<'c, 'm> {
         if self.mtp.is_some() {
             self.mtp_observe(self.bb.r.ptr, toks, p0);
         }
-        if self.dflash.is_some() {
+        if self.dflash.is_some() && self.df_feat_ok {
             self.dflash_observe(m_obs, p0_obs);
         }
+        self.df_feat_ok = true;
         if phases_on() {
             self.ctx.synchronize().unwrap();
             eprintln!("SHADOW_PHASES pass m={m} (graphs {graphs}): embed rows {:.3} s, layers queued by {:.3} s, device drained at {:.3} s (so {:.3} s waiting after the last launch), observers {:.3} s",

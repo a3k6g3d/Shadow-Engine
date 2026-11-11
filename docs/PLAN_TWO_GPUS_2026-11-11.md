@@ -128,6 +128,8 @@ card with both stages on it, `--exact` replies are 10 of 10 identical to a singl
 whole conversation; `--gpus 0,1` on a one-card machine falls back to one card with a warning. What is left before the real
 pair: nothing that needs no card except the drafter across stages (phase 3) and a pinned-buffer hop.**
 
+**Update (STATUS 103): the DFlash drafter now runs across the stages (on the second card, fed the first card's taps); the pair's drafts equal one session's at splits 1, 20, 40 and 47. Left that needs no card: a pinned-buffer hop.**
+
 **Phase 0a (before the card arrives, no hardware): the probe tool and the baseline.**
 `shadow gpus`: list devices (name, UUID, compute capability, VRAM, driver, PCIe gen/width now and max), and per device:
 pinned host -> device and device -> host bandwidth alone, both cards at the same time (does the chipset path hurt the CPU

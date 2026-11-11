@@ -261,3 +261,90 @@ fn a_pair_driven_through_the_first_stage_equals_one_session() {
         eprintln!("the pair as one session, split at layer {split}: {} outputs, every logit identical", got.len());
     }
 }
+
+// ---------------------------------------------------------------------------------------------------------------------- the drafter across the stages
+
+fn drafter_dir() -> Option<std::path::PathBuf> {
+    let d = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../models/dflash2");
+    d.join("model.safetensors").is_file().then_some(d)
+}
+
+fn tiers_drafter(stage: Option<(usize, usize)>, dir: &Path, first_of_pair: bool) -> Tiers {
+    let mut t = Tiers { layers: stage, vram_cache: Some(384 << 20), dflash_q8: true, ..Tiers::default() };
+    if first_of_pair {
+        t.df_taps = true;
+    } else {
+        t.dflash_dir = Some(dir.to_path_buf());
+    }
+    t
+}
+
+/// What the drafter drafts through a session's life: after a batched prompt, single steps, a verify pass, a rollback (replayed), and a conversation snapshot's
+/// restore (`restore_conv`, which keeps the drafter's K/V: STATUS 98) followed by more tokens.  The same script runs on a session and on a pair.
+fn draft_script<'c, 'm>(s: &mut GpuSession<'c, 'm>) -> Vec<Vec<u32>> {
+    let prompt: Vec<u32> = (0..20u32).map(|i| 1000 + i * 37).collect();
+    let mut out = vec![];
+    s.step_batch(&prompt);
+    out.push(s.dflash_draft(555, 3, 0.0));
+    s.step(555);
+    out.push(s.dflash_draft(777, 3, 0.0));
+    s.step(777);
+    let snap_kv = s.snapshot(true).unwrap(); // 22 tokens, with the KV
+    let snap = s.snapshot(false).unwrap();
+    s.step_batch_verify(&[5, 11, 22, 33]);
+    out.push(s.dflash_draft(44, 3, 0.0));
+    s.rollback(&snap, &[5, 11]).unwrap(); // replayed
+    out.push(s.dflash_draft(22, 3, 0.0));
+    s.step(22);
+    s.step(33);
+    out.push(s.dflash_draft(66, 7, 0.0));
+    // a new conversation from the snapshot of 22 tokens: the drafter keeps the K/V of the positions the two share
+    s.restore_conv(&snap_kv).unwrap();
+    out.push(s.dflash_draft(88, 3, 0.0));
+    s.step_batch(&[88, 99, 111]);
+    out.push(s.dflash_draft(222, 3, 0.0));
+    s.step(222);
+    out.push(s.dflash_draft(333, 7, 0.0));
+    out
+}
+
+/// The DFlash drafter on the second stage, fed the features of the taps below the split by the first: every draft identical to the single session's.  Splits: 1
+/// (no tap in the first stage), 20 (two), 40 (four), 47 (all five: the second stage has none).
+#[test]
+fn the_drafter_across_two_stages_drafts_what_one_session_drafts() {
+    let p = std::env::var("SHADOW_MODEL").unwrap_or_else(|_| MODEL.into());
+    if !Path::new(&p).is_file() {
+        eprintln!("SKIPPED, not passed: no model at {p}");
+        return;
+    }
+    let Some(dir) = drafter_dir() else {
+        eprintln!("SKIPPED, not passed: no models/dflash2");
+        return;
+    };
+    let ctx = match Context::new(0) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("SKIPPED, not passed: no card ({e})");
+            return;
+        }
+    };
+    let model = Model::load_lean(Gguf::open(Path::new(&p)).unwrap()).unwrap();
+    let n_layer = model.cfg.n_layer;
+    let want = {
+        let mut t = tiers_drafter(None, &dir, false);
+        t.layers = None;
+        let mut s = GpuSession::with_tiers(&ctx, &model, CAP, t).unwrap();
+        draft_script(&mut s)
+    };
+    let drafted = want.iter().filter(|d| !d.is_empty()).count();
+    assert!(drafted >= want.len() - 1, "the reference session drafted in only {drafted} of {} rounds: {want:?}", want.len());
+    for split in [1usize, 20, 40, n_layer - 1] {
+        let mut a = GpuSession::with_tiers(&ctx, &model, CAP, tiers_drafter(Some((0, split)), &dir, true)).unwrap();
+        let b = GpuSession::with_tiers(&ctx, &model, CAP, tiers_drafter(Some((split, n_layer)), &dir, false)).unwrap();
+        a.attach_peer(b).unwrap();
+        assert!(a.drafter().is_some());
+        let got = draft_script(&mut a);
+        assert_eq!(got, want, "split at layer {split}: the pair drafts other tokens than one session");
+        eprintln!("the drafter across two stages, split at layer {split}: {} rounds, every draft identical ({drafted} drafted)", got.len());
+    }
+}
