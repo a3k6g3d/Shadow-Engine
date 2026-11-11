@@ -118,6 +118,10 @@ exists, a harness that sends parallel requests works, one after another.
 Effort is honest, not hopeful: this is a 10k-line CUDA/Rust engine and a new execution mode. **Nothing in phases 1-5 will
 run on both cards by Thursday.** Thursday is the probes (phase 0b); the first two-card token is the end of phase 2.
 
+**Progress (2026-11-11, STATUS 100): phase 0a done (`shadow gpus`; the 5070 alone: 27.9 / 27.5 GB/s, 40 KiB hop 14.8 us), and
+phase 1's gate G2 passed for the single-token path (bit-identical logits through a two-session split at layers 1, 24, 47).
+Batched paths, rollback / snapshots and fast mode are the remaining work of phases 1-3.**
+
 **Phase 0a (before the card arrives, no hardware): the probe tool and the baseline.**
 `shadow gpus`: list devices (name, UUID, compute capability, VRAM, driver, PCIe gen/width now and max), and per device:
 pinned host -> device and device -> host bandwidth alone, both cards at the same time (does the chipset path hurt the CPU

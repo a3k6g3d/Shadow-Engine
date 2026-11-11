@@ -482,6 +482,10 @@ pub struct GpuSession<'c, 'm> {
     attn: Vec<Option<Attn<'c>>>,
     ple_state: DeviceBuffer<'c>,
     tokens: Vec<u32>,
+    /// The layers this session runs, `[lo, hi)` (`Tiers::stage`), and the residual streams a stage hands over (`stage_out`) or takes in (`stage_in`) for the one step
+    layers: (usize, usize),
+    layers_in: Option<Vec<f32>>,
+    layers_out: Option<Vec<f32>>,
     /// The tokens the session held when it was last `reset` (not emptied by a second reset): the drafter's K/V ring still describes them, so a
     /// snapshot restore right after the reset can keep the positions the two share (`restore`, STATUS 98)
     reset_tokens: Vec<u32>,
@@ -841,6 +845,10 @@ struct PendingRead {
 /// Sizes and placement of the expert tiers below VRAM's dense weights.
 #[derive(Default, Clone)]
 pub struct Tiers {
+    /// The layers this session owns, `[lo, hi)`: `None` is all of them (a single session).  A session that owns part of the model keeps only those layers'
+    /// weights, state and experts, takes the previous stage's residual streams instead of a token when `lo > 0` and hands its own on when `hi < n_layer`
+    /// (`GpuSession::step_stage`; docs/PLAN_TWO_GPUS_2026-11-11.md, phase 1).  `output.weight` and the output hyper-connection are the last stage's.
+    pub layers: Option<(usize, usize)>,
     /// The VRAM expert cache in bytes; `None`: the free VRAM less `VRAM_RESERVE`.
     pub vram_cache: Option<usize>,
     /// The pinned RAM tier in bytes (0: none).  Refused if it would leave less than the RAM floor (`pinned::ram_floor`, `--ram-floor-gib`) available.
@@ -948,7 +956,7 @@ impl Tiers {
             flag(f).map_or(Ok(d), |v| v.parse().map_err(|_| format!("{f}: not a number: {v}")))
         };
         let dflash_dir = flag("--dflash").filter(|p| p.as_str() != "off").map(std::path::PathBuf::from);
-        Ok(Tiers { vram_cache: gib("--expert-cache-gib")?, ram_bytes, ram_auto, order, mtp_dir, dflash_dir,
+        Ok(Tiers { layers: None, vram_cache: gib("--expert-cache-gib")?, ram_bytes, ram_auto, order, mtp_dir, dflash_dir,
                    dflash_q8: !args.iter().any(|a| a == "--dflash-bf16"),
                    dflash_min_p: flag("--dflash-min-p").and_then(|v| v.parse().ok()).unwrap_or(0.0),
                    cpu_experts: num("--cpu-experts", 0)?, cpu_threads: num("--cpu-threads", 8)?,
@@ -1410,6 +1418,14 @@ impl<'c, 'm> GpuSession<'c, 'm> {
                       -> Result<GpuSession<'c, 'm>, String> {
         let cache_bytes = tiers.vram_cache;
         let c = &m.cfg;
+        let layers = tiers.layers.unwrap_or((0, c.n_layer));
+        if layers.0 >= layers.1 || layers.1 > c.n_layer {
+            return Err(format!("the layer range {}..{} is not inside 0..{}", layers.0, layers.1, c.n_layer));
+        }
+        let in_stage = |l: usize| l >= layers.0 && l < layers.1;
+        if tiers.layers.is_some() && (tiers.mtp_dir.is_some() || tiers.dflash_dir.is_some()) {
+            return Err("a session with a layer range has no drafter yet (docs/PLAN_TWO_GPUS_2026-11-11.md, phase 3)".into());
+        }
         let e = |x: crate::driver::CudaError| x.to_string();
         let vmap = std::env::var("SHADOW_VRAM_MAP").is_ok();
         let rmap = std::env::var("SHADOW_RAM_MAP").is_ok();
@@ -1432,6 +1448,12 @@ impl<'c, 'm> GpuSession<'c, 'm> {
         for name in names {
             if name == "token_embd.weight" || name.ends_with(".scale") {
                 continue; // the embedding row is dequantized on the host; .scale scalars/vectors stay on the host
+            }
+            // a stage keeps its own layers' weights; what is outside the layers (the head, the output hyper-connection) is the last stage's
+            match name.strip_prefix("blk.").and_then(|r| r.split('.').next()).and_then(|n| n.parse::<usize>().ok()) {
+                Some(l) if !in_stage(l) => continue,
+                None if layers.1 != c.n_layer => continue,
+                _ => {}
             }
             let bytes = m.read_dense(name)?; // from the RAM copy when the model keeps one, else read from the file now and dropped after the upload
             let buf = ctx.alloc(bytes.len()).map_err(e)?;
@@ -1503,6 +1525,11 @@ impl<'c, 'm> GpuSession<'c, 'm> {
         let mut delta = Vec::new();
         let mut attn = Vec::new();
         for l in 0..c.n_layer {
+            if !in_stage(l) {
+                delta.push(None);
+                attn.push(None);
+                continue;
+            }
             if c.is_attention(l) {
                 delta.push(None);
                 let blocks = if id > 0 { cap / c.compress[l].max(1) + 1 } else { 0 };
@@ -1573,7 +1600,7 @@ impl<'c, 'm> GpuSession<'c, 'm> {
                 + per(format!("blk.{l}.ffn_down_exps.weight"))).next_multiple_of(256))
             .collect();
         let slot_bytes = l_bytes.iter().copied().max().unwrap_or(0);
-        let min_per_layer: usize = (0..c.n_layer).filter(|&l| c.is_moe(l)).map(|l| c.n_expert_used * l_bytes[l]).sum();
+        let min_per_layer: usize = (0..c.n_layer).filter(|&l| c.is_moe(l) && in_stage(l)).map(|l| c.n_expert_used * l_bytes[l]).sum();
         let batch_scratch = match (cache_bytes, slot_bytes) {
             (Some(0), _) | (_, 0) => None,
             _ => {
@@ -1585,7 +1612,8 @@ impl<'c, 'm> GpuSession<'c, 'm> {
             Some(b) => b,
             None => ctx.mem_info().map_err(e)?.0.saturating_sub(vram_reserve()),
         };
-        let order = tiers.order.clone().unwrap_or_else(|| uniform_order(c.n_layer, c.n_expert));
+        let mut order = tiers.order.clone().unwrap_or_else(|| uniform_order(c.n_layer, c.n_expert));
+        order.retain(|&(l, _)| in_stage(l));
         let mut arena = None;
         let mut slot_offset = Vec::new();
         let mut layer_range = vec![0..0; c.n_layer];
@@ -1598,13 +1626,13 @@ impl<'c, 'm> GpuSession<'c, 'm> {
                 let mut l_slots = vec![0usize; c.n_layer];
                 let mut used = 0usize;
                 for l in 0..c.n_layer {
-                    if c.is_moe(l) {
+                    if c.is_moe(l) && in_stage(l) {
                         l_slots[l] = c.n_expert_used;
                         used += c.n_expert_used * l_bytes[l];
                     }
                 }
                 for &(l, _) in &order {
-                    if c.is_moe(l) && l_slots[l] < c.n_expert && used + l_bytes[l] <= budget {
+                    if c.is_moe(l) && in_stage(l) && l_slots[l] < c.n_expert && used + l_bytes[l] <= budget {
                         l_slots[l] += 1;
                         used += l_bytes[l];
                     }
@@ -1690,7 +1718,7 @@ impl<'c, 'm> GpuSession<'c, 'm> {
         }
         let arena_ptr = arena.as_ref().map_or(0, |a| a.ptr);
         vm("before the RAM tier");
-        let ram = RamTier::fill(ctx, m, ram_bytes, tiers.order.clone(), &vram_pinned, arena_ptr)?;
+        let ram = RamTier::fill(ctx, m, ram_bytes, if layers == (0, c.n_layer) { tiers.order.clone() } else { Some(order.clone()) }, &vram_pinned, arena_ptr)?;
         vm("RAM tier filled");
         let mut cache = ExpertCache {
             arena, slot_offset, layer_range, evict_range, slot_bytes, arena_bytes, slots, map: HashMap::new(),
@@ -1793,7 +1821,7 @@ impl<'c, 'm> GpuSession<'c, 'm> {
         let mut s = GpuSession {
             ctx, m, mvp, fw, w, v, b, bb, replay, dscr, mmq, mmq_y, mmq_y_tag: std::cell::Cell::new((0, 0, 0, 0, 0)), fused,
             rparts: Vec::new(), bb_sig: 0, logits_last: false, sub_last: true, sub_first: true,
-            devplan: tiers.tensor_prompt && !std::env::var("SHADOW_PREFILL_DEVPLAN").is_ok_and(|v| v == "0"), dp_tidx, dp_cnt, dp_gstart, dp_copied, dp_eaddr, dp_lay, kv_regions, kv_extra: None, kv_extra_reg, vmm_pool: Vec::new(), prompt_hint: 0, kv_rows: 0, kv_halves: false, router_bias: std::env::var("SHADOW_ROUTER_BIAS").ok().and_then(|v| v.parse().ok()).unwrap_or(0.0), batch_scratch, delta, attn, ple_state, tokens: vec![], reset_tokens: vec![], pictures: vec![], rope_tab: None, rope_on: false, cap, trace: None, stop_after: None,
+            devplan: tiers.tensor_prompt && !std::env::var("SHADOW_PREFILL_DEVPLAN").is_ok_and(|v| v == "0"), dp_tidx, dp_cnt, dp_gstart, dp_copied, dp_eaddr, dp_lay, kv_regions, kv_extra: None, kv_extra_reg, vmm_pool: Vec::new(), prompt_hint: 0, kv_rows: 0, kv_halves: false, router_bias: std::env::var("SHADOW_ROUTER_BIAS").ok().and_then(|v| v.parse().ok()).unwrap_or(0.0), batch_scratch, delta, attn, ple_state, tokens: vec![], layers, layers_in: None, layers_out: None, reset_tokens: vec![], pictures: vec![], rope_tab: None, rope_on: false, cap, trace: None, stop_after: None,
             resident_bytes, expert_uploads: 0, cache, ram, copy_stream, copy_stream2, copy_ev2, copy_event, staging,
             pending: vec![], routing: RoutingCounts::new(c.n_layer, c.n_expert),
             prof: std::env::var("SHADOW_PROFILE").is_ok_and(|v| v == "1")
@@ -2465,6 +2493,23 @@ impl<'c, 'm> GpuSession<'c, 'm> {
         logits
     }
 
+    /// One token through this session's layers (`Tiers::stage`).  The first stage takes the token; a later one takes the previous stage's residual
+    /// streams as `input` (the token again, for its position).  Returns the streams for the next stage, or the logits from the last stage.
+    pub fn step_stage(&mut self, token: u32, input: Option<&[f32]>) -> Vec<f32> {
+        self.layers_in = input.map(|x| x.to_vec());
+        let logits = self.step_opt(token, true);
+        if self.layers.1 < self.m.cfg.n_layer {
+            self.layers_out.take().expect("a stage that is not the last hands its residual streams on")
+        } else {
+            logits
+        }
+    }
+
+    /// The layers this session runs, `[lo, hi)`.
+    pub fn layers(&self) -> (usize, usize) {
+        self.layers
+    }
+
     pub fn step_prefill(&mut self, token: u32) {
         self.step_opt(token, false);
     }
@@ -2477,26 +2522,34 @@ impl<'c, 'm> GpuSession<'c, 'm> {
         let c = &self.m.cfg;
         let (h, cs) = (c.hidden, c.streams);
 
-        let emb = match self.picture_row(self.tokens.len() - 1) {
-            Some(r) => r.to_vec(),
-            None => {
-                let (t, bytes) = self.m.dense("token_embd.weight");
-                let (qk, qb) = t.ty.block().unwrap();
-                let rb = (t.dims[0] / qk * qb) as usize;
-                let mut x = vec![0f32; h];
-                dequantize(t.ty, &bytes[token as usize * rb..(token as usize + 1) * rb], &mut x).unwrap();
-                x
-            }
-        };
-        self.upload_to(self.b.e.ptr, &f32s(&emb));
-        self.k1("broadcast", h * cs, &[Arg::Ptr(self.b.e.ptr), Arg::Ptr(self.b.r.ptr), Arg::U32(h as u32), Arg::U32(cs as u32)]);
-        self.rec_host("embed".into(), &emb);
+        let (lo, hi) = self.layers;
+        if lo == 0 {
+            let emb = match self.picture_row(self.tokens.len() - 1) {
+                Some(r) => r.to_vec(),
+                None => {
+                    let (t, bytes) = self.m.dense("token_embd.weight");
+                    let (qk, qb) = t.ty.block().unwrap();
+                    let rb = (t.dims[0] / qk * qb) as usize;
+                    let mut x = vec![0f32; h];
+                    dequantize(t.ty, &bytes[token as usize * rb..(token as usize + 1) * rb], &mut x).unwrap();
+                    x
+                }
+            };
+            self.upload_to(self.b.e.ptr, &f32s(&emb));
+            self.k1("broadcast", h * cs, &[Arg::Ptr(self.b.e.ptr), Arg::Ptr(self.b.r.ptr), Arg::U32(h as u32), Arg::U32(cs as u32)]);
+            self.rec_host("embed".into(), &emb);
+        } else {
+            // a later stage starts from the previous one's residual streams
+            let r = self.layers_in.take().expect("a stage after the first needs the previous stage's residual streams (step_stage)");
+            assert_eq!(r.len(), h * cs, "the residual streams are {} floats", h * cs);
+            self.upload_to(self.b.r.ptr, &f32s(&r));
+        }
         self.mark("embedding");
 
         let graphs = self.graphs_on && self.trace.is_none() && self.stop_after.is_none() && self.prof.is_none()
             && self.prefetch.is_none() && self.pregate.is_none() && self.cache.slots > 0;
         let mut rn_ready = false;
-        for l in 0..c.n_layer {
+        for l in lo..hi {
             if self.stop_after == Some(l) {
                 self.hc_read("output_hc", false, rn_ready);
                 self.rec("final_u".into(), self.b.u.ptr, h);
@@ -2533,7 +2586,8 @@ impl<'c, 'm> GpuSession<'c, 'm> {
                 self.moe(l, false);
             }
             self.rec(format!("layer{l}.moe"), self.b.y.ptr, h);
-            if l + 1 == c.ple_layer {
+            if (l + 1 == c.ple_layer) || (l + 1 == hi && hi < c.n_layer) {
+                // the PLE layer's input, or the end of this stage: the streams are written as they are, the next layer norms them itself
                 self.hc_write();
                 rn_ready = false;
             } else if l + 1 < c.n_layer && self.stop_after != Some(l + 1) {
@@ -2547,6 +2601,13 @@ impl<'c, 'm> GpuSession<'c, 'm> {
             if self.dflash.is_some() {
                 self.df_capture(l, self.b.r.ptr, 1);
             }
+        }
+        if hi < c.n_layer {
+            // not the last stage: the streams go to the next one
+            let mut out = vec![0u8; h * cs * 4];
+            self.download(self.b.r.ptr, &mut out);
+            self.layers_out = Some(floats(&out));
+            return vec![];
         }
         if self.mtp.is_some() {
             self.mtp_observe(self.b.r.ptr, &[token], self.tokens.len() - 1);
