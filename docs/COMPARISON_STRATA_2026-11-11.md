@@ -10,15 +10,20 @@ RAM samples once a second); the method is [BENCHMARKING.md](BENCHMARKING.md).
 
 | engine and setting | decode tok/s (3 runs) | against Strata |
 |---|---|---|
-| **Shadow 0.1.36, default** (`shadow serve MODEL`, context 24,576) | **55.72** (55.6, 55.7, 55.9) | **+12.5%** |
+| **Shadow 0.1.36, default** (`shadow serve MODEL`, context 24,576; no conversation restore happened) | **55.72** (55.6, 55.7, 55.9) | **+12.5%** |
 | Strata (local build, context 8,192, its tuned config) | 49.52 (50.0, 49.1, 49.6) | |
-| Shadow 0.1.36, `--ctx 8192` (same context as the Strata run) | 46.43 (46.3, 46.4, 46.6) | **-6.2%** |
+| Shadow 0.1.36, `--ctx 8192` (**a snapshot restore at turn 20 switched Shadow's drafter off for the rest of the run: a bug, below**) | 46.43 (46.3, 46.4, 46.6) | **-6.2%** |
 
-Read it as: **Shadow's default setting is 12.5% faster than Strata on decode, but when Shadow is held to the same 8,192-token
-context as the Strata run it is 6% slower.** We do not yet know why Shadow decodes 20% slower at `--ctx 8192` than at its
-default 24,576 (the smaller context gives it a *larger* expert cache, 2,317 slots against 1,843, and still slower decoding);
-that is an open question, not a result. The default is what a user gets, so it is the headline; the `--ctx 8192` row is
-here so nobody can say the matched-context number was hidden.
+Read it as: **when nothing goes wrong Shadow decodes 12.5% faster than Strata; in this bench the `--ctx 8192` runs hit a
+Shadow bug and fell to 6% behind.** The bug (found while checking this comparison, STATUS 98): when a chat turn makes the
+server restore an earlier conversation snapshot, it marks the DFlash drafter as broken and never turns it back on, so the
+rest of the session decodes without it (speculation falls back to prompt lookup and plain one-token steps). In this bench
+the restore happened at turn 20 (and again at turn 34) in both `--ctx 8192` and `--ctx 10240` runs, whose replies are the
+same text, and in one of two `--ctx 12288` runs (at turn 10); no run without a restore was slow, and every run with one
+was (20 of 20 runs). **It is the restore, not the context length**: the 8,192 setting only decided which replies came
+out. A real chat that goes back to an older turn can hit it at any context. The fix is not made yet; until it is, the
+number a user sees depends on whether their conversation triggers a restore. The headline is the unaffected run; the
+affected one is shown so the bug cannot be missed.
 
 Per turn (warm turns, all three runs):
 
@@ -70,10 +75,11 @@ of the PC's RAM (it pins about 39-41 GiB for its expert tier; Strata's budget he
   prompts and level at 9.6k; those figures are older than this build and are not repeated here.
 * **Each engine got its own best setup, and neither was tuned on these prompts.** Shadow's expert placement was recorded
   from 300 other prompts; Strata's profile is its usual mixed one.
-* **The setting that decides the result, `--ctx`, was found by accident** (a quoting slip in a side experiment ran the
-  default context and decoded 20% faster than the standard bench's 8,192). The earlier published "52.1 against 47.7 tok/s"
-  (2026-10-31) was Shadow at `--ctx 8192`, so it is **superseded**: on today's build the same setting reads 46.4 and
-  Strata 49.5.
+* **The speed Shadow shows depends on the restore bug above, found by accident** (a quoting slip in a side experiment ran
+  the default context and decoded 20% faster than the standard bench's `--ctx 8192`; chasing that led to the restore).
+  The earlier published "52.1 against 47.7 tok/s" (2026-10-31) is **superseded**: it was Shadow at `--ctx 8192` on an older
+  build, before this was measured against the restore; on today's build that setting reads 46.4 (restore at turn 20) and
+  Strata 49.5, and the default 55.7.
 
 ## Reproduce
 
