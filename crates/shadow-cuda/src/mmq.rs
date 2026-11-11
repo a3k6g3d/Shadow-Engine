@@ -79,6 +79,14 @@ impl Mmq {
         }
     }
 
+    /// The `mmq_q8_1_ds_layout` class of `gty` (`mmq_get_q8_1_ds_layout` in `mmq.cuh`): projections sharing an input buffer and layout class produce identical `mmq_y` bytes.
+    pub fn ds_layout(gty: i32) -> u8 {
+        match gty {
+            12 | 13 => 1, // MMQ_Q8_1_DS_LAYOUT_DS4 (Q4_K, Q5_K)
+            _ => 0,       // MMQ_Q8_1_DS_LAYOUT_D4 (Q6_K, IQ4_XS)
+        }
+    }
+
     /// The ggml type number of an expert quantization the grouped-expert products can multiply (opt-in, `SHADOW_MMQ_MOE=1`: a tie, docs/STATUS.md 2026-11-06 (46)), by the name `TensorInfo::ty.name()` gives.
     pub fn moe_type(&self, name: &str) -> Option<i32> {
         self.moe?;

@@ -400,10 +400,27 @@ impl DirectIoPool {
                 let lead = (piece_offset - sector_offset) as usize;
                 let sector_end = (piece_offset + chunk_len as u64 + 4095) & !4095;
                 let sector_len = (sector_end - sector_offset) as usize;
-                assert!(sector_len <= DIRECT_SLOT_SIZE, "sector_len {sector_len} > DIRECT_SLOT_SIZE");
+if sector_len > DIRECT_SLOT_SIZE {
+                    // Checked, not asserted: a panic mid-batch unwinds past submit's drain-on-error
+                    // and lets reads queued earlier in this batch land in buffers the caller frees on
+                    // the way out — the very corruption this file guards against. Nothing is allocated
+                    // for this piece yet, so erroring here is safe.
+                    return Err(std::io::Error::other(format!(
+                        "readpool: sector_len {sector_len} > DIRECT_SLOT_SIZE {DIRECT_SLOT_SIZE}"
+                    )));
+                }
 
                 if slots.free.is_empty() && slots.buffers.len() >= DIRECT_MAX_SLOTS {
                     self.retire_oldest(slots)?;
+                    // The invariant (free + pending == buffers, no leaks now that the assert is a
+                    // checked return) makes this state unreachable; if it ever happens there is
+                    // nothing to retire and the cap cannot be honoured — error out (submit drains,
+                    // the caller falls back to the buffered workers).
+                    if slots.free.is_empty() {
+                        return Err(std::io::Error::other(
+                            "readpool: direct-I/O slot cap reached with nothing in flight to retire",
+                        ));
+                    }
                 }
                 let slot_idx = slots.alloc_slot()?;
                 let ev = slots.events[slot_idx];

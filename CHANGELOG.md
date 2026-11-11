@@ -2,6 +2,61 @@
 
 All notable changes to Shadow will be documented in this file.
 
+## [0.1.36] — 2026-11-10
+### Added / Changed
+- **Web UI & Desktop Shell Modernization (`crates/shadow-serve/src/ui.rs`, `crates/shadow-ui/ui/index.html`)**:
+  - **Tabular numerals (`font-variant-numeric: tabular-nums`)** across the live header telemetry pills, Dashboard cards, recent-requests table, message timing metadata, and Tauri launcher status timer so 1 Hz `/v1/telemetry` updates never jitter horizontally.
+  - **Auto-sizing form controls (`field-sizing: content`)** on `#prompt-input`, `#notes-text` (pinned scratchpad), and `#set-mem-kind` with explicit `width: 100%` / `min-block-size` / `max-block-size` bounds and a feature-detected JS fallback (`CSS.supports('field-sizing', 'content')`).
+  - **IME-safe Enter-to-submit (`!e.isComposing && e.keyCode !== 229`)** on `#prompt-input`, `#set-mem-new`, and inline memory editing (`.mem-edit`), plus accessible `aria-label` attributes on form inputs.
+  - **Single-line overflow resilience (`min-inline-size: 0`, `overflow: hidden`, `text-overflow: ellipsis`, `table-layout: fixed`)** across Dashboard `.kv` rows, sidebar conversation items (with `outline-offset: -2px` so scroll containers never clip focus rings), and the recent-requests table.
+  - **Ergonomic polish & keyboard shortcuts**: floating `↓ Jump to latest` button (`#scroll-bottom-btn`) when scrolled up during long conversations, `Copied ✓` feedback on code blocks, global shortcuts (`Ctrl+K` / `Ctrl+/` to search conversations, `Ctrl+Shift+O` for new chat, `Esc` to close modals/dropdowns or stop active generation), keyboard shortcut badges on the Welcome card, and updated `DEFAULT_PERSONA` tool description (`search finds files and earlier outputs by keyword, ranked by BM25 and path match`, with automatic `localStorage` migration from the old `by meaning` wording).
+
+## [0.1.35] — 2026-11-10
+### Added / Changed
+- **Prompt-Path & Decode Round 3 Optimizations (`crates/shadow-cuda/src/kvvmm.rs`, `crates/shadow-cuda/src/mmq.rs`, `crates/shadow-cuda/src/session.rs`, `crates/shadow-cuda/src/pinned.rs`, `crates/shadow/src/main.rs`)**:
+  - **VMM physical handle pool & scratch zero-skip (`SHADOW_VMM_POOL`, default `1`)**: `VmmRegion::release_tail_to` and `remap_tail_from` now pool the 2 MiB `CUmemGenericAllocationHandle` allocations across `lend_kv` and `unlend_kv` (`GpuSession::vmm_pool`, released on `Drop`), avoiding `~2,600` `cuMemCreate` / `cuMemRelease` driver calls per prompt, and `map_bytes_from(..., false)` skips the redundant `1.5 GiB` `cuMemsetD8` on scratch `kv_extra`. Cuts `lend_cache` + `restore_cache` VMM overhead by `70–90 ms` per prompt (`lend_cache`: `91 ms → 40 ms` at 3k, `45 ms → 19 ms` at 15k; `unlend_kv`: `53 ms → 31 ms` at 3k, `26 ms → 16 ms` at 15k).
+  - **Sub-chunk (`si > 0`) fast path & Layer-0 pipeline ordering (`SHADOW_SUBCHUNK_FAST`, default `1`)**: On sub-chunked passes (`m > 2,048`), `dev_plan_buckets` skips rebuilding and re-uploading `dp_eaddr` and `dp_copied` on sub-chunks `si > 0` (since `cache.map` is invariant across sub-chunks of layer `l` and `si == 0` already waited on `sp.events[p]`), `moe_staged` skips the redundant `stream_wait_event(sp.events[p])` and runs a single unmasked `fused_experts` phase on `si > 0`, and on `first_of_pass` (`l == 0`) defers `early` (`stage_copy(1)` + `stage_pipe_read(2)`) until after sub-chunk 0's MoE launches so the GPU executes Layer 0 sub-chunk 0 while `stage_pipe_read(1)` finishes on the CPU read pool.
+  - **Deduplicated `shadow_mmq_quantize` on `bb.u` (`SHADOW_MMQ_REUSE`, default `1`)**: Caches `(x_ptr, k, m, xs, ds_layout)` in `GpuSession::mmq_y_tag` (invalidated whenever `bb.u` or `mmq_y` is written in `hc_read_batch`, `ple_batch`, `big_batch_on`, `big_batch_off`) so back-to-back MMQ projections sharing `bb.u` (`ffn_gate_shexp` + `ffn_up_shexp` on all 48 layers, `attn_qkv` + `attn_gate` on 36 DeltaNet layers, `attn_q` + `attn_k` + `attn_v` on 12 attention layers) quantize `bb.u` once instead of 2–3 times (`~576–768` fewer quantization kernel launches per 15k prompt).
+  - **Overlapped cold file reads with RAM-tier DMA in `restore_cache` (`SHADOW_RESTORE_OVERLAP`, default `1`)**: Queues the RAM-tier `upload_batch` (`~3.2 GiB` over PCIe) onto `copy_stream` asynchronously *before* reading cold file-only evicted experts into `sp.bufs[0]`, overlapping the CPU/NVMe read with the GPU copy engine's RAM-tier transfer (`restore_cache`: `205 ms → 166 ms` at 3k, `180 ms → 154 ms` at 9.6k, `170 ms → 151 ms` at 15k).
+  - **Direct mapped table reads in `routed_overlapped` and `routed_qwen` (`SHADOW_DIRECT_TAB`, default `1`)**: `stage_slice` writes per-layer routing pointer/weight/permutation tables into the mapped staging buffer and passes `stage.dev_ptr + at` directly to `mv_batch` and `moe_combine_qwen_perm`, saving 48 `copy_words` kernel launches per single-token decode step.
+  - **Warning-only RAM floor check in `PinnedRegion::build` (`crates/shadow-cuda/src/pinned.rs`)**: `PinnedRegion::new` and `PinnedRegion::new_chunked` now log a `RAM warning:` instead of hard-failing when `available_ram() < len + ram_floor()`, relying on the chunked-tier watchdog (`pinned::start_watchdog`) to trim 1 GiB chunks if free RAM dips below `ram_floor()`.
+  - **CLI switch `--no-prompt-opt-r3`** (and updated `--no-prompt-opt`) to disable all five Round 3 optimizations for clean A-B-B-A benchmarking.
+  - **Measured (`bench/prompt-opt-2026-11-10/results_r3.json`, interleaved A-B-B-A, bit-identical hashes on all 5 workloads)**:
+    - Warm `3k_a` (2,867 tok): **`2.99 s` (`958.2 tok/s`)** vs `3.08 s` (`931.1 tok/s`) in Round 2 (**+2.9%**, and **+15.1%** vs pre-opt `3.52 s`)
+    - Warm `3k_b` (2,622 tok): **`2.93 s` (`896.2 tok/s`)** vs `3.05 s` (`860.4 tok/s`) in Round 2 (**+4.2%**, and **+23.4%** vs pre-opt `3.82 s` at 43 GiB tier)
+    - `9k6` (9,673 tok): **`5.68 s` (`1,701.6 tok/s`, mean `5.71 s` / `1,693.7 tok/s`)** vs `5.95 s` (`1,627.2 tok/s`) in Round 2 (**+4.1%**, and **+6.6%** vs pre-opt `6.09 s`)
+    - `15k` (15,034 tok): **`8.52 s` (`1,763.8 tok/s`, mean `8.54 s` / `1,761.0 tok/s`)** vs `8.60 s` (`1,748.4 tok/s`) in Round 2 (**+0.7%** over Round 2, **+6.0%** vs pre-opt `9.05 s`, and **+16.2% faster than Strata 0.2.11's `9.90 s` / `1,543 tok/s`**)
+    - `decode200` (200 tok): **`52.9 tok/s` (`53.1 tok/s` warm, +11.1% faster than Strata's `47.7 tok/s`)**.
+
+## [0.1.34] — 2026-11-10
+### Changed
+- **Removed Remaining Hard RAM Guards (`crates/shadow-cuda/src/session.rs`, `crates/shadow-serve/src/engine.rs`)**:
+  - Removed the leftover `available_ram() >= ram_floor() + ...` retention guard on `sp_spare` and `staging` in `GpuSession::with_tiers` and `restore_cache` (`PinnedRegion::new` checks the floor at allocation time and the chunked tier watchdog `pinned::start_watchdog` handles low-RAM pressure thereafter).
+  - Changed the hard error refusal in `expand_pictures` (`not enough free RAM to encode a picture`) to a log warning (`shadow serve: warning: encoding a picture with ... GiB free`), matching `answer()`'s chunked-tier release behavior from STATUS 90.
+  - Updated the in-RAM conversation snapshot check in `chat()` from the hardcoded `RAM_FLOOR + 3 GiB` (`7 GiB`) to the configured `ram_floor()`.
+
+## [0.1.33] — 2026-11-10
+### Added / Changed
+- **Prompt Path Fixed-Cost & Fused-Planner Optimizations (`crates/shadow-cuda/src/session.rs`, `crates/shadow-serve/src/engine.rs`, `crates/shadow-serve/src/lib.rs`, `crates/shadow/src/main.rs`)**:
+  - **Pre-allocated & retained `StagePipe` and `staging` buffers (`SHADOW_KEEP_PIPE`, default `1`)**: `GpuSession::with_tiers` now pre-allocates the 256-slot pinned staging buffer (`502 MiB`) and the three `StagePipe` read-ahead buffers (`546 MiB` at tier 45) during session creation, and removes the old `available_ram() >= ram_floor() + 4 GiB` drop guard in `restore_cache` (relying on `PinnedRegion::new`'s floor check and the chunked tier watchdog `pinned::start_watchdog`). Eliminates `~225 ms` on the first prompt (`3k_a`) and `~68–70 ms` of `cuMemHostRegister` / `cuMemHostUnregister` overhead on every subsequent prompt (`lend_cache` + `restore_cache`).
+  - **Fused-expert fast device planning (`SHADOW_FUSED_FAST_PLAN`, default `1`)**: When `shadow_fused.dll` covers a layer (`fused_covers`), `dev_plan_buckets` skips zeroing the `7.6 MB` width-class record tables (`2.9 GB` of GPU memset per 15k prompt), skips `plan_scan_w` and `plan_fill_w`, uploads only the 4 KB base-address part of `dp_eaddr` (instead of 12 KB + `dp_lay`), quantizes `bb.u` once per sub-chunk across phases 0 and 1, and bypasses `fu.mask` when a layer has no resident VRAM-cache experts (`ph == 1 && !any_res`).
+  - **Batched DMA in `restore_cache` (`SHADOW_RESTORE_SINGLE=0` default)**: Replaces `1,775–1,809` individual `cuMemcpyHtoDAsync` driver calls when restoring evicted experts from the RAM tier and `StagePipe` with a single `cuMemcpyBatchAsync` batch upload.
+  - **Parallel host token-embedding dequantization (`SHADOW_EMBED_PAR`, default `1`)**: Parallelizes the `Q6_K` host embedding dequantization loop across CPU threads (`std::thread::scope`) in `batch()`.
+  - **Honor `"cache_prompt": false` in `/v1/chat/completions`**: `parse_chat` / `chat` now parses `"cache_prompt"` (default `true`) and skips taking host shared-prefix and conversation snapshots (`sess.snapshot_to(true, true)`) when `"cache_prompt": false` is requested (`SHADOW_FORCE_CONV_SNAP=1` forces snapshots).
+  - **CLI switch `--no-prompt-opt`**: Disables all five optimizations at once for clean A-B-B-A benchmarking (`tools/ab_prompt_opt.py`).
+  - **Measured (interleaved A-B-B-A at tier 45, floor 3.5, `bench/prompt-opt-2026-11-10/results_r2.json`, bit-identical hashes across all 5 workloads)**:
+    - `3k_a` (2,867 tok, first prompt): `3.42 s → 3.12 s` (**+9.7%**, `837.9 → 919.1 tok/s`)
+    - `3k_b` (2,622 tok, warm prompt): `2.72 s → 2.62 s` (**+4.0%**, `962.2 → 1,000.9 tok/s`, breaking `1,000 tok/s` at 2.6k tokens)
+    - `9k6` (9,673 tok): `5.89 s → 5.73 s` (**+2.8%**, `1,642.9 → 1,689.1 tok/s`)
+    - `15k` (15,034 tok): `8.70 s → 8.57 s` (**+1.4%**, `1,728.7 → 1,753.6 tok/s`, **15.5% faster than Strata 0.2.11's 9.90 s / 1,543 tok/s**)
+    - `decode200` (200 tok): `53.2 → 52.9 tok/s` (unchanged, **+11% faster than Strata's 47.7 tok/s**).
+
+## [0.1.32] — 2026-11-10
+### Added
+- **Avalon Zero-Cost Oracle & Router-Sync Probes (SHADOW_AVALON_ORACLE=N, SHADOW_AVALON_ORACLE_SYNC=1, crates/shadow-cuda/src/session.rs, crates/shadow/src/main.rs)**:
+  - Added timing-only oracle hooks (--avalon-oracle N and --avalon-oracle-sync, off by default) to measure the exact upper bound of offloading N non-resident experts per layer to the CPU during staged prompt passes (docs/EXPERIMENT_SPEC_2026-11-10.json, docs/STATUS.md 92).
+  - Benchmarked across 5 arms x 3 runs (ench/avalon_oracle_prompt) and 3 arms x 2 runs (ench/avalon_oracle_sync), summarized in ench/avalon-2026-11-10/summary.md: N = 3 is a tie (+0.11% to +0.65%) even for a clairvoyant 0-cost oracle, while synchronizing per layer to read router tops on the host costs -5.31% prompt throughput (-6.22% combined). Closed without building the full CPU prompt port; baseline defaults unchanged.
+
 ## [Unreleased] — 2026-11-05 and 2026-11-06
 Prompt reading with `--tensor-prompt` (the default fast mode) is about 5% / 11% / 23% faster than at the start of 2026-11-06 for 3k / 9.6k / 15k-token prompts (535 / 1,068 / 1,038 tok/s, mean of four server runs each); decode and `--exact` are unchanged (exact hash 162a8e07, `quality_test` 12 of 12).
 ### Fixed

@@ -91,23 +91,41 @@ impl<'c> VmmRegion<'c> {
 
     /// Map (zeroed) chunks until `bytes` are backed.
     pub fn map_bytes(&mut self, bytes: usize) -> Result<(), String> {
+        let mut empty = Vec::new();
+        self.map_bytes_from(bytes, &mut empty, true)
+    }
+
+    /// Map chunks until `bytes` are backed, drawing existing physical handles from `pool` before creating new ones, and optionally zeroing the newly mapped range.
+    pub fn map_bytes_from(&mut self, bytes: usize, pool: &mut Vec<u64>, zero: bool) -> Result<(), String> {
         let n = bytes.div_ceil(self.chunk).min(self.total);
-        self.map_to(n)
+        self.map_to_from(n, pool, zero)
     }
 
     /// Map chunks until `n` are in place (zeroed).
     fn map_to(&mut self, n: usize) -> Result<(), String> {
+        let mut empty = Vec::new();
+        self.map_to_from(n, &mut empty, true)
+    }
+
+    /// Map chunks until `n` are in place, drawing physical handles from `pool` first so `lend_kv` / `unlend_kv` avoid ~2,600 `cuMemCreate` / `cuMemRelease` driver calls per prompt.
+    fn map_to_from(&mut self, n: usize, pool: &mut Vec<u64>, zero: bool) -> Result<(), String> {
         let api = self.ctx.api;
         self.ctx.bind().map_err(|e| e.to_string())?;
         let (p, acc) = (prop(), access());
         let from = self.mapped;
         while self.mapped < n {
-            let mut h = 0u64;
-            // SAFETY: a chunk of physical device memory; mapped at its own slot of the reserved range.
-            let r = unsafe { (api.cuMemCreate)(&mut h, self.chunk, p.as_ptr() as *const _, 0) };
-            if r != 0 {
-                return Err(format!("cuMemCreate failed ({r}): no VRAM to map the KV window's tail back"));
-            }
+            let h = match pool.pop() {
+                Some(h) => h,
+                None => {
+                    let mut h = 0u64;
+                    // SAFETY: a chunk of physical device memory; mapped at its own slot of the reserved range.
+                    let r = unsafe { (api.cuMemCreate)(&mut h, self.chunk, p.as_ptr() as *const _, 0) };
+                    if r != 0 {
+                        return Err(format!("cuMemCreate failed ({r}): no VRAM to map the KV window's tail back"));
+                    }
+                    h
+                }
+            };
             let at = self.base + (self.mapped * self.chunk) as u64;
             let r = unsafe { (api.cuMemMap)(at, self.chunk, 0, h, 0) };
             if r != 0 {
@@ -125,9 +143,11 @@ impl<'c> VmmRegion<'c> {
             if r != 0 {
                 return Err(format!("cuMemSetAccess failed ({r})"));
             }
-            let r = unsafe { (api.cuMemsetD8)(at, 0, len) };
-            if r != 0 {
-                return Err(format!("cuMemsetD8 failed ({r})"));
+            if zero {
+                let r = unsafe { (api.cuMemsetD8)(at, 0, len) };
+                if r != 0 {
+                    return Err(format!("cuMemsetD8 failed ({r})"));
+                }
             }
         }
         Ok(())
@@ -154,10 +174,46 @@ impl<'c> VmmRegion<'c> {
         freed
     }
 
+    /// Unmap every chunk past `keep_pos` positions and move their physical handles into `pool` without releasing them to the driver.
+    pub fn release_tail_to(&mut self, keep_pos: usize, pool: &mut Vec<u64>) -> usize {
+        let api = self.ctx.api;
+        let keep = (keep_pos * self.per_pos).div_ceil(self.chunk).min(self.mapped);
+        if keep >= self.mapped || self.ctx.bind().is_err() {
+            return 0;
+        }
+        let at = self.base + (keep * self.chunk) as u64;
+        // SAFETY: the chunks past `keep` are mapped, nothing on the device is using them.
+        let r = unsafe { (api.cuMemUnmap)(at, (self.mapped - keep) * self.chunk) };
+        if r != 0 {
+            return 0;
+        }
+        pool.extend(self.handles.drain(keep..));
+        let freed = (self.mapped - keep) * self.chunk;
+        self.mapped = keep;
+        freed
+    }
+
     /// Back to the whole window mapped (zeroed tail).
     pub fn remap_tail(&mut self) -> Result<(), String> {
         let n = self.total_chunks();
         self.map_to(n)
+    }
+
+    /// Back to the whole window mapped (zeroed tail), reusing physical handles from `pool`.
+    pub fn remap_tail_from(&mut self, pool: &mut Vec<u64>) -> Result<(), String> {
+        let n = self.total_chunks();
+        self.map_to_from(n, pool, true)
+    }
+
+    /// Release any leftover physical handles in `pool`.
+    pub fn release_pool(ctx: &Context, pool: &mut Vec<u64>) {
+        if pool.is_empty() || ctx.bind().is_err() {
+            return;
+        }
+        let api = ctx.api;
+        for h in pool.drain(..) {
+            unsafe { (api.cuMemRelease)(h) };
+        }
     }
 }
 

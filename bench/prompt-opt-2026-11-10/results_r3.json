@@ -1,0 +1,226 @@
+[
+  {
+    "arm": "r3",
+    "run": 1,
+    "metrics": {
+      "3k_a": {
+        "prompt_n": 2867,
+        "prompt_s": 3.9686472999999998,
+        "prompt_tps": 722.4123947723951,
+        "predicted_n": 16,
+        "predicted_s": 0.5122262,
+        "decode_tps": 31.236199944477658,
+        "wall_s": 4.491887807846069,
+        "hash": "b8b75e04"
+      },
+      "3k_b": {
+        "prompt_n": 2622,
+        "prompt_s": 3.3450368,
+        "prompt_tps": 783.8478787438154,
+        "predicted_n": 16,
+        "predicted_s": 0.3918572,
+        "decode_tps": 40.831200753743964,
+        "wall_s": 3.7436561584472656,
+        "hash": "4ee10896"
+      },
+      "9k6": {
+        "prompt_n": 9673,
+        "prompt_s": 5.7378742,
+        "prompt_tps": 1685.815976934454,
+        "predicted_n": 16,
+        "predicted_s": 0.3738454,
+        "decode_tps": 42.798440210846515,
+        "wall_s": 6.127817153930664,
+        "hash": "9034540f"
+      },
+      "15k": {
+        "prompt_n": 15034,
+        "prompt_s": 8.5508784,
+        "prompt_tps": 1758.1819430387409,
+        "predicted_n": 16,
+        "predicted_s": 0.3702049,
+        "decode_tps": 43.21930909072246,
+        "wall_s": 8.942544937133789,
+        "hash": "f095db85"
+      },
+      "decode200": {
+        "prompt_n": 36,
+        "prompt_s": 0.670828,
+        "prompt_tps": 53.66502292689035,
+        "predicted_n": 200,
+        "predicted_s": 3.7994602,
+        "decode_tps": 52.63905646386294,
+        "wall_s": 4.474111557006836,
+        "hash": "46597785"
+      }
+    }
+  },
+  {
+    "arm": "r2",
+    "run": 1,
+    "metrics": {
+      "3k_a": {
+        "prompt_n": 2867,
+        "prompt_s": 3.1010122,
+        "prompt_tps": 924.5368334894007,
+        "predicted_n": 16,
+        "predicted_s": 0.5071409,
+        "decode_tps": 31.54941752873807,
+        "wall_s": 3.634077548980713,
+        "hash": "b8b75e04"
+      },
+      "3k_b": {
+        "prompt_n": 2622,
+        "prompt_s": 3.5231575,
+        "prompt_tps": 744.218786699147,
+        "predicted_n": 16,
+        "predicted_s": 0.6461461,
+        "decode_tps": 24.76220161353601,
+        "wall_s": 4.175001621246338,
+        "hash": "4ee10896"
+      },
+      "9k6": {
+        "prompt_n": 9673,
+        "prompt_s": 6.1664766,
+        "prompt_tps": 1568.6429427138344,
+        "predicted_n": 16,
+        "predicted_s": 0.3751751,
+        "decode_tps": 42.646753475910316,
+        "wall_s": 6.556558609008789,
+        "hash": "9034540f"
+      },
+      "15k": {
+        "prompt_n": 15034,
+        "prompt_s": 8.5915734,
+        "prompt_tps": 1749.8541070486579,
+        "predicted_n": 16,
+        "predicted_s": 0.3756259,
+        "decode_tps": 42.595571817598305,
+        "wall_s": 8.987420082092285,
+        "hash": "f095db85"
+      },
+      "decode200": {
+        "prompt_n": 36,
+        "prompt_s": 0.6692796,
+        "prompt_tps": 53.789178693030536,
+        "predicted_n": 200,
+        "predicted_s": 3.790634,
+        "decode_tps": 52.76162246210001,
+        "wall_s": 4.463789701461792,
+        "hash": "46597785"
+      }
+    }
+  },
+  {
+    "arm": "r2",
+    "run": 2,
+    "metrics": {
+      "3k_a": {
+        "prompt_n": 2867,
+        "prompt_s": 3.0790762,
+        "prompt_tps": 931.1234324113187,
+        "predicted_n": 16,
+        "predicted_s": 0.504841,
+        "decode_tps": 31.693146951218306,
+        "wall_s": 3.5920400619506836,
+        "hash": "b8b75e04"
+      },
+      "3k_b": {
+        "prompt_n": 2622,
+        "prompt_s": 3.0473276,
+        "prompt_tps": 860.4260336171274,
+        "predicted_n": 16,
+        "predicted_s": 0.3868511,
+        "decode_tps": 41.35958253705366,
+        "wall_s": 3.4407124519348145,
+        "hash": "4ee10896"
+      },
+      "9k6": {
+        "prompt_n": 9673,
+        "prompt_s": 5.7382311,
+        "prompt_tps": 1685.7111244613343,
+        "predicted_n": 16,
+        "predicted_s": 0.3696304,
+        "decode_tps": 43.286482929975456,
+        "wall_s": 6.122020483016968,
+        "hash": "9034540f"
+      },
+      "15k": {
+        "prompt_n": 15034,
+        "prompt_s": 8.606118500000001,
+        "prompt_tps": 1746.8966991332966,
+        "predicted_n": 16,
+        "predicted_s": 0.3687422,
+        "decode_tps": 43.39074833311728,
+        "wall_s": 8.995601415634155,
+        "hash": "f095db85"
+      },
+      "decode200": {
+        "prompt_n": 36,
+        "prompt_s": 0.6589346,
+        "prompt_tps": 54.63364649541851,
+        "predicted_n": 200,
+        "predicted_s": 3.778973,
+        "decode_tps": 52.924432114227855,
+        "wall_s": 4.442014455795288,
+        "hash": "46597785"
+      }
+    }
+  },
+  {
+    "arm": "r3",
+    "run": 2,
+    "metrics": {
+      "3k_a": {
+        "prompt_n": 2867,
+        "prompt_s": 2.9919629,
+        "prompt_tps": 958.2338069766841,
+        "predicted_n": 16,
+        "predicted_s": 0.5081785,
+        "decode_tps": 31.484999857333595,
+        "wall_s": 3.507420301437378,
+        "hash": "b8b75e04"
+      },
+      "3k_b": {
+        "prompt_n": 2622,
+        "prompt_s": 2.9258348,
+        "prompt_tps": 896.1544923862414,
+        "predicted_n": 16,
+        "predicted_s": 0.3885299,
+        "decode_tps": 41.18087179390827,
+        "wall_s": 3.3209266662597656,
+        "hash": "4ee10896"
+      },
+      "9k6": {
+        "prompt_n": 9673,
+        "prompt_s": 5.6845628999999995,
+        "prompt_tps": 1701.6259948500176,
+        "predicted_n": 16,
+        "predicted_s": 0.3688815,
+        "decode_tps": 43.37436276961572,
+        "wall_s": 6.067921876907349,
+        "hash": "9034540f"
+      },
+      "15k": {
+        "prompt_n": 15034,
+        "prompt_s": 8.523700999999999,
+        "prompt_tps": 1763.7878193991087,
+        "predicted_n": 16,
+        "predicted_s": 0.3675688,
+        "decode_tps": 43.529265813638155,
+        "wall_s": 8.911162853240967,
+        "hash": "f095db85"
+      },
+      "decode200": {
+        "prompt_n": 36,
+        "prompt_s": 0.6572231,
+        "prompt_tps": 54.77592007949812,
+        "predicted_n": 200,
+        "predicted_s": 3.7683952,
+        "decode_tps": 53.072989796823855,
+        "wall_s": 4.430168628692627,
+        "hash": "46597785"
+      }
+    }
+  }
+]

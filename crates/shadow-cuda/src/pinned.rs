@@ -214,23 +214,28 @@ pub struct PinnedRegion<'c> {
 }
 
 impl<'c> PinnedRegion<'c> {
-    /// `len` bytes, pinned, if the RAM rule allows it.
+    /// `len` bytes, pinned (warns if available RAM is below the floor; the watchdog trims the tier under pressure).
     pub fn new(ctx: &'c Context, len: usize) -> Result<PinnedRegion<'c>, String> {
-        Self::with_ram_source(ctx, len, available_ram)
+        Self::build(ctx, len, len.max(1), available_ram, false)
     }
 
-    /// As `new`, with where "available RAM" comes from (the tests lower it artificially).
+    /// As `new`, with where "available RAM" comes from (the tests lower it artificially and check the hard refusal).
     pub fn with_ram_source(ctx: &'c Context, len: usize, available: fn() -> u64) -> Result<PinnedRegion<'c>, String> {
-        Self::build(ctx, len, len.max(1), available)
+        Self::build(ctx, len, len.max(1), available, true)
     }
 
-    /// `len` bytes pinned in chunks of `chunk` bytes, the floor checked after each: a region that can give its tail back (`shrink_by`).
+    /// `len` bytes pinned in chunks of `chunk` bytes: a region that can give its tail back (`shrink_by`).
     pub fn new_chunked(ctx: &'c Context, len: usize, chunk: usize) -> Result<PinnedRegion<'c>, String> {
-        Self::build(ctx, len, chunk.max(1 << 20), available_ram)
+        Self::build(ctx, len, chunk.max(1 << 20), available_ram, false)
     }
 
-    fn build(ctx: &'c Context, len: usize, chunk: usize, available: fn() -> u64) -> Result<PinnedRegion<'c>, String> {
-        headroom(len as u64, available())?;
+    fn build(ctx: &'c Context, len: usize, chunk: usize, available: fn() -> u64, strict: bool) -> Result<PinnedRegion<'c>, String> {
+        if let Err(e) = headroom(len as u64, available()) {
+            if strict {
+                return Err(e);
+            }
+            eprintln!("RAM warning: {e}");
+        }
         #[cfg(windows)]
         {
             let total = len.max(1);
@@ -242,6 +247,7 @@ impl<'c> PinnedRegion<'c> {
             let mut r = PinnedRegion { ctx, base, dev_ptr: 0, len: 0, chunks: Vec::new(), devs: Vec::new(), chunk, available };
             ctx.bind().map_err(|e| e.to_string())?;
             let mut off = 0usize;
+            let mut warned = false;
             while off < total {
                 let n = chunk.min(total - off);
                 // SAFETY: [base + off, base + off + n) lies inside the reservation just made.
@@ -268,7 +274,14 @@ impl<'c> PinnedRegion<'c> {
                 r.devs.push(dptr);
                 off += n;
                 r.len = off.min(len);
-                r.check_floor()?; // the pages are locked now: what is left?
+                if let Err(e) = r.check_floor() {
+                    if strict {
+                        return Err(e);
+                    } else if !warned {
+                        eprintln!("RAM warning: {e}");
+                        warned = true;
+                    }
+                }
             }
             Ok(r)
         }

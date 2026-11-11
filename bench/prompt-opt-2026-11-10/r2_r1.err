@@ -1,0 +1,165 @@
+shadow serve: fastest-mode defaults: --tail-skip 3 --tensor-prompt --verify-rank 2 --placement profiles/routing-varied300.shrc --dflash models/dflash2 --spec 3 --dflash-min-p 0.5 (--exact for the exact path)
+RAM floor: 3.5 GiB (default 4): a pinned tier cannot be paged out, and this PC has frozen hard at 0.4 GiB free
+placement: profiles/routing-varied300.shrc, 34990 tokens of routing
+shadow serve: starting 2 MCP server(s) from mcp.json
+shadow serve: listening on http://127.0.0.1:8091
+shadow serve: MCP server time: 3 tools
+shadow serve: MCP server browser: 10 tools
+mmq: loaded J:\Shadow\native\mmq\shadow_mmq.dll (int8 tensor-core projections for the prompt path)
+fused: loaded J:\Shadow\native\fused\shadow_fused.dll (Strata's int8 fused experts for the prompt path)
+dflash: loaded the drafter from models/dflash2 (~1.2 GB VRAM)
+shadow serve: ready in 38.1 s; expert cache: 1843 slots x 1.96 MiB = 3.53 GiB; 0 hits, 0 misses (0.0% hits); 0 slice uploads; RAM tier: 23643 experts, 45.00 GiB pinned (filled in 30.9 s), misses served 0 from RAM, 0 from the file; tail skip (rank >= 3): 0 routed experts skipped; host waits per step: router 0.0 ms, copies 0.0 ms, file 0.0 ms; kernel launches per step 0, 0.0 ms of host time in them
+shadow serve: 31 conversation snapshot(s) on disk in J:/ShadowConvCache (19.42 GiB)
+SHADOW_PHASES stage pipe: the kept buffers again (0.52 GiB pinned)
+SHADOW_PHASES lend_cache: KV tail 0.067 s; to the evictions 0.067; device drained 0.097; evictions and staging region 0.097; stage pipe (3 pinned regions) 0.098; all 0.098 s
+fused experts: taken: gate/up IQ3_XXS + down IQ4_NL, phase 0
+fused experts: taken: gate/up IQ3_XXS + down IQ4_NL, phase 1
+fused experts: taken: gate/up IQ2_S + down Q2_0, phase 0
+fused experts: taken: gate/up IQ2_S + down Q2_0, phase 1
+ram watchdog: available RAM is under the 3.5 GiB floor: asking the tier to give back 2 GiB
+fused experts: taken: gate/up IQ2_S + down IQ4_NL, phase 0
+fused experts: taken: gate/up IQ2_S + down IQ4_NL, phase 1
+fused experts: taken: gate/up IQ3_XXS + down Q2_0, phase 1
+fused experts: taken: gate/up IQ3_S + down IQ4_NL, phase 1
+fused experts: taken: gate/up IQ3_S + down Q2_0, phase 1
+fused experts: taken: gate/up IQ4_XS + down IQ4_NL, phase 1
+SHADOW_PHASES pass m=2867 (graphs false): embed rows 0.015 s, layers queued by 2.548 s, device drained at 2.680 s (so 0.132 s waiting after the last launch), observers 0.098 s
+ram watchdog: available RAM is under the 3.5 GiB floor: asking the tier to give back 2 GiB
+SHADOW_PHASES restore_cache: 0.207 s (1775 evicted experts to bring back): read-ahead + device drained 0.000; big batch off + KV tail 0.053; file reads + stage pipe dropped 0.000; RAM-tier uploads 0.153
+SHADOW_PHASES answer: before the prompt (render, encode, fit_context, restores) 0.004 s; lend_cache 0.098 s; passes 2.795 s; restore_cache 0.207 s; conversation snapshot 0.000 s; prompt_ms 3.101 s for 2867 tokens
+RAM tier: gave back 2 GiB under RAM pressure (1036 experts dropped; tier now 43 GiB, 22607 experts); available RAM 2.52 -> 4.50 GiB
+SHADOW_PHASES pass m=2 (graphs false): embed rows 0.000 s, layers queued by 0.040 s, device drained at 0.040 s (so 0.000 s waiting after the last launch), observers 0.000 s
+SHADOW_PHASES pass m=4 (graphs false): embed rows 0.000 s, layers queued by 0.054 s, device drained at 0.055 s (so 0.001 s waiting after the last launch), observers 0.000 s
+SHADOW_PHASES pass m=4 (graphs false): embed rows 0.000 s, layers queued by 0.051 s, device drained at 0.051 s (so 0.000 s waiting after the last launch), observers 0.000 s
+SHADOW_PHASES pass m=2 (graphs false): embed rows 0.000 s, layers queued by 0.030 s, device drained at 0.030 s (so 0.000 s waiting after the last launch), observers 0.000 s
+SHADOW_PHASES pass m=4 (graphs false): embed rows 0.000 s, layers queued by 0.044 s, device drained at 0.045 s (so 0.001 s waiting after the last launch), observers 0.000 s
+shadow serve: speculation: 5 passes (0 drafted by lookup), 10 of 11 drafted tokens accepted, 16 tokens in 0.5 s                    (drafting 0.05 s, checking 0.41 s, rolling back 0.00 s)
+shadow serve: draft position right/tried: 5/5 3/3 2/3 0/0 0/0 0/0 0/0 0/0
+SHADOW_PHASES lend_cache: KV tail 0.062 s; to the evictions 0.062; device drained 0.091; evictions and staging region 0.091; stage pipe (3 pinned regions) 0.238; all 0.238 s
+ram watchdog: available RAM is under the 3.5 GiB floor: asking the tier to give back 2 GiB
+SHADOW_PHASES pass m=2622 (graphs false): embed rows 0.020 s, layers queued by 2.737 s, device drained at 2.917 s (so 0.179 s waiting after the last launch), observers 0.123 s
+SHADOW_PHASES restore_cache: 0.222 s (1775 evicted experts to bring back): read-ahead + device drained 0.000; big batch off + KV tail 0.065; file reads + stage pipe dropped 0.000; RAM-tier uploads 0.157
+SHADOW_PHASES answer: before the prompt (render, encode, fit_context, restores) 0.003 s; lend_cache 0.238 s; passes 3.062 s; restore_cache 0.222 s; conversation snapshot 0.000 s; prompt_ms 3.523 s for 2622 tokens
+RAM tier: gave back 2 GiB under RAM pressure (1041 experts dropped; tier now 41 GiB, 21566 experts); available RAM 3.28 -> 5.27 GiB
+SHADOW_PHASES pass m=2 (graphs false): embed rows 0.000 s, layers queued by 0.029 s, device drained at 0.029 s (so 0.000 s waiting after the last launch), observers 0.000 s
+SHADOW_PHASES pass m=2 (graphs false): embed rows 0.000 s, layers queued by 0.029 s, device drained at 0.029 s (so 0.000 s waiting after the last launch), observers 0.000 s
+SHADOW_PHASES pass m=4 (graphs false): embed rows 0.000 s, layers queued by 0.036 s, device drained at 0.036 s (so 0.000 s waiting after the last launch), observers 0.000 s
+SHADOW_PHASES pass m=4 (graphs false): embed rows 0.000 s, layers queued by 0.048 s, device drained at 0.048 s (so 0.000 s waiting after the last launch), observers 0.000 s
+SHADOW_PHASES pass m=4 (graphs false): embed rows 0.000 s, layers queued by 0.037 s, device drained at 0.038 s (so 0.001 s waiting after the last launch), observers 0.001 s
+SHADOW_PHASES pass m=4 (graphs false): embed rows 0.000 s, layers queued by 0.051 s, device drained at 0.051 s (so 0.000 s waiting after the last launch), observers 0.002 s
+SHADOW_PHASES pass m=4 (graphs false): embed rows 0.000 s, layers queued by 0.057 s, device drained at 0.058 s (so 0.000 s waiting after the last launch), observers 0.000 s
+SHADOW_PHASES pass m=2 (graphs false): embed rows 0.000 s, layers queued by 0.037 s, device drained at 0.037 s (so 0.000 s waiting after the last launch), observers 0.000 s
+shadow serve: speculation: 8 passes (0 drafted by lookup), 8 of 18 drafted tokens accepted, 16 tokens in 0.6 s                    (drafting 0.09 s, checking 0.54 s, rolling back 0.01 s)
+shadow serve: draft position right/tried: 4/8 2/3 2/2 0/0 0/0 0/0 0/0 0/0
+SHADOW_PHASES lend_cache: KV tail 0.042 s; to the evictions 0.042; device drained 0.057; evictions and staging region 0.057; stage pipe (3 pinned regions) 0.251; all 0.251 s
+SHADOW_PHASES pass m=9673 (graphs false): embed rows 0.056 s, layers queued by 5.339 s, device drained at 5.574 s (so 0.235 s waiting after the last launch), observers 0.098 s
+SHADOW_PHASES restore_cache: 0.185 s (1809 evicted experts to bring back): read-ahead + device drained 0.000; big batch off + KV tail 0.030; file reads + stage pipe dropped 0.021; RAM-tier uploads 0.134
+SHADOW_PHASES answer: before the prompt (render, encode, fit_context, restores) 0.011 s; lend_cache 0.251 s; passes 5.729 s; restore_cache 0.185 s; conversation snapshot 0.000 s; prompt_ms 6.166 s for 9673 tokens
+SHADOW_PHASES pass m=4 (graphs false): embed rows 0.000 s, layers queued by 0.044 s, device drained at 0.044 s (so 0.000 s waiting after the last launch), observers 0.000 s
+SHADOW_PHASES pass m=3 (graphs false): embed rows 0.000 s, layers queued by 0.035 s, device drained at 0.035 s (so 0.000 s waiting after the last launch), observers 0.000 s
+SHADOW_PHASES pass m=4 (graphs false): embed rows 0.000 s, layers queued by 0.040 s, device drained at 0.040 s (so 0.000 s waiting after the last launch), observers 0.000 s
+SHADOW_PHASES pass m=4 (graphs false): embed rows 0.000 s, layers queued by 0.034 s, device drained at 0.034 s (so 0.000 s waiting after the last launch), observers 0.000 s
+SHADOW_PHASES pass m=4 (graphs false): embed rows 0.000 s, layers queued by 0.038 s, device drained at 0.039 s (so 0.000 s waiting after the last launch), observers 0.000 s
+SHADOW_PHASES pass m=4 (graphs false): embed rows 0.000 s, layers queued by 0.041 s, device drained at 0.041 s (so 0.000 s waiting after the last launch), observers 0.000 s
+shadow serve: speculation: 6 passes (0 drafted by lookup), 9 of 17 drafted tokens accepted, 16 tokens in 0.4 s                    (drafting 0.06 s, checking 0.26 s, rolling back 0.01 s)
+shadow serve: draft position right/tried: 5/6 4/5 0/3 0/0 0/0 0/0 0/0 0/0
+SHADOW_PHASES stage pipe: the kept buffers again (0.97 GiB pinned)
+SHADOW_PHASES lend_cache: KV tail 0.030 s; to the evictions 0.030; device drained 0.044; evictions and staging region 0.044; stage pipe (3 pinned regions) 0.044; all 0.044 s
+SHADOW_PHASES pass m=15034 (graphs false): embed rows 0.070 s, layers queued by 8.055 s, device drained at 8.227 s (so 0.172 s waiting after the last launch), observers 0.071 s
+SHADOW_PHASES restore_cache: 0.178 s (1809 evicted experts to bring back): read-ahead + device drained 0.000; big batch off + KV tail 0.026; file reads + stage pipe dropped 0.017; RAM-tier uploads 0.135
+SHADOW_PHASES answer: before the prompt (render, encode, fit_context, restores) 0.017 s; lend_cache 0.044 s; passes 8.369 s; restore_cache 0.178 s; conversation snapshot 0.000 s; prompt_ms 8.592 s for 15034 tokens
+SHADOW_PHASES pass m=4 (graphs false): embed rows 0.000 s, layers queued by 0.045 s, device drained at 0.045 s (so 0.000 s waiting after the last launch), observers 0.000 s
+SHADOW_PHASES pass m=3 (graphs false): embed rows 0.000 s, layers queued by 0.028 s, device drained at 0.029 s (so 0.000 s waiting after the last launch), observers 0.000 s
+SHADOW_PHASES pass m=4 (graphs false): embed rows 0.000 s, layers queued by 0.033 s, device drained at 0.033 s (so 0.000 s waiting after the last launch), observers 0.000 s
+SHADOW_PHASES pass m=4 (graphs false): embed rows 0.000 s, layers queued by 0.034 s, device drained at 0.035 s (so 0.000 s waiting after the last launch), observers 0.000 s
+SHADOW_PHASES pass m=2 (graphs false): embed rows 0.000 s, layers queued by 0.027 s, device drained at 0.027 s (so 0.000 s waiting after the last launch), observers 0.000 s
+SHADOW_PHASES pass m=4 (graphs false): embed rows 0.000 s, layers queued by 0.037 s, device drained at 0.037 s (so 0.000 s waiting after the last launch), observers 0.000 s
+SHADOW_PHASES pass m=2 (graphs false): embed rows 0.000 s, layers queued by 0.029 s, device drained at 0.029 s (so 0.000 s waiting after the last launch), observers 0.000 s
+shadow serve: speculation: 7 passes (0 drafted by lookup), 8 of 16 drafted tokens accepted, 16 tokens in 0.4 s                    (drafting 0.07 s, checking 0.26 s, rolling back 0.01 s)
+shadow serve: draft position right/tried: 5/7 2/4 1/1 0/0 0/0 0/0 0/0 0/0
+SHADOW_PHASES pass m=36 (graphs false): embed rows 0.000 s, layers queued by 0.663 s, device drained at 0.665 s (so 0.002 s waiting after the last launch), observers 0.002 s
+SHADOW_PHASES answer: before the prompt (render, encode, fit_context, restores) 0.000 s; lend_cache 0.000 s; passes 0.669 s; restore_cache 0.000 s; conversation snapshot 0.000 s; prompt_ms 0.669 s for 36 tokens
+SHADOW_PHASES pass m=4 (graphs false): embed rows 0.000 s, layers queued by 0.041 s, device drained at 0.042 s (so 0.000 s waiting after the last launch), observers 0.000 s
+SHADOW_PHASES pass m=3 (graphs false): embed rows 0.000 s, layers queued by 0.034 s, device drained at 0.034 s (so 0.000 s waiting after the last launch), observers 0.000 s
+SHADOW_PHASES pass m=3 (graphs false): embed rows 0.000 s, layers queued by 0.031 s, device drained at 0.031 s (so 0.000 s waiting after the last launch), observers 0.000 s
+SHADOW_PHASES pass m=2 (graphs false): embed rows 0.000 s, layers queued by 0.025 s, device drained at 0.026 s (so 0.000 s waiting after the last launch), observers 0.000 s
+SHADOW_PHASES pass m=4 (graphs false): embed rows 0.000 s, layers queued by 0.037 s, device drained at 0.037 s (so 0.000 s waiting after the last launch), observers 0.000 s
+SHADOW_PHASES pass m=4 (graphs false): embed rows 0.000 s, layers queued by 0.039 s, device drained at 0.039 s (so 0.000 s waiting after the last launch), observers 0.000 s
+SHADOW_PHASES pass m=3 (graphs false): embed rows 0.000 s, layers queued by 0.029 s, device drained at 0.029 s (so 0.000 s waiting after the last launch), observers 0.000 s
+SHADOW_PHASES pass m=3 (graphs false): embed rows 0.000 s, layers queued by 0.034 s, device drained at 0.034 s (so 0.000 s waiting after the last launch), observers 0.000 s
+SHADOW_PHASES pass m=4 (graphs false): embed rows 0.000 s, layers queued by 0.037 s, device drained at 0.037 s (so 0.000 s waiting after the last launch), observers 0.000 s
+SHADOW_PHASES pass m=3 (graphs false): embed rows 0.000 s, layers queued by 0.029 s, device drained at 0.030 s (so 0.001 s waiting after the last launch), observers 0.000 s
+SHADOW_PHASES pass m=3 (graphs false): embed rows 0.000 s, layers queued by 0.028 s, device drained at 0.029 s (so 0.000 s waiting after the last launch), observers 0.000 s
+SHADOW_PHASES pass m=2 (graphs false): embed rows 0.000 s, layers queued by 0.031 s, device drained at 0.031 s (so 0.000 s waiting after the last launch), observers 0.000 s
+SHADOW_PHASES pass m=4 (graphs false): embed rows 0.000 s, layers queued by 0.037 s, device drained at 0.038 s (so 0.000 s waiting after the last launch), observers 0.000 s
+SHADOW_PHASES pass m=4 (graphs false): embed rows 0.000 s, layers queued by 0.039 s, device drained at 0.040 s (so 0.000 s waiting after the last launch), observers 0.000 s
+SHADOW_PHASES pass m=2 (graphs false): embed rows 0.000 s, layers queued by 0.030 s, device drained at 0.030 s (so 0.000 s waiting after the last launch), observers 0.000 s
+SHADOW_PHASES pass m=2 (graphs false): embed rows 0.000 s, layers queued by 0.028 s, device drained at 0.028 s (so 0.000 s waiting after the last launch), observers 0.000 s
+SHADOW_PHASES pass m=2 (graphs false): embed rows 0.000 s, layers queued by 0.026 s, device drained at 0.026 s (so 0.000 s waiting after the last launch), observers 0.000 s
+SHADOW_PHASES pass m=4 (graphs false): embed rows 0.000 s, layers queued by 0.035 s, device drained at 0.035 s (so 0.000 s waiting after the last launch), observers 0.000 s
+SHADOW_PHASES pass m=4 (graphs false): embed rows 0.000 s, layers queued by 0.040 s, device drained at 0.040 s (so 0.000 s waiting after the last launch), observers 0.000 s
+SHADOW_PHASES pass m=4 (graphs false): embed rows 0.000 s, layers queued by 0.037 s, device drained at 0.037 s (so 0.000 s waiting after the last launch), observers 0.000 s
+SHADOW_PHASES pass m=4 (graphs false): embed rows 0.000 s, layers queued by 0.033 s, device drained at 0.034 s (so 0.000 s waiting after the last launch), observers 0.000 s
+SHADOW_PHASES pass m=3 (graphs false): embed rows 0.000 s, layers queued by 0.030 s, device drained at 0.030 s (so 0.000 s waiting after the last launch), observers 0.000 s
+SHADOW_PHASES pass m=4 (graphs false): embed rows 0.000 s, layers queued by 0.035 s, device drained at 0.036 s (so 0.000 s waiting after the last launch), observers 0.000 s
+SHADOW_PHASES pass m=4 (graphs false): embed rows 0.000 s, layers queued by 0.035 s, device drained at 0.035 s (so 0.001 s waiting after the last launch), observers 0.000 s
+SHADOW_PHASES pass m=4 (graphs false): embed rows 0.000 s, layers queued by 0.032 s, device drained at 0.032 s (so 0.000 s waiting after the last launch), observers 0.000 s
+SHADOW_PHASES pass m=4 (graphs false): embed rows 0.000 s, layers queued by 0.038 s, device drained at 0.039 s (so 0.000 s waiting after the last launch), observers 0.000 s
+SHADOW_PHASES pass m=4 (graphs false): embed rows 0.000 s, layers queued by 0.037 s, device drained at 0.037 s (so 0.000 s waiting after the last launch), observers 0.000 s
+SHADOW_PHASES pass m=2 (graphs false): embed rows 0.000 s, layers queued by 0.030 s, device drained at 0.030 s (so 0.000 s waiting after the last launch), observers 0.000 s
+SHADOW_PHASES pass m=2 (graphs false): embed rows 0.000 s, layers queued by 0.029 s, device drained at 0.029 s (so 0.000 s waiting after the last launch), observers 0.000 s
+SHADOW_PHASES pass m=4 (graphs false): embed rows 0.000 s, layers queued by 0.038 s, device drained at 0.038 s (so 0.000 s waiting after the last launch), observers 0.000 s
+SHADOW_PHASES pass m=2 (graphs false): embed rows 0.000 s, layers queued by 0.028 s, device drained at 0.028 s (so 0.000 s waiting after the last launch), observers 0.000 s
+SHADOW_PHASES pass m=4 (graphs false): embed rows 0.000 s, layers queued by 0.041 s, device drained at 0.042 s (so 0.000 s waiting after the last launch), observers 0.000 s
+SHADOW_PHASES pass m=3 (graphs false): embed rows 0.000 s, layers queued by 0.027 s, device drained at 0.027 s (so 0.000 s waiting after the last launch), observers 0.000 s
+SHADOW_PHASES pass m=3 (graphs false): embed rows 0.000 s, layers queued by 0.029 s, device drained at 0.029 s (so 0.000 s waiting after the last launch), observers 0.000 s
+SHADOW_PHASES pass m=4 (graphs false): embed rows 0.000 s, layers queued by 0.038 s, device drained at 0.038 s (so 0.000 s waiting after the last launch), observers 0.000 s
+SHADOW_PHASES pass m=4 (graphs false): embed rows 0.000 s, layers queued by 0.037 s, device drained at 0.038 s (so 0.000 s waiting after the last launch), observers 0.000 s
+SHADOW_PHASES pass m=4 (graphs false): embed rows 0.000 s, layers queued by 0.035 s, device drained at 0.035 s (so 0.000 s waiting after the last launch), observers 0.000 s
+SHADOW_PHASES pass m=2 (graphs false): embed rows 0.000 s, layers queued by 0.025 s, device drained at 0.026 s (so 0.000 s waiting after the last launch), observers 0.000 s
+SHADOW_PHASES pass m=4 (graphs false): embed rows 0.000 s, layers queued by 0.034 s, device drained at 0.035 s (so 0.000 s waiting after the last launch), observers 0.000 s
+SHADOW_PHASES pass m=2 (graphs false): embed rows 0.000 s, layers queued by 0.032 s, device drained at 0.032 s (so 0.001 s waiting after the last launch), observers 0.000 s
+SHADOW_PHASES pass m=4 (graphs false): embed rows 0.000 s, layers queued by 0.037 s, device drained at 0.037 s (so 0.000 s waiting after the last launch), observers 0.000 s
+SHADOW_PHASES pass m=4 (graphs false): embed rows 0.000 s, layers queued by 0.045 s, device drained at 0.045 s (so 0.001 s waiting after the last launch), observers 0.000 s
+SHADOW_PHASES pass m=4 (graphs false): embed rows 0.000 s, layers queued by 0.037 s, device drained at 0.037 s (so 0.000 s waiting after the last launch), observers 0.000 s
+SHADOW_PHASES pass m=3 (graphs false): embed rows 0.000 s, layers queued by 0.033 s, device drained at 0.033 s (so 0.000 s waiting after the last launch), observers 0.000 s
+SHADOW_PHASES pass m=3 (graphs false): embed rows 0.000 s, layers queued by 0.031 s, device drained at 0.031 s (so 0.000 s waiting after the last launch), observers 0.000 s
+SHADOW_PHASES pass m=2 (graphs false): embed rows 0.000 s, layers queued by 0.029 s, device drained at 0.030 s (so 0.000 s waiting after the last launch), observers 0.000 s
+SHADOW_PHASES pass m=2 (graphs false): embed rows 0.000 s, layers queued by 0.026 s, device drained at 0.026 s (so 0.000 s waiting after the last launch), observers 0.000 s
+SHADOW_PHASES pass m=3 (graphs false): embed rows 0.000 s, layers queued by 0.034 s, device drained at 0.034 s (so 0.000 s waiting after the last launch), observers 0.000 s
+SHADOW_PHASES pass m=4 (graphs false): embed rows 0.000 s, layers queued by 0.038 s, device drained at 0.038 s (so 0.000 s waiting after the last launch), observers 0.000 s
+SHADOW_PHASES pass m=2 (graphs false): embed rows 0.000 s, layers queued by 0.030 s, device drained at 0.030 s (so 0.000 s waiting after the last launch), observers 0.000 s
+SHADOW_PHASES pass m=3 (graphs false): embed rows 0.000 s, layers queued by 0.031 s, device drained at 0.032 s (so 0.000 s waiting after the last launch), observers 0.000 s
+SHADOW_PHASES pass m=4 (graphs false): embed rows 0.000 s, layers queued by 0.034 s, device drained at 0.035 s (so 0.000 s waiting after the last launch), observers 0.000 s
+SHADOW_PHASES pass m=2 (graphs false): embed rows 0.000 s, layers queued by 0.026 s, device drained at 0.026 s (so 0.000 s waiting after the last launch), observers 0.000 s
+SHADOW_PHASES pass m=4 (graphs false): embed rows 0.000 s, layers queued by 0.036 s, device drained at 0.036 s (so 0.000 s waiting after the last launch), observers 0.000 s
+SHADOW_PHASES pass m=2 (graphs false): embed rows 0.000 s, layers queued by 0.027 s, device drained at 0.027 s (so 0.000 s waiting after the last launch), observers 0.000 s
+SHADOW_PHASES pass m=4 (graphs false): embed rows 0.000 s, layers queued by 0.041 s, device drained at 0.042 s (so 0.001 s waiting after the last launch), observers 0.000 s
+SHADOW_PHASES pass m=2 (graphs false): embed rows 0.000 s, layers queued by 0.029 s, device drained at 0.030 s (so 0.001 s waiting after the last launch), observers 0.000 s
+SHADOW_PHASES pass m=4 (graphs false): embed rows 0.000 s, layers queued by 0.036 s, device drained at 0.037 s (so 0.000 s waiting after the last launch), observers 0.001 s
+SHADOW_PHASES pass m=4 (graphs false): embed rows 0.000 s, layers queued by 0.033 s, device drained at 0.034 s (so 0.000 s waiting after the last launch), observers 0.000 s
+SHADOW_PHASES pass m=4 (graphs false): embed rows 0.000 s, layers queued by 0.033 s, device drained at 0.034 s (so 0.000 s waiting after the last launch), observers 0.000 s
+SHADOW_PHASES pass m=4 (graphs false): embed rows 0.000 s, layers queued by 0.039 s, device drained at 0.040 s (so 0.000 s waiting after the last launch), observers 0.000 s
+SHADOW_PHASES pass m=3 (graphs false): embed rows 0.000 s, layers queued by 0.029 s, device drained at 0.029 s (so 0.000 s waiting after the last launch), observers 0.000 s
+SHADOW_PHASES pass m=4 (graphs false): embed rows 0.000 s, layers queued by 0.034 s, device drained at 0.035 s (so 0.000 s waiting after the last launch), observers 0.000 s
+SHADOW_PHASES pass m=4 (graphs false): embed rows 0.000 s, layers queued by 0.037 s, device drained at 0.038 s (so 0.000 s waiting after the last launch), observers 0.000 s
+SHADOW_PHASES pass m=4 (graphs false): embed rows 0.000 s, layers queued by 0.039 s, device drained at 0.040 s (so 0.000 s waiting after the last launch), observers 0.000 s
+SHADOW_PHASES pass m=4 (graphs false): embed rows 0.000 s, layers queued by 0.036 s, device drained at 0.037 s (so 0.000 s waiting after the last launch), observers 0.000 s
+SHADOW_PHASES pass m=4 (graphs false): embed rows 0.000 s, layers queued by 0.037 s, device drained at 0.037 s (so 0.000 s waiting after the last launch), observers 0.000 s
+SHADOW_PHASES pass m=4 (graphs false): embed rows 0.000 s, layers queued by 0.036 s, device drained at 0.036 s (so 0.000 s waiting after the last launch), observers 0.000 s
+SHADOW_PHASES pass m=4 (graphs false): embed rows 0.000 s, layers queued by 0.032 s, device drained at 0.032 s (so 0.000 s waiting after the last launch), observers 0.000 s
+SHADOW_PHASES pass m=4 (graphs false): embed rows 0.000 s, layers queued by 0.034 s, device drained at 0.035 s (so 0.000 s waiting after the last launch), observers 0.000 s
+SHADOW_PHASES pass m=4 (graphs false): embed rows 0.000 s, layers queued by 0.044 s, device drained at 0.045 s (so 0.001 s waiting after the last launch), observers 0.000 s
+SHADOW_PHASES pass m=4 (graphs false): embed rows 0.000 s, layers queued by 0.032 s, device drained at 0.032 s (so 0.000 s waiting after the last launch), observers 0.000 s
+SHADOW_PHASES pass m=4 (graphs false): embed rows 0.000 s, layers queued by 0.037 s, device drained at 0.038 s (so 0.001 s waiting after the last launch), observers 0.000 s
+SHADOW_PHASES pass m=4 (graphs false): embed rows 0.000 s, layers queued by 0.035 s, device drained at 0.035 s (so 0.000 s waiting after the last launch), observers 0.000 s
+SHADOW_PHASES pass m=4 (graphs false): embed rows 0.000 s, layers queued by 0.039 s, device drained at 0.040 s (so 0.001 s waiting after the last launch), observers 0.000 s
+SHADOW_PHASES pass m=4 (graphs false): embed rows 0.000 s, layers queued by 0.033 s, device drained at 0.034 s (so 0.000 s waiting after the last launch), observers 0.000 s
+SHADOW_PHASES pass m=4 (graphs false): embed rows 0.000 s, layers queued by 0.032 s, device drained at 0.033 s (so 0.000 s waiting after the last launch), observers 0.000 s
+SHADOW_PHASES pass m=4 (graphs false): embed rows 0.000 s, layers queued by 0.034 s, device drained at 0.035 s (so 0.000 s waiting after the last launch), observers 0.000 s
+SHADOW_PHASES pass m=3 (graphs false): embed rows 0.000 s, layers queued by 0.031 s, device drained at 0.032 s (so 0.000 s waiting after the last launch), observers 0.000 s
+SHADOW_PHASES pass m=2 (graphs false): embed rows 0.000 s, layers queued by 0.026 s, device drained at 0.026 s (so 0.000 s waiting after the last launch), observers 0.000 s
+SHADOW_PHASES pass m=4 (graphs false): embed rows 0.000 s, layers queued by 0.035 s, device drained at 0.035 s (so 0.000 s waiting after the last launch), observers 0.000 s
+SHADOW_PHASES pass m=4 (graphs false): embed rows 0.000 s, layers queued by 0.033 s, device drained at 0.034 s (so 0.000 s waiting after the last launch), observers 0.000 s
+shadow serve: speculation: 82 passes (4 drafted by lookup), 117 of 197 drafted tokens accepted, 200 tokens in 3.8 s                    (drafting 0.53 s, checking 3.06 s, rolling back 0.09 s)
+shadow serve: draft position right/tried: 56/82 37/51 24/34 0/0 0/0 0/0 0/0 0/0

@@ -348,6 +348,35 @@ fn serve(path: &std::path::Path, rest: &[String]) -> ExitCode {
     } else if rest.iter().any(|a| a == "--no-direct-io") {
         std::env::set_var("SHADOW_DIRECT_IO", "0");
     }
+    // timing-only upper bound for CPU-computed misses (docs/STATUS.md 2026-11-10): n experts a layer are left out of the staged copy; the output is wrong
+    if let Some(n) = rest.iter().position(|a| a == "--avalon-oracle").and_then(|i| rest.get(i + 1)) {
+        std::env::set_var("SHADOW_AVALON_ORACLE", n);
+    }
+    if rest.iter().any(|a| a == "--avalon-oracle-sync") {
+        std::env::set_var("SHADOW_AVALON_ORACLE_SYNC", "1");
+    }
+    if rest.iter().any(|a| a == "--no-fused-fast-plan") {
+        std::env::set_var("SHADOW_FUSED_FAST_PLAN", "0");
+    }
+    if rest.iter().any(|a| a == "--no-prompt-opt-r3") {
+        std::env::set_var("SHADOW_VMM_POOL", "0");
+        std::env::set_var("SHADOW_SUBCHUNK_FAST", "0");
+        std::env::set_var("SHADOW_MMQ_REUSE", "0");
+        std::env::set_var("SHADOW_RESTORE_OVERLAP", "0");
+        std::env::set_var("SHADOW_DIRECT_TAB", "0");
+    }
+    if rest.iter().any(|a| a == "--no-prompt-opt") {
+        std::env::set_var("SHADOW_FUSED_FAST_PLAN", "0");
+        std::env::set_var("SHADOW_KEEP_PIPE", "0");
+        std::env::set_var("SHADOW_RESTORE_SINGLE", "1");
+        std::env::set_var("SHADOW_EMBED_PAR", "0");
+        std::env::set_var("SHADOW_FORCE_CONV_SNAP", "1");
+        std::env::set_var("SHADOW_VMM_POOL", "0");
+        std::env::set_var("SHADOW_SUBCHUNK_FAST", "0");
+        std::env::set_var("SHADOW_MMQ_REUSE", "0");
+        std::env::set_var("SHADOW_RESTORE_OVERLAP", "0");
+        std::env::set_var("SHADOW_DIRECT_TAB", "0");
+    }
     let flag = |f: &str| rest.iter().position(|a| a == f).and_then(|i| rest.get(i + 1));
     let host = flag("--host").map(String::as_str).unwrap_or("127.0.0.1");
     let port: u16 = flag("--port").and_then(|v| v.parse().ok()).unwrap_or(8081);

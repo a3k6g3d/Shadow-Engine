@@ -1,0 +1,65 @@
+{
+  "project": "Shadow (Rust MoE inference engine, repo J:\\Shadow on this PC)",
+  "written": "2026-11-10, from the session that verified it is not yet built; for Gemini (the next instance) to execute",
+  "task": "Build the Avalon port ('move compute to the data'), then run the 4-arm bench. This is task 2 of docs/EXPERIMENT_SPEC_2026-11-04b.json; task 1 (hybrid read path, SHADOW_DIRECT_IO) was run and LOST and is closed. Do not rewrite docs/EXPERIMENT_SPEC_2026-11-01.json - it is the design spec; this file is the execution instruction sheet.",
+  "verified_not_built": "grep 'Avalon' in docs/STATUS.md = zero hits; git log last 12 = no batched-kernel or Avalon commit; grep batched_kernel|gather_from_pinned in crates/ = zero. The kernel exists and is wired (crates/shadow-model/src/cpu_expert_avx512.rs, call sites in cpu_expert.rs row_dot/quantize) but the ARCHITECTURE PIECES are what must be built: the no-join submission path and the copy-set exclusion.",
+
+  "what_to_build": [
+    "1. CPU computes cache-miss experts straight from the mmap'd file (page cache -> CPU registers = ONE DRAM read), replacing the path where bytes cross DRAM 3-4 times. The kernel already exists and is fast enough (0.088-0.136 ms/expert, 17-21 GB/s on 14 threads, measured on this machine). DO NOT optimize the kernel.",
+    "2. CPU writes each expert's activation row into the pinned region; the existing copy completion mechanism brings that small row up. NO host join - the previous three attempts' fatal flaw.",
+    "3. Those experts are EXCLUDED from the big-weight copy set; only the ~3 KB output row is copied.",
+    "4. CPU job submitted as soon as the router's tops are known (the 'pre' group's output), so CPU time hides under the GPU's resident-expert work.",
+    "5. Gate behind an env var (SHADOW_AVALON=1 style); baseline (gate off) stays default until measured. The two defensive edits already landed in readpool.rs submit_locked (assert! -> checked error return) - keep them, they are green.",
+    "6. The three previous failed attempts computed FROM THE PINNED BYTES (no DRAM saving) and the host waited for pool completion before combine (the join). GPU-wait reduction worked exactly as predicted (58 -> 46 -> 39 ms/pass) but the CPU time moved into the host join and the pass stayed 104 ms. Fix exactly those two structural problems."
+  ],
+
+  "build_and_test_commands": [
+    "cd J:\\Shadow (the cmd tool's default cwd C:\\Users\\manc_ is invalid, os error 267 - always pass cwd J:\\Shadow)",
+    "cargo build --release -p shadow-model (then the full workspace build for the server exe)",
+    "cargo test -p shadow-model (the readpool tests must stay green)",
+    "cargo test (full suite, before benching)"
+  ],
+
+  "bench_protocol": {
+    "arms": [
+      "arm A: baseline (fastest-mode defaults, gate off), prompt-heavy workload",
+      "arm B: SHADOW_AVALON=1 (1 expert/layer on the CPU path), same workload",
+      "arm C: 2 experts/layer, prompt-heavy",
+      "arm D: 3 experts/layer, prompt-heavy; plus the mixed prompt+decode headline pair (baseline vs gate on) if time permits",
+      "4 arms x 3 runs, interleaved, one fresh launch per run, warm turns only (turn 0 dropped)"
+    ],
+    "scoring": "TOTAL throughput (tools/bench_total.py), not the median. Noise floor 0.8% median / 2.0% p90 - anything under ~1% is a tie, and a tie is a LOSS.",
+    "harness": "tools/bench_vs_strata.ps1 takes --arm name=flags pairs, -Runs 3, -PromptsFile, and scores through tools/bench_total.py + plot_bench.py. Build a Shadow-vs-Shadow variant: same driver, arms differ ONLY by the gate. Match the shape of the prompt-2026-11-02-b2k-cross-session* runs. bench/*.sh (fid, corr, ceil, chunk, mb, post) are the existing pieces.",
+    "cost": "one full build + ~40 min per bench round + server restarts (36 s load, ~30 s tier refill)"
+  },
+
+  "machine_facts": {
+    "gpu": "RTX 5070 12.2 GB, expert cache 4.42 GiB (bigger caches measured as losses: 4.8 -5%, 5.0 -10%)",
+    "cpu": "i7-11700K, 8C/16T, HAS full AVX-512 (F/BW/VL/VNNI/VBMI/VBMI2) - verified via CPUID family 6 model 167 and IsProcessorFeaturePresent(0x21)=1",
+    "dram": "DDR4-2933 ~30 GB/s - this is the wall; copy engine achieves 13 GB/s, link can do 23-28",
+    "ram": "64 GB, 36 GiB pinned tier, 3 GiB pinned floor (machine froze hard at 0.4 GiB free)",
+    "model": "89 GiB IQ3_S GGUF, served from disk via mmap; OS file cache holds ~50 GiB and serves buffered reads at ~9.5 GB/s; unbuffered reads cap at 3.5 GB/s (drive ceiling)"
+  },
+
+  "net_dram_math_per_expert_moved_to_cpu": "old GPU path: 3 big DRAM passes (4.5 MB); new CPU path: 1 big read (1.5 MB) + 2 small passes for the 3 KB output row. ~3x traffic reduction for bytes moved to the CPU.",
+
+  "honest_odds": "about 40% it wins. The architecture is right and the kernel is fast enough; the risks are this PC's DRAM (30 GB/s vs Avalon's 33-35), the cache (4.4 GiB vs Avalon's 9-14), and the 3 GiB pinned floor - the same three walls the notes kept hitting separately. Ceiling ~1.4x alone; the target is the prompt path only (Shadow ~130-226 tok/s vs Strata 1,376 - the ~10x gap is why this exists).",
+
+  "rules": [
+    "measure, and what loses stays opt-in (off by default)",
+    "every experiment gets a dated entry in docs/STATUS.md with its measured numbers, wins and losses alike (STATUS.md lives in docs/, not the root)",
+    "do not change the kernel; do not change the pinned tier, the floor, the cache size, or the fastest-mode defaults (--spec 3, DFlash 2, verify-rank 2, tail-skip 3, tensor-prompt)",
+    "do not touch the decode path (decode is already a win: 52.1 vs Strata's 47.7, locked in as defaults)",
+    "the AI measures, the human commits - do not commit anything without the human",
+    "the flag-level knobs are exhausted - this is code work"
+  ],
+
+  "deliverables": [
+    "the port, gated, baseline default, cargo build clean, cargo test green",
+    "the 4-arm bench run: raw logs + csvs in a new dated bench/ directory, summary.md with totals per arm",
+    "the STATUS.md entry written either way - a loss is a result",
+    "leave the tree uncommitted for the human"
+  ],
+
+  "note_from_the_writing_instance": "This spec was written by the instance that holds the 36 GiB pinned tier and the GPU (me) - I can write code and compile, but only the next instance can launch the server. The driver script I left is written but UNEXERCISED (I could not test-run it); expect to debug it once. replace_lines strips leading whitespace from the first line of newText - use edit_file for single-line indentation fixes. grep/search are unreliable on shadow-serve/src/ui.rs (one giant raw-string literal) - use Select-String there."
+}

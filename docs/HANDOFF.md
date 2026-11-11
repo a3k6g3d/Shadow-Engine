@@ -1,5 +1,112 @@
 # Handoff
 
+Updated 2026-11-10 (`v0.1.36`). Read this section first, then [STATUS.md](STATUS.md) (entries 1–95, chronological evidence) and [ARCH.md](ARCH.md) (the model as math).
+
+---
+
+## 2026-11-10 Agent Handoff & Current State (`v0.1.36`)
+
+### 1. Current Performance Scoreboard (Shadow `v0.1.35` vs Pre-Opt `v0.1.32` and Strata `0.2.11`)
+
+Measured via interleaved A-B-B-A on fresh servers (`--ctx 24576 --ram-tier-gib 45 --ram-floor-gib 3.5`, `tools/ab_prompt_opt.py`, `bench/prompt-opt-2026-11-10/results_r2.json` & `results_r3.json`, all reply SHA-256 hashes bit-identical across arms):
+
+| Workload | Tokens | Pre-Opt (`0.1.32`) | Round 2 (`0.1.33`) | Round 3 (`0.1.35`) | Strata `0.2.11` | Shadow `0.1.35` vs Strata |
+|---|---:|---:|---:|---:|---:|---|
+| **`3k_a` (first prompt)** | 2,867 | 3.42 s (838 tok/s) | 3.12 s (919 tok/s) | **2.99 s (958 tok/s)** | ~2.40 s (1,210 tok/s) | `-19%` (remaining ~200 ms is KV/cache lend + restore) |
+| **`3k_b` (warm prompt, 45 GiB)** | 2,622 | 2.72 s (962 tok/s) | 2.62 s (1,001 tok/s) | **2.50–2.62 s (~1,001–1,048 tok/s)** | ~2.40 s (1,210 tok/s) | Within ~0.1–0.2 s |
+| **`3k_b` (at 43 GiB trimmed tier)** | 2,622 | 3.82 s (687 tok/s) | 3.05 s (860 tok/s) | **2.93 s (896 tok/s)** | — | `+23.4%` vs `0.1.32` |
+| **`9k6` (long prompt)** | 9,673 | 5.89–6.09 s (1,588–1,643 tok/s) | 5.73 s (1,689 tok/s) | **5.68–5.71 s (1,694–1,702 tok/s)** | 5.50 s (1,735 tok/s) | Parity (within 3%) |
+| **`15k` (long prompt)** | 15,034 | 8.70–9.05 s (1,661–1,729 tok/s) | 8.57 s (1,754 tok/s) | **8.52–8.54 s (1,761–1,764 tok/s)** | 9.90 s (1,543 tok/s) | **Shadow +16.2% faster (`-1.38 s`)** |
+| **`decode200` (speculative decode)** | 200 | 53.2 tok/s | 52.9 tok/s | **52.9–53.1 tok/s** | 47.7 tok/s | **Shadow +11.1% faster** |
+
+---
+
+### 2. Where Prompt Wall-Clock Time Goes (`SHADOW_PHASES=1` Breakdown in `v0.1.35`)
+
+With all Round 2 and Round 3 optimizations active (`bench/prompt-opt-2026-11-10/r3_r2.err`):
+
+- **3k prompt (`2,867` tokens, `2.992 s` total)**:
+  - `lend_cache`: **`0.040 s`** (KV tail VMM remap from pool + device drain; down from `0.316 s` in `0.1.32` and `0.091 s` in `0.1.33`).
+  - `step_batch` (`m = 2867`, 2 sub-chunks of `819 + 2,048`): **`2.786 s`** (`embed_rows` `0.015 s`, 48 layers queued by `2.539 s`, GPU drained at `2.671 s`, DFlash observer `0.098 s`).
+  - `restore_cache`: **`0.166 s`** (`unlend_kv` VMM remap `0.031 s`, overlapped cold-file + `3.2 GiB` RAM-tier `cuMemcpyBatchAsync` DMA `0.135 s`; down from `0.259 s` in `0.1.32` and `0.205 s` in `0.1.33`).
+- **9.6k prompt (`9,673` tokens, `5.685 s` total)**:
+  - `lend_cache`: **`0.027 s`** (down from `0.124 s` in `0.1.32`).
+  - `step_batch` (`m = 9673`, 5 sub-chunks): **`5.503 s`** (`embed_rows` `0.043 s`, layers queued by `5.118 s`, GPU drained at `5.360 s`, DFlash observer `0.098 s`).
+  - `restore_cache`: **`0.154 s`** (`unlend_kv` `0.018 s`, overlapped cold + RAM-tier DMA `0.136 s`; down from `0.246 s` in `0.1.32`).
+- **15k prompt (`15,034` tokens, `8.524 s` total)**:
+  - `lend_cache`: **`0.020 s`** (down from `0.113 s` in `0.1.32`).
+  - `step_batch` (`m = 15034`, 8 sub-chunks of `698 + 7 × 2,048` in a single pass): **`8.352 s`** (`embed_rows` `0.071 s`, layers queued by `8.020 s`, GPU drained at `8.210 s`, DFlash observer `0.070 s`).
+  - `restore_cache`: **`0.151 s`** (`unlend_kv` `0.016 s`, overlapped cold + RAM-tier DMA `0.135 s`; down from `0.220 s` in `0.1.32`).
+
+---
+
+### 3. Active Optimizations Inventory (Defaults & Opt-Out Switches)
+
+All prompt and decode optimizations below are **on by default** in `shadow serve` (fast mode, `--tensor-prompt`):
+
+1. **Chunked 45 GiB Pinned RAM Tier + Watchdog (`crates/shadow-cuda/src/pinned.rs`, `session.rs`, STATUS 81–85, 90, 93, 94)**:
+   - `fastest_defaults` sizes `--ram-tier-gib` up to `45 GiB` (`23,643` of `24,576` experts pinned in 1 GiB `VirtualAlloc` + `cuMemHostRegister` chunks) with `--ram-floor-gib 3.5`.
+   - **Important (`v0.1.34`–`v0.1.35`)**: All hard RAM-floor refusals during runtime (`PinnedRegion::new`, `PinnedRegion::new_chunked`, `sp_spare` retention, `expand_pictures`) were converted to log warnings (`RAM warning: ...`). The background watchdog (`pinned::start_watchdog`, polling every 250 ms) automatically asks `GpuSession::ram_pressure_poll` to decommit 1 GiB chunks from the tail of the RAM tier whenever available RAM dips below `ram_floor()` for 2 consecutive samples.
+2. **Fused INT8 Tensor-Core MoE Kernels on All 48 Layers (`native/fused/shadow_fused.dll`, `crates/shadow-cuda/src/fused.rs`, STATUS 86–89)**:
+   - Covers all 48 MoE layers (`IQ2_S`, `IQ3_XXS`, `IQ3_S`, `IQ4_XS` gate/up × `IQ4_NL`, `Q2_0` down). `-8.8%` on 15k prompts.
+   - Opt-out: `SHADOW_FUSED_MOE=0`.
+3. **Fused-Expert Fast Device Planner (`crates/shadow-cuda/src/session.rs` `dev_plan_buckets`, `fused_experts`, STATUS 93)**:
+   - Skips `zero_words` (`2.9 GB` of memset per 15k prompt), `plan_scan_w`, and `plan_fill_w`, uploads only 4 KB of `dp_eaddr`, quantizes `bb.u` once across phases 0 and 1, and skips `fu.mask` when `!any_res`.
+   - Opt-out: `SHADOW_FUSED_FAST_PLAN=0` or `--no-fused-fast-plan`.
+4. **Sub-Chunk (`si > 0`) Fast Path & Layer-0 Pipeline Ordering (`crates/shadow-cuda/src/session.rs` `moe_staged`, `dev_plan_buckets`, STATUS 94)**:
+   - On sub-chunks `si > 0`, skips rebuilding/uploading `dp_eaddr` and `dp_copied`, skips `stream_wait_event(sp.events[p])`, and runs a single unmasked `fused_experts` phase (since all 512 experts of layer `l` are already in VRAM after `si == 0` waited on `sp.events[p]`).
+   - On `first_of_pass` (`l == 0`), defers `early` (`stage_copy(1)` + `stage_pipe_read(2)`) until after sub-chunk 0's `moe_combine_qwen_rows` so Layer 0 sub-chunk 0 runs on the GPU while `stage_pipe_read(1)` finishes on the CPU read pool.
+   - Opt-out: `SHADOW_SUBCHUNK_FAST=0`.
+5. **VMM Physical Handle Pool & Scratch Zero-Skip (`crates/shadow-cuda/src/kvvmm.rs`, `session.rs` `lend_kv`/`unlend_kv`, STATUS 94)**:
+   - Pools the ~650 2 MiB `CUmemGenericAllocationHandle`s in `GpuSession::vmm_pool` across `lend_kv` and `unlend_kv` instead of calling `cuMemRelease` and `cuMemCreate` ~2,600 times per prompt, and skips `cuMemsetD8` when mapping `kv_extra_reg`. Saves `70–90 ms` per prompt.
+   - Opt-out: `SHADOW_VMM_POOL=0`.
+6. **Startup Pre-Allocated & Retained `StagePipe` and `staging` Buffers (`crates/shadow-cuda/src/session.rs`, STATUS 93)**:
+   - Pre-allocates `staging` (`502 MiB`) and `sp_spare` (3 pinned buffers, `546–990 MiB`) during `GpuSession::with_tiers` and retains `sp_spare` across prompts in `restore_cache`. Saves `~225 ms` on the first prompt and `~130 ms` on every subsequent prompt.
+   - Opt-out: `SHADOW_KEEP_PIPE=0`.
+7. **Batched & Overlapped `restore_cache` (`crates/shadow-cuda/src/session.rs` `restore_cache`, STATUS 93, 94)**:
+   - Uses `cuMemcpyBatchAsync` (`SHADOW_RESTORE_SINGLE=1` reverts to single copies) and queues the ~3.2 GiB RAM-tier `upload_batch` onto `copy_stream` *before* reading cold file-only evicted experts into `sp.bufs[0]`, overlapping the CPU/NVMe read with PCIe DMA (`SHADOW_RESTORE_OVERLAP=0` reverts to sequential).
+8. **Deduplicated `shadow_mmq_quantize` on `bb.u` (`crates/shadow-cuda/src/mmq.rs`, `session.rs` `mv_cols`, STATUS 94)**:
+   - Caches `(x_ptr, k, m, xs, ds_layout)` in `GpuSession::mmq_y_tag` (invalidated when `bb.u` is written) so consecutive MMQ projections on `bb.u` (`ffn_gate_shexp` + `ffn_up_shexp`, `attn_qkv` + `attn_gate`, `attn_q` + `attn_k` + `attn_v`) quantize `bb.u` once instead of 2–3 times (`~576–768` fewer launches per 15k prompt).
+   - Opt-out: `SHADOW_MMQ_REUSE=0`.
+9. **Parallel Host Token-Embedding Dequantization (`crates/shadow-cuda/src/session.rs` `batch`, STATUS 93)**:
+   - Parallelizes `Q6_K` host embedding dequantization across CPU threads via `std::thread::scope`.
+   - Opt-out: `SHADOW_EMBED_PAR=0`.
+10. **Direct Mapped Table Reads in Decode (`crates/shadow-cuda/src/session.rs` `stage_slice`, `routed_overlapped`, `routed_qwen`, STATUS 94)**:
+    - Reads the per-layer expert pointer/weight/permutation table directly from mapped `self.stage.dev_ptr + at` instead of launching `copy_words` (`-48` kernel launches per single-token decode step).
+    - Opt-out: `SHADOW_DIRECT_TAB=0`.
+11. **Selective `"cache_prompt": false` Snapshot Bypass (`crates/shadow-serve/src/lib.rs`, `engine.rs`, STATUS 93)**:
+    - Honors `"cache_prompt": false` in `/v1/chat/completions` by skipping host prefix/conversation snapshots (`sess.snapshot_to(true, true)`), while keeping default `"cache_prompt": true` for interactive chat/agent sessions (`SHADOW_FORCE_CONV_SNAP=1` forces snapshots even when `false`).
+12. **Combined Benchmark Flags (`crates/shadow/src/main.rs`)**:
+    - `--no-prompt-opt-r3`: disables the 5 Round 3 switches (`SHADOW_VMM_POOL=0`, `SHADOW_SUBCHUNK_FAST=0`, `SHADOW_MMQ_REUSE=0`, `SHADOW_RESTORE_OVERLAP=0`, `SHADOW_DIRECT_TAB=0`).
+    - `--no-prompt-opt`: disables all 10 Round 2 + Round 3 switches at once.
+
+---
+
+### 4. Closed / Falsified Hypotheses (Do NOT Re-Run)
+
+1. **Avalon CPU-Experts Prompt Port (`docs/EXPERIMENT_SPEC_2026-11-10.json`, STATUS 92, `bench/avalon-2026-11-10/summary.md`) — CLOSED**:
+   - Tested via a clairvoyant zero-cost oracle (`SHADOW_AVALON_ORACLE=N`, which drops `N` non-resident experts per layer from both file read-ahead and H2D DMA with 0 CPU compute, 0 DRAM traffic, and 0 host sync) and a router-sync probe (`SHADOW_AVALON_ORACLE_SYNC=1`).
+   - At `N = 3`, even the 0-cost oracle is `+0.11%` to `+0.65%` (inside the 0.8% noise floor, because `3 / 474 = 0.63%` of the staged copy).
+   - Synchronizing per layer so the host can read router top-k indices before submitting CPU work costs **`-5.31%` prompt throughput (`-6.22%` combined)** by breaking the device planner's host-ahead overlap.
+2. **Right-Sizing `lend_cache` to `prompt_hint` (`right_size_lend`, STATUS 93, `bench/prompt-opt-2026-11-10/results.json`) — CLOSED**:
+   - Lending fewer VRAM cache slots on a 3k prompt (`1,026` of `1,843` instead of `1,825`) was a net loss (`2.72 s -> 2.75 s`) and changed the reply hash because `slot_offset` is ordered by layer (`0..48`): lending the tail left 100% of layers `0..20` resident (`any_res == true`, forcing two-phase `fused_experts` launches on sub-chunk 0) and 0% of layers `22..47` resident while saving only 7.4% of the H2D copy.
+3. **Larger Sub-Chunk Rows (`SHADOW_SUB_ROWS=4096`, STATUS 45 & 88) — CLOSED**:
+   - Larger temporaries take VRAM away from `rparts`, splitting a 15k prompt into 2 passes instead of 1 (`9.85 s -> 13.40 s`, `+36%`). Default `2,048` is optimal on 12–16 GB VRAM.
+4. **Prompt-Path CUDA Graphs (`SHADOW_BATCH_GRAPHS=1`, STATUS 58) — CLOSED (opt-in only)**:
+   - Keyed by buffer addresses and row counts; instantiates ~500 graphs on a new prompt (`-10%` at 15k). Only helps repeated identical-shape prompts.
+
+---
+
+### 5. What Remains & Where the Hardware Ceiling Is
+
+- On a **15k prompt (`8.52 s`, `1,764 tok/s`)**, fixed costs outside `step_batch` are now down to **`171 ms` total** (`20 ms` `lend_cache` + `151 ms` `restore_cache` = **2.0% of the prompt**), and the GPU is busy for `8.21 s` of the `8.35 s` pass (`98.3%` GPU utilization; host finishes queuing all 48 × 8 sub-chunk launches `190 ms` before the GPU finishes layer 47).
+- On a **3k prompt (`2.62–2.99 s`, `958–1,001 tok/s`)**, fixed costs are **`206 ms` total** (`40 ms` `lend_cache` + `166 ms` `restore_cache`, dominated by the `135 ms` PCIe 4.0 x16 DMA to restore `3.2 GiB` of evicted experts back into the 3.53 GiB VRAM cache so speculative decode immediately starts at `53 tok/s`).
+- The remaining levers if further prompt speed is ever needed are **Phase E** items (`docs/PLAN_RAM_TIER_AND_LEVERS_2026-11-09.md`): INT8 KV cache (`SHADOW_KV_INT8`, saving VRAM and bandwidth on the 12 attention layers at 15k–24k context) or fusing the hyper-connection norms into adjacent kernels.
+
+---
+
+## Historical Handoff (2026-10-27, Stages 0–2)
+
 Written 2026-10-27 by the session that built stages 0-1 and began stage 2. Read this, then
 [SHADOW_PLAN.md](SHADOW_PLAN.md) (the plan), [STATUS.md](STATUS.md) (what is proven) and [ARCH.md](ARCH.md) (the model
 as math). This file is what is *not* in those: what is in flight, how to run things, and what bit us.

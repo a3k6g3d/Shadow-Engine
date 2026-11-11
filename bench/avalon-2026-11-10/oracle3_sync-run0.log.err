@@ -1,0 +1,38 @@
+shadow serve: fastest-mode defaults: --tail-skip 3 --tensor-prompt --verify-rank 2 --dflash models/dflash2 --spec 3 --dflash-min-p 0.5 (--exact for the exact path)
+RAM floor: 3.0 GiB (default 4): a pinned tier cannot be paged out, and this PC has frozen hard at 0.4 GiB free
+placement: J:/Shadow/profiles/routing-varied300.shrc, 34990 tokens of routing
+shadow serve: starting 2 MCP server(s) from mcp.json
+shadow serve: listening on http://127.0.0.1:8092
+shadow serve: MCP server time: 3 tools
+mmq: loaded J:\Shadow\native\mmq\shadow_mmq.dll (int8 tensor-core projections for the prompt path)
+fused: loaded J:\Shadow\native\fused\shadow_fused.dll (Strata's int8 fused experts for the prompt path)
+dflash: loaded the drafter from models/dflash2 (~1.2 GB VRAM)
+shadow serve: MCP server browser: 10 tools
+shadow serve: ready in 35.1 s; expert cache: 2071 slots x 1.96 MiB = 3.97 GiB; 0 hits, 0 misses (0.0% hits); 0 slice uploads; RAM tier: 18935 experts, 36.00 GiB pinned (filled in 27.9 s), misses served 0 from RAM, 0 from the file; tail skip (rank >= 3): 0 routed experts skipped; host waits per step: router 0.0 ms, copies 0.0 ms, file 0.0 ms; kernel launches per step 0, 0.0 ms of host time in them
+shadow serve: 31 conversation snapshot(s) on disk in J:/ShadowConvCache (19.42 GiB)
+fused experts: taken: gate/up IQ3_XXS + down IQ4_NL, phase 0
+fused experts: taken: gate/up IQ3_XXS + down IQ4_NL, phase 1
+fused experts: taken: gate/up IQ2_S + down Q2_0, phase 0
+fused experts: taken: gate/up IQ2_S + down Q2_0, phase 1
+fused experts: taken: gate/up IQ2_S + down IQ4_NL, phase 0
+fused experts: taken: gate/up IQ2_S + down IQ4_NL, phase 1
+fused experts: taken: gate/up IQ3_XXS + down Q2_0, phase 1
+fused experts: taken: gate/up IQ3_S + down IQ4_NL, phase 1
+fused experts: taken: gate/up IQ3_S + down Q2_0, phase 1
+AVALON-ORACLE n=3: 3.0 experts a layer left out of the copy (mean over 48 layer copies; the others were resident)
+fused experts: taken: gate/up IQ4_XS + down IQ4_NL, phase 1
+shadow serve: conversation snapshot of 3709 tokens (0.31 GiB) in 0.09 s; 1 kept
+shadow serve: speculation: 9 passes (0 drafted by lookup), 6 of 20 drafted tokens accepted, 16 tokens in 0.5 s                    (drafting 0.09 s, checking 0.36 s, rolling back 0.01 s)
+shadow serve: draft position right/tried: 6/9 0/4 0/0 0/0 0/0 0/0 0/0 0/0
+AVALON-ORACLE n=3: 3.0 experts a layer left out of the copy (mean over 96 layer copies; the others were resident)
+shadow serve: conversation snapshot of 8738 tokens (0.57 GiB) in 0.15 s; 1 kept
+shadow serve: speculation: 10 passes (0 drafted by lookup), 6 of 23 drafted tokens accepted, 16 tokens in 0.6 s                    (drafting 0.11 s, checking 0.43 s, rolling back 0.02 s)
+shadow serve: draft position right/tried: 4/10 2/4 0/1 0/0 0/0 0/0 0/0 0/0
+AVALON-ORACLE n=3: 3.0 experts a layer left out of the copy (mean over 144 layer copies; the others were resident)
+shadow serve: conversation snapshot of 12510 tokens (0.77 GiB) in 0.21 s; 1 kept
+shadow serve: speculation: 5 passes (1 drafted by lookup), 10 of 13 drafted tokens accepted, 16 tokens in 0.3 s                    (drafting 0.04 s, checking 0.21 s, rolling back 0.00 s)
+shadow serve: draft position right/tried: 4/5 3/3 3/3 0/0 0/0 0/0 0/0 0/0
+AVALON-ORACLE n=3: 3.0 experts a layer left out of the copy (mean over 192 layer copies; the others were resident)
+shadow serve: conversation snapshot of 16824 tokens (1.00 GiB) in 0.26 s; 1 kept
+shadow serve: speculation: 7 passes (1 drafted by lookup), 8 of 19 drafted tokens accepted, 16 tokens in 0.4 s                    (drafting 0.06 s, checking 0.30 s, rolling back 0.01 s)
+shadow serve: draft position right/tried: 5/7 2/5 1/2 0/0 0/0 0/0 0/0 0/0

@@ -1,0 +1,10 @@
+suite,arm,runs,warm_turns,prompt_tokens_total,prompt_tok_s,prompt_tok_s_turns1_3,decode_tok_s,combined_tok_s,delta_vs_base_turns1_3_pct
+oracle_prompt,oracle0,3,5,132453,1140.41,1018.30,47.22,1094.58,0.00
+oracle_prompt,oracle0_warm_r1_r2,2,5,88302,1127.38,1032.10,47.40,1082.73,0.00
+oracle_prompt,oracle3,3,5,132441,1195.60,1038.36,40.71,1139.33,+0.11
+oracle_prompt,oracle12,3,5,132447,1178.82,1050.21,46.36,1133.73,+1.25
+oracle_prompt,oracle25,3,5,132417,1199.32,1068.47,36.99,1155.77,+3.01
+oracle_prompt,oracle50,3,5,132411,1249.56,1105.32,37.74,1203.22,+6.57
+oracle_sync,baseA,2,3,26134,1037.72,1037.72,43.55,957.70,0.00
+oracle_sync,baseB,2,3,26134,1036.69,1036.69,43.77,957.22,-0.10
+oracle_sync,oracle3_sync,2,3,26134,982.61,982.61,36.82,898.17,-5.31

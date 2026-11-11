@@ -205,6 +205,21 @@ fn big_rows_cap() -> usize {
 fn sub_rows_cap() -> usize {
     std::env::var("SHADOW_SUB_ROWS").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(2048).max(256)
 }
+/// `SHADOW_AVALON_ORACLE=n` (timing only, the output is WRONG): the staged copy leaves out the n highest-numbered experts of every layer that the VRAM cache does not hold - no file
+/// read, no copy - as if a CPU path computed them for free and hid every cycle of it.  That is an upper bound for any "compute the miss on the CPU" design (docs/STATUS.md
+/// 2026-11-10).  A fixed set of expert numbers (not a per-layer choice): their stage slots are zeroed at the start of a pass and never written, so the GPU runs the same kernels
+/// on finite zeros (stale bytes from another layer's quantization crashed the fused int8 kernels: CUDA 700).  Off by default.
+fn avalon_oracle_n() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| std::env::var("SHADOW_AVALON_ORACLE").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(0))
+}
+/// Whether expert `e` of `ne` is one the oracle leaves out.
+fn avalon_oracle_skips(e: usize, ne: usize) -> bool {
+    let n = avalon_oracle_n();
+    n > 0 && e + n >= ne
+}
+static AVALON_SKIPPED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static AVALON_LAYERS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 /// Bytes the big batch's buffers take for `total` rows a pass: the temporaries for the sub-chunk and the residual streams of every row.
 fn big_batch_bytes(c: &shadow_model::forward::Config, total: usize) -> usize {
     let sub = sub_rows_cap().min(total);
@@ -424,6 +439,8 @@ pub struct GpuSession<'c, 'm> {
     /// llama.cpp's int8 MMQ products for the quantized dense projections of a long prompt (`mmq.rs`, `SHADOW_MMQ=0` off), and the buffer for the quantized activations
     mmq: Option<crate::mmq::Mmq>,
     mmq_y: DeviceBuffer<'c>,
+    /// `(x_ptr, k, m, xs, ds_layout)` of the activations currently quantized in `mmq_y`, so back-to-back projections on `bb.u` skip re-quantizing (`SHADOW_MMQ_REUSE=0` off)
+    mmq_y_tag: std::cell::Cell<(u64, usize, usize, usize, u8)>,
     /// Strata's fused int8 experts for the width-class planner's phases (`fused.rs`, on by default with `--tensor-prompt` when `native/fused/shadow_fused.dll` is built; `SHADOW_FUSED_MOE=0` off)
     fused: Option<crate::fused::Fused>,
     /// with `--tensor-prompt` (`SHADOW_PREFILL_DEVPLAN=0` off): a long prompt's MoE is routed and planned on the device (`dev_plan`); these are its scratch buffers:
@@ -452,6 +469,8 @@ pub struct GpuSession<'c, 'm> {
     kv_extra: Option<DeviceBuffer<'c>>,
     /// the address range `kv_extra` lives in: fixed, so the CUDA graphs captured over the big batch's buffers stay valid from one prompt to the next
     kv_extra_reg: Option<crate::kvvmm::VmmRegion<'c>>,
+    /// physical 2 MiB VMM chunk handles unmapped from `kv_regions` while a prompt borrows the KV tail (`SHADOW_VMM_POOL=0` off)
+    vmm_pool: Vec<u64>,
     prompt_hint: usize,
     /// rows of the batch buffers `lend_kv` made room for (BIG_BATCH or BIG_BATCH_MAX)
     kv_rows: usize,
@@ -1733,16 +1752,45 @@ impl<'c, 'm> GpuSession<'c, 'm> {
         let copy_stream2 = ctx.stream().map_err(e)?;
         let copy_ev2 = ctx.event().map_err(e)?;
         let copy_event = ctx.event().map_err(e)?;
-        let staging = if slot_bytes > 0 && c.n_expert_used > 0 {
-            // four tokens' worth: a batched step may read up to 4 * n_expert_used of a layer's misses together
-            Some(PinnedRegion::new(ctx, 4 * c.n_expert_used * slot_bytes)?)
+        let staging_slots = if !std::env::var("SHADOW_KEEP_PIPE").is_ok_and(|v| v == "0") {
+            std::env::var("SHADOW_PREFILL_STAGING").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(256)
+        } else {
+            4 * c.n_expert_used
+        };
+        let staging = if slot_bytes > 0 && staging_slots > 0 {
+            // room for a prompt chunk's share of misses (`SHADOW_PREFILL_STAGING` slots, else four tokens' worth)
+            PinnedRegion::new(ctx, staging_slots * slot_bytes)
+                .or_else(|_| PinnedRegion::new(ctx, 4 * c.n_expert_used * slot_bytes))
+                .ok()
+        } else {
+            None
+        };
+        let sp_spare = if slot_bytes > 0 && !std::env::var("SHADOW_KEEP_PIPE").is_ok_and(|v| v == "0") {
+            let ne = c.n_expert;
+            let mut per_layer = vec![0usize; c.n_layer];
+            for &(l, _) in ram.at.keys() {
+                per_layer[l] += 1;
+            }
+            let mut sp_slots = per_layer.iter().map(|&n| ne.saturating_sub(n)).max().unwrap_or(ne).max(1);
+            if let Some(n) = std::env::var("SHADOW_STAGE_SLOTS").ok().and_then(|v| v.parse::<usize>().ok()) {
+                sp_slots = n.max(1);
+            }
+            let bytes = sp_slots * slot_bytes;
+            match (PinnedRegion::new(ctx, bytes), PinnedRegion::new(ctx, bytes), PinnedRegion::new(ctx, bytes), ctx.event(), ctx.event(),
+                   ctx.event(), ctx.event(), ctx.event(), ctx.event(), ctx.event()) {
+                (Ok(a), Ok(b), Ok(c3), Ok(e0), Ok(e1), Ok(d0), Ok(d1), Ok(b0), Ok(b1), Ok(b2)) => {
+                    Some(StagePipe { base: 0, events: [e0, e1], done: [d0, d1], ready: [usize::MAX; 2], bufs: [a, b, c3], buf_done: [b0, b1, b2], layer: [usize::MAX; 3],
+                                     at: [HashMap::new(), HashMap::new(), HashMap::new()], slots: sp_slots, pending: false })
+                }
+                _ => None,
+            }
         } else {
             None
         };
         let mut s = GpuSession {
-            ctx, m, mvp, fw, w, v, b, bb, replay, dscr, mmq, mmq_y, fused,
+            ctx, m, mvp, fw, w, v, b, bb, replay, dscr, mmq, mmq_y, mmq_y_tag: std::cell::Cell::new((0, 0, 0, 0, 0)), fused,
             rparts: Vec::new(), bb_sig: 0, logits_last: false, sub_last: true, sub_first: true,
-            devplan: tiers.tensor_prompt && !std::env::var("SHADOW_PREFILL_DEVPLAN").is_ok_and(|v| v == "0"), dp_tidx, dp_cnt, dp_gstart, dp_copied, dp_eaddr, dp_lay, kv_regions, kv_extra: None, kv_extra_reg, prompt_hint: 0, kv_rows: 0, kv_halves: false, router_bias: std::env::var("SHADOW_ROUTER_BIAS").ok().and_then(|v| v.parse().ok()).unwrap_or(0.0), batch_scratch, delta, attn, ple_state, tokens: vec![], pictures: vec![], rope_tab: None, rope_on: false, cap, trace: None, stop_after: None,
+            devplan: tiers.tensor_prompt && !std::env::var("SHADOW_PREFILL_DEVPLAN").is_ok_and(|v| v == "0"), dp_tidx, dp_cnt, dp_gstart, dp_copied, dp_eaddr, dp_lay, kv_regions, kv_extra: None, kv_extra_reg, vmm_pool: Vec::new(), prompt_hint: 0, kv_rows: 0, kv_halves: false, router_bias: std::env::var("SHADOW_ROUTER_BIAS").ok().and_then(|v| v.parse().ok()).unwrap_or(0.0), batch_scratch, delta, attn, ple_state, tokens: vec![], pictures: vec![], rope_tab: None, rope_on: false, cap, trace: None, stop_after: None,
             resident_bytes, expert_uploads: 0, cache, ram, copy_stream, copy_stream2, copy_ev2, copy_event, staging,
             pending: vec![], routing: RoutingCounts::new(c.n_layer, c.n_expert),
             prof: std::env::var("SHADOW_PROFILE").is_ok_and(|v| v == "1")
@@ -1756,7 +1804,7 @@ impl<'c, 'm> GpuSession<'c, 'm> {
             tensor_prompt: tiers.tensor_prompt,
             lent: None,
             sp: None,
-            sp_spare: None,
+            sp_spare,
             rows: MAX_BATCH,
             small_bb: None,
             pipeline: tiers.pipeline,
@@ -2324,6 +2372,22 @@ impl<'c, 'm> GpuSession<'c, 'm> {
         assert_eq!(r, 0, "cuMemcpyHtoDAsync failed ({r})");
     }
 
+    /// Writes `data` into the mapped staging buffer (`self.stage`) and returns its device address without a `copy_words` launch; falls back to `upload_to(fallback, data)` when full or disabled (`SHADOW_DIRECT_TAB=0`).
+    fn stage_slice(&self, fallback: u64, data: &[u8]) -> u64 {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if *ON.get_or_init(|| !std::env::var("SHADOW_DIRECT_TAB").is_ok_and(|v| v == "0")) {
+            let at = self.stage_at.get();
+            if data.len().is_multiple_of(4) && !data.is_empty() && at + data.len() <= STAGE_BYTES && !self.stage_ptr.is_null() {
+                // SAFETY: [at, at + len) is inside the mapped staging region and not yet handed to a kernel since the last drain.
+                unsafe { std::ptr::copy_nonoverlapping(data.as_ptr(), self.stage_ptr.add(at), data.len()) };
+                self.stage_at.set((at + data.len()).next_multiple_of(256));
+                return self.stage.dev_ptr + at as u64;
+            }
+        }
+        self.upload_to(fallback, data);
+        fallback
+    }
+
     /// Asynchronous host-to-device DMA from pinned memory (`PinnedRegion`) on `stream` (null = default stream).
     /// Queues `n` copies (device `dsts`, pinned host `srcs`, `lens` bytes) on `stream`: one `cuMemcpyBatchAsync` call when the driver has it (the host
     /// time of 450 single calls was the longest step of a long prompt's layer), else one by one.
@@ -2864,7 +2928,12 @@ impl<'c, 'm> GpuSession<'c, 'm> {
         }
         let _ = self.ctx.synchronize();
         let keep = self.tokens.len() + self.prompt_hint + 256;
-        let freed: usize = self.kv_regions.iter_mut().map(|r| r.release_tail(keep)).sum();
+        let pool_on = !std::env::var("SHADOW_VMM_POOL").is_ok_and(|v| v == "0");
+        let freed: usize = if pool_on {
+            self.kv_regions.iter_mut().map(|r| r.release_tail_to(keep, &mut self.vmm_pool)).sum()
+        } else {
+            self.kv_regions.iter_mut().map(|r| r.release_tail(keep)).sum()
+        };
         let rb = bb_row_floats(&self.m.cfg) * 4;
         // twice the rows when the tail is that big (a long window, a short prompt); the rows are one of two values, so the graphs captured per row count stay valid
         let halves = if with_halves { 2 * self.m.cfg.n_expert * self.cache.slot_bytes } else { 0 };
@@ -2882,18 +2951,28 @@ impl<'c, 'm> GpuSession<'c, 'm> {
         }
         if rows > 0 {
             if let Some(reg) = self.kv_extra_reg.as_mut() {
-                if reg.map_bytes(want).is_ok() {
+                let mapped = if pool_on {
+                    reg.map_bytes_from(want, &mut self.vmm_pool, false)
+                } else {
+                    reg.map_bytes(want)
+                };
+                if mapped.is_ok() {
                     // SAFETY: a view of the region's mapped range; the session owns the region.
                     self.kv_extra = Some(unsafe { DeviceBuffer::view(self.ctx, reg.base, want) });
                     self.kv_rows = rows;
                     return true;
                 }
-                reg.release_tail(0);
+                if pool_on {
+                    reg.release_tail_to(0, &mut self.vmm_pool);
+                } else {
+                    reg.release_tail(0);
+                }
             }
         }
         for r in &mut self.kv_regions {
-            let _ = r.remap_tail();
+            let _ = if pool_on { r.remap_tail_from(&mut self.vmm_pool) } else { r.remap_tail() };
         }
+        crate::kvvmm::VmmRegion::release_pool(self.ctx, &mut self.vmm_pool);
         false
     }
 
@@ -2902,14 +2981,21 @@ impl<'c, 'm> GpuSession<'c, 'm> {
         if self.kv_regions.is_empty() || (self.kv_extra.is_none() && self.kv_regions.iter().all(|r| r.is_full())) {
             return;
         }
+        let pool_on = !std::env::var("SHADOW_VMM_POOL").is_ok_and(|v| v == "0");
         self.kv_extra = None;
         self.kv_halves = false;
         if let Some(reg) = self.kv_extra_reg.as_mut() {
-            reg.release_tail(0);
+            if pool_on {
+                reg.release_tail_to(0, &mut self.vmm_pool);
+            } else {
+                reg.release_tail(0);
+            }
         }
         for r in &mut self.kv_regions {
-            r.remap_tail().unwrap_or_else(|err| panic!("KV window: {err}"));
+            let res = if pool_on { r.remap_tail_from(&mut self.vmm_pool) } else { r.remap_tail() };
+            res.unwrap_or_else(|err| panic!("KV window: {err}"));
         }
+        crate::kvvmm::VmmRegion::release_pool(self.ctx, &mut self.vmm_pool);
     }
 
     /// `long`: a prompt long enough (`LONG_PROMPT` tokens) to pay for the layer-ahead pipeline and the big batch (which allocate pinned
@@ -2943,15 +3029,13 @@ impl<'c, 'm> GpuSession<'c, 'm> {
         let t_lend0 = std::time::Instant::now();
         let kv_lent = pipe && big && arena_hosts && self.lend_kv(false);
         let t_lend_kv = t_lend0.elapsed().as_secs_f64();
-        let big_cap = big_rows_cap();
         // more rows than the KV tail holds (`SHADOW_BIG_ROWS`): the rest of their buffers from the arena, past the halves (256 MiB more for the carving's gaps)
         let extra = if kv_lent {
-            let cap = big_rows_cap();
-            (big_batch_bytes(&self.m.cfg, cap) + (256 << 20)).saturating_sub(self.kv_extra.as_ref().map_or(0, |x| x.bytes))
+            (big_batch_bytes(&self.m.cfg, big_rows_cap()) + (256 << 20)).saturating_sub(self.kv_extra.as_ref().map_or(0, |x| x.bytes))
         } else { 0 };
         let want = std::env::var("SHADOW_PREFILL_LEND_MIB").ok().and_then(|v| v.parse::<usize>().ok()).map(|m| m << 20)
             .unwrap_or((self.m.cfg.n_expert * if pipe { 2 } else { 1 } + if pipe { 2 } else { 0 }) * self.cache.slot_bytes
-                       + if pipe && big && !kv_lent { big_batch_bytes(&self.m.cfg, big_cap) + (1 << 16) } else { extra })
+                       + if pipe && big && !kv_lent { big_batch_bytes(&self.m.cfg, big_rows_cap()) + (1 << 16) } else { extra })
             .min((self.cache.arena_bytes / 100 * std::env::var("SHADOW_LEND_PCT").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(99)).min(self.cache.arena_bytes.saturating_sub(24 * self.cache.slot_bytes)));
         let target = self.cache.arena_bytes - want;
         let s0 = self.cache.slot_offset.partition_point(|&o| (o as usize) < target);
@@ -3080,7 +3164,7 @@ impl<'c, 'm> GpuSession<'c, 'm> {
         let total: usize = sizes.iter().sum();
         let stride = self.cache.slot_bytes;
         let want: Vec<usize> = (0..self.m.cfg.n_expert)
-            .filter(|&e| !self.cache.map.contains_key(&(l, e)) && !self.ram.at.contains_key(&(l, e))).collect();
+            .filter(|&e| !self.cache.map.contains_key(&(l, e)) && !self.ram.at.contains_key(&(l, e)) && !avalon_oracle_skips(e, self.m.cfg.n_expert)).collect();
         let sp = self.sp.as_mut().unwrap();
         let p = l % 3;
         // The buffers were sized for the file-only experts a layer had when the pipeline was set up; the RAM tier changes while a long prompt is read
@@ -3167,6 +3251,11 @@ impl<'c, 'm> GpuSession<'c, 'm> {
             if self.cache.map.contains_key(&(l, e)) {
                 continue;
             }
+            if avalon_oracle_skips(e, self.m.cfg.n_expert) {
+                // oracle (timing only): left out of the copy (and the read), its slot stays zero
+                AVALON_SKIPPED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                continue;
+            }
             let dst = half + (e * self.cache.slot_bytes) as u64;
             if self.fv_on && !self.ram.at.contains_key(&(l, e)) {
                 // a file-only expert: its gate, up and down pieces straight from the registered file view into the slot
@@ -3222,6 +3311,14 @@ impl<'c, 'm> GpuSession<'c, 'm> {
             }
         }
         self.expert_uploads += 3 * n as usize;
+        if avalon_oracle_n() > 0 {
+            use std::sync::atomic::Ordering::Relaxed;
+            AVALON_LAYERS.fetch_add(1, Relaxed);
+            if l + 1 == self.m.cfg.n_layer {
+                eprintln!("AVALON-ORACLE n={}: {:.1} experts a layer left out of the copy (mean over {} layer copies; the others were resident)", avalon_oracle_n(),
+                          AVALON_SKIPPED.load(Relaxed) as f64 / AVALON_LAYERS.load(Relaxed) as f64, AVALON_LAYERS.load(Relaxed));
+            }
+        }
         let sp = self.sp.as_mut().unwrap();
         sp.events[p].record(Some(&self.copy_stream)).unwrap();
         sp.buf_done[rb].record(Some(&self.copy_stream)).unwrap();
@@ -3236,13 +3333,31 @@ impl<'c, 'm> GpuSession<'c, 'm> {
         let c = &self.m.cfg;
         let (h, k, ne) = (c.hidden, c.n_expert_used, c.n_expert);
         let p = l & 1;
+        // oracle cost probe (timing only): a CPU path needs this layer's router tops on the host, so the host would wait for the GPU here, every layer, and could no longer run ahead
+        if avalon_oracle_n() > 0 && std::env::var("SHADOW_AVALON_ORACLE_SYNC").is_ok_and(|v| v == "1") {
+            let ev = self.ctx.event().unwrap();
+            ev.record(None).unwrap();
+            ev.synchronize().unwrap();
+        }
         let stage_time = std::env::var("SHADOW_STAGE_TIME").is_ok_and(|v| v == "1");
         heap_check("moe_staged start");
         let t_start = std::time::Instant::now();
         // the copy of layer l + 1 is queued behind layer l's experts (it overlaps them); `SHADOW_STAGE_LEAD=2`: layer l + 2's is queued there instead and waits
         // for layer l's combine, so each copy overlaps a whole layer ahead of its use - a tie at 4,096 rows (docs/STATUS.md 2026-11-04), so opt-in
         let lead2 = std::env::var("SHADOW_STAGE_LEAD").is_ok_and(|v| v == "2");
-        if self.sp.as_ref().unwrap().ready[p] != l {
+        let sub_fast = !std::env::var("SHADOW_SUBCHUNK_FAST").is_ok_and(|v| v == "0");
+        let first_of_pass = self.sp.as_ref().unwrap().ready[p] != l;
+        if first_of_pass {
+            let on = avalon_oracle_n().min(c.n_expert);
+            if on > 0 {
+                // oracle (timing only): the slots of the experts it leaves out are zero for the whole pass (nothing writes them)
+                let sb = self.cache.slot_bytes;
+                for hp in 0..2usize {
+                    let at = self.sp.as_ref().unwrap().base + ((hp * c.n_expert + c.n_expert - on) * sb) as u64;
+                    // SAFETY: inside stage half hp (slots ne - on .. ne), which only `stage_copy` writes and it leaves these out.
+                    unsafe { DeviceBuffer::view(self.ctx, at, on * sb) }.zero().unwrap();
+                }
+            }
             // the first layer of a pass: read and copy it here, and start layer l + 1's reads
             self.stage_pipe_read(l);
             self.stage_copy(l);
@@ -3254,9 +3369,9 @@ impl<'c, 'm> GpuSession<'c, 'm> {
         }
         // the next layer's copy and the read-ahead after it are queued at the start of the layer (its first sub-chunk), not behind its last experts: the half the copy fills
         // was read by layer l - 1, whose combine the copy stream waits for, so the copy runs behind the whole layer's mixers and experts
-        // (`SHADOW_STAGE_EARLY=0`: after the layer, as before)
+        // (`SHADOW_STAGE_EARLY=0`: after the layer, as before; on the first layer of a pass with `SHADOW_SUBCHUNK_FAST` on, queued after sub-chunk 0's MoE launches so `stage_pipe_read(l + 1)` overlaps sub-chunk 0's GPU work)
         let early = !lead2 && !std::env::var("SHADOW_STAGE_EARLY").is_ok_and(|v| v == "0");
-        if early && self.sub_first && l + 1 < c.n_layer {
+        if early && !(first_of_pass && sub_fast) && self.sub_first && l + 1 < c.n_layer {
             let t0 = std::time::Instant::now();
             self.ctx.stream_wait_event(Some(&self.copy_stream), &self.sp.as_ref().unwrap().done[(l + 1) & 1]).unwrap();
             self.stage_copy(l + 1);
@@ -3304,8 +3419,8 @@ impl<'c, 'm> GpuSession<'c, 'm> {
             self.upload_to(self.bb.gtab.ptr, &plan.bytes);
             (plan, set.len())
         } else if buckets {
-            // routed and planned on the device, in width classes (`plan_fill_w`)
-            let (lay, any_res) = self.dev_plan_buckets(l, m, sizes);
+            // routed and planned on the device, in width classes (`plan_fill_w`, skipped when the fused int8 path covers the layer)
+            let (lay, any_res) = self.dev_plan_buckets(l, m, sizes, infos);
             let plan = GroupedPlan { bytes: vec![], phase: [(0, 0, 0); 2], weights: lay.weights as u64, counts: lay.counts as u64, chunk_n: 32 };
             blay = Some((lay, any_res));
             (plan, 0)
@@ -3317,16 +3432,18 @@ impl<'c, 'm> GpuSession<'c, 'm> {
         match &blay {
             Some((lay, any_res)) => {
                 if *any_res {
-                    self.routed_buckets(lay, 0, m, infos);
+                    self.routed_buckets(lay, 0, m, infos, true);
                 }
             }
             None => self.routed_grouped(&plan, 0, 0, m, infos),
         }
         self.lt_point("staged: resident experts done");
-        self.ctx.stream_wait_event(None, &self.sp.as_ref().unwrap().events[p]).unwrap();
+        if self.sub_first || !sub_fast {
+            self.ctx.stream_wait_event(None, &self.sp.as_ref().unwrap().events[p]).unwrap();
+        }
         self.lt_point("staged: GPU stalled on the copy");
         match &blay {
-            Some((lay, _)) => self.routed_buckets(lay, 1, m, infos),
+            Some((lay, any_res)) => self.routed_buckets(lay, 1, m, infos, *any_res),
             None => self.routed_grouped(&plan, 1, 0, m, infos),
         }
         self.lt_point("staged: copied experts done");
@@ -3338,11 +3455,23 @@ impl<'c, 'm> GpuSession<'c, 'm> {
             Arg::Ptr(row(&bb.so, h, 0)), Arg::Ptr(row(&bb.sgl, 1, 0)), Arg::Ptr(bb.gtab.ptr + plan.counts),
             Arg::U32(h as u32), Arg::U32(k as u32)]);
         if !self.sub_last {
+            if early && first_of_pass && sub_fast && self.sub_first && l + 1 < c.n_layer {
+                self.ctx.stream_wait_event(Some(&self.copy_stream), &self.sp.as_ref().unwrap().done[(l + 1) & 1]).unwrap();
+                self.stage_copy(l + 1);
+                self.sp.as_ref().unwrap().buf_done[(l + 2) % 3].synchronize().unwrap();
+                self.stage_pipe_read(l + 2);
+            }
             // not the layer's last sub-chunk: the copy pipeline moves on once, after the last one
             return;
         }
         if !lead2 {
             self.sp.as_ref().unwrap().done[p].record(None).unwrap();
+        }
+        if early && first_of_pass && sub_fast && self.sub_first && l + 1 < c.n_layer {
+            self.ctx.stream_wait_event(Some(&self.copy_stream), &self.sp.as_ref().unwrap().done[(l + 1) & 1]).unwrap();
+            self.stage_copy(l + 1);
+            self.sp.as_ref().unwrap().buf_done[(l + 2) % 3].synchronize().unwrap();
+            self.stage_pipe_read(l + 2);
         }
         if early {
             return;
@@ -3488,6 +3617,7 @@ impl<'c, 'm> GpuSession<'c, 'm> {
                 self.batch_max = if !rparts.is_empty() && rparts.len() == total.div_ceil(rows) { total } else { rows };
                 self.rparts = rparts;
                 self.bb_sig = self.bb_signature();
+                self.mmq_y_tag.set((0, 0, 0, 0, 0));
                 true
             }
             Err(_) => false, // cannot happen: `take` does not fail; the fixed buffers are dropped views
@@ -3519,6 +3649,7 @@ impl<'c, 'm> GpuSession<'c, 'm> {
         self.bb_sig = 0;
         self.rows = MAX_BATCH;
         self.batch_max = MAX_BATCH;
+        self.mmq_y_tag.set((0, 0, 0, 0, 0));
     }
 
     /// Gives the lent cache back: the layers' ranges as they were, and the evicted entries read again from the RAM tier
@@ -3539,12 +3670,50 @@ impl<'c, 'm> GpuSession<'c, 'm> {
         self.cache.evict_range = lent.evict_saved;
         let arena = self.cache.arena.as_ref().unwrap().ptr;
         let stream = self.copy_stream.raw();
+        let overlap = !std::env::var("SHADOW_RESTORE_OVERLAP").is_ok_and(|v| v == "0");
+        let single = std::env::var("SHADOW_RESTORE_SINGLE").is_ok_and(|v| v == "1");
+        // queue the RAM-tier DMA on `copy_stream` first (`SHADOW_RESTORE_OVERLAP=0` waits for the file reads first, as before) so the cold file reads below overlap the ~3.2 GiB PCIe transfer
+        if overlap {
+            let mut dsts: Vec<u64> = Vec::with_capacity(lent.saved.len());
+            let mut srcs: Vec<u64> = Vec::with_capacity(lent.saved.len());
+            let mut host_srcs: Vec<u64> = Vec::with_capacity(lent.saved.len());
+            let mut lens: Vec<usize> = Vec::with_capacity(lent.saved.len());
+            for &(s, l, e) in &lent.saved {
+                if self.cache.map.contains_key(&(l, e)) {
+                    continue;
+                }
+                let Some(&off) = self.ram.at.get(&(l, e)) else { continue };
+                let Some(region) = self.ram.region.as_ref() else { continue };
+                let total: usize = ["gate", "up", "down"].iter().map(|p| self.m.expert_bytes(&format!("blk.{l}.ffn_{p}_exps.weight"))).sum();
+                if let Some(&r) = self.ram.ring_by_off.get(&off) {
+                    self.ram.ring_ref[r] = true;
+                }
+                let src = &region.as_slice()[off..off + total];
+                if single {
+                    self.upload_pinned_on(arena + self.cache.slot_offset[s], src, stream);
+                } else {
+                    dsts.push(arena + self.cache.slot_offset[s]);
+                    srcs.push(region.dev_addr(off));
+                    host_srcs.push(src.as_ptr() as u64);
+                    lens.push(total);
+                }
+                self.cache.owner[s] = Some((l, e));
+                self.cache.map.insert((l, e), s);
+                self.cache.stamp[s] = 0;
+            }
+            if !dsts.is_empty() {
+                self.upload_batch(&mut dsts, &mut srcs, &host_srcs, &mut lens, stream);
+            }
+        }
         // the evicted experts the RAM tier does not hold come back from the file, through the pipeline's pinned read-ahead buffer
         if let Some(mut sp) = self.sp.take() {
             let cold: Vec<(usize, usize, usize)> = lent.saved.iter().copied()
                 .filter(|&(_, l, e)| !self.cache.map.contains_key(&(l, e)) && !self.ram.at.contains_key(&(l, e))).collect();
             let stride = self.cache.slot_bytes;
-            for batch in cold.chunks(sp.slots.max(1)) {
+            for (bi, batch) in cold.chunks(sp.slots.max(1)).enumerate() {
+                if bi > 0 {
+                    self.copy_stream.synchronize().unwrap();
+                }
                 let mut sizes_of: Vec<[usize; 3]> = vec![];
                 let mut names_of: Vec<[String; 3]> = vec![];
                 for &(_, l, _) in batch {
@@ -3563,38 +3732,74 @@ impl<'c, 'm> GpuSession<'c, 'm> {
                     }
                     self.m.experts_into_many(&mut jobs);
                 }
+                let mut dsts: Vec<u64> = Vec::with_capacity(batch.len());
+                let mut srcs: Vec<u64> = Vec::with_capacity(batch.len());
+                let mut host_srcs: Vec<u64> = Vec::with_capacity(batch.len());
+                let mut lens: Vec<usize> = Vec::with_capacity(batch.len());
                 for (i, &(s, l, e)) in batch.iter().enumerate() {
                     let total: usize = sizes_of[i].iter().sum();
-                    let src = &sp.bufs[0].as_slice()[i * stride..i * stride + total];
-                    self.upload_pinned_on(arena + self.cache.slot_offset[s], src, stream);
+                    let at = i * stride;
+                    let src = &sp.bufs[0].as_slice()[at..at + total];
+                    if single {
+                        self.upload_pinned_on(arena + self.cache.slot_offset[s], src, stream);
+                    } else {
+                        dsts.push(arena + self.cache.slot_offset[s]);
+                        srcs.push(sp.bufs[0].dev_ptr + at as u64);
+                        host_srcs.push(src.as_ptr() as u64);
+                        lens.push(total);
+                    }
                     self.cache.owner[s] = Some((l, e));
                     self.cache.map.insert((l, e), s);
                     self.cache.stamp[s] = 0;
                 }
+                if !dsts.is_empty() {
+                    self.upload_batch(&mut dsts, &mut srcs, &host_srcs, &mut lens, stream);
+                }
+                if !overlap {
+                    self.copy_stream.synchronize().unwrap();
+                }
+            }
+            if overlap {
                 self.copy_stream.synchronize().unwrap();
             }
-            // kept for the next long prompt unless RAM is getting short (4 GiB over the floor) or `SHADOW_KEEP_PIPE=0`
-            if !std::env::var("SHADOW_KEEP_PIPE").is_ok_and(|v| v == "0") && crate::pinned::available_ram() >= crate::pinned::ram_floor() + (4 << 30) {
+            // kept for the next long prompt unless `SHADOW_KEEP_PIPE=0` (if RAM falls below the floor, the watchdog shrinks the tier and logs a warning)
+            if !std::env::var("SHADOW_KEEP_PIPE").is_ok_and(|v| v == "0") {
                 self.sp_spare = Some(sp);
             }
         }
         let t_r_cold = t_restore.elapsed().as_secs_f64();
-        for (s, l, e) in lent.saved {
-            // the prompt may have loaded this expert again into another slot: one owner only
-            if self.cache.map.contains_key(&(l, e)) {
-                continue;
+        if !overlap {
+            let mut dsts: Vec<u64> = Vec::with_capacity(lent.saved.len());
+            let mut srcs: Vec<u64> = Vec::with_capacity(lent.saved.len());
+            let mut host_srcs: Vec<u64> = Vec::with_capacity(lent.saved.len());
+            let mut lens: Vec<usize> = Vec::with_capacity(lent.saved.len());
+            for (s, l, e) in lent.saved {
+                // the prompt may have loaded this expert again into another slot: one owner only
+                if self.cache.map.contains_key(&(l, e)) {
+                    continue;
+                }
+                let Some(&off) = self.ram.at.get(&(l, e)) else { continue };
+                let Some(region) = self.ram.region.as_ref() else { continue };
+                let total: usize = ["gate", "up", "down"].iter().map(|p| self.m.expert_bytes(&format!("blk.{l}.ffn_{p}_exps.weight"))).sum();
+                if let Some(&r) = self.ram.ring_by_off.get(&off) {
+                    self.ram.ring_ref[r] = true;
+                }
+                let src = &region.as_slice()[off..off + total];
+                if single {
+                    self.upload_pinned_on(arena + self.cache.slot_offset[s], src, stream);
+                } else {
+                    dsts.push(arena + self.cache.slot_offset[s]);
+                    srcs.push(region.dev_addr(off));
+                    host_srcs.push(src.as_ptr() as u64);
+                    lens.push(total);
+                }
+                self.cache.owner[s] = Some((l, e));
+                self.cache.map.insert((l, e), s);
+                self.cache.stamp[s] = 0;
             }
-            let Some(&off) = self.ram.at.get(&(l, e)) else { continue };
-            let Some(region) = self.ram.region.as_ref() else { continue };
-            let total: usize = ["gate", "up", "down"].iter().map(|p| self.m.expert_bytes(&format!("blk.{l}.ffn_{p}_exps.weight"))).sum();
-            if let Some(&r) = self.ram.ring_by_off.get(&off) {
-                self.ram.ring_ref[r] = true;
+            if !dsts.is_empty() {
+                self.upload_batch(&mut dsts, &mut srcs, &host_srcs, &mut lens, stream);
             }
-            let src = &region.as_slice()[off..off + total];
-            self.upload_pinned_on(arena + self.cache.slot_offset[s], src, stream);
-            self.cache.owner[s] = Some((l, e));
-            self.cache.map.insert((l, e), s);
-            self.cache.stamp[s] = 0;
         }
         self.copy_stream.synchronize().unwrap();
         if phases_on() {
@@ -4163,16 +4368,35 @@ impl<'c, 'm> GpuSession<'c, 'm> {
                 // groups of rows: one upload and one launch each (a launch and a copy a token took 0.27 s for 15k tokens); a group ends where the residual storage moves to the next part
                 let scratch_ptr = self.bb.rn.ptr;
                 let mut host = vec![0f32; g_rows * h];
+                let par = self.pictures.is_empty() && !std::env::var("SHADOW_EMBED_PAR").is_ok_and(|v| v == "0");
                 let mut j0 = 0;
                 while j0 < m {
                     let boundary = if sub_mode { (j0 + pad) / self.rows * self.rows + self.rows - pad } else { m };
                     let j1 = (j0 + g_rows).min(m).min(boundary);
-                    for j in j0..j1 {
-                        fill(j, &mut host[(j - j0) * h..(j - j0 + 1) * h]);
+                    let n_rows = j1 - j0;
+                    if par && n_rows >= 64 {
+                        let ty = t.ty;
+                        let chunk_rows = n_rows.div_ceil(8).max(16);
+                        std::thread::scope(|s| {
+                            for (ci, slice) in host[..n_rows * h].chunks_mut(chunk_rows * h).enumerate() {
+                                let r0 = j0 + ci * chunk_rows;
+                                let r_cnt = slice.len() / h;
+                                s.spawn(move || {
+                                    for r in 0..r_cnt {
+                                        let tok = toks[r0 + r] as usize;
+                                        dequantize(ty, &bytes[tok * rb..(tok + 1) * rb], &mut slice[r * h..(r + 1) * h]).unwrap();
+                                    }
+                                });
+                            }
+                        });
+                    } else {
+                        for j in j0..j1 {
+                            fill(j, &mut host[(j - j0) * h..(j - j0 + 1) * h]);
+                        }
                     }
                     // one stream (the default): the next group's upload waits for this group's launch
-                    self.upload_to(scratch_ptr, &f32s(&host[..(j1 - j0) * h]));
-                    self.k1("broadcast_rows", (j1 - j0) * ch, &[Arg::Ptr(scratch_ptr), Arg::Ptr(row_ptr(j0)), Arg::U32(h as u32), Arg::U32(cs as u32), Arg::U32((j1 - j0) as u32)]);
+                    self.upload_to(scratch_ptr, &f32s(&host[..n_rows * h]));
+                    self.k1("broadcast_rows", n_rows * ch, &[Arg::Ptr(scratch_ptr), Arg::Ptr(row_ptr(j0)), Arg::U32(h as u32), Arg::U32(cs as u32), Arg::U32(n_rows as u32)]);
                     j0 = j1;
                 }
             }
@@ -4387,12 +4611,23 @@ impl<'c, 'm> GpuSession<'c, 'm> {
             if let Some(gty) = crate::mmq::Mmq::ggml_type(&ty) {
                 let k = t.dims[0] as usize;
                 if k % 256 == 0 && xs % 4 == 0 && x % 16 == 0 && mq.y_bytes(k, m) <= self.mmq_y.bytes {
+                    static MMQ_REUSE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+                    let reuse = *MMQ_REUSE.get_or_init(|| !std::env::var("SHADOW_MMQ_REUSE").is_ok_and(|v| v == "0"));
                     let stream = self.ls().map_or(0, |s| s.raw() as u64);
+                    let tag = (x, k, m, xs, crate::mmq::Mmq::ds_layout(gty));
                     // SAFETY: x holds m rows of k floats xs apart (the caller's buffers), the quantized copy fits mmq_y (checked), the weights are `rows` rows of k values in their GGUF
                     // layout, y holds m rows of `rows` floats ys apart.
                     unsafe {
-                        mq.quantize(x, self.mmq_y.ptr, k, m, xs, gty, stream).unwrap_or_else(|e| panic!("{name}: {e}"));
+                        if !reuse || self.capturing.get() || self.mmq_y_tag.get() != tag {
+                            mq.quantize(x, self.mmq_y.ptr, k, m, xs, gty, stream).unwrap_or_else(|e| panic!("{name}: {e}"));
+                            if !self.capturing.get() {
+                                self.mmq_y_tag.set(tag);
+                            }
+                        }
                         mq.gemm(gty, wptr, self.mmq_y.ptr, y, rows, k, m, ys, stream).unwrap_or_else(|e| panic!("{name}: {e}"));
+                    }
+                    if y == x {
+                        self.mmq_y_tag.set((0, 0, 0, 0, 0));
                     }
                     return;
                 }
@@ -4543,6 +4778,7 @@ impl<'c, 'm> GpuSession<'c, 'm> {
 
     /// `hc_read` for the batch's m tokens.
     fn hc_read_batch(&self, p: &str, inject: bool, skip_norm: bool, m: usize) {
+        self.mmq_y_tag.set((0, 0, 0, 0, 0));
         let c = &self.m.cfg;
         let (h, cs, rank) = (c.hidden, c.streams, c.hc_rank);
         let ch = h * cs;
@@ -5018,41 +5254,74 @@ impl<'c, 'm> GpuSession<'c, 'm> {
         GroupedPlan { bytes: vec![], phase: [(g, a0 as u64, r0 as u64), (g, a1 as u64, r1 as u64)], weights: w as u64, counts: counts as u64, chunk_n }
     }
 
+    /// Whether `fused_experts` covers this layer's formats, shapes and scratch buffers for `m` rows.
+    fn fused_covers(&self, m: usize, infos: &[TensorInfo]) -> bool {
+        let Some(fu) = self.fused.as_ref() else { return false };
+        let c = &self.m.cfg;
+        let (h, ff, k, ne) = (c.hidden, c.expert_ff, c.n_expert_used, c.n_expert);
+        let (gate, up, down) = (&infos[0], &infos[1], &infos[2]);
+        let (Some(gt), Some(dt)) = (crate::fused::Fused::gu_type(&gate.ty.name()), crate::fused::Fused::d_type(&down.ty.name())) else { return false };
+        if gate.ty != up.ty || gate.dims != up.dims || h != 2560 || ff != 640 || gate.dims[0] as usize != h || gate.dims[1] as usize != ff || down.dims[0] as usize != ff
+            || down.dims[1] as usize != h || !fu.supported(gt, dt) || gate.ty.block().is_none() || down.ty.block().is_none() {
+            return false;
+        }
+        let n = m * k;
+        let al = |x: usize| x.next_multiple_of(256);
+        let (xa_b, sc_b, id_b) = (al(fu.act_bytes(m, h)), al(fu.group_bytes(n, ne)), al(n * 4));
+        xa_b + sc_b + 3 * id_b <= self.bb.eg.bytes && fu.act_bytes(n, ff) <= self.bb.act.bytes
+    }
+
     /// The width-class planner's `dev_plan`: routes layer l's m tokens (`route_topk_rows`) and plans them (`plan_scan_w`, `plan_fill_w`) on the device into `bb.gtab` as `bucket_layout` says;
     /// the second value is whether any of the layer's experts is resident in the VRAM cache (else phase 0 is empty and is not launched).
-    fn dev_plan_buckets(&mut self, l: usize, m: usize, sizes: &[usize]) -> (BucketLayout, bool) {
+    fn dev_plan_buckets(&mut self, l: usize, m: usize, sizes: &[usize], infos: &[TensorInfo]) -> (BucketLayout, bool) {
         let c = &self.m.cfg;
         let (k, ne) = (c.n_expert_used, c.n_expert);
         let lay = bucket_layout(m, k, ne);
         assert!(lay.total <= self.bb.gtab.bytes, "width-class plan: {} bytes of tables for {} ({} rows)", lay.total, self.bb.gtab.bytes, m);
-        let p = l & 1;
-        let arena = self.cache.arena.as_ref().unwrap().ptr;
-        let half = self.sp.as_ref().unwrap().base + (p * ne * self.cache.slot_bytes) as u64;
-        let part = [0u64, sizes[0] as u64, (sizes[0] + sizes[1]) as u64];
-        let mut eaddr: Vec<u8> = Vec::with_capacity(3 * ne * 8);
-        let mut copied = vec![0u8; ne.next_multiple_of(4)];
-        for pt in 0..3 {
-            for e in 0..ne {
-                let base = match self.cache.map.get(&(l, e)) {
-                    Some(&s) => arena + self.cache.slot_offset[s],
-                    None => half + (e * self.cache.slot_bytes) as u64,
-                };
-                eaddr.extend_from_slice(&(base + part[pt]).to_le_bytes());
+        static FAST_PLAN: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let fused_only = *FAST_PLAN.get_or_init(|| !std::env::var("SHADOW_FUSED_FAST_PLAN").is_ok_and(|v| v == "0")) && self.fused_covers(m, infos);
+        let sub_fast = !std::env::var("SHADOW_SUBCHUNK_FAST").is_ok_and(|v| v == "0");
+        let any_res = if fused_only && sub_fast && !self.sub_first {
+            // sub-chunk 0 already uploaded `dp_eaddr` for layer l and waited on `sp.events[p]`, so all 512 experts of layer l are in VRAM at `dp_eaddr`
+            false
+        } else {
+            let p = l & 1;
+            let arena = self.cache.arena.as_ref().unwrap().ptr;
+            let half = self.sp.as_ref().unwrap().base + (p * ne * self.cache.slot_bytes) as u64;
+            let part = [0u64, sizes[0] as u64, (sizes[0] + sizes[1]) as u64];
+            let nparts = if fused_only { 1 } else { 3 };
+            let mut eaddr: Vec<u8> = Vec::with_capacity(nparts * ne * 8);
+            let mut copied = vec![0u8; ne.next_multiple_of(4)];
+            for pt in 0..nparts {
+                for e in 0..ne {
+                    let base = match self.cache.map.get(&(l, e)) {
+                        Some(&s) => arena + self.cache.slot_offset[s],
+                        None => half + (e * self.cache.slot_bytes) as u64,
+                    };
+                    eaddr.extend_from_slice(&(base + part[pt]).to_le_bytes());
+                }
             }
-        }
-        let mut any_res = false;
-        for e in 0..ne {
-            let res = self.cache.map.contains_key(&(l, e));
-            copied[e] = !res as u8;
-            any_res |= res;
-        }
-        self.upload_to(self.dp_eaddr.ptr, &eaddr);
-        self.upload_to(self.dp_copied.ptr, &copied);
-        self.upload_to(self.dp_lay.ptr, &lay.lay_words());
+            let mut any_res = false;
+            for e in 0..ne {
+                let res = self.cache.map.contains_key(&(l, e));
+                copied[e] = !res as u8;
+                any_res |= res;
+            }
+            self.upload_to(self.dp_eaddr.ptr, &eaddr);
+            if !fused_only || any_res {
+                self.upload_to(self.dp_copied.ptr, &copied);
+            }
+            if !fused_only {
+                self.upload_to(self.dp_lay.ptr, &lay.lay_words());
+            }
+            any_res
+        };
         let (gt, rl) = (self.bb.gtab.ptr, self.bb.rl.ptr);
-        let nrec = (lay.weights - lay.roff[0][0]) / 4;
-        self.k1("zero_words", ne, &[Arg::Ptr(self.dp_cnt.ptr), Arg::U32(ne as u32)]);
-        self.k1("zero_words", nrec, &[Arg::Ptr(gt + lay.roff[0][0] as u64), Arg::U32(nrec as u32)]);
+        if !fused_only {
+            let nrec = (lay.weights - lay.roff[0][0]) / 4;
+            self.k1("zero_words", ne, &[Arg::Ptr(self.dp_cnt.ptr), Arg::U32(ne as u32)]);
+            self.k1("zero_words", nrec, &[Arg::Ptr(gt + lay.roff[0][0] as u64), Arg::U32(nrec as u32)]);
+        }
         assert!(ne <= 512 && k <= 16, "route_topk_rows: {ne} experts, top {k}");
         let route_args = [Arg::Ptr(rl), Arg::Ptr(self.dp_tidx.ptr), Arg::Ptr(gt + lay.weights as u64), Arg::Ptr(self.dp_cnt.ptr), Arg::U32(ne as u32), Arg::U32(k as u32), Arg::U32(m as u32)];
         if std::env::var("SHADOW_ROUTE_UNIFORM").is_ok_and(|v| v == "1") {
@@ -5060,9 +5329,11 @@ impl<'c, 'm> GpuSession<'c, 'm> {
         } else {
             self.k("route_topk_rows", m.div_ceil(8) as u32, 256, &route_args);
         }
-        self.k("plan_scan_w", 1, 1024, &[Arg::Ptr(self.dp_cnt.ptr), Arg::Ptr(self.dp_copied.ptr), Arg::Ptr(self.dp_gstart.ptr), Arg::U32(ne as u32)]);
-        self.k("plan_fill_w", ne as u32, 256, &[Arg::Ptr(self.dp_tidx.ptr), Arg::Ptr(self.dp_cnt.ptr), Arg::Ptr(self.dp_gstart.ptr), Arg::Ptr(self.dp_copied.ptr), Arg::Ptr(self.dp_eaddr.ptr),
-                                                Arg::Ptr(gt), Arg::Ptr(self.dp_lay.ptr), Arg::U32(ne as u32), Arg::U32(k as u32), Arg::U32(m as u32), Arg::U32((self.rows * k) as u32)]);
+        if !fused_only {
+            self.k("plan_scan_w", 1, 1024, &[Arg::Ptr(self.dp_cnt.ptr), Arg::Ptr(self.dp_copied.ptr), Arg::Ptr(self.dp_gstart.ptr), Arg::U32(ne as u32)]);
+            self.k("plan_fill_w", ne as u32, 256, &[Arg::Ptr(self.dp_tidx.ptr), Arg::Ptr(self.dp_cnt.ptr), Arg::Ptr(self.dp_gstart.ptr), Arg::Ptr(self.dp_copied.ptr), Arg::Ptr(self.dp_eaddr.ptr),
+                                                    Arg::Ptr(gt), Arg::Ptr(self.dp_lay.ptr), Arg::U32(ne as u32), Arg::U32(k as u32), Arg::U32(m as u32), Arg::U32((self.rows * k) as u32)]);
+        }
         self.k1("fill_words", m, &[Arg::Ptr(gt + lay.counts as u64), Arg::U32(m as u32), Arg::U32(k as u32)]);
         (lay, any_res)
     }
@@ -5080,7 +5351,7 @@ impl<'c, 'm> GpuSession<'c, 'm> {
     /// gate/up, SwiGLU and grouped down launches: the layer's input quantized to int8, the routing ids masked to this phase's experts, grouped on the device (`sf_group`), then one
     /// set of launches per 128 experts reading each expert's blob through the planner's address table (`dp_eaddr`: gate rows, up rows, down rows are one blob in a cache slot or a
     /// stage half) and storing the down products at their pairs' rows of `bb.eo`, where the combine reads them.  False when the layer is not covered (formats, shapes, buffers).
-    fn fused_experts(&self, ph: usize, m: usize, infos: &[TensorInfo]) -> bool {
+    fn fused_experts(&self, ph: usize, m: usize, infos: &[TensorInfo], any_res: bool) -> bool {
         let Some(fu) = self.fused.as_ref() else { return false };
         let c = &self.m.cfg;
         let (h, ff, k, ne) = (c.hidden, c.expert_ff, c.n_expert_used, c.n_expert);
@@ -5119,12 +5390,21 @@ impl<'c, 'm> GpuSession<'c, 'm> {
         let (xa, sc) = (bb.eg.ptr, bb.eg.ptr + xa_b as u64);
         let (ids2, slot, src) = (sc + sc_b as u64, sc + (sc_b + id_b) as u64, sc + (sc_b + 2 * id_b) as u64);
         let stream = self.ls().map_or(0, |s| s.raw() as u64);
+        static FAST_PLAN: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let fast = *FAST_PLAN.get_or_init(|| !std::env::var("SHADOW_FUSED_FAST_PLAN").is_ok_and(|v| v == "0"));
         // SAFETY: every address is inside this session's buffers with the sizes checked above (`dp_tidx`: m * k expert ids, `dp_copied`: a byte an expert, `dp_eaddr`: ne blob addresses
         // first); `bb.eo` holds `rows * k` rows of `hidden` floats, 256-aligned, and the down products go to the rows of the pairs they belong to.
         unsafe {
-            fu.quantize(bb.u.ptr, m, h, xa, stream);
-            fu.mask(self.dp_tidx.ptr, n, self.dp_copied.ptr, ph as i32, ids2, stream);
-            fu.group(ids2, n, k, ne, sc, slot, src, stream);
+            if !fast || ph == 0 || !any_res {
+                fu.quantize(bb.u.ptr, m, h, xa, stream);
+            }
+            let ids_in = if fast && ph == 1 && !any_res {
+                self.dp_tidx.ptr
+            } else {
+                fu.mask(self.dp_tidx.ptr, n, self.dp_copied.ptr, ph as i32, ids2, stream);
+                ids2
+            };
+            fu.group(ids_in, n, k, ne, sc, slot, src, stream);
             fu.experts(self.dp_eaddr.ptr, &geom, ne, n, sc, xa, src, bb.act.ptr, bb.eo.ptr, stream);
         }
         true
@@ -5132,8 +5412,8 @@ impl<'c, 'm> GpuSession<'c, 'm> {
 
     /// Phase `ph` of the width-class plan (0: the resident experts, 1: the copied ones) for the pass's m rows: per class gate + up grouped, then SwiGLU over the rows, then per class
     /// down into bb.eo row (token, rank).  A class's grid holds its capacity of groups; the empty ones (count 0) leave at once.
-    fn routed_buckets(&self, lay: &BucketLayout, ph: usize, m: usize, infos: &[TensorInfo]) {
-        if self.fused_experts(ph, m, infos) {
+    fn routed_buckets(&self, lay: &BucketLayout, ph: usize, m: usize, infos: &[TensorInfo], any_res: bool) {
+        if self.fused_experts(ph, m, infos, any_res) {
             return;
         }
         let c = &self.m.cfg;
@@ -5645,21 +5925,21 @@ impl<'c, 'm> GpuSession<'c, 'm> {
         for &(_, w) in top {
             tab.extend_from_slice(&(w as f32).to_le_bytes());
         }
-        self.upload_to(self.b.tab.ptr, &tab);
+        let tab_ptr = self.stage_slice(self.b.tab.ptr, &tab);
         let b = &self.b;
         let u = row(&self.bb.u, h, j);
         let eu = if infos[0].ty == infos[1].ty && infos[0].dims == infos[1].dims {
-            self.mv_batch(&infos[0], b.tab.ptr, 2 * n, u, 0, b.eg.ptr, ff);
+            self.mv_batch(&infos[0], tab_ptr, 2 * n, u, 0, b.eg.ptr, ff);
             b.eg.ptr + (n * ff * 4) as u64
         } else {
-            self.mv_batch(&infos[0], b.tab.ptr, n, u, 0, b.eg.ptr, ff);
-            self.mv_batch(&infos[1], b.tab.ptr + 8 * n as u64, n, u, 0, b.eu.ptr, ff);
+            self.mv_batch(&infos[0], tab_ptr, n, u, 0, b.eg.ptr, ff);
+            self.mv_batch(&infos[1], tab_ptr + 8 * n as u64, n, u, 0, b.eu.ptr, ff);
             b.eu.ptr
         };
         self.k1("swiglu", n * ff, &[Arg::Ptr(b.eg.ptr), Arg::Ptr(eu), Arg::Ptr(b.act.ptr), Arg::U32((n * ff) as u32)]);
-        self.mv_batch(&infos[2], b.tab.ptr + 16 * n as u64, n, b.act.ptr, ff, b.eo.ptr, h);
+        self.mv_batch(&infos[2], tab_ptr + 16 * n as u64, n, b.act.ptr, ff, b.eo.ptr, h);
         self.k1("moe_combine_qwen", h, &[
-            Arg::Ptr(row(&self.bb.y, h, j)), Arg::Ptr(b.eo.ptr), Arg::Ptr(b.tab.ptr + 24 * n as u64),
+            Arg::Ptr(row(&self.bb.y, h, j)), Arg::Ptr(b.eo.ptr), Arg::Ptr(tab_ptr + 24 * n as u64),
             Arg::Ptr(row(&self.bb.so, h, j)), Arg::Ptr(row(&self.bb.sgl, 1, j)), Arg::U32(h as u32), Arg::U32(n as u32)]);
     }
 
@@ -5729,7 +6009,7 @@ impl<'c, 'm> GpuSession<'c, 'm> {
             tab.extend_from_slice(&(w as f32).to_le_bytes());
         }
         tab.extend(perm.iter().flat_map(|p| p.to_le_bytes()));
-        self.upload_to(self.b.tab.ptr, &tab);
+        let tab_ptr = self.stage_slice(self.b.tab.ptr, &tab);
         // rows first..first + cnt of eo: gate+up, swiglu, down
         let run = |s: &Self, first: usize, cnt: usize| {
             if cnt == 0 {
@@ -5738,10 +6018,10 @@ impl<'c, 'm> GpuSession<'c, 'm> {
             let b = &s.b;
             let eg = b.eg.ptr + (2 * first * ff * 4) as u64;
             let act = b.act.ptr + (first * ff * 4) as u64;
-            s.mv_batch(&infos[0], b.tab.ptr + 16 * first as u64, 2 * cnt, b.u.ptr, 0, eg, ff);
+            s.mv_batch(&infos[0], tab_ptr + 16 * first as u64, 2 * cnt, b.u.ptr, 0, eg, ff);
             s.k1("swiglu", cnt * ff, &[Arg::Ptr(eg), Arg::Ptr(eg + (cnt * ff * 4) as u64), Arg::Ptr(act),
                                       Arg::U32((cnt * ff) as u32)]);
-            s.mv_batch(&infos[2], b.tab.ptr + (16 * n + 8 * first) as u64, cnt, act, ff, b.eo.ptr + (first * h * 4) as u64, h);
+            s.mv_batch(&infos[2], tab_ptr + (16 * n + 8 * first) as u64, cnt, act, ff, b.eo.ptr + (first * h * 4) as u64, h);
         };
         run(self, 0, nh);
         for &(i, e, base) in &misses {
@@ -5759,7 +6039,7 @@ impl<'c, 'm> GpuSession<'c, 'm> {
         }
         let b = &self.b;
         self.k1("moe_combine_qwen_perm", h, &[
-            Arg::Ptr(b.y.ptr), Arg::Ptr(b.eo.ptr), Arg::Ptr(b.tab.ptr + 24 * n as u64), Arg::Ptr(b.tab.ptr + (24 * n + 4 * na) as u64),
+            Arg::Ptr(b.y.ptr), Arg::Ptr(b.eo.ptr), Arg::Ptr(tab_ptr + 24 * n as u64), Arg::Ptr(tab_ptr + (24 * n + 4 * na) as u64),
             // the shared expert's output is row n_expert_used of eo (`moe` launches it there), whatever n is
             Arg::Ptr(b.eo.ptr + (c.n_expert_used * h * 4) as u64), Arg::Ptr(b.sgl.ptr), Arg::U32(h as u32), Arg::U32(na as u32)]);
     }
@@ -5796,6 +6076,7 @@ impl<'c, 'm> GpuSession<'c, 'm> {
             return false;
         }
         let (a_key, b_qry, c_gv, d_gvn, u_val) = (bb.rn.ptr, bb.up.ptr, bb.qkv.ptr, bb.x.ptr, bb.u.ptr);
+        self.mmq_y_tag.set((0, 0, 0, 0, 0));
         self.upload_to(c_gv, &f32s(&e));
         self.mv_cols(&format!("{p}.ple_key.weight"), c_gv, width, a_key, ch, m);
         self.mv_cols(&format!("{p}.ple_value.weight"), c_gv, width, u_val, h, m);
@@ -5841,6 +6122,7 @@ impl<'c, 'm> GpuSession<'c, 'm> {
 
 impl Drop for GpuSession<'_, '_> {
     fn drop(&mut self) {
+        crate::kvvmm::VmmRegion::release_pool(self.ctx, &mut self.vmm_pool);
         // little-endian: u32 token count, the tokens (u32), u32 record width k, then (layer, k expert ids) as u16s
         if let Some((path, log)) = self.route_log.take() {
             let k = self.m.cfg.n_expert_used as u32;
