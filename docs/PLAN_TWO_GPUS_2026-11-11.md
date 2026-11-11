@@ -26,7 +26,13 @@ Consequences:
   (~200 MB or more) off both cards. Optional, free.
 * Check before install: PSU wattage and the 5060 Ti's power connector (5070 250 W + 5060 Ti ~180 W + an 11700K that can
   pull 125-250 W: ~750 W or more is the safe size), and the clearance for a second card under the 5070.
-  *Not known; please tell me the PSU.*
+  **Update 2026-11-11:** the present supply is ~650 W (unconfirmed label); the 5070 is the MSI RTX 5070 12G SHADOW 3X OC
+  (250 W, one 16-pin, 303 x 121 x 49 mm, [MSI datasheet](https://storage-asset.msi.com/datasheet/vga/ca/GeForce-RTX-5070-12G-SHADOW-3X-OC.pdf)).
+  Measured: that card averaged 80 W and peaked at 153 W over the 36-prompt decode bench (`bench/vs-strata-final-2026-11-11`
+  gpu.csv); a long-prompt peak is not measured. **A 1000 W supply is ordered, due Monday 2026-11-16**; the card is due
+  Thursday 2026-11-12. Until the swap: if the two cards run at all on the 650 W unit, only with the power limits lowered
+  (`nvidia-smi -pl`: ~200 W and ~140 W; the CPU's short-term limit in the BIOS), for the probes and short tests, no long
+  runs; the card needs its own free 8-pin (or the connector its model uses). After the swap: use only the new unit's cables.
 
 ## 2. Why a layer split
 
