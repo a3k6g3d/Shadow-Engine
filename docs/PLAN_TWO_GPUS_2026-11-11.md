@@ -51,6 +51,18 @@ compute on its layers (448 against 672 GB/s: +3 ms): **~+15-25% decode (55 -> ~6
 means fewer "skipped unless in VRAM" tail experts (`--tail-skip`), so fidelity should rise a little. Prompt reading gains
 the same way on GPU 1's layers (no stage copies).
 
+**"One card waits while the other works" (raised by the user, 2026-11-11).** True for one stream of text: a token's layers
+depend on each other and the next token on the last, so a layer split cannot keep both cards busy on a single decode. What
+it does not mean is wasted speed: today's limit is bytes over PCIe into the 5070 (the kernels run at 30-45% of VRAM
+bandwidth waiting for copies, STATUS), not arithmetic, so an idle card is not what is slow; the gain is the bytes
+removed. Where both cards *can* work at once, in order of cost: (1) **prompt reading**, sub-chunks pipelined across the
+cards (phase 4); (2) **several requests at once** (an agent harness sending parallel requests or sub-agents): card 0 on
+request A's layers while card 1 runs request B's, throughput up to ~2x on the part card 1 owns, no per-token gain (new
+phase 4b; needs the engine to hold more than one session's state, which it does not today); (3) **the per-layer expert split**
+(phase 5), the only way to use both on one stream of decode: both compute each layer at the same time, paid for with ~96
+hops a token. Phase 5's merit is decided by the measured hop latency (G1) and the phase 3 numbers; if the hop is ~50 us it
+may beat the layer split outright and is then the better primary design.
+
 Rejected, and why:
 * **GPU 1 as a remote expert cache for GPU 0** (copy GPU 1 -> GPU 0 on a miss): the bytes still enter GPU 0's PCIe link,
   which is the bottleneck. No gain.
