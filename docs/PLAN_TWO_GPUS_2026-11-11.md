@@ -33,6 +33,8 @@ Consequences:
   Thursday 2026-11-12. Until the swap: if the two cards run at all on the 650 W unit, only with the power limits lowered
   (`nvidia-smi -pl`: ~200 W and ~140 W; the CPU's short-term limit in the BIOS), for the probes and short tests, no long
   runs; the card needs its own free 8-pin (or the connector its model uses). After the swap: use only the new unit's cables.
+  **The second card (2026-11-11): Gigabyte WINDFORCE (OC or not) RTX 5060 Ti 16GB**: 180 W, one 8-pin, dual-slot, ~208 mm
+  ([Gigabyte](https://www.gigabyte.com/Graphics-Card/GV-N506TWF2OC-16GD/sp), [BuildCores](https://www.buildcores.com/products/GPU/crlwbjaxo/Gigabyte-WINDFORCE-OC-GeForce-RTX-5060-Ti-16GB-GDDR7)); it fits under the 5070 in the lower slot.
 
 ## 2. Why a layer split
 
