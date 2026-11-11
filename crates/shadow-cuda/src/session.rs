@@ -843,6 +843,14 @@ struct PendingRead {
 }
 
 /// Sizes and placement of the expert tiers below VRAM's dense weights.
+/// What a stage's batched step returns (`GpuSession::step_batch_stage`).
+pub enum StageOut {
+    /// every token's residual streams, `streams x hidden` floats each, in order: the next stage's input
+    Streams(Vec<f32>),
+    /// the last stage: every row's logits
+    Logits(Vec<Vec<f32>>),
+}
+
 #[derive(Default, Clone)]
 pub struct Tiers {
     /// The layers this session owns, `[lo, hi)`: `None` is all of them (a single session).  A session that owns part of the model keeps only those layers'
@@ -2502,6 +2510,20 @@ impl<'c, 'm> GpuSession<'c, 'm> {
             self.layers_out.take().expect("a stage that is not the last hands its residual streams on")
         } else {
             logits
+        }
+    }
+
+    /// `step_batch` through this session's layers (`Tiers::layers`), up to `batch_max` tokens: the first stage takes the tokens, a later one the previous
+    /// stage's residual streams as `input` (`tokens.len() x streams x hidden` floats; the tokens again, for their positions).  A stage that is not the last
+    /// returns the streams for the next (`StageOut::Streams`), the last one the logits of every row.  Needs a VRAM expert cache (a session without one steps a token at a time).
+    pub fn step_batch_stage(&mut self, tokens: &[u32], input: Option<&[f32]>) -> StageOut {
+        assert!(tokens.len() >= 2 && tokens.len() <= self.batch_max && self.batches(), "step_batch_stage takes 2..={} tokens and needs a VRAM expert cache", self.batch_max);
+        self.layers_in = input.map(|x| x.to_vec());
+        let logits = self.batch(tokens, true);
+        if self.layers.1 < self.m.cfg.n_layer {
+            StageOut::Streams(self.layers_out.take().expect("a stage that is not the last hands its residual streams on"))
+        } else {
+            StageOut::Logits(logits)
         }
     }
 
@@ -4310,6 +4332,16 @@ impl<'c, 'm> GpuSession<'c, 'm> {
     }
 
     pub fn rollback(&mut self, snap: &Snapshot<'c>, kept: &[u32]) -> Result<(), String> {
+        if !self.rollback_replay(snap, kept)? {
+            self.prefill_batch(kept);
+        }
+        Ok(())
+    }
+
+    /// The part of `rollback` that needs nothing from other stages: back to `snap`, then this session's layers' recurrent states advanced over the first
+    /// `kept` tokens of the last verify pass from what that pass recorded.  `Ok(false)`: the pass did not record them (the kept tokens are not a prefix of
+    /// it, or it was not a verify pass), so the session is at `snap` and the caller reads `kept` again (through every stage, for a session with a layer range).
+    pub fn rollback_replay(&mut self, snap: &Snapshot<'c>, kept: &[u32]) -> Result<bool, String> {
         let pass = self.replay.pass.take();
         let fits = pass.as_ref().is_some_and(|(p0, toks)| {
             *p0 == snap.tokens.len() && !kept.is_empty() && kept.len() <= toks.len() && toks[..kept.len()] == *kept
@@ -4317,14 +4349,14 @@ impl<'c, 'm> GpuSession<'c, 'm> {
         });
         self.restore(snap)?;
         if !fits {
-            self.prefill_batch(kept);
-            return Ok(());
+            return Ok(false);
         }
+        let (lo, hi) = self.layers;
         let c = &self.m.cfg;
         let (kd, vh) = (c.ssm_k_heads * c.ssm_head_dim, c.ssm_v_heads);
         let chd = 2 * kd + vh * c.ssm_head_dim;
         let ch = c.hidden * c.streams;
-        for l in 0..c.n_layer {
+        for l in lo..hi {
             if l == c.ple_layer {
                 let p = format!("blk.{l}");
                 for j in 0..kept.len() {
@@ -4349,7 +4381,18 @@ impl<'c, 'm> GpuSession<'c, 'm> {
             mt.pending = true;
             self.k1("copy", ch, &[Arg::Ptr(last), Arg::Ptr(row(&self.bb.r, ch, kept.len() - 1)), Arg::U32(ch as u32)]);
         }
-        Ok(())
+        Ok(true)
+    }
+
+    /// `step_batch_verify` through this session's layers (`step_batch_stage`): the pass also records what `rollback_replay` needs.
+    pub fn step_batch_verify_stage(&mut self, tokens: &[u32], input: Option<&[f32]>) -> StageOut {
+        let p0 = self.tokens.len();
+        let keep = self.batches() && (2..=MAX_VERIFY.min(self.batch_max)).contains(&tokens.len());
+        self.replay.on.set(keep);
+        let out = self.step_batch_stage(tokens, input);
+        self.replay.on.set(false);
+        self.replay.pass = keep.then(|| (p0, tokens.to_vec()));
+        out
     }
 
     pub fn step_batch_opt(&mut self, tokens: &[u32], with_logits: bool) -> Vec<Vec<f32>> {
@@ -4407,6 +4450,7 @@ impl<'c, 'm> GpuSession<'c, 'm> {
         let c = &self.m.cfg;
         let (h, cs) = (c.hidden, c.streams);
         let ch = h * cs;
+        let (lo, hi) = self.layers;
         // a pass bigger than the temporaries' rows runs layer by layer in sub-chunks (the first takes the remainder, so the last is a full one), the residual streams
         // of every row in `rbig`; `bb.r` is a view of the sub-chunk being run
         let sub_mode = m > self.rows && !self.rparts.is_empty() && !self.pipeline_ok(m);
@@ -4425,10 +4469,17 @@ impl<'c, 'm> GpuSession<'c, 'm> {
         assert!(sub_mode || m <= self.rows, "a pass of {m} rows with temporaries for {}", self.rows);
         // row j's residual streams are at storage row j + pad (the first sub-chunk, the remainder, ends part 0): a sub-chunk is inside one part
         let pad = if sub_mode { (self.rows - m % self.rows) % self.rows } else { 0 };
+        let stage_in = if lo > 0 { Some(self.layers_in.take().expect("a stage after the first needs the previous stage's residual streams (step_batch_stage)")) } else { None };
         let row_ptr = |j: usize| -> u64 {
             if sub_mode { self.rparts[(j + pad) / self.rows].ptr + (((j + pad) % self.rows) * ch * 4) as u64 } else { self.bb.r.ptr + (j * ch * 4) as u64 }
         };
-        {
+        if let Some(r) = stage_in.as_ref() {
+            // a stage after the first starts from the previous stage's residual streams, one row of `ch` floats a token
+            assert_eq!(r.len(), m * ch, "{m} tokens' residual streams are {} floats", m * ch);
+            for j in 0..m {
+                self.upload_to(row_ptr(j), &f32s(&r[j * ch..(j + 1) * ch]));
+            }
+        } else {
             let (t, bytes) = self.m.dense("token_embd.weight");
             let (qk, qb) = t.ty.block().unwrap();
             let rb = (t.dims[0] / qk * qb) as usize;
@@ -4506,7 +4557,8 @@ impl<'c, 'm> GpuSession<'c, 'm> {
         // whether each row's normalized input to the layer is in `rn`; a sub-chunked pass keeps only the residual streams between sub-chunks, so each sub-chunk
         // normalizes its own at the start (`rmsnorm_groups_rows`, 0.2 ms) and `rn` is the sub-chunk's scratch
         let mut rn_layer = rn_ready;
-        for l in 0..(if piped { 0 } else { c.n_layer }) {
+        let layer_loop = if piped { 0..0 } else { lo..hi };
+        for l in layer_loop {
             for (si, &(s0, ms)) in subs.iter().enumerate() {
                 rn_ready = rn_layer && !sub_mode;
                 if sub_mode {
@@ -4588,8 +4640,8 @@ impl<'c, 'm> GpuSession<'c, 'm> {
                     self.lt_point("moe (router wait, fetch, experts)");
                 }
                 self.mark("batch: routed experts + combine");
-                let next = if l + 1 == c.ple_layer {
-                    None
+                let next = if l + 1 == c.ple_layer || (l + 1 == hi && hi < c.n_layer) {
+                    None // the PLE layer's input, or the end of this stage: the next layer norms the streams itself
                 } else if l + 1 < c.n_layer {
                     Some(format!("blk.{}.hc_attn_norm.weight", l + 1))
                 } else {
@@ -4610,7 +4662,7 @@ impl<'c, 'm> GpuSession<'c, 'm> {
         }
         let t_layers = t_pass.elapsed().as_secs_f64();
         let (m_obs, p0_obs) = { let &(s0, ms) = subs.last().unwrap(); (ms, p0 + s0) };
-        if with_logits {
+        if with_logits && hi == c.n_layer {
             // the last sub-chunk's output rows (a sub-chunked pass gives logits for its last rows only; the rows before come back empty)
             self.hc_read_batch("output_hc", false, rn_ready, m_obs);
         }
@@ -4620,6 +4672,20 @@ impl<'c, 'm> GpuSession<'c, 'm> {
         }
         self.sub_last = true;
         self.sub_first = true;
+        if hi < c.n_layer {
+            // not the last stage: every token's residual streams go to the next one
+            let rp = |j: usize| -> u64 {
+                if sub_mode { self.rparts[(j + pad) / self.rows].ptr + (((j + pad) % self.rows) * ch * 4) as u64 } else { self.bb.r.ptr + (j * ch * 4) as u64 }
+            };
+            let mut out = Vec::with_capacity(m * ch);
+            for j in 0..m {
+                let mut bytes = vec![0u8; ch * 4];
+                self.download(rp(j), &mut bytes);
+                out.extend(floats(&bytes));
+            }
+            self.layers_out = Some(out);
+            return vec![];
+        }
         if let Some((_, log)) = self.route_log.as_mut() {
             log.extend(logs.into_iter().flatten());
         }
