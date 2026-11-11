@@ -48,26 +48,42 @@ mod win {
     extern "system" {
         pub fn GlobalMemoryStatusEx(status: *mut MemoryStatusEx) -> i32;
         pub fn GetCurrentProcess() -> isize;
-        pub fn K32GetProcessMemoryInfo(process: isize, counters: *mut ProcessMemoryCounters, cb: u32) -> i32;
-        pub fn GetSystemTimes(idle: *mut FileTime, kernel: *mut FileTime, user: *mut FileTime) -> i32;
-        pub fn GetProcessTimes(process: isize, creation: *mut FileTime, exit: *mut FileTime, kernel: *mut FileTime, user: *mut FileTime) -> i32;
+        pub fn K32GetProcessMemoryInfo(
+            process: isize,
+            counters: *mut ProcessMemoryCounters,
+            cb: u32,
+        ) -> i32;
+        pub fn GetSystemTimes(
+            idle: *mut FileTime,
+            kernel: *mut FileTime,
+            user: *mut FileTime,
+        ) -> i32;
+        pub fn GetProcessTimes(
+            process: isize,
+            creation: *mut FileTime,
+            exit: *mut FileTime,
+            kernel: *mut FileTime,
+            user: *mut FileTime,
+        ) -> i32;
     }
 }
 
 #[repr(C)]
 #[derive(Default, Clone, Copy, Debug)]
 pub struct NvmlUtilization {
-    pub gpu: u32,    // Percent of time over sample period during which one or more kernels executed
+    pub gpu: u32, // Percent of time over sample period during which one or more kernels executed
     pub memory: u32, // Percent of time memory controller was busy
 }
 
 pub struct NvmlGpu {
     device: *mut std::ffi::c_void,
-    get_utilization: Option<unsafe extern "C" fn(*mut std::ffi::c_void, *mut NvmlUtilization) -> i32>,
+    get_utilization:
+        Option<unsafe extern "C" fn(*mut std::ffi::c_void, *mut NvmlUtilization) -> i32>,
     get_temperature: Option<unsafe extern "C" fn(*mut std::ffi::c_void, u32, *mut u32) -> i32>,
     /// nvmlDeviceGetMemoryInfo: (total, free, used) bytes - the whole device, whoever holds it.
     get_memory: Option<unsafe extern "C" fn(*mut std::ffi::c_void, *mut [u64; 3]) -> i32>,
-    get_name: Option<unsafe extern "C" fn(*mut std::ffi::c_void, *mut std::ffi::c_char, u32) -> i32>,
+    get_name:
+        Option<unsafe extern "C" fn(*mut std::ffi::c_void, *mut std::ffi::c_char, u32) -> i32>,
     _dylib: Option<shadow_cuda::dylib::Dylib>,
 }
 
@@ -85,19 +101,35 @@ impl NvmlGpu {
         #[cfg(windows)]
         {
             if let Ok(lib) = shadow_cuda::dylib::Dylib::open(std::path::Path::new("nvml.dll")) {
-                let init: Option<unsafe extern "C" fn() -> i32> = lib.sym("nvmlInit_v2")
+                let init: Option<unsafe extern "C" fn() -> i32> = lib
+                    .sym("nvmlInit_v2")
                     .or_else(|| lib.sym("nvmlInit"))
                     .map(|p| unsafe { std::mem::transmute(p) });
-                let get_handle: Option<unsafe extern "C" fn(u32, *mut *mut std::ffi::c_void) -> i32> = lib.sym("nvmlDeviceGetHandleByIndex_v2")
+                let get_handle: Option<
+                    unsafe extern "C" fn(u32, *mut *mut std::ffi::c_void) -> i32,
+                > = lib
+                    .sym("nvmlDeviceGetHandleByIndex_v2")
                     .or_else(|| lib.sym("nvmlDeviceGetHandleByIndex"))
                     .map(|p| unsafe { std::mem::transmute(p) });
-                let get_utilization: Option<unsafe extern "C" fn(*mut std::ffi::c_void, *mut NvmlUtilization) -> i32> = lib.sym("nvmlDeviceGetUtilizationRates")
+                let get_utilization: Option<
+                    unsafe extern "C" fn(*mut std::ffi::c_void, *mut NvmlUtilization) -> i32,
+                > = lib
+                    .sym("nvmlDeviceGetUtilizationRates")
                     .map(|p| unsafe { std::mem::transmute(p) });
-                let get_temperature: Option<unsafe extern "C" fn(*mut std::ffi::c_void, u32, *mut u32) -> i32> = lib.sym("nvmlDeviceGetTemperature")
+                let get_temperature: Option<
+                    unsafe extern "C" fn(*mut std::ffi::c_void, u32, *mut u32) -> i32,
+                > = lib
+                    .sym("nvmlDeviceGetTemperature")
                     .map(|p| unsafe { std::mem::transmute(p) });
-                let get_memory: Option<unsafe extern "C" fn(*mut std::ffi::c_void, *mut [u64; 3]) -> i32> = lib.sym("nvmlDeviceGetMemoryInfo")
+                let get_memory: Option<
+                    unsafe extern "C" fn(*mut std::ffi::c_void, *mut [u64; 3]) -> i32,
+                > = lib
+                    .sym("nvmlDeviceGetMemoryInfo")
                     .map(|p| unsafe { std::mem::transmute(p) });
-                let get_name: Option<unsafe extern "C" fn(*mut std::ffi::c_void, *mut std::ffi::c_char, u32) -> i32> = lib.sym("nvmlDeviceGetName")
+                let get_name: Option<
+                    unsafe extern "C" fn(*mut std::ffi::c_void, *mut std::ffi::c_char, u32) -> i32,
+                > = lib
+                    .sym("nvmlDeviceGetName")
                     .map(|p| unsafe { std::mem::transmute(p) });
 
                 if let (Some(init_fn), Some(handle_fn)) = (init, get_handle) {
@@ -144,7 +176,11 @@ impl NvmlGpu {
             return None;
         }
         // SAFETY: b is NUL-terminated (NVML's contract, and the buffer was zeroed).
-        Some(unsafe { std::ffi::CStr::from_ptr(b.as_ptr()) }.to_string_lossy().into_owned())
+        Some(
+            unsafe { std::ffi::CStr::from_ptr(b.as_ptr()) }
+                .to_string_lossy()
+                .into_owned(),
+        )
     }
 
     pub fn sample(&self) -> (f64, f64, u32) {
@@ -237,13 +273,17 @@ impl SysMonitor {
                 + (cur_proc_user.saturating_sub(self.last_proc_user));
 
             if sys_total > 0 && self.last_sys_kernel > 0 {
-                let cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1) as f64;
+                let cores = std::thread::available_parallelism()
+                    .map(|n| n.get())
+                    .unwrap_or(1) as f64;
                 let sys_busy = sys_total.saturating_sub(sys_idle);
                 self.sys_cpu_pct = ((sys_busy as f64 / sys_total as f64) * 100.0).clamp(0.0, 100.0);
                 // Windows Task Manager: percentage of overall system CPU capacity
-                self.proc_cpu_pct = ((proc_total as f64 / sys_total as f64) * 100.0).clamp(0.0, 100.0);
+                self.proc_cpu_pct =
+                    ((proc_total as f64 / sys_total as f64) * 100.0).clamp(0.0, 100.0);
                 // Cores consumed: e.g. 1.0 core
-                self.proc_cores_used = ((proc_total as f64 / sys_total as f64) * cores).clamp(0.0, cores);
+                self.proc_cores_used =
+                    ((proc_total as f64 / sys_total as f64) * cores).clamp(0.0, cores);
             }
 
             self.last_sys_idle = cur_sys_idle;
@@ -327,13 +367,19 @@ impl TelemetryService {
         }
 
         let used_ram = total_ram.saturating_sub(avail_ram);
-        let cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
+        let cores = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1);
         // the session's numbers once it is up; NVML's for the whole device before that (while the model loads)
         let (vram_total, vram_free) = match (s.vram_total, self.nvml.memory()) {
             (0, Some((t, f))) => (t as usize, f as usize),
             _ => (s.vram_total, s.vram_free),
         };
-        let gpu_name = if s.gpu_name.is_empty() { self.nvml.name().unwrap_or_default() } else { s.gpu_name.clone() };
+        let gpu_name = if s.gpu_name.is_empty() {
+            self.nvml.name().unwrap_or_default()
+        } else {
+            s.gpu_name.clone()
+        };
         let vram_used = vram_total.saturating_sub(vram_free);
         let hit_rate = if s.vram_hits + s.vram_misses > 0 {
             (s.vram_hits as f64 / (s.vram_hits + s.vram_misses) as f64) * 100.0
@@ -346,6 +392,22 @@ impl TelemetryService {
         } else {
             0.0
         };
+
+        let spec_rate = if s.spec_n.1 > 0 {
+            (s.spec_n.2 as f64 / s.spec_n.1 as f64 * 1000.0).round() / 10.0
+        } else {
+            0.0
+        };
+        let spec_mean = if s.spec_n.0 > 0 {
+            ((s.spec_n.2 + s.spec_n.0) as f64 / s.spec_n.0 as f64 * 100.0).round() / 100.0
+        } else {
+            0.0
+        };
+        let spec_positions = s
+            .spec_pos
+            .iter()
+            .map(|p| json!({"tried": p.0, "right": p.1}))
+            .collect::<Vec<_>>();
 
         json!({
             "cpu": {
@@ -400,6 +462,7 @@ impl TelemetryService {
                 "prefill_total": crate::engine::PREFILL.1.load(std::sync::atomic::Ordering::Relaxed)
             },
             "mcp": crate::mcp::status().into_iter().map(|(name, tools, error)| json!({"name": name, "tools": tools, "error": error})).collect::<Vec<_>>(),
+        "spec": json!({"acceptance_rate": spec_rate, "mean_accepted_per_pass": spec_mean, "passes": s.spec_n.0, "drafted": s.spec_n.1, "accepted": s.spec_n.2, "lookup_passes": s.spec_n.3, "positions": spec_positions}),
             "recent": s.recent.iter().map(|r| json!({
                 "at": r.at, "prompt_tokens": r.prompt_tokens, "cached_tokens": r.cached_tokens, "completion_tokens": r.completion_tokens,
                 "prompt_ms": r.prompt_ms.round(), "predicted_ms": r.predicted_ms.round(), "finish": r.finish, "pictures": r.pictures,

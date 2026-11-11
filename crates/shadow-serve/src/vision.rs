@@ -10,8 +10,14 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 
 /// Where the helper and the projector are looked for (after `SHADOW_VISION_EXE` / `SHADOW_MMPROJ`): Shadow's own folders, then Strata's build.
-const EXE_CANDIDATES: &[&str] = &["bin/strata-vision.exe", r"J:\Strata-work\build-0145\strata-vision.exe"];
-const MMPROJ_CANDIDATES: &[&str] = &["models/Qwen3.8-Flash-Next.mmproj-f16.gguf", r"J:\Strata-work\models\sc117\Qwen3.8-Flash-Next.mmproj-f16.gguf"];
+const EXE_CANDIDATES: &[&str] = &[
+    "bin/strata-vision.exe",
+    r"J:\Strata-work\build-0145\strata-vision.exe",
+];
+const MMPROJ_CANDIDATES: &[&str] = &[
+    "models/Qwen3.8-Flash-Next.mmproj-f16.gguf",
+    r"J:\Strata-work\models\sc117\Qwen3.8-Flash-Next.mmproj-f16.gguf",
+];
 
 /// `var` if set, else the first candidate that exists (relative ones in the working directory, then beside the Shadow checkout).
 fn locate(var: &str, candidates: &[&str]) -> String {
@@ -20,7 +26,10 @@ fn locate(var: &str, candidates: &[&str]) -> String {
         return abs(PathBuf::from(p));
     }
     let root = Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../.."));
-    candidates.iter().flat_map(|c| [PathBuf::from(c), root.join(c)]).find(|p| p.is_file())
+    candidates
+        .iter()
+        .flat_map(|c| [PathBuf::from(c), root.join(c)])
+        .find(|p| p.is_file())
         .map_or_else(|| candidates[0].to_string(), abs)
 }
 
@@ -48,13 +57,23 @@ impl Encoder {
         let mmproj = locate("SHADOW_MMPROJ", MMPROJ_CANDIDATES);
         for (what, p) in [("picture encoder", &exe), ("vision projector", &mmproj)] {
             if !Path::new(p).is_file() {
-                return Err(format!("no {what} at {p} (set SHADOW_VISION_EXE / SHADOW_MMPROJ)"));
+                return Err(format!(
+                    "no {what} at {p} (set SHADOW_VISION_EXE / SHADOW_MMPROJ)"
+                ));
             }
         }
-        let threads = std::thread::available_parallelism().map_or(8, |n| (n.get() / 2).clamp(2, 16));
+        let threads =
+            std::thread::available_parallelism().map_or(8, |n| (n.get() / 2).clamp(2, 16));
         let mut cmd = Command::new(&exe);
-        cmd.arg("--mmproj").arg(&mmproj).arg("--model").arg(model).arg("--threads").arg(threads.to_string())
-            .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null());
+        cmd.arg("--mmproj")
+            .arg(&mmproj)
+            .arg("--model")
+            .arg(model)
+            .arg("--threads")
+            .arg(threads.to_string())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
         if let Some(d) = Path::new(&exe).parent() {
             cmd.current_dir(d);
         }
@@ -63,17 +82,30 @@ impl Encoder {
         let mut stdout = BufReader::new(child.stdout.take().ok_or("no stdout")?);
         let mut line = String::new();
         stdout.read_line(&mut line).map_err(|e| e.to_string())?;
-        let n_embd = line.trim().strip_prefix("READY ").and_then(|v| v.parse().ok())
+        let n_embd = line
+            .trim()
+            .strip_prefix("READY ")
+            .and_then(|v| v.parse().ok())
             .ok_or_else(|| format!("the picture encoder did not start: {:?}", line.trim()))?;
         let dir = std::env::temp_dir().join(format!("shadow-pictures-{}", std::process::id()));
         std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-        Ok(Encoder { child, stdin, stdout, n_embd, dir, seq: 0 })
+        Ok(Encoder {
+            child,
+            stdin,
+            stdout,
+            n_embd,
+            dir,
+            seq: 0,
+        })
     }
 
     /// The rows for a picture file's bytes (PNG, JPEG...).
     pub fn encode(&mut self, bytes: &[u8]) -> Result<Picture, String> {
         self.seq += 1;
-        let (img, out) = (self.dir.join(format!("{}.img", self.seq)), self.dir.join(format!("{}.sve", self.seq)));
+        let (img, out) = (
+            self.dir.join(format!("{}.img", self.seq)),
+            self.dir.join(format!("{}.sve", self.seq)),
+        );
         std::fs::write(&img, bytes).map_err(|e| e.to_string())?;
         let r = self.ask(&img, &out);
         let _ = std::fs::remove_file(&img);
@@ -83,9 +115,13 @@ impl Encoder {
 
     fn ask(&mut self, img: &Path, out: &Path) -> Result<Picture, String> {
         // the helper splits the line at the last space, so the paths must have none (the temp dir's does not)
-        writeln!(self.stdin, "ENC {} {}", img.display(), out.display()).and_then(|_| self.stdin.flush()).map_err(|e| e.to_string())?;
+        writeln!(self.stdin, "ENC {} {}", img.display(), out.display())
+            .and_then(|_| self.stdin.flush())
+            .map_err(|e| e.to_string())?;
         let mut line = String::new();
-        self.stdout.read_line(&mut line).map_err(|e| e.to_string())?;
+        self.stdout
+            .read_line(&mut line)
+            .map_err(|e| e.to_string())?;
         let line = line.trim();
         if !line.starts_with("OK ") {
             return Err(format!("the picture encoder said: {line}"));
@@ -95,11 +131,19 @@ impl Encoder {
         if d.len() < 20 || i32_at(0) != 0x3145_5653 {
             return Err("the picture encoder wrote a file that is not SVE1".into());
         }
-        let (n, nx, ny, ne) = (i32_at(1) as usize, i32_at(2) as usize, i32_at(3) as usize, i32_at(4) as usize);
+        let (n, nx, ny, ne) = (
+            i32_at(1) as usize,
+            i32_at(2) as usize,
+            i32_at(3) as usize,
+            i32_at(4) as usize,
+        );
         if ne != self.n_embd || d.len() != 20 + n * ne * 4 {
             return Err("the picture encoder's file has the wrong size".into());
         }
-        let rows = d[20..].chunks_exact(4).map(|c| f32::from_le_bytes(c.try_into().unwrap())).collect();
+        let rows = d[20..]
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+            .collect();
         Ok(Picture { n, nx, ny, rows })
     }
 }

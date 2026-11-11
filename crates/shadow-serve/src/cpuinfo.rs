@@ -34,8 +34,17 @@ fn cpuid_name_and_base() -> (String, u32) {
             }
         }
     }
-    let name = String::from_utf8_lossy(&name).trim_matches(|c: char| c == '\0' || c.is_whitespace()).to_string();
-    (name, if max >= 0x16 { cpuid(0x16).eax & 0xffff } else { 0 })
+    let name = String::from_utf8_lossy(&name)
+        .trim_matches(|c: char| c == '\0' || c.is_whitespace())
+        .to_string();
+    (
+        name,
+        if max >= 0x16 {
+            cpuid(0x16).eax & 0xffff
+        } else {
+            0
+        },
+    )
 }
 
 #[cfg(not(target_arch = "x86_64"))]
@@ -59,9 +68,20 @@ mod sys {
     #[link(name = "pdh")]
     extern "system" {
         pub fn PdhOpenQueryW(source: *const u16, user: usize, query: *mut isize) -> u32;
-        pub fn PdhAddEnglishCounterW(query: isize, path: *const u16, user: usize, counter: *mut isize) -> u32;
+        pub fn PdhAddEnglishCounterW(
+            query: isize,
+            path: *const u16,
+            user: usize,
+            counter: *mut isize,
+        ) -> u32;
         pub fn PdhCollectQueryData(query: isize) -> u32;
-        pub fn PdhGetFormattedCounterArrayW(counter: isize, format: u32, size: *mut u32, count: *mut u32, buf: *mut u8) -> u32;
+        pub fn PdhGetFormattedCounterArrayW(
+            counter: isize,
+            format: u32,
+            size: *mut u32,
+            count: *mut u32,
+            buf: *mut u8,
+        ) -> u32;
         pub fn PdhCloseQuery(query: isize) -> u32;
     }
 }
@@ -77,15 +97,29 @@ fn read_caches() -> Vec<(u8, u32, u32, u32)> {
             return vec![];
         }
         let n = len as usize / std::mem::size_of::<Slpi>();
-        let mut buf: Vec<Slpi> = (0..n).map(|_| Slpi { mask: 0, relationship: 0, pad: 0, u: [0; 16] }).collect();
+        let mut buf: Vec<Slpi> = (0..n)
+            .map(|_| Slpi {
+                mask: 0,
+                relationship: 0,
+                pad: 0,
+                u: [0; 16],
+            })
+            .collect();
         if GetLogicalProcessorInformation(buf.as_mut_ptr(), &mut len) == 0 {
             return vec![];
         }
         let mut out: Vec<(u8, u32, u32, u32)> = vec![];
         for r in buf.iter().filter(|r| r.relationship == 2) {
             // CACHE_DESCRIPTOR: level u8, associativity u8, line size u16, size u32, type u32 (0 unified, 1 instruction, 2 data, 3 trace)
-            let (level, size, kind) = (r.u[0], u32::from_le_bytes(r.u[4..8].try_into().unwrap()), u32::from_le_bytes(r.u[8..12].try_into().unwrap()));
-            match out.iter_mut().find(|c| c.0 == level && c.1 == kind && c.2 == size) {
+            let (level, size, kind) = (
+                r.u[0],
+                u32::from_le_bytes(r.u[4..8].try_into().unwrap()),
+                u32::from_le_bytes(r.u[8..12].try_into().unwrap()),
+            );
+            match out
+                .iter_mut()
+                .find(|c| c.0 == level && c.1 == kind && c.2 == size)
+            {
                 Some(c) => c.3 += 1,
                 None => out.push((level, kind, size, 1)),
             }
@@ -103,7 +137,11 @@ fn read_caches() -> Vec<(u8, u32, u32, u32)> {
 impl CpuStatic {
     pub fn read() -> CpuStatic {
         let (name, base_mhz) = cpuid_name_and_base();
-        CpuStatic { name, base_mhz, caches: read_caches() }
+        CpuStatic {
+            name,
+            base_mhz,
+            caches: read_caches(),
+        }
     }
 
     fn json(&self) -> Value {
@@ -143,7 +181,9 @@ fn read_array(counter: isize) -> Vec<(String, f64)> {
             return vec![];
         }
         let mut buf = vec![0u8; size as usize];
-        if PdhGetFormattedCounterArrayW(counter, 0x200, &mut size, &mut count, buf.as_mut_ptr()) != 0 {
+        if PdhGetFormattedCounterArrayW(counter, 0x200, &mut size, &mut count, buf.as_mut_ptr())
+            != 0
+        {
             return vec![];
         }
         let mut out = vec![];
@@ -159,7 +199,10 @@ fn read_array(counter: isize) -> Vec<(String, f64)> {
             while *name_ptr.add(n) != 0 && n < 128 {
                 n += 1;
             }
-            out.push((String::from_utf16_lossy(std::slice::from_raw_parts(name_ptr, n)), value));
+            out.push((
+                String::from_utf16_lossy(std::slice::from_raw_parts(name_ptr, n)),
+                value,
+            ));
         }
         out
     }
@@ -176,8 +219,19 @@ impl CpuLive {
                 let mut q = 0isize;
                 let (mut perf, mut therm) = (0isize, 0isize);
                 if PdhOpenQueryW(std::ptr::null(), 0, &mut q) == 0
-                    && PdhAddEnglishCounterW(q, wide(r"\Processor Information(_Total)\% Processor Performance").as_ptr(), 0, &mut perf) == 0 {
-                    let _ = PdhAddEnglishCounterW(q, wide(r"\Thermal Zone Information(*)\Temperature").as_ptr(), 0, &mut therm);
+                    && PdhAddEnglishCounterW(
+                        q,
+                        wide(r"\Processor Information(_Total)\% Processor Performance").as_ptr(),
+                        0,
+                        &mut perf,
+                    ) == 0
+                {
+                    let _ = PdhAddEnglishCounterW(
+                        q,
+                        wide(r"\Thermal Zone Information(*)\Temperature").as_ptr(),
+                        0,
+                        &mut therm,
+                    );
                     PdhCollectQueryData(q);
                     Some((q, perf, therm))
                 } else {
@@ -187,7 +241,10 @@ impl CpuLive {
         };
         #[cfg(not(windows))]
         let pdh = None;
-        CpuLive { info, pdh: Mutex::new(pdh) }
+        CpuLive {
+            info,
+            pdh: Mutex::new(pdh),
+        }
     }
 
     /// The CPU's part of the telemetry: model, base and current clock, caches, thermal zones.

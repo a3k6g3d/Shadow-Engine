@@ -77,7 +77,8 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
       overflow: hidden;
     }
     header {
-      background: var(--surface);
+      background: rgba(18, 20, 28, 0.88);
+      backdrop-filter: blur(12px);
       border-bottom: 1px solid var(--border);
       padding: 0.65rem 1.25rem;
       display: flex;
@@ -85,6 +86,10 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
       justify-content: space-between;
       flex-shrink: 0;
       z-index: 10;
+    }
+    button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-visible, .chat-item:focus-visible {
+      outline: 2px solid var(--accent);
+      outline-offset: 2px;
     }
     .header-left {
       display: flex;
@@ -141,6 +146,7 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
       align-items: center;
       gap: 0.65rem;
       font-size: 0.8rem;
+      font-variant-numeric: tabular-nums;
     }
     .pill {
       background: var(--surface-hover);
@@ -151,6 +157,7 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
       align-items: center;
       gap: 0.35rem;
       color: var(--text-muted);
+      font-variant-numeric: tabular-nums;
     }
     .pill strong {
       color: var(--text);
@@ -164,8 +171,10 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
     .welcome p { margin: 0; opacity: 0.8; }
     .chips { display: flex; flex-wrap: wrap; gap: 8px; }
     .chip { background: rgba(255,255,255,0.04); border: 1px solid rgba(255,255,255,0.1); color: inherit; border-radius: 999px;
-            padding: 6px 12px; font: inherit; font-size: 0.85rem; cursor: pointer; }
-    .chip:hover { border-color: rgba(99, 102, 241, 0.6); background: rgba(99, 102, 241, 0.12); }
+            padding: 6px 12px; font: inherit; font-size: 0.85rem; cursor: pointer; transition: border-color 0.15s ease, background 0.15s ease, transform 0.1s ease; }
+    .chip:hover { border-color: rgba(99, 102, 241, 0.6); background: rgba(99, 102, 241, 0.12); transform: translateY(-1px); }
+    .kbd-hints { display: flex; flex-wrap: wrap; gap: 0.75rem; font-size: 0.74rem; color: var(--text-dim); margin-top: 0.15rem; }
+    .kbd-hints kbd { background: rgba(255,255,255,0.06); border: 1px solid var(--border); border-radius: 4px; padding: 0.08rem 0.38rem; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 0.7rem; color: var(--text-muted); }
     .msg-error { color: var(--danger); }
     .attach-btn { background: var(--surface-hover); border: 1px solid var(--border); color: var(--text-muted); border-radius: 0.6rem;
       padding: 0 0.8rem; cursor: pointer; font-size: 1.05rem; }
@@ -179,7 +188,7 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
     .att-chip button:hover { color: var(--danger); }
     .bubble .att-note { margin-top: 0.4rem; font-size: 0.78rem; color: var(--text-muted); }
     body.dragging #input-pane { outline: 2px dashed var(--accent, #6366f1); outline-offset: -4px; }
-    .msg-meta { margin-top: 0.6rem; font-size: 0.74rem; color: var(--text-muted); opacity: 0.8; }
+    .msg-meta { margin-top: 0.6rem; font-size: 0.74rem; color: var(--text-muted); opacity: 0.8; font-variant-numeric: tabular-nums; }
     .pill.action { cursor: pointer; }
     .pill.action:hover { color: var(--text); border-color: var(--accent, #6366f1); }
     .bubble ul, .bubble ol { margin: 4px 0 4px 1.3em; padding: 0; }
@@ -187,7 +196,7 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
     .md-gap { height: 0.6em; }
     .md-h { font-weight: 600; margin: 6px 0 2px; }
     .md-h1 { font-size: 1.15rem; } .md-h2 { font-size: 1.05rem; }
-    .reading-note { opacity: 0.65; font-size: 0.88rem; margin-right: 6px; }
+    .reading-note { opacity: 0.65; font-size: 0.88rem; margin-right: 6px; font-variant-numeric: tabular-nums; }
     .msg-error small { display: block; opacity: 0.7; margin-top: 4px; }
     #send-btn:disabled { opacity: 0.45; cursor: not-allowed; }
 
@@ -206,15 +215,15 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
     body.view-chat #chat-sidebar { display: flex; }
     body.side-closed #chat-sidebar { display: none; }
     .side-head { display: flex; gap: 0.5rem; padding: 0.75rem; }
-    .side-new { flex: 1; background: var(--accent); color: #fff; border: none; border-radius: 0.6rem; padding: 0.55rem 0.8rem; font-weight: 600; cursor: pointer; }
+    .side-new { flex: 1; background: var(--accent); color: #fff; border: none; border-radius: 0.6rem; padding: 0.55rem 0.8rem; font-weight: 600; cursor: pointer; transition: background 0.15s ease; }
     .side-new:hover { background: var(--accent-hover); }
     .side-search { margin: 0 0.75rem 0.5rem; padding: 0.45rem 0.7rem; background: var(--bg); border: 1px solid var(--border); border-radius: 0.5rem; color: var(--text); font-size: 0.85rem; }
     #chat-list { flex: 1; overflow-y: auto; padding: 0 0.5rem 0.75rem; display: flex; flex-direction: column; gap: 2px; }
     .side-group { font-size: 0.7rem; letter-spacing: 0.06em; text-transform: uppercase; color: var(--text-dim); padding: 0.7rem 0.5rem 0.25rem; }
-    .chat-item { display: flex; align-items: center; gap: 0.4rem; padding: 0.5rem 0.6rem; border-radius: 0.5rem; cursor: pointer; color: var(--text-muted); font-size: 0.85rem; }
+    .chat-item { display: flex; align-items: center; gap: 0.4rem; padding: 0.5rem 0.6rem; border-radius: 0.5rem; cursor: pointer; color: var(--text-muted); font-size: 0.85rem; min-inline-size: 0; outline-offset: -2px; }
     .chat-item:hover { background: var(--surface-hover); color: var(--text); }
     .chat-item.active { background: var(--accent-light); color: var(--text); }
-    .chat-item .t { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .chat-item .t { flex: 1; min-inline-size: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
     .chat-item .x { opacity: 0; background: none; border: none; color: var(--text-dim); cursor: pointer; }
     .chat-item:hover .x { opacity: 1; }
     .chat-item .x:hover { color: var(--danger); }
@@ -227,11 +236,11 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
     #queue-bar:empty { display: none; }
     #notes-box { max-width: 880px; width: 100%; margin: 0 auto 0.5rem; display: none; }
     #notes-box.open { display: block; }
-    #notes-text { width: 100%; box-sizing: border-box; min-height: 5rem; max-height: 14rem; resize: vertical; background: var(--surface-hover); color: var(--text); border: 1px solid var(--border); border-radius: 0.6rem; padding: 0.5rem 0.7rem; font: inherit; font-size: 0.82rem; }
-    #notes-hint { font-size: 0.74rem; color: var(--text-muted); margin: 0.15rem 0.2rem 0; }
-    .q-item { display: flex; align-items: center; gap: 0.6rem; background: var(--surface-hover); border: 1px dashed var(--border); border-radius: 0.6rem; padding: 0.35rem 0.7rem; font-size: 0.82rem; color: var(--text-muted); }
-    .q-item .n { color: var(--accent); font-weight: 700; }
-    .q-item .t { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text); }
+    #notes-text { field-sizing: content; width: 100%; height: auto; box-sizing: border-box; min-block-size: 5rem; max-block-size: 14rem; min-height: 5rem; max-height: 14rem; resize: vertical; background: var(--surface-hover); color: var(--text); border: 1px solid var(--border); border-radius: 0.6rem; padding: 0.5rem 0.7rem; font: inherit; font-size: 0.82rem; }
+    #notes-hint { font-size: 0.74rem; color: var(--text-muted); margin: 0.15rem 0.2rem 0; font-variant-numeric: tabular-nums; }
+    .q-item { display: flex; align-items: center; gap: 0.6rem; background: var(--surface-hover); border: 1px dashed var(--border); border-radius: 0.6rem; padding: 0.35rem 0.7rem; font-size: 0.82rem; color: var(--text-muted); min-inline-size: 0; }
+    .q-item .n { color: var(--accent); font-weight: 700; font-variant-numeric: tabular-nums; }
+    .q-item .t { flex: 1; min-inline-size: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text); }
     .q-item button { background: none; border: none; color: var(--text-muted); cursor: pointer; }
     .q-item button:hover { color: var(--danger); }
     .q-note { font-size: 0.78rem; color: var(--text-dim); }
@@ -245,14 +254,14 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
     .set-wrap textarea:focus, .set-wrap input[type=text]:focus { border-color: var(--accent); outline: none; }
     .set-row { display: flex; gap: 0.5rem; align-items: center; flex-wrap: wrap; }
     .set-row input[type=text] { flex: 1; min-width: 200px; background: var(--bg); border: 1px solid var(--border); border-radius: 0.5rem; padding: 0.5rem 0.7rem; color: var(--text); font: inherit; font-size: 0.88rem; }
-    .set-row select { background: var(--bg); border: 1px solid var(--border); border-radius: 0.5rem; padding: 0.5rem; color: var(--text); font: inherit; font-size: 0.85rem; }
+    .set-row select { field-sizing: content; max-inline-size: 24ch; background: var(--bg); border: 1px solid var(--border); border-radius: 0.5rem; padding: 0.5rem 0.65rem; color: var(--text); font: inherit; font-size: 0.85rem; }
     .set-help { margin: 0; font-size: 0.8rem; color: var(--text-muted); line-height: 1.5; }
     .set-toggle { display: flex; gap: 0.5rem; align-items: center; font-size: 0.88rem; cursor: pointer; }
     #set-mem-list { display: flex; flex-direction: column; gap: 0.3rem; }
-    .mem-item { display: flex; align-items: center; gap: 0.6rem; background: var(--bg); border: 1px solid var(--border-subtle); border-radius: 0.5rem; padding: 0.4rem 0.6rem; font-size: 0.86rem; }
+    .mem-item { display: flex; align-items: center; gap: 0.6rem; background: var(--bg); border: 1px solid var(--border-subtle); border-radius: 0.5rem; padding: 0.4rem 0.6rem; font-size: 0.86rem; min-inline-size: 0; }
     .mem-item .badge { font-size: 0.68rem; text-transform: uppercase; letter-spacing: 0.05em; color: var(--accent); background: var(--accent-light); border-radius: 9999px; padding: 0.1rem 0.5rem; flex: none; }
-    .mem-item .mem-text { flex: 1; cursor: text; color: var(--text); }
-    .mem-item .mem-edit { flex: 1; background: var(--surface); border: 1px solid var(--accent); border-radius: 0.4rem; padding: 0.2rem 0.4rem; color: var(--text); font: inherit; }
+    .mem-item .mem-text { flex: 1; min-inline-size: 0; cursor: text; color: var(--text); }
+    .mem-item .mem-edit { flex: 1; min-inline-size: 0; background: var(--surface); border: 1px solid var(--accent); border-radius: 0.4rem; padding: 0.2rem 0.4rem; color: var(--text); font: inherit; }
     .mem-item button { background: none; border: none; color: var(--text-dim); cursor: pointer; }
     .mem-item button:hover { color: var(--danger); }
     .sug { display: flex; gap: 0.5rem; align-items: flex-start; font-size: 0.86rem; padding: 0.3rem 0; }
@@ -262,10 +271,10 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
     #browser-pane { display: none; flex-direction: column; width: 46%; min-width: 320px; flex: none; border-left: 1px solid var(--border); background: var(--surface); min-height: 0; }
     body.view-chat.browser-open #browser-pane { display: flex; }
     .bp-head { display: flex; align-items: center; gap: 0.5rem; padding: 0.6rem 0.75rem; border-bottom: 1px solid var(--border-subtle); font-size: 0.82rem; }
-    .bp-url { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; background: var(--bg); border: 1px solid var(--border); border-radius: 9999px; padding: 0.25rem 0.8rem; color: var(--text-muted); }
+    .bp-url { flex: 1; min-inline-size: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; background: var(--bg); border: 1px solid var(--border); border-radius: 9999px; padding: 0.25rem 0.8rem; color: var(--text-muted); }
     .bp-body { flex: 1; overflow: auto; padding: 0.6rem; display: flex; align-items: flex-start; justify-content: center; }
     .bp-body img { display: none; max-width: 100%; border-radius: 0.5rem; border: 1px solid var(--border); }
-    .bp-status { padding: 0.4rem 0.75rem; font-size: 0.75rem; color: var(--text-dim); border-top: 1px solid var(--border-subtle); }
+    .bp-status { padding: 0.4rem 0.75rem; font-size: 0.75rem; color: var(--text-dim); border-top: 1px solid var(--border-subtle); font-variant-numeric: tabular-nums; }
 
     /* Dashboard */
     #dash-panel { overflow-y: auto; padding: 1.25rem 1.5rem 2rem; }
@@ -273,26 +282,37 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
     .dash-head h1 { font-size: 1.25rem; margin: 0; }
     .dash-head p { margin: 0.2rem 0 0; color: var(--text-muted); font-size: 0.85rem; }
     .dash-actions { display: flex; gap: 0.5rem; flex-wrap: wrap; }
-    .dash-btn { background: var(--surface-hover); border: 1px solid var(--border); color: var(--text); border-radius: 0.6rem; padding: 0.5rem 0.85rem; cursor: pointer; font-size: 0.85rem; }
+    .dash-btn { background: var(--surface-hover); border: 1px solid var(--border); color: var(--text); border-radius: 0.6rem; padding: 0.5rem 0.85rem; cursor: pointer; font-size: 0.85rem; transition: border-color 0.15s ease, background 0.15s ease; }
     .dash-btn:hover { border-color: var(--accent); }
     .dash-btn.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+    .dash-btn.primary:hover { background: var(--accent-hover); }
     .dash-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 1rem; }
-    .dcard { background: var(--surface); border: 1px solid var(--border); border-radius: 0.9rem; padding: 1rem 1.1rem; display: flex; flex-direction: column; gap: 0.6rem; min-width: 0; }
+    .dcard { background: var(--surface); border: 1px solid var(--border); border-radius: 0.9rem; padding: 1rem 1.1rem; display: flex; flex-direction: column; gap: 0.6rem; min-width: 0; transition: border-color 0.15s ease; }
+    .dcard:hover { border-color: #2d3448; }
     .dcard.wide { grid-column: 1 / -1; }
-    .dcard h3 { margin: 0; font-size: 0.78rem; letter-spacing: 0.06em; text-transform: uppercase; color: var(--text-muted); font-weight: 600; display: flex; justify-content: space-between; align-items: center; }
-    .dcard h3 .tag { text-transform: none; letter-spacing: 0; font-weight: 500; color: var(--text-dim); font-size: 0.75rem; }
-    .big { font-size: 1.9rem; font-weight: 700; line-height: 1.1; }
+    .dcard h3 { margin: 0; font-size: 0.78rem; letter-spacing: 0.06em; text-transform: uppercase; color: var(--text-muted); font-weight: 600; display: flex; justify-content: space-between; align-items: center; gap: 0.5rem; min-inline-size: 0; }
+    .dcard h3 .tag { text-transform: none; letter-spacing: 0; font-weight: 500; color: var(--text-dim); font-size: 0.75rem; min-inline-size: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .big { font-size: 1.9rem; font-weight: 700; line-height: 1.1; font-variant-numeric: tabular-nums; }
     .big small { font-size: 0.85rem; font-weight: 500; color: var(--text-muted); margin-left: 0.3rem; }
-    .kv { display: flex; justify-content: space-between; gap: 1rem; font-size: 0.84rem; color: var(--text-muted); }
-    .kv b { color: var(--text); font-weight: 600; text-align: right; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .kv { display: flex; justify-content: space-between; gap: 0.75rem; font-size: 0.84rem; color: var(--text-muted); min-inline-size: 0; }
+    .kv > span { min-inline-size: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .kv b { color: var(--text); font-weight: 600; text-align: right; min-inline-size: 0; max-inline-size: 65%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-variant-numeric: tabular-nums; }
     .bar { height: 8px; border-radius: 9999px; background: var(--bg); overflow: hidden; display: flex; }
-    .bar > i { display: block; height: 100%; background: var(--accent); }
+    .bar > i { display: block; height: 100%; background: var(--accent); transition: width 0.25s ease; }
     .bar > i.b { background: #10b981; }
     .bar > i.c { background: #f59e0b; }
-    canvas.spark { width: 100%; height: 64px; display: block; }
-    table.recent { width: 100%; border-collapse: collapse; font-size: 0.82rem; }
-    table.recent th { text-align: right; color: var(--text-dim); font-weight: 600; font-size: 0.72rem; text-transform: uppercase; letter-spacing: 0.05em; padding: 0.3rem 0.5rem; }
-    table.recent td { text-align: right; padding: 0.4rem 0.5rem; border-top: 1px solid var(--border-subtle); color: var(--text-muted); }
+canvas.spark { width: 100%; height: 64px; display: block; }
+    /* Dashboard drag & drop: drag a tile by its title bar, drop it on another to swap, snap into the grid; the layout is remembered in this browser */
+    #dash-grid .dcard { cursor: grab; }
+    #dash-grid .dcard h3 { cursor: grab; }
+    #dash-grid .dcard h3 .grip { opacity: 0; margin-right: 0.4rem; color: var(--text-dim); }
+    #dash-grid .dcard:hover h3 .grip { opacity: 1; }
+    #dash-grid .dcard.dragging { opacity: 0.4; border-style: dashed; cursor: grabbing; }
+    #dash-grid .dcard.droptarget { box-shadow: inset 0 0 0 2px var(--accent); }
+    #dash-grid .dcard[draggable] { cursor: grabbing; }
+    table.recent { width: 100%; table-layout: fixed; border-collapse: collapse; font-size: 0.82rem; font-variant-numeric: tabular-nums; }
+    table.recent th { text-align: right; color: var(--text-dim); font-weight: 600; font-size: 0.72rem; text-transform: uppercase; letter-spacing: 0.05em; padding: 0.3rem 0.5rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    table.recent td { text-align: right; padding: 0.4rem 0.5rem; border-top: 1px solid var(--border-subtle); color: var(--text-muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
     table.recent th:first-child, table.recent td:first-child { text-align: left; }
     table.recent td b { color: var(--text); font-weight: 600; }
     .dash-empty { color: var(--text-dim); font-size: 0.85rem; padding: 0.5rem 0; }
@@ -504,6 +524,10 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
       opacity: 0.8;
     }
     .copy-btn:hover { opacity: 1; color: var(--text); }
+    .bubble { position: relative; }
+    .bubble > .copy-btn.bubble-copy { opacity: 0; }
+    .msg-row:hover .bubble > .copy-btn.bubble-copy { opacity: 0.8; }
+    .msg-row .bubble > .copy-btn.bubble-copy:hover { opacity: 1; color: var(--text); }
 
     /* Input Area */
     #input-pane {
@@ -870,16 +894,40 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
     }
     @keyframes blink { 0%, 100% { opacity: 1; } 50% { opacity: 0; } }
     /* Compact chat bar: one rounded bar (attach, text, send / stop inside it) and a slim status line under it */
-    #input-pane { background: transparent; border-top: none; padding: 0.35rem 1.25rem 0.45rem; gap: 0.25rem; }
-    .input-box { align-items: flex-end; gap: 0.3rem; background: var(--surface); border: 1px solid var(--border); border-radius: 1.2rem; padding: 0.28rem 0.35rem; transition: border-color 0.15s; }
-    .input-box:focus-within { border-color: var(--accent); }
-    .input-box textarea { background: transparent; border: none; padding: 0.4rem 0.4rem; min-height: 30px; font-size: 0.92rem; line-height: 1.35; }
-    .input-box textarea:focus { border: none; }
+    #input-pane { background: transparent; border-top: none; padding: 0.35rem 1.25rem 0.45rem; gap: 0.25rem; position: relative; }
+    .input-box { align-items: flex-end; gap: 0.3rem; background: var(--surface); border: 1px solid var(--border); border-radius: 1.2rem; padding: 0.28rem 0.35rem; transition: border-color 0.15s, box-shadow 0.15s; box-shadow: 0 8px 24px -8px rgba(0, 0, 0, 0.45); }
+    .input-box:focus-within { border-color: var(--accent); box-shadow: 0 8px 24px -8px rgba(0, 0, 0, 0.55), 0 0 0 1px rgba(99, 102, 241, 0.25); }
+    .input-box textarea { field-sizing: content; width: 100%; height: auto; min-block-size: 30px; max-block-size: 200px; background: transparent; border: none; padding: 0.4rem 0.4rem; min-height: 30px; max-height: 200px; font-size: 0.92rem; line-height: 1.35; }
+    .input-box textarea:focus { border: none; outline: none; }
     .attach-btn { width: 32px; height: 32px; padding: 0; border-radius: 50%; background: transparent; border: none; font-size: 1rem; align-self: flex-end; }
     .send-btn, .stop-btn { height: 32px; padding: 0 0.95rem; border-radius: 9999px; font-size: 0.8rem; }
     .stop-btn { box-shadow: none; }
     .controls-bar { font-size: 0.72rem; }
     .controls-left { gap: 0.15rem; }
+    #timing-info { font-variant-numeric: tabular-nums; }
+    #scroll-bottom-btn {
+      position: absolute;
+      top: -2.4rem;
+      left: 50%;
+      transform: translateX(-50%);
+      background: rgba(22, 25, 36, 0.92);
+      backdrop-filter: blur(8px);
+      border: 1px solid var(--border);
+      color: var(--text);
+      border-radius: 9999px;
+      padding: 0.28rem 0.85rem;
+      font-size: 0.76rem;
+      font-weight: 600;
+      cursor: pointer;
+      display: none;
+      align-items: center;
+      gap: 0.35rem;
+      box-shadow: 0 6px 18px rgba(0, 0, 0, 0.5);
+      z-index: 20;
+      transition: border-color 0.15s ease, background 0.15s ease;
+    }
+    #scroll-bottom-btn.visible { display: inline-flex; }
+    #scroll-bottom-btn:hover { border-color: var(--accent); background: var(--surface-hover); }
     .menu-pill-btn { background: transparent; border-color: transparent; padding: 0.15rem 0.55rem; font-size: 0.74rem; color: var(--text-muted); gap: 0.35rem; }
     .menu-pill-btn:hover { background: var(--surface-hover); color: var(--text); border-color: transparent; }
     .menu-pill-btn.active-state { border-color: transparent; }
@@ -919,7 +967,7 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
       </div>
     </div>
     <div class="stats-bar">
-      <button class="pill action" id="newchat-btn" onclick="newChat()" title="Start a new conversation (clears this one)">＋ New chat</button>
+      <button class="pill action" id="newchat-btn" onclick="newChat()" title="Start a new conversation (Ctrl+Shift+O)">＋ New chat</button>
       <span class="pill ready" id="status-pill">Ready</span>
       <span class="pill" id="speed-pill">Speed: <strong>-- tok/s</strong></span>
       <span class="pill" id="gpu-header-pill">GPU: <strong>--% • VRAM: -- GiB</strong></span>
@@ -929,10 +977,10 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
   <div class="main-wrap">
     <aside id="chat-sidebar">
       <div class="side-head">
-        <button class="side-new" onclick="newChat()">＋ New chat</button>
+        <button class="side-new" onclick="newChat()" title="Start a new conversation (Ctrl+Shift+O)">＋ New chat</button>
         <button class="side-toggle" title="Hide the conversation list" onclick="toggleSidebar()">«</button>
       </div>
-      <input class="side-search" id="chat-search" placeholder="Search conversations" oninput="renderChatList()">
+      <input class="side-search" id="chat-search" aria-label="Search conversations" placeholder="Search conversations (Ctrl+K)" oninput="renderChatList()">
       <div id="chat-list"></div>
     </aside>
 
@@ -947,12 +995,43 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
           <button class="dash-btn primary" onclick="newChat(); switchView('chat')">＋ New chat</button>
           <button class="dash-btn" id="dash-last" onclick="openLastChat()">Resume last chat</button>
           <button class="dash-btn" onclick="switchView('settings')">Settings</button>
-          <button class="dash-btn" id="dash-tools" onclick="toggleTools(); dashRefresh()">Windows tools</button>
+<button class="dash-btn" id="dash-tools" onclick="toggleTools(); dashRefresh()">Windows tools</button>
+          <button class="dash-btn" id="dash-reset" style="display:none" onclick="dashResetLayout()">Reset layout</button>
         </div>
       </div>
-      <div class="dash-grid">
-        <div class="dcard">
-          <h3>Engine <span class="tag" id="d-state">--</span></h3>
+<div class="dash-grid" id="dash-grid">
+        <div class="dcard" data-tile="tiers">
+          <h3><span class="grip">&#9776;</span>Expert tiers <span class="tag">where the model's experts live</span></h3>
+          <div class="big" id="d-hit" title="share of expert lookups answered from the VRAM cache">--<small>% hit</small></div>
+          <canvas class="spark" id="c-hit"></canvas>
+          <div class="bar"><i id="d-hitbar" style="width:0"></i></div>
+          <div class="kv"><span>VRAM cache hits / misses</span><b id="d-hitmiss">--</b></div>
+          <div class="kv"><span>Expert cache</span><b id="d-slots">--</b></div>
+          <div class="kv"><span>RAM tier (pinned)</span><b id="d-pin">--</b></div>
+          <div class="kv"><span>Misses served from RAM / drive</span><b id="d-served">--</b></div>
+          <div class="bar"><i class="b" id="d-ramserved" style="width:0"></i><i class="c" id="d-fileserved" style="width:0"></i></div>
+          <div class="kv"><span>Misses read from RAM / drive</span><b id="d-servedn">--</b></div>
+          <div class="kv"><span>Reply latency p50 / p95</span><b id="d-p50p95">--</b></div>
+        </div>
+        <div class="dcard" data-tile="speed">
+          <h3><span class="grip">&#9776;</span>Decode speed <span class="tag">last 40 replies</span></h3>
+          <div class="big" id="d-tps" title="the last reply answered">--<small>tok/s</small></div>
+          <canvas class="spark" id="c-tps"></canvas>
+          <div class="kv"><span>Average</span><b id="d-tps-avg">--</b></div>
+          <div class="kv"><span>Prompt reading (last)</span><b id="d-pps">--</b></div>
+        </div>
+        <div class="dcard" data-tile="spec">
+          <h3><span class="grip">&#9776;</span>Speculation <span class="tag">draft &amp; verify</span></h3>
+          <div class="big" id="d-acc" title="share of drafted tokens the model accepted">--<small>% accepted</small></div>
+          <canvas class="spark" id="c-acc"></canvas>
+          <div class="kv"><span>Drafts made / accepted</span><b id="d-specnums">--</b></div>
+          <div class="kv"><span>Verify passes run</span><b id="d-specpasses">--</b></div>
+          <div class="kv"><span>Tokens per pass</span><b id="d-specperpass">--</b></div>
+          <div class="kv"><span>Acceptance by position</span><b id="d-specpos">--</b></div>
+          <canvas class="spark" id="d-specposbars" title="acceptance rate at draft position 1..8"></canvas>
+        </div>
+        <div class="dcard" data-tile="engine">
+          <h3><span class="grip">&#9776;</span>Engine <span class="tag" id="d-state">--</span></h3>
           <div class="big" id="d-model" style="font-size:1.05rem;word-break:break-all">--</div>
           <div class="kv"><span>Uptime</span><b id="d-uptime">--</b></div>
           <div class="kv"><span>Process ID</span><b id="d-pid">--</b></div>
@@ -961,15 +1040,8 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
           <div class="kv"><span>Context in use</span><b id="d-ctx">--</b></div>
           <div class="bar"><i id="d-ctxbar" style="width:0"></i></div>
         </div>
-        <div class="dcard">
-          <h3>Decode speed <span class="tag">last 40 replies</span></h3>
-          <div class="big" id="d-tps">--<small>tok/s</small></div>
-          <canvas class="spark" id="c-tps"></canvas>
-          <div class="kv"><span>Average</span><b id="d-tps-avg">--</b></div>
-          <div class="kv"><span>Prompt reading (last)</span><b id="d-pps">--</b></div>
-        </div>
-        <div class="dcard">
-          <h3>GPU <span class="tag" id="d-gpuname">--</span></h3>
+        <div class="dcard" data-tile="gpu">
+          <h3><span class="grip">&#9776;</span>GPU <span class="tag" id="d-gpuname">--</span></h3>
           <div class="big" id="d-gpu">--<small>% busy</small></div>
           <canvas class="spark" id="c-gpu"></canvas>
           <div class="kv"><span>VRAM</span><b id="d-vram">--</b></div>
@@ -978,19 +1050,8 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
           <div class="kv"><span>Memory controller busy</span><b id="d-memctl">--</b></div>
           <div class="kv"><span>Free VRAM</span><b id="d-vramfree">--</b></div>
         </div>
-        <div class="dcard">
-          <h3>Expert tiers <span class="tag">where the model's experts live</span></h3>
-          <div class="kv"><span>VRAM cache hit rate</span><b id="d-hit">--</b></div>
-          <div class="bar"><i id="d-hitbar" style="width:0"></i></div>
-          <div class="kv"><span>RAM tier (pinned)</span><b id="d-pin">--</b></div>
-          <div class="kv"><span>Misses served from RAM / drive</span><b id="d-served">--</b></div>
-          <div class="bar"><i class="b" id="d-ramserved" style="width:0"></i><i class="c" id="d-fileserved" style="width:0"></i></div>
-          <div class="kv"><span>Expert cache</span><b id="d-slots">--</b></div>
-          <div class="kv"><span>VRAM cache hits / misses</span><b id="d-hitmiss">--</b></div>
-          <div class="kv"><span>Misses read from RAM / drive</span><b id="d-servedn">--</b></div>
-        </div>
-        <div class="dcard">
-          <h3>CPU <span class="tag" id="d-cputag">--</span></h3>
+        <div class="dcard" data-tile="cpu">
+          <h3><span class="grip">&#9776;</span>CPU <span class="tag" id="d-cputag">--</span></h3>
           <div class="big" id="d-cpusys">--<small>% busy (whole PC)</small></div>
           <canvas class="spark" id="c-cpu"></canvas>
           <div class="kv"><span><i style="color:#a78bfa">&#9632;</i> Shadow</span><b id="d-cpuproc">--</b></div>
@@ -1000,24 +1061,24 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
           <div class="kv"><span>Cache</span><b id="d-cpucache">--</b></div>
           <div class="kv"><span>Temperature</span><b id="d-cputemp">--</b></div>
         </div>
-        <div class="dcard">
-          <h3>System memory <span class="tag" id="d-ramtag">--</span></h3>
+        <div class="dcard" data-tile="ram">
+          <h3><span class="grip">&#9776;</span>System memory <span class="tag" id="d-ramtag">--</span></h3>
           <div class="big" id="d-ramfree">--<small>GiB free</small></div>
           <canvas class="spark" id="c-ram"></canvas>
           <div class="kv"><span>Shadow's working set</span><b id="d-ws">--</b></div>
           <div class="kv"><span>RAM in use (whole PC)</span><b id="d-ramused">--</b></div>
         </div>
-        <div class="dcard">
-          <h3>Conversations <span class="tag" id="d-chatcount">--</span></h3>
+        <div class="dcard" data-tile="chats">
+          <h3><span class="grip">&#9776;</span>Conversations <span class="tag" id="d-chatcount">--</span></h3>
           <div id="d-chats" class="dash-empty">No saved conversations yet.</div>
         </div>
-        <div class="dcard">
-          <h3>Tools <span class="tag" id="d-toolcount">--</span></h3>
+        <div class="dcard" data-tile="tools">
+          <h3><span class="grip">&#9776;</span>Tools <span class="tag" id="d-toolcount">--</span></h3>
           <div class="kv"><span>Built in</span><b>read, write, edit, glob, grep, cmd, web search, web fetch</b></div>
           <div id="d-mcp" class="dash-empty">No MCP servers.</div>
         </div>
-        <div class="dcard wide">
-          <h3>Recent requests <span class="tag">newest first</span></h3>
+        <div class="dcard wide" data-tile="recent">
+          <h3><span class="grip">&#9776;</span>Recent requests <span class="tag">newest first</span></h3>
           <div id="d-recent" class="dash-empty">Nothing answered yet.</div>
         </div>
       </div>
@@ -1029,7 +1090,7 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
         <h1>Settings</h1>
         <div class="dcard">
           <h3>Default persona <span class="tag">how Shadow behaves in every new chat</span></h3>
-          <textarea id="set-persona" spellcheck="false"></textarea>
+          <textarea id="set-persona" aria-label="Default persona" spellcheck="false"></textarea>
           <div class="set-row">
             <button class="dash-btn primary" onclick="savePersonaSetting()">Save</button>
             <button class="dash-btn" onclick="resetPersonaSetting()">Reset to the built-in default</button>
@@ -1043,8 +1104,8 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
           <p class="set-help">Short notes about you that Shadow reads at the start of every chat. It adds notes itself when you tell it something lasting about you or your work (or say "remember ..."); edit one by clicking it, delete with the cross. Kept on this PC only, in %APPDATA%\Shadow\memory.json.</p>
           <div id="set-mem-list"></div>
           <div class="set-row">
-            <input type="text" id="set-mem-new" placeholder="Add a note, e.g. I prefer short answers with the code first" onkeydown="if (event.key === 'Enter') addMemory()">
-            <select id="set-mem-kind"><option value="user">about me</option><option value="preference">preference</option><option value="project">project</option><option value="reference">reference</option></select>
+            <input type="text" id="set-mem-new" aria-label="Add a memory note" placeholder="Add a note, e.g. I prefer short answers with the code first" onkeydown="if (event.key === 'Enter' && !event.isComposing && event.keyCode !== 229) { event.preventDefault(); addMemory(); }">
+            <select id="set-mem-kind" aria-label="Memory category"><option value="user">about me</option><option value="preference">preference</option><option value="project">project</option><option value="reference">reference</option></select>
             <button class="dash-btn" onclick="addMemory()">Add</button>
           </div>
           <div class="set-row">
@@ -1069,13 +1130,21 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
               <button class="chip" onclick="useSuggestion(this)">List the files in J:\Shadow\docs</button>
               <button class="chip" onclick="useSuggestion(this)">Write a Rust function that parses comma-separated integers</button>
             </div>
+            <div class="kbd-hints">
+              <span><kbd>Enter</kbd> Send</span>
+              <span><kbd>Shift+Enter</kbd> New line</span>
+              <span><kbd>Ctrl+K</kbd> Search chats</span>
+              <span><kbd>Ctrl+Shift+O</kbd> New chat</span>
+              <span><kbd>Esc</kbd> Stop</span>
+            </div>
           </div>
         </div>
       </div>
 
       <div id="input-pane">
+        <button id="scroll-bottom-btn" onclick="scrollToBottom(true)" title="Scroll to bottom">↓ Jump to latest</button>
         <div id="notes-box">
-          <textarea id="notes-text" placeholder="Pinned notes for this chat: the plan, decisions, key facts. Shadow sees them at the end of every request and can change them with its notes tool."></textarea>
+          <textarea id="notes-text" aria-label="Pinned notes for this chat" placeholder="Pinned notes for this chat: the plan, decisions, key facts. Shadow sees them at the end of every request and can change them with its notes tool."></textarea>
           <div id="notes-hint"></div>
         </div>
         <div id="queue-bar"></div>
@@ -1083,7 +1152,7 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
         <div class="input-box">
           <input type="file" id="file-input" multiple hidden>
           <button class="attach-btn" id="attach-btn" title="Attach text or code files (or drop / paste them)" onclick="document.getElementById('file-input').click()">📎</button>
-          <textarea id="prompt-input" rows="1" placeholder="Message Shadow (Enter to send, Shift+Enter for a new line)"></textarea>
+          <textarea id="prompt-input" aria-label="Message Shadow" rows="1" placeholder="Message Shadow (Enter to send, Shift+Enter for a new line)"></textarea>
           <button id="send-btn" class="send-btn">Send</button>
           <button id="stop-btn" class="stop-btn" onclick="stopGeneration(event)">
             <span>⏹</span> Stop
@@ -1203,8 +1272,15 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
     let currentEffort = localStorage.getItem('shadow_effort') || 'medium';
     if (currentEffort === 'high') currentEffort = 'medium'; // the High level was removed from the menu
     let toolsEnabled = localStorage.getItem('shadow_tools_enabled') !== 'false';
-    const DEFAULT_PERSONA = "You are Shadow, a capable AI assistant running locally on the user's Windows PC: nothing you are told leaves this machine. Be direct and accurate, keep answers as short as the question allows, and say so when you are unsure. You can use tools: read_file, glob, grep, edit_file, write_file, cmd (PowerShell), web_search and web_fetch (use these for anything current or that you are not sure of, and cite the page), and any mcp__ tools you are given. When asked to look at, test or change files, use the tools instead of describing what you would do. If the user asks you to take a role for a task (for example 'act as a software engineer and design this'), do that for the task. Your context window is small. Earlier tool outputs are shortened to a preview that says how to read them again (recall with id=N or message=N, optionally a line range or a text to search for), old turns become one-line summaries that name their messages (recall with message=N), and recall with only a text searches everything earlier (search finds files and earlier outputs by meaning, when you do not know the exact words). Keep pinned notes with the notes tool (the plan, the decisions, the facts you will need with file and line numbers): they are shown to you at the end of every request and never shortened. To change code: read just the lines you need with read_file (about 100), then replace them by line number with replace_lines (give expect, a piece of the old text, so a stale number cannot overwrite the wrong lines), or use edit_file with the exact old text. After reading something you will need later, put the facts in your notes, and do not read the same part twice; after about eight reads in a row, stop reading, save your notes and make the edit. Work in small steps and finish with an answer.";
+    const DEFAULT_PERSONA = "You are Shadow, a capable AI assistant running locally on the user's Windows PC: nothing you are told leaves this machine. Be direct and accurate, keep answers as short as the question allows, and say so when you are unsure. You can use tools: read_file, glob, grep, edit_file, write_file, cmd (PowerShell), web_search and web_fetch (use these for anything current or that you are not sure of, and cite the page), and any mcp__ tools you are given. When asked to look at, test or change files, use the tools instead of describing what you would do. If the user asks you to take a role for a task (for example 'act as a software engineer and design this'), do that for the task. Your context window is small. Earlier tool outputs are shortened to a preview that says how to read them again (recall with id=N or message=N, optionally a line range or a text to search for), old turns become one-line summaries that name their messages (recall with message=N), and recall with only a text searches everything earlier (search finds files and earlier outputs by keyword, ranked by BM25 and path match). Keep pinned notes with the notes tool (the plan, the decisions, the facts you will need with file and line numbers): they are shown to you at the end of every request and never shortened. To change code: read just the lines you need with read_file (about 100), then replace them by line number with replace_lines (give expect, a piece of the old text, so a stale number cannot overwrite the wrong lines), or use edit_file with the exact old text. After reading something you will need later, put the facts in your notes, and do not read the same part twice; after about eight reads in a row, stop reading, save your notes and make the edit. Work in small steps and finish with an answer.";
     let currentPersona = localStorage.getItem('shadow_persona') || DEFAULT_PERSONA;
+    if (currentPersona.includes('(search finds files and earlier outputs by meaning, when you do not know the exact words)')) {
+      currentPersona = currentPersona.replace(
+        '(search finds files and earlier outputs by meaning, when you do not know the exact words)',
+        '(search finds files and earlier outputs by keyword, ranked by BM25 and path match)'
+      );
+      localStorage.setItem('shadow_persona', currentPersona);
+    }
 
     // Elements
     const chatPanel = document.getElementById('chat-panel');
@@ -1224,6 +1300,7 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
     const statusPill = document.getElementById('status-pill');
     const gpuHeaderPill = document.getElementById('gpu-header-pill');
     const timingInfo = document.getElementById('timing-info');
+    const scrollBottomBtn = document.getElementById('scroll-bottom-btn');
 
     let history = [];
     let isGenerating = false;
@@ -1231,16 +1308,26 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
     let currentAbortController = null;
     let autoScroll = true;
 
+    function updateScrollBtn() {
+      if (!scrollBottomBtn) return;
+      const dist = messagesEl.scrollHeight - messagesEl.scrollTop - messagesEl.clientHeight;
+      scrollBottomBtn.classList.toggle('visible', !autoScroll && dist > 100 && history.length > 0);
+    }
     messagesEl.addEventListener('scroll', () => {
       const dist = messagesEl.scrollHeight - messagesEl.scrollTop - messagesEl.clientHeight;
       autoScroll = dist < 48;
+      updateScrollBtn();
     }, { passive: true });
     messagesEl.addEventListener('wheel', (e) => {
-      if (e.deltaY < 0) autoScroll = false;
+      if (e.deltaY < 0) {
+        autoScroll = false;
+        updateScrollBtn();
+      }
     }, { passive: true });
     function scrollToBottom(force) {
       if (force) autoScroll = true;
       if (autoScroll) messagesEl.scrollTop = messagesEl.scrollHeight;
+      updateScrollBtn();
     }
 
     function stopGeneration(e) {
@@ -1276,11 +1363,80 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
       }
     }
 
-    // Global Escape key to instantly halt active generation
+    // Copy button on chat bubbles: appears on row hover, copies everything visible in the bubble
+    let copyProbe = null;
+    function visibleBubbleText(bubble) {
+      if (!copyProbe) {
+        copyProbe = document.createElement('div');
+        copyProbe.style.cssText = 'position:fixed;left:-99999px;top:0;width:1px;';
+        document.body.appendChild(copyProbe);
+      }
+      const clone = bubble.cloneNode(true);
+      clone.querySelectorAll('.copy-btn').forEach(b => b.remove());
+      clone.style.width = bubble.offsetWidth + 'px';
+      copyProbe.appendChild(clone);
+      const text = clone.innerText || clone.textContent || '';
+      copyProbe.innerHTML = '';
+      return text;
+    }
+    function fallbackCopyText(text) {
+      const ta = document.createElement('textarea');
+      ta.value = text;
+      ta.style.cssText = 'position:fixed;left:-99999px;';
+      document.body.appendChild(ta);
+      ta.select();
+      try { document.execCommand('copy'); } catch (_) {}
+      ta.remove();
+    }
+    function copyBubble(btn) {
+      const text = visibleBubbleText(btn.parentElement);
+      const done = () => { btn.textContent = 'Copied'; setTimeout(() => { btn.textContent = 'Copy'; }, 1200); };
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(text).then(done, () => { fallbackCopyText(text); done(); });
+      } else { fallbackCopyText(text); done(); }
+    }
+    messagesEl.addEventListener('mouseover', (e) => {
+      const row = e.target.closest ? e.target.closest('.msg-row') : null;
+      if (!row) return;
+      const bubble = row.querySelector(':scope > .bubble');
+      if (!bubble) return;
+      if (!bubble.querySelector(':scope > .copy-btn')) {
+        const btn = document.createElement('button');
+        btn.className = 'copy-btn bubble-copy';
+        btn.textContent = 'Copy';
+        btn.onclick = () => copyBubble(btn);
+        bubble.appendChild(btn);
+      }
+    });
+
+    // Global keyboard shortcuts: Escape closes modals/dropdowns or stops generation; Ctrl+K searches chats; Ctrl+Shift+O starts a new chat
     window.addEventListener('keydown', (e) => {
-      if (e.key === 'Escape' && isGenerating) {
+      if (e.key === 'Escape') {
+        if (personaModal && personaModal.classList.contains('open')) {
+          e.preventDefault();
+          closePersonaModal();
+          return;
+        }
+        if (thinkingDropdown && thinkingDropdown.classList.contains('open')) {
+          e.preventDefault();
+          thinkingDropdown.classList.remove('open');
+          thinkingBtn.classList.remove('open');
+          return;
+        }
+        if (isGenerating) {
+          e.preventDefault();
+          stopGeneration(e);
+        }
+      } else if ((e.ctrlKey || e.metaKey) && (e.key === 'k' || e.key === 'K' || e.key === '/')) {
         e.preventDefault();
-        stopGeneration(e);
+        if (currentView !== 'chat') switchView('chat');
+        if (document.body.classList.contains('side-closed')) toggleSidebar();
+        const searchEl = document.getElementById('chat-search');
+        if (searchEl) { searchEl.focus(); searchEl.select(); }
+      } else if ((e.ctrlKey || e.metaKey) && e.shiftKey && (e.key === 'o' || e.key === 'O')) {
+        e.preventDefault();
+        if (currentView !== 'chat') switchView('chat');
+        newChat();
       }
     });
 
@@ -1439,16 +1595,20 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
       closePersonaModal();
     }
 
-    // Textarea auto-resize
+    // Textarea auto-resize (progressive enhancement: CSS field-sizing: content handles modern browsers; JS fallback for older engines)
+    const supportsFieldSizing = typeof CSS !== 'undefined' && CSS.supports && CSS.supports('field-sizing', 'content');
     inputEl.addEventListener('input', () => {
-      inputEl.style.height = 'auto';
-      inputEl.style.height = Math.min(inputEl.scrollHeight, 200) + 'px';
+      if (!supportsFieldSizing) {
+        inputEl.style.height = 'auto';
+        inputEl.style.height = Math.min(inputEl.scrollHeight, 200) + 'px';
+      }
       document.documentElement.style.setProperty('--bar-h', document.querySelector('.input-box').offsetHeight + 'px');
     });
 
     inputEl.addEventListener('keydown', (e) => {
       if (e.key === 'Enter' && !e.shiftKey) {
         e.preventDefault();
+        if (e.isComposing || e.keyCode === 229) return;
         sendMessage();
       }
     });
@@ -1461,12 +1621,21 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
       }[m]));
     }
 
+    function copyCodeBlock(btn) {
+      const codeEl = btn.nextElementSibling;
+      const text = codeEl ? (codeEl.innerText || codeEl.textContent || '') : '';
+      const done = () => { btn.textContent = 'Copied ✓'; setTimeout(() => { btn.textContent = 'Copy'; }, 1200); };
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(text).then(done, () => { fallbackCopyText(text); done(); });
+      } else { fallbackCopyText(text); done(); }
+    }
+
     // A small Markdown subset, escape-first: everything the model wrote is HTML-escaped before any tag is added, so model
     // output can never inject markup.  Fenced code, inline code, bold, italics, headings, bullet and numbered lists.
     function renderMarkdown(raw) {
       const blocks = [];
       let text = raw.replace(/```(\w*)\n?([\s\S]*?)(```|$)/g, (_, lang, code) => {
-        blocks.push(`<pre><button class="copy-btn" onclick="navigator.clipboard.writeText(this.nextElementSibling.innerText)">Copy</button><code>${escapeHtml(code.replace(/\n$/, ''))}</code></pre>`);
+        blocks.push(`<pre><button class="copy-btn" onclick="copyCodeBlock(this)">Copy</button><code>${escapeHtml(code.replace(/\n$/, ''))}</code></pre>`);
         return `\u0000${blocks.length - 1}\u0000`;
       });
       const inline = (t) => escapeHtml(t)
@@ -2071,6 +2240,7 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
                       if (thinkStopBtn) thinkStopBtn.style.display = 'none';
                       const chevron = thinkBlock.querySelector('.think-chevron');
                       if (chevron) chevron.style.display = 'inline-block';
+                      if (thinkContent.style.display !== 'none') toggleThinkBlock(thinkBlock.querySelector('.think-header-left'));
                     }
                     rawContent += delta.content;
                     const cleanStream = stripToolCalls(rawContent);
@@ -2114,6 +2284,7 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
             if (thinkStopBtn) thinkStopBtn.style.display = 'none';
             const chevron = thinkBlock.querySelector('.think-chevron');
             if (chevron) chevron.style.display = 'inline-block';
+            if (thinkContent.style.display !== 'none') toggleThinkBlock(thinkBlock.querySelector('.think-header-left'));
           }
 
           // Check if assistant called tools
@@ -2275,7 +2446,8 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
         const res = await fetch('/v1/telemetry');
         if (!res.ok) return;
         const d = await res.json();
-        dashPush(d);
+        // a drawing bug on the Dashboard must not read as "Server offline" (it did: a <div> given to spark() threw here and the catch below said the server was gone)
+        try { dashPush(d); } catch (err) { console.error('dashboard render failed:', err); }
         offlineCount = 0;
         // the engine is gone while a reply is awaited: say so instead of throbbing for ever
         if (isGenerating && d.process && d.process.state === 'failed') markStalled("Shadow's engine stopped (it failed). Restart Shadow, then send the message again.");
@@ -2498,7 +2670,7 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
     function dashRefresh() { if (lastTel) dashRender(lastTel); }
     function spark(id, vals, max, color, bars, overlay) {
       const cv = document.getElementById(id);
-      if (!cv || !cv.clientWidth) return;
+      if (!cv || !cv.getContext || !cv.clientWidth) return;
       const w = cv.clientWidth, h = cv.clientHeight, dpr = window.devicePixelRatio || 1;
       if (cv.width !== Math.round(w * dpr)) { cv.width = Math.round(w * dpr); cv.height = Math.round(h * dpr); }
       const g = cv.getContext('2d');
@@ -2538,7 +2710,21 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
       const wid = (id, pct) => { const e = document.getElementById(id); if (e) e.style.width = Math.max(0, Math.min(100, pct)) + '%'; };
       const gib = b => (b / 2 ** 30).toFixed(1), p = d.process || {}, gpu = d.gpu || {}, ram = d.ram || {}, cpu = d.cpu || {}, rec = d.recent || [];
       set('d-state', p.state === 'loading' ? 'loading the model' : p.busy ? 'generating' : 'ready');
-      set('d-model', p.model || '--');
+set('d-model', p.model || '--');
+      // Speculation card: the acceptance rate is the number that says whether speculation helps or just burns compute
+      const spec = d.spec || {}, acc = spec.acceptance_rate || 0;
+      set('d-acc', acc.toFixed(1) + ' %');
+      const dacc = document.getElementById('d-acc');
+      if (dacc) dacc.style.color = acc < 30 ? '#ef4444' : acc < 60 ? '#f59e0b' : '';
+      const ac = (window.__specAccHist || (window.__specAccHist = []));
+      if (!ac.length || ac[ac.length - 1] !== acc) { ac.push(acc); if (ac.length > 40) ac.shift(); }
+      spark('c-acc', ac, 100, acc >= 60 ? '#22c55e' : acc >= 30 ? '#f59e0b' : '#ef4444');
+      html('d-specnums', 'drafted ' + (spec.drafted || 0).toLocaleString() + ' · accepted ' + (spec.accepted || 0).toLocaleString() + ' · lookup-only passes ' + (spec.lookup_passes || 0).toLocaleString());
+      set('d-specpasses', (spec.passes || 0).toLocaleString());
+      set('d-specperpass', (spec.mean_accepted_per_pass || 0).toFixed(2));
+      const spos = spec.positions || [];
+      html('d-specpos', spos.length ? spos.map((q, i) => '<div class="kv"><span>position ' + (i + 1) + '</span><b>' + (q.tried ? (q.right / q.tried * 100).toFixed(1) : '0.0') + ' % <small>(' + q.right + '/' + q.tried + ')</small></b></div>').join('') : '<div class="dash-empty">No speculation data yet.</div>');
+      spark('d-specposbars', spos.map(q => q.tried ? q.right / q.tried * 100 : 0), 100, '#8b5cf6', true);
       const up = p.uptime_s || 0;
       set('d-uptime', up >= 3600 ? Math.floor(up / 3600) + ' h ' + Math.floor(up % 3600 / 60) + ' min' : Math.floor(up / 60) + ' min ' + Math.floor(up % 60) + ' s');
       set('d-spec', p.dflash_active ? 'On (DFlash + lookup)' : p.mtp_active ? 'On (MTP head)' : 'Prompt lookup only');
@@ -2561,7 +2747,10 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
       html('d-gpu', (gpu.utilization_percent != null ? Math.round(gpu.utilization_percent) : '--') + '<small>% busy</small>');
       spark('c-gpu', dashHist.gpu, 100, '#10b981');
       set('d-vram', gib(gpu.vram_used_bytes || 0) + ' / ' + gib(gpu.vram_total_bytes || 0) + ' GiB');
-      wid('d-vrambar', gpu.vram_total_bytes ? 100 * gpu.vram_used_bytes / gpu.vram_total_bytes : 0);
+      const vramPct = gpu.vram_total_bytes ? 100 * gpu.vram_used_bytes / gpu.vram_total_bytes : 0;
+      wid('d-vrambar', vramPct);
+      const gpuBig = document.getElementById('d-gpu');
+      if (gpuBig) gpuBig.style.color = vramPct > 85 ? 'var(--danger)' : vramPct > 75 ? 'var(--warning)' : '';
       set('d-temp', gpu.temperature_c ? gpu.temperature_c + ' °C' : '--');
       set('d-memctl', (gpu.memory_controller_percent || 0).toFixed(0) + '%');
       set('d-vramfree', gib(gpu.vram_free_bytes || 0) + ' GiB');
@@ -2569,7 +2758,9 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
       set('d-servedn', (ram.ram_served_hits || 0).toLocaleString() + ' / ' + (ram.file_served_misses || 0).toLocaleString());
       set('d-ramused', gib(ram.system_used_bytes || 0) + ' GiB (' + (ram.system_load_percent || 0) + '%)');
       set('d-pid', p.pid || '--');
-      set('d-hit', (gpu.expert_cache_hit_rate || 0).toFixed(1) + '%');
+set('d-hit', (gpu.expert_cache_hit_rate || 0).toFixed(1) + '%');
+      const hitBig = document.getElementById('d-hit');
+      if (hitBig) hitBig.style.color = (gpu.expert_cache_hit_rate || 0) < 60 ? 'var(--danger)' : (gpu.expert_cache_hit_rate || 0) < 80 ? 'var(--warning)' : '';
       wid('d-hitbar', gpu.expert_cache_hit_rate || 0);
       set('d-pin', gib(ram.pinned_tier_bytes || 0) + ' GiB (' + (ram.pinned_tier_experts || 0).toLocaleString() + ' experts)');
       const rs = ram.ram_served_hits || 0, fs = ram.file_served_misses || 0, tot = rs + fs;
@@ -2577,7 +2768,9 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
       wid('d-ramserved', tot ? 100 * rs / tot : 0);
       wid('d-fileserved', tot ? 100 * fs / tot : 0);
       set('d-slots', (gpu.expert_cache_slots || 0).toLocaleString() + ' slots in VRAM');
-      html('d-ramfree', gib(ram.system_available_bytes || 0) + '<small>GiB free</small>');
+html('d-ramfree', gib(ram.system_available_bytes || 0) + '<small>GiB free</small>');
+      const ramBig = document.getElementById('d-ramfree');
+      if (ramBig) ramBig.style.color = (ram.system_load_percent || 0) > 85 ? 'var(--danger)' : (ram.system_load_percent || 0) > 75 ? 'var(--warning)' : '';
       set('d-ramtag', gib(ram.system_total_bytes || 0) + ' GiB total');
       spark('c-ram', dashHist.ram, 0, '#f59e0b');
       set('d-ws', gib(ram.process_working_set_bytes || 0) + ' GiB');
@@ -2615,6 +2808,11 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
               `<td>${nr > 0 && r.prompt_ms > 0 ? Math.round(nr / (r.prompt_ms / 1000)) + ' tok/s' : '-'}</td><td><b>${r.completion_tokens}</b> tokens</td>` +
               `<td>${r.predicted_ms > 0 ? (r.completion_tokens / (r.predicted_ms / 1000)).toFixed(1) + ' tok/s' : '-'}</td><td>${r.finish}</td></tr>`;
           }).join('') + '</table>';
+}
+      {
+        const sp = rec.filter(r => r.predicted_ms > 0 && r.completion_tokens > 0).map(r => 1000 * r.completion_tokens / r.predicted_ms).sort((a, b) => a - b);
+        const pct = f => sp.length ? sp[Math.min(sp.length - 1, Math.floor(f * sp.length))] : 0;
+        set('d-p50p95', sp.length ? pct(0.5).toFixed(1) + ' / ' + pct(0.95).toFixed(1) + ' tok/s, ' + sp.length + ' repl' + (sp.length === 1 ? 'y' : 'ies') : '--');
       }
       dashChats();
     }
@@ -2676,7 +2874,14 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
         if (save && inp.value.trim() && inp.value.trim() !== old) await memCall('PUT', '/v1/memory/' + id, { text: inp.value });
         else renderMemory();
       };
-      inp.onkeydown = e => { if (e.key === 'Enter') finish(true); if (e.key === 'Escape') finish(false); };
+      inp.onkeydown = e => {
+        if (e.key === 'Enter') {
+          e.preventDefault();
+          if (e.isComposing || e.keyCode === 229) return;
+          finish(true);
+        }
+        if (e.key === 'Escape') finish(false);
+      };
       inp.onblur = () => finish(true);
     }
     function deleteMemory(id) { memCall('DELETE', '/v1/memory/' + id); }
@@ -2975,8 +3180,64 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
     // (the old #monitor link: the Process Monitor became part of the Dashboard)
     if (['#dash', '#settings', '#monitor'].includes(window.location.hash)) switchView(window.location.hash === '#settings' ? 'settings' : 'dash');
 
-    pollTelemetry();
+pollTelemetry();
     setInterval(pollTelemetry, 1000);
+
+    // ---- dashboard tiles drag & drop: drag by the title bar, drop on another tile to swap, snap into the grid; the order is remembered in this browser
+    const dashGrid = document.getElementById('dash-grid');
+    const DASH_ORDER_KEY = 'shadow_dash_order';
+    let dashDragEl = null;
+    function dashSaveOrder() {
+      const order = [...dashGrid.querySelectorAll(':scope > .dcard')].map(c => c.dataset.tile);
+      localStorage.setItem(DASH_ORDER_KEY, JSON.stringify(order));
+    }
+    function dashApplyOrder(order) {
+      for (const name of order) {
+        const card = dashGrid.querySelector(`:scope > .dcard[data-tile="${name}"]`);
+        if (card) dashGrid.appendChild(card);
+      }
+    }
+    function dashResetLayout() {
+      localStorage.removeItem(DASH_ORDER_KEY);
+      location.reload();
+    }
+    function dashEnableDrag() {
+      if (!dashGrid) return;
+for (const card of dashGrid.querySelectorAll(':scope > .dcard')) {
+        card.setAttribute('draggable', 'true');
+card.addEventListener('dragstart', e => {
+          dashDragEl = card;
+          card.classList.add('dragging');
+          e.dataTransfer.setData('text/plain', card.dataset.tile);
+          e.dataTransfer.effectAllowed = 'move';
+        });
+        card.addEventListener('dragend', () => {
+          card.classList.remove('dragging');
+          dashGrid.querySelectorAll('.droptarget').forEach(c => c.classList.remove('droptarget'));
+          dashDragEl = null;
+        });
+        card.addEventListener('dragenter', () => { if (dashDragEl && dashDragEl !== card) card.classList.add('droptarget'); });
+        card.addEventListener('dragover', e => { if (dashDragEl) e.preventDefault(); });
+        card.addEventListener('dragleave', e => { if (e.relatedTarget && !card.contains(e.relatedTarget)) card.classList.remove('droptarget'); });
+        card.addEventListener('drop', e => {
+          e.preventDefault();
+          card.classList.remove('droptarget');
+          if (!dashDragEl || dashDragEl === card) return;
+          const cards = [...dashGrid.querySelectorAll(':scope > .dcard')];
+          const di = cards.indexOf(dashDragEl), ti = cards.indexOf(card);
+          dashGrid.insertBefore(dashDragEl, di < ti ? card.nextSibling : card);
+          dashSaveOrder();
+          dashRefresh();
+        });
+      }
+      const saved = localStorage.getItem(DASH_ORDER_KEY);
+      if (saved) {
+        try { dashApplyOrder(JSON.parse(saved)); } catch (e) {}
+        const btn = document.getElementById('dash-reset');
+        if (btn) btn.style.display = '';
+      }
+    }
+    dashEnableDrag();
   </script>
 </body>
 </html>
