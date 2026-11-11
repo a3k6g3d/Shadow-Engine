@@ -1,0 +1,109 @@
+[strata] sampling defaults from the config: temperature=0.0, top_p=1.0, top_k=1
+loading the model (the first start takes a minute or two) ...
+[strata] effort_position end: a request's non-default reasoning effort goes right before the answer, so changing it keeps the cached conversation
+[strata] starting the engine: reading the model's weights ...
+[strata] loading the most-used experts into RAM (up to 36 GiB; the rest are read from the model files as needed) and locking part of them for the GPU.
+         YOUR PC CAN BE SLOW OR STOP RESPONDING FOR 1-3 MINUTES NOW - this is normal.
+         Please wait and don't close this window; the browser opens when it is ready.
+[strata] filling the GPU's expert cache (2610 experts, 5.01 GiB of VRAM) ...
+[strata] almost ready ...
+[strata] still starting (29 s) - please wait ...
+[strata] slot save/restore on: C:\Users\a3k6g\AppData\Local\Temp\claude\c2eb5aa3e3d3334d\95988fd8-569b-47c7-99ea-9f100d75d035\scratchpad\strata_cfg\slots (session files are kept until deleted: about 1.2 GB per 63K-token conversation; restore only files this server wrote)
+[strata] thinking budget: 16000 tokens (reasoning_budget_tokens; a request can set its own)
+ready: http://127.0.0.1:8091/v1  (OpenAI: /v1/chat/completions, Anthropic: /v1/messages, context 8192 tokens)
+       open http://127.0.0.1:8091/ in a browser to chat; close this window to stop the model
+[strata] reading the prompt: 59 of 66 tokens, 1 s so far
+[strata] thinking capped at 50 of max_tokens 100 to leave room for the answer (budget 16000)
+[strata] answering: 45 of max 96 tokens, 46.2 tok/s, 2 s
+[strata] done: 96 tokens in 3 s (48.6 tok/s) (length, cancel=False), expert cache 45.2% hit (+14.4% of the routed experts over PCIe)
+[strata] reading the prompt: 104 of 105 tokens, 1 s so far
+[strata] thinking: 50 of budget 50 (max 100) tokens, 62.6 tok/s, 2 s
+[strata] thinking budget reached (50 tokens): wrapping up the thinking
+[strata] thinking: 68 of max 100 tokens, 36.2 tok/s, 3 s
+[strata] done: 100 tokens in 4 s (41.3 tok/s) (length, cancel=False), expert cache 54.9% hit (+12.1% of the routed experts over PCIe)
+[strata] thinking capped at 50 of max_tokens 100 to leave room for the answer (budget 16000)
+[strata] reading the prompt: 221 of 228 tokens, 2 s so far
+[strata] done: 17 tokens in 2 s (42.7 tok/s) (stop, cancel=False), expert cache 56.8% hit (+12.1% of the routed experts over PCIe)
+[strata] thinking: 2 of budget 50 (max 100) tokens, 60.1 tok/s, 1 s
+[strata] thinking budget reached (50 tokens): wrapping up the thinking
+[strata] thinking: 68 of max 100 tokens, 38.8 tok/s, 3 s
+[strata] done: 100 tokens in 3 s (40.8 tok/s) (length, cancel=False), expert cache 63.7% hit (+11.0% of the routed experts over PCIe)
+[strata] thinking capped at 50 of max_tokens 100 to leave room for the answer (budget 16000)
+[strata] reading the prompt: 261 of 268 tokens, 1 s so far
+[strata] answering: 38 of max 96 tokens, 49.1 tok/s, 2 s
+[strata] answering: 94 of max 96 tokens, 52.2 tok/s, 3 s
+[strata] done: 96 tokens in 3 s (53.3 tok/s) (length, cancel=False), expert cache 57.7% hit (+11.8% of the routed experts over PCIe)
+[strata] thinking: 12 of budget 50 (max 100) tokens, 71.5 tok/s, 1 s
+[strata] answering: 61 of max 100 tokens, 52.1 tok/s, 2 s
+[strata] done: 100 tokens in 3 s (52.2 tok/s) (length, cancel=False), expert cache 54.8% hit (+12.7% of the routed experts over PCIe)
+[strata] thinking capped at 50 of max_tokens 100 to leave room for the answer (budget 16000)
+[strata] reading the prompt: 389 of 396 tokens, 2 s so far
+[strata] answering: 35 of max 96 tokens, 55.7 tok/s, 3 s
+[strata] answering: 87 of max 96 tokens, 51.9 tok/s, 4 s
+[strata] done: 96 tokens in 4 s (52.4 tok/s) (length, cancel=False), expert cache 46.6% hit (+14.1% of the routed experts over PCIe)
+[strata] thinking: 1 of budget 50 (max 100) tokens, 1000000.0 tok/s, 1 s
+[strata] thinking budget reached (50 tokens): wrapping up the thinking
+[strata] thinking: 68 of max 100 tokens, 37.2 tok/s, 3 s
+[strata] done: 100 tokens in 4 s (39.4 tok/s) (length, cancel=False), expert cache 53.1% hit (+13.5% of the routed experts over PCIe)
+[strata] thinking capped at 50 of max_tokens 100 to leave room for the answer (budget 16000)
+[strata] reading the prompt: 513 of 520 tokens, 2 s so far
+[strata] answering: 24 of max 96 tokens, 40.1 tok/s, 3 s
+[strata] answering: 77 of max 96 tokens, 47.6 tok/s, 4 s
+[strata] done: 96 tokens in 4 s (49.4 tok/s) (length, cancel=False), expert cache 53.3% hit (+13.6% of the routed experts over PCIe)
+[strata] thinking: 2 of budget 50 (max 100) tokens, 53.3 tok/s, 1 s
+[strata] thinking budget reached (50 tokens): wrapping up the thinking
+[strata] thinking: 68 of max 100 tokens, 35.7 tok/s, 3 s
+[strata] done: 100 tokens in 4 s (35.5 tok/s) (length, cancel=False), expert cache 58.5% hit (+11.7% of the routed experts over PCIe)
+[strata] warm-up: 5 of 5 requests in 33 s
+[strata] reading the prompt: 649 of 656 tokens, 2 s so far
+[strata] answering: 31 of max 96 tokens, 51.2 tok/s, 3 s
+[strata] answering: 81 of max 96 tokens, 50.3 tok/s, 4 s
+[strata] done: 96 tokens in 4 s (49.8 tok/s) (length, cancel=False), expert cache 58.4% hit (+11.8% of the routed experts over PCIe)
+[strata] reading the prompt: 786 of 787 tokens, 1 s so far
+[strata] answering: 45 of max 96 tokens, 45.3 tok/s, 2 s
+[strata] done: 96 tokens in 3 s (49.0 tok/s) (length, cancel=False), expert cache 51.7% hit (+13.9% of the routed experts over PCIe)
+[strata] reading the prompt: 913 of 914 tokens, 1 s so far
+[strata] done: 15 tokens in 2 s (46.8 tok/s) (stop, cancel=False), expert cache 50.8% hit (+14.3% of the routed experts over PCIe)
+[strata] answering: 30 of max 96 tokens, 56.8 tok/s, 1 s
+[strata] answering: 83 of max 96 tokens, 50.8 tok/s, 2 s
+[strata] done: 96 tokens in 2 s (52.3 tok/s) (length, cancel=False), expert cache 54.6% hit (+12.4% of the routed experts over PCIe)
+[strata] reading the prompt: 1,078 of 1,085 tokens, 1 s so far
+[strata] answering: 36 of max 96 tokens, 51.8 tok/s, 2 s
+[strata] done: 63 tokens in 3 s (52.6 tok/s) (stop, cancel=False), expert cache 61.4% hit (+11.1% of the routed experts over PCIe)
+[strata] answering: 26 of max 96 tokens, 45.6 tok/s, 1 s
+[strata] done: 36 tokens in 1 s (45.9 tok/s) (stop, cancel=False), expert cache 42.7% hit (+16.5% of the routed experts over PCIe)
+[strata] answering: 34 of max 96 tokens, 52.3 tok/s, 1 s
+[strata] done: 55 tokens in 2 s (47.9 tok/s) (stop, cancel=False), expert cache 51.2% hit (+14.1% of the routed experts over PCIe)
+[strata] answering: 15 of max 96 tokens, 50.7 tok/s, 1 s
+[strata] done: 65 tokens in 2 s (57.4 tok/s) (stop, cancel=False), expert cache 63.3% hit (+10.3% of the routed experts over PCIe)
+[strata] answering: 23 of max 96 tokens, 40.0 tok/s, 1 s
+[strata] done: 28 tokens in 1 s (42.7 tok/s) (stop, cancel=False), expert cache 48.8% hit (+14.7% of the routed experts over PCIe)
+[strata] answering: 32 of max 96 tokens, 49.7 tok/s, 1 s
+[strata] done: 85 tokens in 2 s (53.4 tok/s) (stop, cancel=False), expert cache 56.2% hit (+12.7% of the routed experts over PCIe)
+[strata] done: 18 tokens in 1 s (63.4 tok/s) (stop, cancel=False), expert cache 53.9% hit (+11.8% of the routed experts over PCIe)
+[strata] done: 4 tokens in 0 s (84.6 tok/s) (stop, cancel=False), expert cache 62.0% hit (+10.9% of the routed experts over PCIe)
+[strata] done: 19 tokens in 1 s (60.5 tok/s) (stop, cancel=False), expert cache 60.7% hit (+11.0% of the routed experts over PCIe)
+[strata] done: 20 tokens in 1 s (51.9 tok/s) (stop, cancel=False), expert cache 52.0% hit (+10.5% of the routed experts over PCIe)
+[strata] answering: 23 of max 96 tokens, 52.9 tok/s, 1 s
+[strata] done: 37 tokens in 1 s (49.2 tok/s) (stop, cancel=False), expert cache 53.3% hit (+12.3% of the routed experts over PCIe)
+[strata] done: 13 tokens in 1 s (45.5 tok/s) (stop, cancel=False), expert cache 53.1% hit (+12.7% of the routed experts over PCIe)
+[strata] done: 20 tokens in 1 s (63.0 tok/s) (stop, cancel=False), expert cache 60.8% hit (+10.9% of the routed experts over PCIe)
+[strata] done: 9 tokens in 1 s (52.4 tok/s) (stop, cancel=False), expert cache 68.1% hit (+8.9% of the routed experts over PCIe)
+[strata] done: 11 tokens in 1 s (47.4 tok/s) (stop, cancel=False), expert cache 54.7% hit (+12.7% of the routed experts over PCIe)
+[strata] done: 18 tokens in 1 s (53.5 tok/s) (stop, cancel=False), expert cache 60.4% hit (+10.5% of the routed experts over PCIe)
+[strata] answering: 27 of max 96 tokens, 45.6 tok/s, 1 s
+[strata] done: 33 tokens in 1 s (45.8 tok/s) (stop, cancel=False), expert cache 48.8% hit (+14.3% of the routed experts over PCIe)
+[strata] done: 8 tokens in 1 s (39.8 tok/s) (stop, cancel=False), expert cache 59.9% hit (+10.2% of the routed experts over PCIe)
+[strata] done: 12 tokens in 0 s (68.4 tok/s) (stop, cancel=False), expert cache 69.3% hit (+8.5% of the routed experts over PCIe)
+[strata] done: 28 tokens in 1 s (46.0 tok/s) (stop, cancel=False), expert cache 48.8% hit (+14.9% of the routed experts over PCIe)
+[strata] done: 28 tokens in 1 s (49.7 tok/s) (stop, cancel=False), expert cache 48.1% hit (+13.8% of the routed experts over PCIe)
+[strata] done: 9 tokens in 1 s (54.7 tok/s) (stop, cancel=False), expert cache 65.2% hit (+9.5% of the routed experts over PCIe)
+[strata] answering: 29 of max 96 tokens, 43.9 tok/s, 1 s
+[strata] done: 31 tokens in 1 s (44.8 tok/s) (stop, cancel=False), expert cache 40.2% hit (+15.2% of the routed experts over PCIe)
+[strata] done: 12 tokens in 1 s (56.2 tok/s) (stop, cancel=False), expert cache 55.3% hit (+12.7% of the routed experts over PCIe)
+[strata] done: 10 tokens in 1 s (39.3 tok/s) (stop, cancel=False), expert cache 61.8% hit (+9.9% of the routed experts over PCIe)
+[strata] reading the prompt: 2,614 of 2,615 tokens, 1 s so far
+[strata] answering: 48 of max 96 tokens, 48.4 tok/s, 2 s
+[strata] done: 96 tokens in 3 s (52.5 tok/s) (length, cancel=False), expert cache 52.8% hit (+13.1% of the routed experts over PCIe)
+[strata] reading the prompt: 2,733 of 2,734 tokens, 1 s so far
+[strata] done: 12 tokens in 2 s (44.3 tok/s) (stop, cancel=False), expert cache 34.0% hit (+14.8% of the routed experts over PCIe)

@@ -1,0 +1,13 @@
+Traceback (most recent call last):
+  File "<frozen runpy>", line 198, in _run_module_as_main
+  File "<frozen runpy>", line 88, in _run_code
+  File "J:\Strata-work\Strata-0140\serve\server.py", line 7334, in <module>
+    sys.exit(main())
+             ^^^^^^
+  File "J:\Strata-work\Strata-0140\serve\server.py", line 7067, in main
+    tok = ST.Tokenizer(tokens, merges, types)
+          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "J:\Strata-work\Strata-0140\tools\strata_tokenizer.py", line 89, in __init__
+    self._re = regex.compile(QWEN35_PATTERN)
+               ^^^^^^^^^^^^^
+AttributeError: module 'regex' has no attribute 'compile'

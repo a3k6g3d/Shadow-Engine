@@ -1,0 +1,22 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 720 330" font-family="Segoe UI, Arial, sans-serif">
+  <rect width="720" height="330" fill="#ffffff"/>
+  <text x="24" y="32" font-size="18" font-weight="600" fill="#111">Decode speed, 36 varied prompts, 3 interleaved runs each (tok/s, higher is better)</text>
+  <text x="24" y="52" font-size="12" fill="#555">RTX 5070 12 GiB, i7-11700K, 64 GiB RAM, same model file. Strata = local build-0145 on its tuned config.</text>
+  <g font-size="13" fill="#111">
+    <text x="24" y="104">Shadow, default (ctx 24,576)</text>
+    <rect x="250" y="84" width="390" height="28" rx="3" fill="#1f6feb"/>
+    <text x="646" y="104" font-weight="600">55.7</text>
+
+    <text x="24" y="164">Strata (ctx 8,192)</text>
+    <rect x="250" y="144" width="347" height="28" rx="3" fill="#8b949e"/>
+    <text x="603" y="164" font-weight="600">49.5</text>
+
+    <text x="24" y="224">Shadow, --ctx 8192</text>
+    <rect x="250" y="204" width="325" height="28" rx="3" fill="#79b8ff"/>
+    <text x="581" y="224" font-weight="600">46.4</text>
+  </g>
+  <line x1="250" y1="72" x2="250" y2="248" stroke="#999"/>
+  <text x="24" y="276" font-size="12" fill="#333">Shadow default is +12.5% against Strata; held to the same 8,192-token context Shadow is -6.2%.</text>
+  <text x="24" y="296" font-size="12" fill="#333">Different engines write different text, so the score is total tokens / total generating time. Prompt speed not measured.</text>
+  <text x="24" y="316" font-size="12" fill="#333">Data: bench/vs-strata-final-2026-11-11. Method and caveats: docs/COMPARISON_STRATA_2026-11-11.md</text>
+</svg>
