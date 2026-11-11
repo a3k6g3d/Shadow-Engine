@@ -99,6 +99,14 @@ Rejected, and why:
 
 ## 4. Phases, gates, what comes out
 
+**Priorities (the user's call, 2026-11-11): single-stream speed first; several sessions and agentic work second.** So the
+order is phases 0a-3 as written (they are the single-stream gain), then **phase 4 (prompt pipeline) before 4b and 5**: an
+agentic loop is mostly long prompts (tool output, growing history) and short replies, with the prefix cache and
+snapshots (STATUS 99) carrying the history, so prompt-reading speed and restore behaviour decide its latency as much as
+decode does. Then 4b (concurrent requests: today `engine.rs` runs one request at a time and the rest queue, so parallel
+sub-agents wait in line) and 5 (both cards on one stream), chosen by the G1 hop latency and the phase 3 numbers. Until 4b
+exists, a harness that sends parallel requests works, one after another.
+
 Effort is honest, not hopeful: this is a 10k-line CUDA/Rust engine and a new execution mode. **Nothing in phases 1-5 will
 run on both cards by Thursday.** Thursday is the probes (phase 0b); the first two-card token is the end of phase 2.
 
