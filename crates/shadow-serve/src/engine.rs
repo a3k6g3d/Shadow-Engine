@@ -1087,10 +1087,9 @@ fn answer<'c>(
     if let Some(snap) = prefix.snap.as_ref() {
         let n = snap.tokens().len();
         if cached < n && n < ids.len() && ids[..n] == *snap.tokens() {
-            match sess.restore(snap) {
+            match sess.restore_conv(snap) {
                 Ok(()) => {
-                    cached = n;
-                    sess.dflash_break();
+                    cached = n; // the drafter keeps its K/V where it can (`GpuSession::restore`, STATUS 98)
                 }
                 Err(e) => {
                     eprintln!("shadow serve: prefix restore failed ({e}); reading the prompt");
@@ -1126,10 +1125,9 @@ fn answer<'c>(
                 .unwrap()
                 .load(&path)
                 .and_then(|b| shadow_cuda::session::Snapshot::from_bytes(&b));
-            match snap.and_then(|s| sess.restore(&s)) {
+            match snap.and_then(|s| sess.restore_conv(&s)) {
                 Ok(()) => {
-                    cached = n;
-                    sess.dflash_break();
+                    cached = n; // the drafter keeps its K/V where it can (`GpuSession::restore`, STATUS 98)
                     eprintln!("shadow serve: restored a conversation snapshot of {cached} tokens from disk in {:.2} s", t1.elapsed().as_secs_f64());
                 }
                 Err(e) => {
@@ -1140,10 +1138,9 @@ fn answer<'c>(
             }
         } else if let Some(i) = best {
             let t1 = Instant::now();
-            match sess.restore(&prefix.convs[i]) {
+            match sess.restore_conv(&prefix.convs[i]) {
                 Ok(()) => {
                     cached = prefix.convs[i].tokens().len();
-                    sess.dflash_break();
                     eprintln!("shadow serve: restored a conversation snapshot of {cached} tokens in {:.2} s", t1.elapsed().as_secs_f64());
                     // it is the freshest again
                     let s = prefix.convs.remove(i);

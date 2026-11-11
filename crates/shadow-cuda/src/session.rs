@@ -482,6 +482,9 @@ pub struct GpuSession<'c, 'm> {
     attn: Vec<Option<Attn<'c>>>,
     ple_state: DeviceBuffer<'c>,
     tokens: Vec<u32>,
+    /// The tokens the session held when it was last `reset` (not emptied by a second reset): the drafter's K/V ring still describes them, so a
+    /// snapshot restore right after the reset can keep the positions the two share (`restore`, STATUS 98)
+    reset_tokens: Vec<u32>,
     /// Pictures: (first token index, rows, the rows as n x hidden floats); the embedding of a token inside one is its row (`set_pictures`).
     pictures: Vec<(usize, usize, usize, std::sync::Arc<Vec<f32>>)>,
     /// The rotary position table (token index -> t, h, w; forward.cu `g_rope_tab`), made with the first picture; `rope_on`: the kernels read it.
@@ -1790,7 +1793,7 @@ impl<'c, 'm> GpuSession<'c, 'm> {
         let mut s = GpuSession {
             ctx, m, mvp, fw, w, v, b, bb, replay, dscr, mmq, mmq_y, mmq_y_tag: std::cell::Cell::new((0, 0, 0, 0, 0)), fused,
             rparts: Vec::new(), bb_sig: 0, logits_last: false, sub_last: true, sub_first: true,
-            devplan: tiers.tensor_prompt && !std::env::var("SHADOW_PREFILL_DEVPLAN").is_ok_and(|v| v == "0"), dp_tidx, dp_cnt, dp_gstart, dp_copied, dp_eaddr, dp_lay, kv_regions, kv_extra: None, kv_extra_reg, vmm_pool: Vec::new(), prompt_hint: 0, kv_rows: 0, kv_halves: false, router_bias: std::env::var("SHADOW_ROUTER_BIAS").ok().and_then(|v| v.parse().ok()).unwrap_or(0.0), batch_scratch, delta, attn, ple_state, tokens: vec![], pictures: vec![], rope_tab: None, rope_on: false, cap, trace: None, stop_after: None,
+            devplan: tiers.tensor_prompt && !std::env::var("SHADOW_PREFILL_DEVPLAN").is_ok_and(|v| v == "0"), dp_tidx, dp_cnt, dp_gstart, dp_copied, dp_eaddr, dp_lay, kv_regions, kv_extra: None, kv_extra_reg, vmm_pool: Vec::new(), prompt_hint: 0, kv_rows: 0, kv_halves: false, router_bias: std::env::var("SHADOW_ROUTER_BIAS").ok().and_then(|v| v.parse().ok()).unwrap_or(0.0), batch_scratch, delta, attn, ple_state, tokens: vec![], reset_tokens: vec![], pictures: vec![], rope_tab: None, rope_on: false, cap, trace: None, stop_after: None,
             resident_bytes, expert_uploads: 0, cache, ram, copy_stream, copy_stream2, copy_ev2, copy_event, staging,
             pending: vec![], routing: RoutingCounts::new(c.n_layer, c.n_expert),
             prof: std::env::var("SHADOW_PROFILE").is_ok_and(|v| v == "1")
@@ -2004,6 +2007,11 @@ impl<'c, 'm> GpuSession<'c, 'm> {
             a.nblocks = 0;
         }
         self.ple_state.zero().unwrap();
+        if !self.tokens.is_empty() && self.pictures.is_empty() {
+            self.reset_tokens = std::mem::take(&mut self.tokens);
+        } else if !self.tokens.is_empty() {
+            self.reset_tokens.clear(); // the old session had pictures: its drafter features are not the plain tokens'
+        }
         self.tokens.clear();
         self.pictures.clear();
         if let Some(mt) = self.mtp.as_mut() {
@@ -2137,6 +2145,20 @@ impl<'c, 'm> GpuSession<'c, 'm> {
             }
         }
         self.tokens = snap.tokens.clone();
+        Ok(())
+    }
+
+    /// `restore` for the server going back to a conversation snapshot (a new conversation from the shared-prefix snapshot, one read lately, one from
+    /// disk), not for a speculation's `rollback`: the drafter keeps its K/V where it can (`dflash_restored`, STATUS 98).  The drafter's ring still
+    /// holds the old session's positions; those below the snapshot are the snapshot's when the old session starts with its tokens (and had no
+    /// pictures, whose rows change the features).
+    pub fn restore_conv(&mut self, snap: &Snapshot<'c>) -> Result<(), String> {
+        let n_s = snap.tokens.len();
+        // right after a `reset` the session holds no tokens but the ring still describes the ones it had
+        let old: &[u32] = if self.tokens.is_empty() { &self.reset_tokens } else { &self.tokens };
+        let same = self.pictures.is_empty() && old.len() >= n_s && old[..n_s] == snap.tokens[..];
+        self.restore(snap)?;
+        self.dflash_restored(same, n_s);
         Ok(())
     }
 

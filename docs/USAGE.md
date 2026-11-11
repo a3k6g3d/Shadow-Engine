@@ -107,6 +107,7 @@ Defaults are right for normal use; these are for measurement and diagnosis.
 | `SHADOW_REPORT=1` | print the session report after each answer (tier hits, verify pass times, launches) |
 | `SHADOW_LTIME=1`, `SHADOW_KTIME=1`, `SHADOW_PROFILE=1` | time a batched pass by segment / each kernel / the single-token step (these synchronize: they slow the run) |
 | `SHADOW_DF_TIME=1` | time the phases of the DFlash draft round |
+| `SHADOW_DF_KEEP=0` | the old behaviour: any conversation-snapshot restore switches the DFlash drafter off for the rest of the session (decode -17% to -38%, STATUS 98-99). Default on: the drafter keeps the K/V it still has after a restore |
 | `SHADOW_DF_DUMP=DIR` | write the drafter's features and tokens (`feats.bin`) for training and the reference check; `SHADOW_DF_DUMP_DRAFTS=1` also each draft |
 | `SHADOW_RECORD_ROUTING=FILE` | `serve` rewrites a routing profile of everything it has read after each answer |
 | `SHADOW_NO_PREFIX=1` | no shared-prefix snapshots (every new conversation reads its whole prompt) |

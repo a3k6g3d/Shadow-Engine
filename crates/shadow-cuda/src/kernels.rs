@@ -286,7 +286,7 @@ pub const FILES: &[File] = &[
             e("df_rope", &[W, U, U, F]),
             e("df_ring_put", &[C, W, U, U, U]),
             e("df_silu_mul", &[W, C, U]),
-            e("df_attention", &[C, C, C, W, U, U, U, U, F]),
+            e("df_attention", &[C, C, C, W, U, U, U, U, F, U]),
             e("df_top16", &[C, U, U, C, W, W]),
             e("df_walk", &[C, C, C, C, C, U, U, U, W]),
             e("gated_rmsnorm_heads", &[W, C, C, U, F]),

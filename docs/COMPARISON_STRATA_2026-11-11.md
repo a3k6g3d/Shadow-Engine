@@ -13,6 +13,7 @@ RAM samples once a second); the method is [BENCHMARKING.md](BENCHMARKING.md).
 | **Shadow 0.1.36, default** (`shadow serve MODEL`, context 24,576; no conversation restore happened) | **55.72** (55.6, 55.7, 55.9) | **+12.5%** |
 | Strata (local build, context 8,192, its tuned config) | 49.52 (50.0, 49.1, 49.6) | |
 | Shadow 0.1.36, `--ctx 8192` (**a snapshot restore at turn 20 switched Shadow's drafter off for the rest of the run: a bug, below**) | 46.43 (46.3, 46.4, 46.6) | **-6.2%** |
+| *the same `--ctx 8192` run after the fix (STATUS 99; 0.1.36 plus the fix, 2 runs, measured separately from the three rows above)* | *55.66 (55.6, 55.7)* | *+12.4%* |
 
 Read it as: **when nothing goes wrong Shadow decodes 12.5% faster than Strata; in this bench the `--ctx 8192` runs hit a
 Shadow bug and fell to 6% behind.** The bug (found while checking this comparison, STATUS 98): when a chat turn makes the
@@ -21,9 +22,12 @@ rest of the session decodes without it (speculation falls back to prompt lookup 
 the restore happened at turn 20 (and again at turn 34) in both `--ctx 8192` and `--ctx 10240` runs, whose replies are the
 same text, and in one of two `--ctx 12288` runs (at turn 10); no run without a restore was slow, and every run with one
 was (20 of 20 runs). **It is the restore, not the context length**: the 8,192 setting only decided which replies came
-out. A real chat that goes back to an older turn can hit it at any context. The fix is not made yet; until it is, the
-number a user sees depends on whether their conversation triggers a restore. The headline is the unaffected run; the
-affected one is shown so the bug cannot be missed.
+out. A real chat that goes back to an older turn can hit it at any context. **Fixed the same day (STATUS 99, off switch
+`SHADOW_DF_KEEP=0`)**: the drafter keeps the K/V it still has after a restore. The same `--ctx 8192` bench, two interleaved
+runs against the unfixed build: 46.6 before, **55.7 after** (the replies and the drafting statistics are identical up to the
+restore at turn 20; after it, 35.4 against 56.5 tok/s). The fixed row is not from the same session as the Strata runs
+(Strata was not re-run), so the +12.4% beside it compares two sessions of the same machine; the first three rows are the
+interleaved comparison, kept as measured.
 
 Per turn (warm turns, all three runs):
 

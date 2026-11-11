@@ -6,6 +6,13 @@ use crate::dflash::*;
 use crate::kernels::Arg;
 use shadow_model::quant::dequantize;
 
+/// `SHADOW_DF_KEEP=0`: the old behaviour, any snapshot restore switches the drafter off until a conversation is read from position 0
+/// (STATUS 98: decode -17% for the rest of the session).  On by default.
+fn df_keep() -> bool {
+    static KEEP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *KEEP.get_or_init(|| !std::env::var("SHADOW_DF_KEEP").is_ok_and(|v| v == "0"))
+}
+
 impl<'c, 'm> GpuSession<'c, 'm> {
     /// y_j = W x_j (a BF16 matrix of `rows` x `cols` at `w`) for j < m, x_j at x + j * xs floats, y_j at y + j * ys.
     fn df_mv_ptr(&self, w: u64, q8: bool, rows: usize, cols: usize, x: u64, xs: usize, y: u64, ys: usize, m: usize) {
@@ -102,9 +109,19 @@ impl<'c, 'm> GpuSession<'c, 'm> {
             f.write_all(&bytes).unwrap();
         }
         let df = self.dflash.as_mut().unwrap();
+        let (valid_old, lo_old) = (df.valid, df.lo);
         df.valid = valid;
         if p0 == 0 {
             df.broken = false;
+        }
+        if df_keep() {
+            // positions p0 .. valid now hold their own K/V.  Read from the start, or far past the end of what was usable, or below its start:
+            // nothing earlier connects to them, the usable range starts here; read on from the end of the usable range: it grows.  A hole of a
+            // few positions is read on from too: the last token a reply sampled is never stepped, so a chat's next prompt starts one position
+            // past `valid` (the first version of this reset the range at every turn: accept 0.595 against 0.625, STATUS 98)
+            if p0 == 0 || p0 > valid_old + 2 * BLOCK || p0 < lo_old {
+                df.lo = p0;
+            }
         }
     }
 
@@ -114,6 +131,27 @@ impl<'c, 'm> GpuSession<'c, 'm> {
         if let Some(df) = self.dflash.as_mut() {
             df.broken = true;
         }
+    }
+
+    /// `restore` has put the session back to a snapshot of `n_s` positions (called with the old session still in `self.tokens`; `same` =
+    /// its first `n_s` tokens are the snapshot's, no pictures involved).  The drafter keeps what is still its own: when the old session
+    /// starts with the snapshot's tokens, its K/V ring holds those positions' features - except the slots the old session overwrote
+    /// (every position it observed past the ring, and the `BLOCK` rows of its last draft), which `lo` leaves out of the window; when it was
+    /// another conversation, nothing below the restore point is usable and the window starts there.  Before STATUS 98 any restore switched
+    /// the drafter off for the rest of the session (`SHADOW_DF_KEEP=0` brings that back).
+    pub(super) fn dflash_restored(&mut self, same: bool, n_s: usize) {
+        let Some(df) = self.dflash.as_mut() else { return };
+        if !df_keep() {
+            df.broken = true;
+            return;
+        }
+        if same && !df.broken && df.valid >= n_s {
+            let stale = (df.valid + BLOCK).saturating_sub(RING);
+            df.lo = df.lo.max(stale).min(n_s);
+        } else {
+            df.lo = n_s;
+        }
+        df.valid = n_s;
     }
 
     fn df_embed(&self, tok: u32) -> Vec<f32> {
@@ -192,7 +230,7 @@ impl<'c, 'm> GpuSession<'c, 'm> {
             unsafe {
                 self.fw.launch("df_attention", (N_HEAD as u32, nb, 1), (128, 1, 1), ((WINDOW + BLOCK) * 4) as u32, self.ls(), &[
                     f(b.q.ptr), f(df.kring[i].ptr), f(df.vring[i].ptr), f(b.ao.ptr), Arg::U32(n as u32), Arg::U32(nb),
-                    Arg::U32(WINDOW as u32), Arg::U32(RING as u32), Arg::F32((HEAD_DIM as f32).powf(-0.5))])
+                    Arg::U32(WINDOW as u32), Arg::U32(RING as u32), Arg::F32((HEAD_DIM as f32).powf(-0.5)), Arg::U32(df.lo.min(n) as u32)])
             }
             .unwrap_or_else(|err| panic!("df_attention: {err}"));
             lap("layer: attention");

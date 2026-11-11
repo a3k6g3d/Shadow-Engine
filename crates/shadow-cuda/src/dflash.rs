@@ -84,8 +84,12 @@ pub struct DflashModel<'c> {
     pub vring: Vec<DeviceBuffer<'c>>,
     /// positions 0 .. valid have K/V from the main model's features
     pub valid: usize,
-    /// the session was restored from a snapshot the drafter has no features for: no drafts until a conversation starts
-    /// from position 0 again
+    /// the lowest position whose ring slot holds its own K/V: positions `lo .. valid` are usable (0 in a conversation read from the
+    /// start; after a restore, the part of the old session's ring that the old session had not overwritten, or the restore point
+    /// itself when the old session was another conversation: STATUS 98)
+    pub lo: usize,
+    /// the old behaviour, `SHADOW_DF_KEEP=0`: the session was restored from a snapshot the drafter has no features for: no
+    /// drafts until a conversation starts from position 0 again
     pub broken: bool,
     /// the token ids the candidates are picked from (`draft_vocab.bin` beside the weights: the main model's likeliest
     /// ~43% of the vocabulary), on the device; None: the whole vocabulary
@@ -321,7 +325,7 @@ impl<'c> DflashModel<'c> {
         let ring = |_| ctx.alloc(RING * KV_WIDTH * 4).map_err(e);
         let kring = (0..LAYERS).map(ring).collect::<Result<Vec<_>, _>>()?;
         let vring = (0..LAYERS).map(ring).collect::<Result<Vec<_>, _>>()?;
-        Ok(Self { weights, tensors, bufs, kring, vring, valid: 0, broken: false, draft_ids, min_p: 0.0, prof: std::env::var("SHADOW_DF_TIME").is_ok_and(|v| v == "1").then(Default::default), mask_emb: None, stats: (0, 0, 0) })
+        Ok(Self { weights, tensors, bufs, kring, vring, valid: 0, lo: 0, broken: false, draft_ids, min_p: 0.0, prof: std::env::var("SHADOW_DF_TIME").is_ok_and(|v| v == "1").then(Default::default), mask_emb: None, stats: (0, 0, 0) })
     }
 
     pub fn ptr(&self, name: &str) -> u64 {

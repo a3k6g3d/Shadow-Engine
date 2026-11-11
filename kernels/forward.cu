@@ -2743,16 +2743,19 @@ extern "C" __global__ void df_silu_mul(float* g, const float* u, unsigned int n)
 }
 
 // Attention of the block's `rows` queries (32 heads of 128, 8 KV heads of 128) over the keys of positions
-// [max(0, qpos + 1 - window), n + rows) kept in the rings (position p in slot p % ring): the block sees all of itself.
+// [max(0, qpos + 1 - window, floor_pos), n + rows) kept in the rings (position p in slot p % ring): the block sees all of itself.
+// `floor_pos` (<= n): the lowest position whose ring slot holds its own K/V (0 normally; higher after the session went back to a
+// snapshot and the old session had already overwritten the slots of the oldest positions: STATUS 98)
 // grid = (32, rows), block 128, dynamic shared = (window + rows) floats
 extern "C" __global__ void df_attention(const float* q, const float* kc, const float* vc, float* out, unsigned int n,
-                                        unsigned int rows, unsigned int window, unsigned int ring, float scale) {
+                                        unsigned int rows, unsigned int window, unsigned int ring, float scale, unsigned int floor_pos) {
     extern __shared__ float sc[];
     __shared__ float qv[128];
     __shared__ float red[128];
     unsigned int h = blockIdx.x, t = blockIdx.y, kvh = h / 4, d = threadIdx.x;
     unsigned int qpos = n + t, hi = n + rows - 1;
     unsigned int lo = qpos + 1 > window ? qpos + 1 - window : 0;
+    if (lo < floor_pos) lo = floor_pos;
     qv[d] = q[(u64) t * 4096 + h * 128 + d];
     __syncthreads();
     unsigned int len = hi - lo + 1;
