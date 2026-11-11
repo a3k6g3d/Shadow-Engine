@@ -35,6 +35,8 @@ as CUBIN (`SHADOW_KERNEL_CACHE` moves the cache). Every kernel entry point's par
 shadow serve MODEL.gguf
 ```
 
+**Server only, from the Start menu (no window, no chat page):** the Start menu entry **Shadow (server only)** runs `shadow-ui.exe --headless` - the same server as the **Shadow** entry (same `%APPDATA%\Shadow\desktop.json`, so the same model and port 8081) but no window. A tray icon stays: hover shows the state (starting / loading / ready), the menu has *Open Chat in Browser*, *Restart Server*, *Open Console Log*, *Open Settings* and *Quit* (Quit stops the server it started; a server that was already running is left alone). Point another harness (Hermes, pi, ...) at `http://127.0.0.1:8081/v1`. It is one instance with the normal launcher: start only one of the two. `tools/make_headless_shortcut.ps1` (re)creates the entry (run it again after the exe moves).
+
 With no tier flags this is the **fastest measured mode**, an OpenAI-compatible server on `http://127.0.0.1:8081`:
 
 | default | flag it stands for | what it is |

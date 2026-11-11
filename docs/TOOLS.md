@@ -18,6 +18,7 @@ CUDA index, `safetensors`, `numpy`, `matplotlib`).
 | tool | what |
 |---|---|
 | `tools/run_capped.ps1` | runs a program under a hard working-set cap and a free-RAM watchdog (kills below 4 GiB). **Every model load goes through it** (`shadow-bench` does this itself). |
+| `tools/make_headless_shortcut.ps1` | creates the Start menu entry "Shadow (server only)" = `shadow-ui.exe --headless` (server + tray icon, no window) for running another harness against the API |
 | `tools/bench_total.py DIR...` | total decode throughput per arm from a `shadow-bench` directory (the honest headline) |
 | `tools/plot_bench.py DIR...` | charts and tables of the machine's CPU, RAM, disk, GPU, power, PCIe during each run, per run and per arm |
 | `tools/autotune.py` | coordinate ascent over serving flags with paired bench rounds; adopts only what clears the noise |

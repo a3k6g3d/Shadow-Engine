@@ -286,9 +286,11 @@ fn open_chat(app: &AppHandle) {
         let url = state.cfg.url.clone();
         log(&state, &format!("connecting to {}", url));
         if probe(&url) {
+            set_tip(&app, &format!("Shadow server ready: {url}"));
             navigate(&app, &url);
             return;
         }
+        set_tip(&app, "Shadow server: starting");
         if let Some(w) = app.get_webview_window("main") {
             let _ = w.eval("if (!location.href.includes('tauri.localhost') && !location.href.startsWith('tauri://')) location.replace('http://tauri.localhost/');");
         }
@@ -300,14 +302,17 @@ fn open_chat(app: &AppHandle) {
                 return;
             }
             if probe(&url) {
+                set_tip(&app, &format!("Shadow server ready: {url}"));
                 navigate(&app, &url);
                 return;
             }
             let secs = started.elapsed().as_secs();
             if secs > state.cfg.load_timeout_minutes * 60 {
+                set_tip(&app, "Shadow server: failed to start (see Open Console Log)");
                 let _ = app.emit("status", Status { state: "failed", secs, lines: tail_log(&state.cfg.console_log, 14) });
                 return;
             }
+            set_tip(&app, &format!("Shadow server: loading the model ({secs} s)"));
             let st = if state.cfg.start_server { "loading" } else { "waiting" };
             let _ = app.emit("status", Status { state: st, secs, lines: tail_log(&state.cfg.console_log, 8) });
         }
@@ -319,6 +324,10 @@ fn show_window(app: &AppHandle) {
         let _ = w.unminimize();
         let _ = w.show();
         let _ = w.set_focus();
+    } else {
+        // headless: there is no window, "show" opens the chat page in the default browser
+        let url = app.state::<State>().cfg.url.clone();
+        let _ = app.opener().open_url(url, None::<&str>);
     }
 }
 
@@ -344,10 +353,24 @@ fn quit_app(app: AppHandle) {
     app.exit(0);
 }
 
+/// Headless: `shadow-ui.exe --headless` (the "Shadow (server only)" Start menu entry). No window and no chat page: it starts the same server
+/// (same desktop.json, port 8081 by default), keeps the tray icon (tooltip = server state; menu = open the chat in the browser, restart, log, quit),
+/// and stops the server on Quit. For pointing another harness (Hermes, pi, ...) at http://127.0.0.1:8081/v1.
+fn is_headless() -> bool {
+    std::env::args().skip(1).any(|a| a == "--headless" || a == "--server-only")
+}
+
+fn set_tip(app: &AppHandle, text: &str) {
+    if let Some(t) = app.tray_by_id("shadow") {
+        let _ = t.set_tooltip(Some(text));
+    }
+}
+
 fn main() {
     let cfg_path = config_path();
     let cfg = load_config(&cfg_path);
     let origin = cfg.url.trim_end_matches('/').to_string();
+    let headless = is_headless();
 
     let app = tauri::Builder::default()
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| show_window(app)))
@@ -366,24 +389,27 @@ fn main() {
             let handle = app.handle().clone();
             let allowed = origin.clone();
             let nav_handle = handle.clone();
-            WebviewWindowBuilder::new(app, "main", WebviewUrl::App("index.html".into()))
-                .title("Shadow")
-                .inner_size(1280.0, 860.0)
-                .min_inner_size(720.0, 520.0)
-                .disable_drag_drop_handler()
-                .on_navigation(move |url| {
-                    let s = url.as_str();
-                    if s.starts_with(&allowed) || url.host_str() == Some("tauri.localhost") || url.scheme() == "tauri" {
-                        return true;
-                    }
-                    if url.scheme() == "http" || url.scheme() == "https" {
-                        let _ = nav_handle.opener().open_url(s, None::<&str>);
-                    }
-                    false
-                })
-                .build()?;
+            if !headless {
+                WebviewWindowBuilder::new(app, "main", WebviewUrl::App("index.html".into()))
+                    .title("Shadow")
+                    .inner_size(1280.0, 860.0)
+                    .min_inner_size(720.0, 520.0)
+                    .disable_drag_drop_handler()
+                    .on_navigation(move |url| {
+                        let s = url.as_str();
+                        if s.starts_with(&allowed) || url.host_str() == Some("tauri.localhost") || url.scheme() == "tauri" {
+                            return true;
+                        }
+                        if url.scheme() == "http" || url.scheme() == "https" {
+                            let _ = nav_handle.opener().open_url(s, None::<&str>);
+                        }
+                        false
+                    })
+                    .build()?;
+            }
 
-            let show = MenuItem::with_id(app, "show", "Show Shadow", true, None::<&str>)?;
+            let show_label = if headless { "Open Chat in Browser" } else { "Show Shadow" };
+            let show = MenuItem::with_id(app, "show", show_label, true, None::<&str>)?;
             let restart = MenuItem::with_id(app, "restart", "Restart Server", true, None::<&str>)?;
             let log_item = MenuItem::with_id(app, "log", "Open Console Log", true, None::<&str>)?;
             let settings = MenuItem::with_id(app, "settings", "Open Settings", true, None::<&str>)?;
@@ -392,8 +418,8 @@ fn main() {
             let sep2 = PredefinedMenuItem::separator(app)?;
             let menu = Menu::with_items(app, &[&show, &restart, &sep1, &log_item, &settings, &sep2, &quit])?;
 
-            let mut tray = TrayIconBuilder::new()
-                .tooltip("Shadow")
+            let mut tray = TrayIconBuilder::with_id("shadow")
+                .tooltip(if headless { "Shadow server (no window)" } else { "Shadow" })
                 .menu(&menu)
                 .show_menu_on_left_click(false)
                 .on_menu_event(|app, event| match event.id.as_ref() {
@@ -402,7 +428,9 @@ fn main() {
                         let app = app.clone();
                         std::thread::spawn(move || {
                             stop_server(&app.state::<State>());
-                            show_window(&app);
+                            if app.get_webview_window("main").is_some() {
+                                show_window(&app);
+                            }
                             open_chat(&app);
                         });
                     }
