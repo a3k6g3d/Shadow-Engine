@@ -49,6 +49,10 @@ fn main() -> ExitCode {
     if args.first().map(String::as_str) == Some("serve") && args.len() >= 2 {
         return serve(&PathBuf::from(&args[1]), &args[2..]);
     }
+    // `shadow gpus [--mib N]`: the cards, their host bandwidth and the hop between them (docs/PLAN_TWO_GPUS_2026-11-11.md)
+    if args.first().map(String::as_str) == Some("gpus") {
+        return ExitCode::from(shadow_cuda::probe::run_cli(&args[1..]) as u8);
+    }
     if args.first().map(String::as_str) != Some("inspect") || args.len() < 2 {
         eprintln!("usage: shadow inspect MODEL.gguf [--tensors] [--kv]\n       shadow kv MODEL.gguf KEY");
         return ExitCode::from(2);

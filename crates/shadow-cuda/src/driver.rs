@@ -17,6 +17,11 @@ type H = *mut c_void;
 pub const CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT: c_int = 16;
 pub const CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR: c_int = 75;
 pub const CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR: c_int = 76;
+pub const CU_DEVICE_ATTRIBUTE_MEMORY_CLOCK_RATE: c_int = 36;
+pub const CU_DEVICE_ATTRIBUTE_GLOBAL_MEMORY_BUS_WIDTH: c_int = 37;
+pub const CU_DEVICE_ATTRIBUTE_PCI_BUS_ID: c_int = 33;
+pub const CU_DEVICE_ATTRIBUTE_PCI_DEVICE_ID: c_int = 34;
+pub const CU_DEVICE_ATTRIBUTE_PCI_DOMAIN_ID: c_int = 50;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CudaError {
@@ -68,6 +73,8 @@ table! {
     cuDeviceGetName: fn(*mut c_char, c_int, CuDevice) = ["cuDeviceGetName"];
     cuDeviceGetAttribute: fn(*mut c_int, c_int, CuDevice) = ["cuDeviceGetAttribute"];
     cuDeviceTotalMem: fn(*mut usize, CuDevice) = ["cuDeviceTotalMem_v2"];
+    cuDeviceGetUuid: fn(*mut u8, CuDevice) = ["cuDeviceGetUuid_v2", "cuDeviceGetUuid"];
+    cuDeviceCanAccessPeer: fn(*mut c_int, CuDevice, CuDevice) = ["cuDeviceCanAccessPeer"];
     cuDevicePrimaryCtxRetain: fn(*mut H, CuDevice) = ["cuDevicePrimaryCtxRetain"];
     cuDevicePrimaryCtxSetFlags: fn(CuDevice, c_uint) = ["cuDevicePrimaryCtxSetFlags_v2", "cuDevicePrimaryCtxSetFlags"];
     cuDevicePrimaryCtxRelease: fn(CuDevice) = ["cuDevicePrimaryCtxRelease_v2", "cuDevicePrimaryCtxRelease"];
