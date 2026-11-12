@@ -116,6 +116,7 @@ Defaults are right for normal use; these are for measurement and diagnosis.
 | `SHADOW_VTIME=1` | the host's time in each verify layer's MoE, by part, in microseconds a layer (a line every 480 layers; STATUS 107) |
 | `SHADOW_SHARED_EARLY=0` | queue the batched MoE's shared expert after the host has the router's logits, as before STATUS 107 (default: before the host's wait, +2.3% decode) |
 | `SHADOW_FETCH_FIRST=0` | issue a group's expert copies after the plan and the resident experts' launches, as before STATUS 107 (default: before, +1.25% decode) |
+| `SHADOW_FINISH_TOOL=0` | `shadow serve` stops offering the `finish` tool (the closing status of an agent task, STATUS 109): it leaves `GET /v1/tools`, `/v1/tools/execute` answers `unknown tool` for it, and the chat page stops asking the model to use it (default on) |
 | `SHADOW_VERIFY_GRAPHS=0` | verify passes (batches of at most `MAX_VERIFY` rows) run their DeltaNet segments eagerly instead of as CUDA graphs (default on: +2.5% decode, STATUS 106; prompt passes are unaffected, `SHADOW_BATCH_GRAPHS=1` is still their opt-in) |
 | `SHADOW_SPEC_BYTES=1` | per verify pass: the experts copied, by the lowest row that routes to them, the share copied only for drafts that were rejected, and what a rank-1 verify from each depth would skip (a line every 100 passes; STATUS 105) |
 | `SHADOW_HOP=0` | the hand-off between two stages (`--gpus A,B`) through host vectors and a copy a row, as before STATUS 104 (default: one copy of a chunk through a pinned buffer) |
@@ -127,6 +128,13 @@ Defaults are right for normal use; these are for measurement and diagnosis.
 | `SHADOW_SPEC_MIN_P`, `SHADOW_LOOKUP_MIN` | the MTP chain cutoff; the shortest repeat that prompt-lookup drafts |
 | `SHADOW_GRAPHS=0`, `SHADOW_OVERLAP=0`, `SHADOW_BATCH=n`, `SHADOW_REF_ORDER=1` | switch off CUDA graphs / overlapped copies / batching / use the reference sum order |
 | `SHADOW_FUSE`, `SHADOW_ZERO_COPY`, `SHADOW_SYNC`, `SHADOW_HUGE_PAGES` | opt-in experiments (all measured; see STATUS.md) |
+
+## Closing an agent task: the `finish` tool
+
+A task that used tools should end with what is finished, what is **not** done or not verified and, only when the model cannot go on without the user, one question with its options. The server offers one tool for that, `finish` (in `GET /v1/tools`), with string fields `done`, `pending`, `question`, `options` (one item a line, or a JSON array as text; only `done` is required and an empty status is refused).
+
+- **Chat page:** when the tools are on and the server offers `finish`, the system prompt gets a short instruction (after the persona and memory: a saved persona gets it too) and the model closes a task by calling `finish`. The page draws the call as a status card (Done / Not done / not verified / Needs your answer, with one button per option that sends that answer), ends the turn without another model step, and draws the same card again when the chat is reopened. A `finish` that comes with other tool calls, or says nothing, is refused as a tool result and the task goes on. A plain question, or a chat with the tools off, is unchanged: no instruction, no tool, no card. Settings -> Task status turns it off for the page (a new chat; `shadow_finish_on` in local storage), `SHADOW_FINISH_TOOL=0` turns it off for the server.
+- **API clients:** `finish` is a normal function tool. A client that lists it in `tools` gets it back as a `tool_calls` entry; executing it through `/v1/tools/execute` returns an acknowledgement (`Status recorded; ...`), and the status is the call's own arguments. The server does not add the tool or the instruction to a request that did not list it, so headless harnesses are unchanged unless they take the tool from `/v1/tools`.
 
 ## The RAM rule
 

@@ -488,6 +488,28 @@ canvas.spark { width: 100%; height: 64px; display: block; }
       color: #a7f3d0;
     }
 
+    /* The closing status of an agent task (the finish tool) */
+    .finish-card {
+      border: 1px solid var(--border);
+      border-left: 3px solid var(--success);
+      background: var(--surface-elevated);
+      border-radius: 0.5rem;
+      padding: 0.6rem 0.9rem;
+      margin: 0.65rem 0;
+      font-size: 0.88rem;
+      line-height: 1.5;
+    }
+    .finish-card.open { border-left-color: var(--warning); }
+    .finish-card .fin-h { font-weight: 600; font-size: 0.78rem; text-transform: uppercase; letter-spacing: 0.04em; margin: 0.45rem 0 0.15rem; color: var(--text-muted); }
+    .finish-card > .fin-h:first-child, .finish-card > div:first-child > .fin-h { margin-top: 0; }
+    .finish-card .fin-done .fin-h { color: var(--success); }
+    .finish-card .fin-pending .fin-h { color: var(--warning); }
+    .finish-card ul { margin: 0; padding-left: 1.2rem; }
+    .finish-card .fin-q { font-weight: 600; margin-top: 0.2rem; }
+    .finish-card .fin-opts { display: flex; flex-wrap: wrap; gap: 0.4rem; margin-top: 0.4rem; }
+    .finish-card .fin-opt { background: var(--accent-light); border: 1px solid var(--accent); color: var(--text); border-radius: 0.4rem; padding: 0.25rem 0.65rem; cursor: pointer; font: inherit; font-size: 0.84rem; text-align: left; }
+    .finish-card .fin-opt:hover { background: var(--accent-glow); }
+
     pre {
       background: var(--code-bg);
       border: 1px solid var(--border);
@@ -1099,6 +1121,11 @@ canvas.spark { width: 100%; height: 64px; display: block; }
           <p class="set-help">This is the starting point of every chat. For a one-off, just say it in the chat: "act as a software engineer and design this", "review this like a security auditor", "be brief". The persona itself changes only here.</p>
         </div>
         <div class="dcard">
+          <h3>Task status</h3>
+          <label class="set-toggle"><input type="checkbox" id="set-finish-on" onchange="setFinishOn(this.checked)"> End tasks that use tools with a status card</label>
+          <p class="set-help">When Shadow has used its tools it closes the task with what it did, what is not done or not verified and, only if it needs you, one question with buttons for the answers. Off: it ends with a plain message as before. Takes effect in a new chat (the instruction is part of the start of the prompt).</p>
+        </div>
+        <div class="dcard">
           <h3>Memory <span class="tag" id="set-mem-count">--</span></h3>
           <label class="set-toggle"><input type="checkbox" id="set-mem-on" onchange="setMemoryOn(this.checked)"> Use memory in chats</label>
           <p class="set-help">Short notes about you that Shadow reads at the start of every chat. It adds notes itself when you tell it something lasting about you or your work (or say "remember ..."); edit one by clicking it, delete with the cross. Kept on this PC only, in %APPDATA%\Shadow\memory.json.</p>
@@ -1489,6 +1516,59 @@ canvas.spark { width: 100%; height: 64px; display: block; }
       return [...msgs.slice(0, -1), { ...last, content: c }];
     }
 
+    // ---- The closing status of an agent task (docs/STATUS.md 109): a task that used tools ends with a `finish` call (done / pending / question with options), drawn as a card
+    // and ending the turn.  The tool comes from the server (GET /v1/tools; SHADOW_FINISH_TOOL=0 removes it there), this switch is the page's own (Settings).
+    let finishOn = localStorage.getItem('shadow_finish_on') !== 'false';
+    function finishActive() { return toolsEnabled && finishOn && availableTools.some(t => t.name === 'finish'); }
+    function setFinishOn(on) { finishOn = on; localStorage.setItem('shadow_finish_on', on); }
+    // the tools of a request: without the page's finish switch the model never sees the tool
+    function requestTools() { return finishOn ? availableTools : availableTools.filter(t => t.name !== 'finish'); }
+    const FINISH_HINT = 'When a task needed your tools (you read, changed or ran something), end it by calling the finish tool once, alone, after you have seen the results of your other calls, instead of a closing message. ' +
+      'done: what you actually did, one short item a line (file names, what changed). pending: what is NOT done, NOT tested or NOT verified, one item a line (if you did not run the code or the tests, say so; never claim something works that you did not run). ' +
+      'question and options: only when you cannot go on without the user (one question, the answers one a line, your recommendation first); otherwise leave them out. ' +
+      'Do not call finish for a plain question or a conversation: answer those in text.';
+    // a status field as a list: a JSON array or lines (bullets and numbers stripped), at most 12 items of 400 characters
+    function finishItems(v) {
+      if (v === undefined || v === null) return [];
+      let a = v;
+      if (typeof a === 'string') {
+        const t = a.trim();
+        if (t.startsWith('[')) { try { const j = JSON.parse(t); if (Array.isArray(j)) a = j; } catch (_) {} }
+        if (typeof a === 'string') a = t.split(/\r?\n/);
+      }
+      if (!Array.isArray(a)) a = [a];
+      return a.map(x => String(x === null || x === undefined ? '' : x).replace(/^\s*(?:[-*\u2022]|\d+[.)])\s+/, '').trim()).filter(Boolean).slice(0, 12).map(x => x.slice(0, 400));
+    }
+    function parseFinish(args) {
+      const a = args && typeof args === 'object' ? args : {};
+      const question = String(a.question === undefined || a.question === null ? '' : a.question).trim().slice(0, 600);
+      return { done: finishItems(a.done), pending: finishItems(a.pending !== undefined ? a.pending : a.not_done), question, options: question ? finishItems(a.options).slice(0, 6) : [] };
+    }
+    // the status is accepted when the model said what it did and what is left (or asked); `calls` is how many tool calls the message held: finish goes alone, after the results
+    function checkFinish(args, calls) {
+      const f = parseFinish(args);
+      if (calls > 1) return { ok: false, output: 'error: call finish alone, after you have seen the results of your other tool calls (they ran just now); report the status in your next message.' };
+      if (!f.done.length && !f.pending.length && !f.question) return { ok: false, output: 'error: finish needs done (what you did), and pending (what is not done or not verified) or a question' };
+      return { ok: true, f };
+    }
+    function finishCardHtml(f) {
+      const list = items => '<ul>' + items.map(x => '<li>' + escapeHtml(x) + '</li>').join('') + '</ul>';
+      let h = '';
+      if (f.done.length) h += '<div class="fin-done"><div class="fin-h">Done</div>' + list(f.done) + '</div>';
+      if (f.pending.length) h += '<div class="fin-pending"><div class="fin-h">Not done / not verified</div>' + list(f.pending) + '</div>';
+      else if (!f.question) h += '<div class="fin-pending"><div class="fin-h">Not done / not verified</div><div>Nothing was reported as left.</div></div>';
+      if (f.question) {
+        h += '<div class="fin-h">Needs your answer</div><div class="fin-q">' + escapeHtml(f.question) + '</div>';
+        if (f.options.length) h += '<div class="fin-opts">' + f.options.map(o => '<button type="button" class="fin-opt" onclick="useSuggestion(this)">' + escapeHtml(o) + '</button>').join('') + '</div>';
+      }
+      return '<div class="finish-card' + (f.question ? ' open' : '') + '">' + h + '</div>';
+    }
+    function finishCardEl(f) {
+      const d = document.createElement('div');
+      d.innerHTML = finishCardHtml(f);
+      return d.firstChild;
+    }
+
     // Load tool schemas from server
     async function loadTools() {
       try {
@@ -1809,7 +1889,7 @@ canvas.spark { width: 100%; height: 64px; display: block; }
     async function warmPrompt(cachedTokens) {
       if (modelState !== 'ready' || isGenerating || history.length || cachedTokens > 0 || !memoryLoaded) return;
       if (toolsEnabled && availableTools.length === 0) return;
-      const key = JSON.stringify([systemPrompt(), toolsEnabled]);
+      const key = JSON.stringify([systemPrompt(), toolsEnabled, finishOn]);
       if (key === warmedKey) return;
       warmedKey = key;
       const msgs = [];
@@ -1818,7 +1898,7 @@ canvas.spark { width: 100%; height: 64px; display: block; }
       msgs.push({ role: 'user', content: 'Hi' });
       const body = { messages: msgs, max_tokens: 1, stream: false, reasoning_effort: currentEffort,
                      chat_template_kwargs: { enable_thinking: currentEffort !== 'off' } };
-      if (toolsEnabled) body.tools = availableTools;
+      if (toolsEnabled) body.tools = requestTools();
       try {
         timingInfo.textContent = 'Warming up the prompt...';
         await fetch('/v1/chat/completions', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
@@ -2169,7 +2249,7 @@ canvas.spark { width: 100%; height: 64px; display: block; }
           chat_template_kwargs: { enable_thinking: currentEffort !== 'off' }
         };
         if (toolsEnabled && availableTools.length > 0) {
-          requestBody.tools = availableTools;
+          requestBody.tools = requestTools();
         }
 
         try {
@@ -2314,7 +2394,17 @@ canvas.spark { width: 100%; height: 64px; display: block; }
             sameCalls = callSig === lastCallSig ? sameCalls + 1 : 1;
             lastCallSig = callSig;
 
+            let finished = false;
             for (const tc of toolCalls) {
+              // finish: the status of the task as a card, no tool run; refused (a tool result the model reads) when it came with other calls or says nothing
+              const fin = tc.name === 'finish' && finishActive() ? checkFinish(tc.arguments, toolCalls.length) : null;
+              if (fin && fin.ok) {
+                bubbleEl.appendChild(finishCardEl(fin.f));
+                history.push({ role: 'tool', content: `<tool_response>\n${fin.f.question ? 'Status recorded; waiting for the user\'s answer.' : 'Status recorded; the task is closed.'}\n</tool_response>` });
+                finished = true;
+                scrollToBottom(false);
+                continue;
+              }
               const argSummary = formatToolArgsSummary(tc.arguments);
               const toolCard = document.createElement('div');
               toolCard.className = 'tool-call-block running';
@@ -2327,7 +2417,7 @@ canvas.spark { width: 100%; height: 64px; display: block; }
               bubbleEl.appendChild(toolCard);
               scrollToBottom(false);
 
-              const result = await executeLocalTool(tc.name, tc.arguments);
+              const result = fin ? { name: 'finish', output: fin.output, is_error: true } : await executeLocalTool(tc.name, tc.arguments);
               // the same call again: its result is not new - say so, or a model that lost the earlier result to the shortening reads it a third and fourth time
               const callKey = tc.name + '|' + JSON.stringify(tc.arguments);
               const timesCalled = (callCounts.get(callKey) || 0) + 1;
@@ -2350,6 +2440,8 @@ canvas.spark { width: 100%; height: 64px; display: block; }
                 content: `<tool_response>\n${result.output}\n</tool_response>`
               });
             }
+            // the status was given: the task ends here (no further model step)
+            if (finished) break;
             // the same call again and again: the model is stuck, not working - stop and say so (the history keeps the results, "continue" resumes)
             if (sameCalls >= MAX_SAME_CALLS) { stuck = true; break; }
             // Loop continues to let Shadow formulate final answer using the tool output
@@ -2588,6 +2680,11 @@ canvas.spark { width: 100%; height: 64px; display: block; }
             if (tCursor < all.length && all[tCursor] && all[tCursor].role === 'tool') {
               toolOut = unwrapToolResponse(messageText(all[tCursor]));
               tCursor++;
+            }
+            // a finish that was accepted shows as its status card (a refused one, an error result, as the tool card it was)
+            if (tc.name === 'finish' && toolCalls.length === 1 && checkFinish(tc.arguments, 1).ok && !/^error:/.test(toolOut)) {
+              cardsHtml += finishCardHtml(parseFinish(tc.arguments));
+              continue;
             }
             const argSummary = formatToolArgsSummary(tc.arguments);
             cardsHtml += `
@@ -2837,7 +2934,7 @@ html('d-ramfree', gib(ram.system_available_bytes || 0) + '<small>GiB free</small
       return [notes, toolsEnabled ? MEMORY_HINT : ''].filter(Boolean).join('\n\n');
     }
     function systemPrompt() {
-      return [(currentPersona || '').trim(), frozenMemory !== null ? frozenMemory : memoryBlock()].filter(Boolean).join('\n\n');
+      return [(currentPersona || '').trim(), frozenMemory !== null ? frozenMemory : memoryBlock(), finishActive() ? FINISH_HINT : ''].filter(Boolean).join('\n\n');
     }
     async function loadMemory() {
       try { const r = await fetch('/v1/memory'); if (r.ok) memories = await r.json(); } catch (_) {}
@@ -2894,6 +2991,7 @@ html('d-ramfree', gib(ram.system_available_bytes || 0) + '<small>GiB free</small
     function settingsOpen() {
       document.getElementById('set-persona').value = currentPersona;
       document.getElementById('set-mem-on').checked = memoryOn;
+      document.getElementById('set-finish-on').checked = finishOn;
       loadMemory();
     }
     function savePersonaSetting() {

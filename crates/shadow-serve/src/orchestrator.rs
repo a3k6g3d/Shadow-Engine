@@ -541,6 +541,7 @@ fn execute_tool_inner(inv: &ToolInvocation) -> ToolResult {
                 },
             }
         }
+        "finish" if finish_tool_enabled() => finish_ack(&inv.arguments),
         "memory_list" => ToolResult {
             name: inv.name.clone(),
             output: crate::memory::as_text(),
@@ -1154,16 +1155,89 @@ fn execute_tool_inner(inv: &ToolInvocation) -> ToolResult {
     }
 }
 
+/// Whether the `finish` tool (the closing status of an agent task, docs/STATUS.md 109) is offered: on unless `SHADOW_FINISH_TOOL=0`.
+pub fn finish_tool_enabled() -> bool {
+    finish_enabled_from(std::env::var("SHADOW_FINISH_TOOL").ok().as_deref())
+}
+
+fn finish_enabled_from(v: Option<&str>) -> bool {
+    !matches!(v.map(str::trim), Some("0") | Some("off") | Some("false"))
+}
+
 /// Shadow's own tools and those of the MCP servers that are up (`mcp.rs`).
 pub fn tool_definitions() -> Value {
-    let mut v = builtin_tool_definitions();
+    let mut v = builtin_tool_definitions_with(finish_tool_enabled());
     v.as_array_mut()
         .expect("an array")
         .extend(crate::mcp::tool_definitions());
     v
 }
 
-fn builtin_tool_definitions() -> Value {
+/// The `finish` tool: the model ends a task that used tools by saying what is done, what is pending or unverified and, only when it cannot go on without the user, one
+/// question with its options.  The chat page draws it as a status card and ends the turn; to an API client it is a plain tool whose execution is an acknowledgement.
+/// Every field is a string (the page's tool-call parser hands over strings): one item a line, or a JSON array as text.
+fn finish_tool_definition() -> Value {
+    json!({
+        "name": "finish",
+        "description": "End a task that needed tools by reporting its status, instead of a closing message: what you did, what is NOT done or NOT verified, and - only if you cannot go on without the user - one question. Call it alone, after you have seen the results of your other tool calls. Do not use it to answer a plain question.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "done": { "type": "string", "description": "What is finished, one short item per line (file names, what changed). Only what you actually did." },
+                "pending": { "type": "string", "description": "What is NOT done, NOT tested or NOT verified (say so if you did not run the code or the tests), one item per line. Leave empty only when nothing is left." },
+                "question": { "type": "string", "description": "Only when you need the user's input to go on: one question. Leave empty otherwise." },
+                "options": { "type": "string", "description": "With a question: the answers you offer, one per line (the first is the one you recommend)." }
+            },
+            "required": ["done"]
+        }
+    })
+}
+
+fn builtin_tool_definitions_with(finish: bool) -> Value {
+    let mut v = builtin_tool_definitions_core();
+    if finish {
+        v.as_array_mut().expect("an array").push(finish_tool_definition());
+    }
+    v
+}
+
+/// The acknowledgement of `finish`: short and not an error (the page ends the task and never reads it; an API client executing the call through `/v1/tools/execute` gets
+/// it, and its own arguments are the status).
+fn finish_ack(args: &Value) -> ToolResult {
+    let text = |k: &str| {
+        args.get(k)
+            .map(|v| match v {
+                Value::String(s) => s.trim().to_string(),
+                Value::Array(a) => a
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+                _ => String::new(),
+            })
+            .unwrap_or_default()
+    };
+    if text("done").is_empty() && text("pending").is_empty() && text("question").is_empty() {
+        return ToolResult {
+            name: "finish".into(),
+            output: "error: finish needs done (what you did), and pending (what is not done or not verified) or a question".into(),
+            is_error: true,
+            images: vec![],
+        };
+    }
+    ToolResult {
+        name: "finish".into(),
+        output: if text("question").is_empty() {
+            "Status recorded; the task is closed.".into()
+        } else {
+            "Status recorded; waiting for the user's answer.".into()
+        },
+        is_error: false,
+        images: vec![],
+    }
+}
+
+fn builtin_tool_definitions_core() -> Value {
     json!([
         {
             "name": "memory_save",
@@ -1341,6 +1415,50 @@ fn builtin_tool_definitions() -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn finish_is_offered_unless_switched_off() {
+        for on in [None, Some(""), Some("1"), Some("on")] {
+            assert!(finish_enabled_from(on), "{on:?}");
+        }
+        for off in [Some("0"), Some("off"), Some(" 0 "), Some("false")] {
+            assert!(!finish_enabled_from(off), "{off:?}");
+        }
+        let names = |v: Value| -> Vec<String> {
+            v.as_array()
+                .unwrap()
+                .iter()
+                .map(|d| d["name"].as_str().unwrap().to_string())
+                .collect()
+        };
+        let with = names(builtin_tool_definitions_with(true));
+        let without = names(builtin_tool_definitions_with(false));
+        assert_eq!(with.last().map(String::as_str), Some("finish"));
+        assert!(!without.contains(&"finish".to_string()));
+        assert_eq!(with.len(), without.len() + 1);
+        // every property of finish is a string: the page's tool-call parser hands over strings
+        let def = finish_tool_definition();
+        for (k, p) in def["input_schema"]["properties"].as_object().unwrap() {
+            assert_eq!(p["type"], "string", "{k}");
+        }
+    }
+
+    #[test]
+    fn finish_acknowledges_a_status_and_refuses_an_empty_one() {
+        let r = finish_ack(&json!({"done": "edited a.rs", "pending": "tests not run"}));
+        assert!(!r.is_error && r.output.len() < toollog::LOGGED_MIN && !r.output.contains("(output #"));
+        assert!(r.output.contains("closed"), "{}", r.output);
+        let q = finish_ack(&json!({"done": "x", "question": "which one?", "options": "a
+b"}));
+        assert!(!q.is_error && q.output.contains("waiting"), "{}", q.output);
+        // an array as the status of an API client works too
+        assert!(!finish_ack(&json!({"done": ["a", "b"]})).is_error);
+        // nothing said: the model is told what is missing and the task stays open
+        for empty in [json!({}), json!({"done": "  "}), json!({"done": ""})] {
+            let e = finish_ack(&empty);
+            assert!(e.is_error && e.output.contains("needs done"), "{}", e.output);
+        }
+    }
 
     #[test]
     fn text_parameters_take_the_schema_types() {
