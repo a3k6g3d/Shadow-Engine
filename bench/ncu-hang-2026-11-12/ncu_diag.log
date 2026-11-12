@@ -1,0 +1,23 @@
+13:03:30 === A_q6k_skip0_count1: server extra [], ncu extra [-k regex:matvec_cols_q6_k --launch-skip 0 --launch-count 1 --section SpeedOfLight]
+13:03:44 A_q6k_skip0_count1: server up True after 9 s; VRAM used 11154 MiB
+13:03:58 A_q6k_skip0_count1: client: reply 'The vast ocean stretches endlessly toward the horizon, its r' in 14.2 s
+13:04:02 A_q6k_skip0_count1: ncu stdout tail: ==PROF== Connected to process 31752 (J:\Shadow\target-dev\release\shadow.exe) / ==PROF== Profiling "matvec_cols_q6_k": 0% / ==WARNING== Backing up device memory in system memory. Kernel replay might be slow. Consider using "--replay-mode application" to avoid memory save-and-restore. / ....50%....100% - 9 passes
+13:04:03 A_q6k_skip0_count1: report written: False
+13:04:03 === B_freevram: server extra [--expert-cache-gib 2], ncu extra [-k regex:matvec_cols_q6_k --launch-skip 0 --launch-count 1 --section SpeedOfLight]
+13:04:15 B_freevram: server up True after 9 s; VRAM used 8714 MiB
+13:04:26 B_freevram: client: reply 'The vast ocean stretches endlessly toward the horizon, its r' in 10.3 s
+13:04:30 B_freevram: ncu stdout tail: ==PROF== Connected to process 3296 (J:\Shadow\target-dev\release\shadow.exe) / ==PROF== Profiling "matvec_cols_q6_k": 0% / ==WARNING== Backing up device memory in system memory. Kernel replay might be slow. Consider using "--replay-mode application" to avoid memory save-and-restore. / ....50%....100% - 9 passes
+13:04:30 B_freevram: report written: False
+13:04:30 === C_skip400: server extra [], ncu extra [-k regex:matvec_cols_q6_k --launch-skip 400 --launch-count 2 --section SpeedOfLight]
+13:04:42 C_skip400: server up True after 9 s; VRAM used 11154 MiB
+13:07:13 C_skip400: NO REPLY after 150 s; GPU util 0 %
+13:07:16 C_skip400 engine threads (top by CPU in 3 s): 31236:Wait/UserRequest +0.02s tot 0.1s | 10440:Wait/Unknown +0s tot 0.4s | 10112:Wait/EventPairLow +0s tot 0s | 34260:Wait/Unknown +0s tot 0.4s | 30072:Wait/Unknown +0s tot 0.4s | 25052:Wait/Unknown +0s tot 0.4s
+13:07:19 C_skip400 ncu threads (top by CPU in 3 s): 25100:Running/ +3.02s tot 164.2s | 8112:Wait/UserRequest +0.02s tot 0s | 4908:Wait/UserRequest +0s tot 0s | 24780:Wait/Unknown +0s tot 0s | 9504:Wait/UserRequest +0s tot 0s | 19112:Wait/EventPairLow +0s tot 0s
+13:07:24 C_skip400: ncu stdout tail: ==PROF== Connected to process 12828 (J:\Shadow\target-dev\release\shadow.exe)
+13:07:24 C_skip400: report written: False
+13:07:24 === D_nomatch: server extra [], ncu extra [-k regex:zzz_no_such_kernel --launch-count 1 --section SpeedOfLight]
+13:07:37 D_nomatch: server up True after 9 s; VRAM used 11154 MiB
+13:07:39 D_nomatch: client: reply 'The vast ocean stretches endlessly toward the horizon, its r' in 1.5 s
+13:07:43 D_nomatch: ncu stdout tail: ==PROF== Connected to process 31820 (J:\Shadow\target-dev\release\shadow.exe)
+13:07:43 D_nomatch: report written: False
+13:07:43 all experiments done

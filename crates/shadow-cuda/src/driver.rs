@@ -109,6 +109,8 @@ table! {
     cuModuleGetFunction: fn(*mut H, H, *const c_char) = ["cuModuleGetFunction"];
     cuModuleGetGlobal: fn(*mut CuDevicePtr, *mut usize, H, *const c_char) = ["cuModuleGetGlobal_v2", "cuModuleGetGlobal"];
     cuLaunchKernel: fn(H, c_uint, c_uint, c_uint, c_uint, c_uint, c_uint, c_uint, H, *mut *mut c_void, *mut *mut c_void) = ["cuLaunchKernel"];
+    cuProfilerStart: fn() = ["cuProfilerStart"];
+    cuProfilerStop: fn() = ["cuProfilerStop"];
     cuStreamCreate: fn(*mut H, c_uint) = ["cuStreamCreate"];
     cuStreamDestroy: fn(H) = ["cuStreamDestroy_v2"];
     cuStreamSynchronize: fn(H) = ["cuStreamSynchronize"];

@@ -1,0 +1,21 @@
+13:08:48 === F1_skip400_reorder_off: server extra [], env [SHADOW_FETCH_FIRST=0 SHADOW_SHARED_EARLY=0]
+13:09:01 F1_skip400_reorder_off: server up True after 9 s; VRAM used 11154 MiB
+13:10:42 F1_skip400_reorder_off: NO REPLY after 100 s; GPU util 0 %
+13:10:48 F1_skip400_reorder_off: ncu stdout tail: ==PROF== Connected to process 952 (J:\Shadow\target-dev\release\shadow.exe) / ==ERROR== The application returned an error code (4294967295).
+13:10:48 F1_skip400_reorder_off: report written: False
+13:10:48 === F2_skip20: server extra [], env []
+13:11:01 F2_skip20: server up True after 9 s; VRAM used 11154 MiB
+13:11:56 F2_skip20: client finished in 55 s: reply 'The vast ocean stretches endlessly toward the horizon, its r' in 54.3 s
+13:12:01 F2_skip20: ncu stdout tail: ....50%....100% - 8 passes / ==ERROR== The application returned an error code (4294967295). / ==PROF== Report: C:\Users\a3k6g\AppData\Local\Temp\claude\c2eb5aa3e3d3334d\95988fd8-569b-47c7-99ea-9f100d75d035\scratchpad\ncu_diag2_F2_skip20.ncu-repz
+13:12:01 F2_skip20: report written: False
+13:12:01 === F3_skip100: server extra [], env []
+13:12:14 F3_skip100: server up True after 9 s; VRAM used 11154 MiB
+13:13:54 F3_skip100: NO REPLY after 100 s; GPU util 0 %
+13:14:00 F3_skip100: ncu stdout tail: ==PROF== Connected to process 32756 (J:\Shadow\target-dev\release\shadow.exe) / ==ERROR== The application returned an error code (4294967295).
+13:14:00 F3_skip100: report written: False
+13:14:00 === E1_small_skip400: server extra [--expert-cache-gib 0.5], env []
+13:14:13 E1_small_skip400: server up True after 9 s; VRAM used 6944 MiB
+13:15:53 E1_small_skip400: NO REPLY after 100 s; GPU util 0 %
+13:16:00 E1_small_skip400: ncu stdout tail: ==PROF== Connected to process 4476 (J:\Shadow\target-dev\release\shadow.exe) / ==ERROR== The application returned an error code (4294967295).
+13:16:00 E1_small_skip400: report written: False
+13:16:00 all experiments done

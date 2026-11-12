@@ -1,0 +1,6 @@
+==PROF== Connected to process 34724 (J:\Shadow\target-dev\release\shadow.exe)
+==PROF== Profiling "matvec_cols_q6_k": 0%
+==WARNING== Backing up device memory in system memory. Kernel replay might be slow. Consider using "--replay-mode application" to avoid memory save-and-restore.
+....50%....100% - 8 passes
+==ERROR== The application returned an error code (4294967295).
+==PROF== Report: C:\Users\a3k6g\AppData\Local\Temp\claude\c2eb5aa3e3d3334d\95988fd8-569b-47c7-99ea-9f100d75d035\scratchpad\ncu_diag2_F2_skip20.ncu-repz

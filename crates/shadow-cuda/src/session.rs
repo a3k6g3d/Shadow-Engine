@@ -744,6 +744,36 @@ fn fetch_first() -> bool {
     *ON.get_or_init(|| !std::env::var("SHADOW_FETCH_FIRST").is_ok_and(|v| v == "0"))
 }
 
+/// `SHADOW_NCU_RANGE=from:n` (STATUS 108): for Nsight Compute started with `--profile-from-start off`: the driver's profiler range covers batched passes of 2..=`MAX_VERIFY` rows number
+/// `from` up to (not including) `from + n`, counted from 0 since the start.  Nsight Compute's `--launch-skip` made every launch it skipped cost ~2 s (it backs the device memory up
+/// for each), so a decode kernel late in a run could not be reached; kernels outside the range are not intercepted at all.
+fn ncu_range() -> Option<(usize, usize)> {
+    static R: std::sync::OnceLock<Option<(usize, usize)>> = std::sync::OnceLock::new();
+    *R.get_or_init(|| {
+        let v = std::env::var("SHADOW_NCU_RANGE").ok()?;
+        let (a, n) = v.split_once(':')?;
+        Some((a.parse().ok()?, n.parse().ok()?))
+    })
+}
+
+static NCU_PASS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+fn ncu_pass(ctx: &Context, rows: usize) {
+    let Some((from, n)) = ncu_range() else { return };
+    if !(2..=MAX_VERIFY).contains(&rows) {
+        return;
+    }
+    let c = NCU_PASS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if c == from || c == from + n {
+        // the previous pass's kernels end before the range changes
+        let _ = ctx.synchronize();
+        ctx.bind().unwrap();
+        // SAFETY: the driver's profiler start / stop, no arguments.
+        let r = unsafe { if c == from { (ctx.api.cuProfilerStart)() } else { (ctx.api.cuProfilerStop)() } };
+        eprintln!("ncu range: {} at batched pass {c} ({rows} rows), driver result {r}", if c == from { "start" } else { "stop" });
+    }
+}
+
 /// Rows per copy through the hop's pinned buffer (a chunk is at most `HOP_CHUNK_ROWS` x `NFEAT` floats = 50 MiB of pinned memory, taken at the first hop).
 const HOP_CHUNK_ROWS: usize = 1024;
 
@@ -4904,6 +4934,7 @@ impl<'c, 'm> GpuSession<'c, 'm> {
         }
         let t_pass = std::time::Instant::now();
         let m = toks.len();
+        ncu_pass(self.ctx, m);
         let p0 = self.tokens.len();
         assert!(p0 + m <= self.cap, "this session was made for {} positions", self.cap);
         self.tokens.extend_from_slice(toks);

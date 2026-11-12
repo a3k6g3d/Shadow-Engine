@@ -1,0 +1,4 @@
+==PROF== Connected to process 3296 (J:\Shadow\target-dev\release\shadow.exe)
+==PROF== Profiling "matvec_cols_q6_k": 0%
+==WARNING== Backing up device memory in system memory. Kernel replay might be slow. Consider using "--replay-mode application" to avoid memory save-and-restore.
+....50%....100% - 9 passes

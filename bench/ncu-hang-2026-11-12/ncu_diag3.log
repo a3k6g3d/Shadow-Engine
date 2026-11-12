@@ -1,0 +1,13 @@
+13:18:01 === G1_range_sol: server extra [], env [SHADOW_NCU_RANGE=6:1]
+13:18:14 G1_range_sol: server up True after 9 s; VRAM used 11154 MiB
+13:20:25 G1_range_sol: client finished in 131 s: 64 tokens 16 tokens 64 tokens 46 tokens
+13:20:30 G1_range_sol: ncu stdout tail: ==PROF== Profiling "matvec_cols_bf16": 0%....50%....100% - 8 passes / ==ERROR== The application returned an error code (4294967295). / ==PROF== Report: C:\Users\a3k6g\AppData\Local\Temp\claude\c2eb5aa3e3d3334d\95988fd8-569b-47c7-99ea-9f100d75d035\scratchpad\ncu_diag3_G1_range_sol.ncu-repz
+13:20:30 G1_range_sol: engine said: ncu range: start at batched pass 6 (4 rows), driver result 0 / ncu range: stop at batched pass 7 (4 rows), driver result 0
+13:20:30 G1_range_sol: report written: ncu_diag3_G1_range_sol.ncu-repz
+13:20:30 === G2_range_stalls: server extra [], env [SHADOW_NCU_RANGE=6:1]
+13:20:42 G2_range_stalls: server up True after 9 s; VRAM used 11154 MiB
+13:27:39 G2_range_stalls: client finished in 417 s: 64 tokens 16 tokens 64 tokens 46 tokens
+13:27:44 G2_range_stalls: ncu stdout tail: ==ERROR== The application returned an error code (4294967295). / ==WARNING== No source files were imported. Check that the target application was compiled with -lineinfo. / ==PROF== Report: C:\Users\a3k6g\AppData\Local\Temp\claude\c2eb5aa3e3d3334d\95988fd8-569b-47c7-99ea-9f100d75d035\scratchpad\ncu_diag3_G2_range_stalls.ncu-repz
+13:27:44 G2_range_stalls: engine said: ncu range: start at batched pass 6 (4 rows), driver result 0 / ncu range: stop at batched pass 7 (4 rows), driver result 0
+13:27:44 G2_range_stalls: report written: ncu_diag3_G2_range_stalls.ncu-repz
+13:27:44 all experiments done
