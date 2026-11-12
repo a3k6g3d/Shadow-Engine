@@ -1,0 +1,47 @@
+243 decode rounds (of 249 draft rounds), 13.01 s: 53.5 ms a round
+per round: kernels 33.0 ms, H2D copies 9.1 ms (216 MB), both at once 3.0 ms, neither 14.4 ms
+shares: kernel busy 61.7%, copy busy 16.9%, copy with no kernel 11.4%, neither 27.0%
+copy rate while copying: 23.9 GB/s
+kernel time 33.0 ms a round
+  matvec_cols_q6_k                    6.37 ms a round (19.3%),  95.1 launches a round,  66.9 us each
+  matvec_grouped_iq4_nl               3.26 ms a round ( 9.9%),  72.2 launches a round,  45.1 us each
+  matvec_cols_iq4_xs                  2.91 ms a round ( 8.8%),  95.2 launches a round,  30.6 us each
+  matvec_cols_q8_0                    2.38 ms a round ( 7.2%),  57.6 launches a round,  41.3 us each
+  matvec_cols_bf16                    2.18 ms a round ( 6.6%), 204.1 launches a round,  10.7 us each
+  matvec_grouped_iq2_s                2.17 ms a round ( 6.6%),  37.5 launches a round,  57.8 us each
+  matvec_grouped_iq3_xxs              1.95 ms a round ( 5.9%),  31.9 launches a round,  61.0 us each
+  delta_step                          1.74 ms a round ( 5.3%),  42.1 launches a round,  41.3 us each
+  hc_down_inject_cols_fast_bf16       1.39 ms a round ( 4.2%), 102.6 launches a round,  13.6 us each
+  matvec_grouped_iq3_s                1.16 ms a round ( 3.5%),  18.5 launches a round,  62.9 us each
+  matvec_cols_q5_k                    1.10 ms a round ( 3.3%),  32.8 launches a round,  33.6 us each
+  matvec_cols_f32                     0.85 ms a round ( 2.6%), 101.5 launches a round,   8.4 us each
+  matvec_cols_q4_k                    0.80 ms a round ( 2.4%),  45.5 launches a round,  17.5 us each
+  hc_write_rmsnorm_rows_f             0.63 ms a round ( 1.9%), 100.5 launches a round,   6.3 us each
+gaps 0.00-0.01 ms: 1777.3 a round, 4.07 ms a round
+gaps 0.01-0.10 ms: 186.8 a round, 5.23 ms a round
+gaps 0.10-1.00 ms: 20.5 a round, 6.86 ms a round
+gaps 1.00-inf ms: 2.2 a round, 4.35 ms a round
+gaps of 0.1 ms or more, by the API call running in them (ms a round; calls overlap):
+  cuEventSynchronize                        2.79
+  cuMemcpyDtoH_v2                           1.16
+  cuMemcpyDtoD_v2                           0.30
+  cuLaunchKernel                            0.11
+  cuMemAlloc_v2                             0.05
+  cuCtxSetCurrent                           0.02
+  cuMemcpyHtoDAsync_v2                      0.02
+  cuEventRecord                             0.00
+  cuStreamWaitEvent                         0.00
+  (no API call over 20 us: 6.76 ms a round: host work)
+by the kernels around the gap:
+  matvec_grouped_iq4_nl -> matvec_grouped_iq3_xxs                         2.55
+  matvec_grouped_iq4_nl -> matvec_grouped_iq2_s                           2.01
+  matvec_cols_q6_k -> conv_silu_step                                      1.68
+  matvec_cols_q6_k -> copy_words                                          1.17
+  matvec_grouped_iq4_nl -> matvec_grouped_iq3_s                           1.12
+  df_walk -> copy_words                                                   0.86
+  matvec_grouped_q2_0 -> matvec_grouped_iq2_s                             0.70
+  matvec_grouped_q2_0 -> matvec_grouped_iq3_xxs                           0.34
+  matvec_grouped_q2_0 -> matvec_grouped_iq3_s                             0.25
+  hc_write -> copy_words                                                  0.25
+  matvec_grouped_iq4_nl -> matvec_grouped_iq4_xs                          0.16
+  copy_words -> matvec_grouped_iq3_xxs                                    0.05

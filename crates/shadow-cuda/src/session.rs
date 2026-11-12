@@ -500,6 +500,7 @@ pub struct GpuSession<'c, 'm> {
     hop_buf: Option<crate::driver::PinnedHost>,
     hop_src: Option<HopSrc<'c>>,
     hop_done: Event<'c>,
+    spec_bytes: Option<SpecBytes>,
     /// The tokens the session held when it was last `reset` (not emptied by a second reset): the drafter's K/V ring still describes them, so a
     /// snapshot restore right after the reset can keep the positions the two share (`restore`, STATUS 98)
     reset_tokens: Vec<u32>,
@@ -655,6 +656,43 @@ struct Prefetch<'c> {
 
 /// The mapped staging region for small uploads (`GpuSession::upload_to`).
 const STAGE_BYTES: usize = 4 << 20;
+
+/// `SHADOW_SPEC_BYTES=1` (STATUS 105): where a verify pass's copied experts go.  Each expert a verify pass copies (not in VRAM) is put on the lowest row
+/// that routes to it (row 0 is the token being stepped, row j the j-th draft); when the engine says how many rows it kept (`note_verify`), an expert whose
+/// lowest row was not kept was copied for nothing.  `cf[d]`: the bytes a rank-1 verify from draft depth d + 1 on would not have copied (every row that routes to
+/// the expert is that deep or deeper and has it at rank 2 or lower).
+#[derive(Default)]
+struct SpecBytes {
+    /// this pass: [lowest row][from the RAM tier, from the file] bytes, and the counterfactual bytes [depth][lowest row]
+    pass: [[u64; 2]; 8],
+    cf_pass: [[u64; 8]; 3],
+    /// every pass so far: the same, and [lowest row] bytes of rejected rows
+    tot: [[u64; 2]; 8],
+    waste: [u64; 8],
+    cf: [[u64; 2]; 3],
+    passes: u64,
+    rows: u64,
+    kept: u64,
+}
+
+impl SpecBytes {
+    fn report(&self) -> String {
+        let n = self.passes.max(1) as f64;
+        let mb = |x: u64| x as f64 / n / 1e6;
+        let all: u64 = self.tot.iter().map(|r| r[0] + r[1]).sum();
+        let file: u64 = self.tot.iter().map(|r| r[1]).sum();
+        let waste: u64 = self.waste.iter().sum();
+        let rows: Vec<String> = (0..8).filter(|&j| self.tot[j][0] + self.tot[j][1] > 0).map(|j| {
+            let t = self.tot[j][0] + self.tot[j][1];
+            format!("row {j}: {:.1} MB ({:.0}% of it rejected)", mb(t), 100.0 * self.waste[j] as f64 / t as f64)
+        }).collect();
+        let cf: Vec<String> = (0..3).map(|d| format!("from depth {}: {:.1} MB ({:.1} MB of it in rejected rows)", d + 1, mb(self.cf[d][0]), mb(self.cf[d][1]))).collect();
+        format!("spec bytes: {} verify passes, {:.2} rows and {:.2} kept a pass; copied {:.1} MB a pass ({:.1} MB from the file), {:.1} MB a kept token; \
+                 copied only for rejected rows {:.1} MB a pass ({:.1}%); by the lowest row that routes to the expert: {}; a rank-1 verify would skip {}",
+                self.passes, self.rows as f64 / n, self.kept as f64 / n, mb(all), mb(file), all as f64 / self.kept.max(1) as f64 / 1e6,
+                mb(waste), 100.0 * waste as f64 / all.max(1) as f64, rows.join(", "), cf.join(", "))
+    }
+}
 
 /// Rows per copy through the hop's pinned buffer (a chunk is at most `HOP_CHUNK_ROWS` x `NFEAT` floats = 50 MiB of pinned memory, taken at the first hop).
 const HOP_CHUNK_ROWS: usize = 1024;
@@ -1976,6 +2014,7 @@ impl<'c, 'm> GpuSession<'c, 'm> {
             hop_buf: None,
             hop_src: None,
             hop_done: ctx.event().map_err(e)?,
+            spec_bytes: std::env::var("SHADOW_SPEC_BYTES").is_ok_and(|v| v == "1").then(SpecBytes::default),
             graphs: HashMap::new(),
             multi: HashMap::new(),
             fuse: tiers.fuse.or_else(|| std::env::var("SHADOW_FUSE").ok().and_then(|v| v.parse().ok())).unwrap_or(0),
@@ -4587,6 +4626,31 @@ impl<'c, 'm> GpuSession<'c, 'm> {
     /// The engine's word on a verify pass of `m` positions (the anchor and m - 1 drafts) of which `keep` were kept: the
     /// marginal commitment probability of each draft position (`--accept-moe`).
     pub fn note_verify(&mut self, keep: usize, m: usize) {
+        if let Some(sb) = self.spec_bytes.as_mut() {
+            sb.passes += 1;
+            sb.rows += m as u64;
+            sb.kept += keep as u64;
+            for j in 0..8 {
+                let rejected = j >= keep;
+                for f in 0..2 {
+                    sb.tot[j][f] += sb.pass[j][f];
+                    if rejected {
+                        sb.waste[j] += sb.pass[j][f];
+                    }
+                }
+                for d in 0..3 {
+                    sb.cf[d][0] += sb.cf_pass[d][j];
+                    if rejected {
+                        sb.cf[d][1] += sb.cf_pass[d][j];
+                    }
+                }
+            }
+            sb.pass = Default::default();
+            sb.cf_pass = Default::default();
+            if sb.passes % 100 == 0 {
+                eprintln!("{}", sb.report());
+            }
+        }
         if self.commit.len() < m {
             self.commit.resize(m, (0, 0));
         }
@@ -6111,6 +6175,34 @@ impl<'c, 'm> GpuSession<'c, 'm> {
         let names = [format!("{p}.ffn_gate_exps.weight"), format!("{p}.ffn_up_exps.weight"), format!("{p}.ffn_down_exps.weight")];
         let infos: Vec<TensorInfo> = names.iter().map(|n| self.expert_info(n)).collect();
         let sizes: Vec<usize> = names.iter().map(|n| self.m.expert_bytes(n)).collect();
+        if self.replay.on.get() {
+            if let Some(sb) = self.spec_bytes.as_mut() {
+                let bytes = sizes.iter().sum::<usize>() as u64;
+                // every expert this pass copies: its lowest row, and whether every row routing to it is at depth >= d + 1 with it at rank 2 or lower
+                let mut seen: HashMap<usize, (usize, [bool; 3])> = HashMap::new();
+                for (j, top) in tops.iter().enumerate() {
+                    for (i, &(e, _)) in top.iter().enumerate() {
+                        if self.cache.map.contains_key(&(l, e)) {
+                            continue;
+                        }
+                        let ent = seen.entry(e).or_insert((j, [true; 3]));
+                        ent.0 = ent.0.min(j);
+                        for (d, f) in ent.1.iter_mut().enumerate() {
+                            *f &= j > d && i >= 1;
+                        }
+                    }
+                }
+                for (e, (j, cf)) in seen {
+                    let jj = j.min(7);
+                    sb.pass[jj][!self.ram.at.contains_key(&(l, e)) as usize] += bytes;
+                    for d in 0..3 {
+                        if cf[d] {
+                            sb.cf_pass[d][jj] += bytes;
+                        }
+                    }
+                }
+            }
+        }
         // Hybrid MoE in a verify pass: up to `cpu_experts` of the layer's cache misses that the RAM tier holds and that
         // ONE token routes to (the CPU computes an expert per token; a copy serves every token that uses it) are computed
         // on the CPU from the pinned bytes while the GPU runs the resident experts and the copies run.  Their rank rows of

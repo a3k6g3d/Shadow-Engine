@@ -1,9 +1,10 @@
 """Summarizes an Nsight Systems export (SQLite) of a shadow prompt: how much of the prompt's window the GPU runs kernels, copies host to device, or does neither.
 
   nsys export --type sqlite -o X.sqlite -f true X.nsys-rep
-  py tools/nsys_pass_summary.py X.sqlite
+  py tools/nsys_pass_summary.py X.sqlite [MARKER]
 
-The window runs from the first to the last `select_blocks_rows` launch (the sparse attention of a long prompt)."""
+The window runs from the first to the last launch of the kernel MARKER: `select_blocks_rows` (the default: the sparse attention of a long prompt), or e.g.
+`df_attention` (the DFlash drafter: the decode of a run)."""
 import sqlite3, sys
 from collections import defaultdict
 
@@ -12,7 +13,8 @@ c = db.cursor()
 names = {r[0]: r[1] for r in c.execute("select id,value from StringIds")}
 ks = c.execute("select start,end,shortName from CUPTI_ACTIVITY_KIND_KERNEL order by start").fetchall()
 ms = c.execute("select start,end,bytes,copyKind from CUPTI_ACTIVITY_KIND_MEMCPY order by start").fetchall()
-sel = [k for k in ks if names.get(k[2], '') == 'select_blocks_rows']
+marker = sys.argv[2] if len(sys.argv) > 2 else 'select_blocks_rows'
+sel = [k for k in ks if names.get(k[2], '') == marker]
 t0, t1 = sel[0][0], sel[-1][1]
 
 
@@ -64,6 +66,6 @@ tk = sum(d.values())
 for nm, v in sorted(d.items(), key=lambda x: -x[1])[:16]:
     print('%-34s %7.0f ms %5.1f%% of kernel time, %6d launches, %.1f us each' % (nm, v / 1e6, 100 * v / tk, n[nm], v / n[nm] / 1e3))
 gaps = [K[i + 1][0] - K[i][1] for i in range(len(K) - 1)]
-for lo, hi in [(100e3, 1e6), (1e6, 10e6), (10e6, 50e6), (50e6, 1e15)]:
+for lo, hi in [(0, 10e3), (10e3, 100e3), (100e3, 1e6), (1e6, 10e6), (10e6, 50e6), (50e6, 1e15)]:
     gg = [g for g in gaps if lo <= g < hi]
-    print('gaps with no kernel, %.1f-%s ms: %d, total %.0f ms' % (lo / 1e6, 'inf' if hi > 1e14 else '%.0f' % (hi / 1e6), len(gg), sum(gg) / 1e6))
+    print('gaps with no kernel, %.2f-%s ms: %d, total %.0f ms' % (lo / 1e6, 'inf' if hi > 1e14 else '%.2f' % (hi / 1e6), len(gg), sum(gg) / 1e6))

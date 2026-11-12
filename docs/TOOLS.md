@@ -24,6 +24,7 @@ CUDA index, `safetensors`, `numpy`, `matplotlib`).
 | `tools/autotune.py` | coordinate ascent over serving flags with paired bench rounds; adopts only what clears the noise |
 | `tools/bench_vs_strata.ps1`, `run_strata.ps1`, `strata_bench_cfg.py` | the same bench against a Strata install, as an interleaved arm, with its server under the RAM floor |
 | `tools/cache_sim.py` | replays a routing log through VRAM expert-cache policies and prints each one's hit rate (`SHADOW_ROUTE_LOG`, `SHADOW_CACHE_DUMP`) |
+| `tools/nsys_decode_rounds.py X.sqlite` | decode only from an Nsight Systems export (`--cuda-graph-trace=node`): per DFlash round the kernel, copy and idle time, the kernels by name, the gaps by size and by the CUDA call running in them |
 | `tools/spec_probe.py` | what speculation could buy from routing logs: expert-union size per verify pass, accepted tokens per pass |
 | `tools/serve_check.py [URL]` | live checks of a running `shadow serve`: every route, streamed vs whole answers identical, prefix reuse, refusals, concurrent requests |
 
