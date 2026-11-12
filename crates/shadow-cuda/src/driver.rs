@@ -422,6 +422,33 @@ impl RawFunction<'_> {
     }
 }
 
+/// Pinned host memory usable from every context (`CU_MEMHOSTALLOC_PORTABLE`), freed on drop: where one card's copy lands and another's starts (the hop between two stages).
+pub struct PinnedHost {
+    api: &'static Api,
+    pub p: *mut c_void,
+    pub bytes: usize,
+}
+
+impl PinnedHost {
+    pub fn new(ctx: &Context, bytes: usize) -> Result<PinnedHost, String> {
+        ctx.bind().map_err(|e| e.to_string())?;
+        let mut p: *mut c_void = std::ptr::null_mut();
+        // SAFETY: an out-pointer; flags 1 = portable.
+        let r = unsafe { (ctx.api.cuMemHostAlloc)(&mut p, bytes, 1) };
+        if r != 0 {
+            return Err(format!("cuMemHostAlloc of {} MiB failed ({r})", bytes >> 20));
+        }
+        Ok(PinnedHost { api: ctx.api, p, bytes })
+    }
+}
+
+impl Drop for PinnedHost {
+    fn drop(&mut self) {
+        // SAFETY: the pointer `cuMemHostAlloc` gave, freed once.
+        unsafe { (self.api.cuMemFreeHost)(self.p) };
+    }
+}
+
 pub struct Stream<'c> {
     ctx: &'c Context,
     stream: H,

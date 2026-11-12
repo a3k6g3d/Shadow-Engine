@@ -130,6 +130,8 @@ pair: nothing that needs no card except the drafter across stages (phase 3) and 
 
 **Update (STATUS 103): the DFlash drafter now runs across the stages (on the second card, fed the first card's taps); the pair's drafts equal one session's at splits 1, 20, 40 and 47. Left that needs no card: a pinned-buffer hop.**
 
+**Update (STATUS 104): the hop now goes through a pinned buffer in chunks (22x faster for prompt passes on one card, -0.2 ms a verify pass; `SHADOW_HOP=0` is the old one). Nothing is left that needs no card except overlapping the two stages' work (phase 5's territory) and measuring.**
+
 **Phase 0a (before the card arrives, no hardware): the probe tool and the baseline.**
 `shadow gpus`: list devices (name, UUID, compute capability, VRAM, driver, PCIe gen/width now and max), and per device:
 pinned host -> device and device -> host bandwidth alone, both cards at the same time (does the chipset path hurt the CPU

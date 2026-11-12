@@ -348,3 +348,64 @@ fn the_drafter_across_two_stages_drafts_what_one_session_drafts() {
         eprintln!("the drafter across two stages, split at layer {split}: {} rounds, every draft identical ({drafted} drafted)", got.len());
     }
 }
+
+// ---------------------------------------------------------------------------------------------------------------------- a long prompt (the lent cache, big batches)
+
+/// A prompt of 1,300 tokens read the way the engine reads one (`hint_prompt`, `lend_cache`, chunks of `batch_rows()`, the last with logits), then a few steps, on one
+/// session and on the pair: the hop moves big passes (more than one chunk of the pinned buffer when the rows allow it).  Every logit identical.
+#[test]
+fn a_long_prompt_through_the_pair_equals_one_session() {
+    let p = std::env::var("SHADOW_MODEL").unwrap_or_else(|_| MODEL.into());
+    if !Path::new(&p).is_file() {
+        eprintln!("SKIPPED, not passed: no model at {p}");
+        return;
+    }
+    let ctx = match Context::new(0) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("SKIPPED, not passed: no card ({e})");
+            return;
+        }
+    };
+    let model = Model::load_lean(Gguf::open(Path::new(&p)).unwrap()).unwrap();
+    let n_layer = model.cfg.n_layer;
+    const LONG: usize = 1300;
+    let prompt: Vec<u32> = (0..LONG as u32).map(|i| 1000 + (i * 7919) % 9000).collect();
+    let run = |s: &mut GpuSession, tag: &str| -> Vec<Vec<f32>> {
+        let mut out = vec![];
+        s.hint_prompt(prompt.len());
+        let lent = s.lend_cache(false);
+        let chunk = s.batch_rows();
+        eprintln!("{tag}: lent {lent}, batch_rows {chunk}");
+        let mut i = 0;
+        while i < prompt.len() {
+            let end = (i + chunk).min(prompt.len());
+            if end == prompt.len() {
+                out.push(s.step_batch_last(&prompt[i..end]).pop().unwrap());
+            } else {
+                s.prefill_batch(&prompt[i..end]);
+            }
+            i = end;
+        }
+        if lent {
+            s.restore_cache();
+        }
+        out.push(s.step(4242));
+        out.push(s.step(17));
+        out
+    };
+    let big = |stage: Option<(usize, usize)>| Tiers { layers: stage, vram_cache: Some(1536 << 20), ..Tiers::default() };
+    let want = {
+        let mut s = GpuSession::with_tiers(&ctx, &model, LONG + 8, big(None)).unwrap();
+        run(&mut s, "one session")
+    };
+    let mut a = GpuSession::with_tiers(&ctx, &model, LONG + 8, big(Some((0, 24)))).unwrap();
+    let b = GpuSession::with_tiers(&ctx, &model, LONG + 8, big(Some((24, n_layer)))).unwrap();
+    a.attach_peer(b).unwrap();
+    let got = run(&mut a, "pair");
+    assert_eq!(got.len(), want.len());
+    for (i, (g, w)) in got.iter().zip(&want).enumerate() {
+        same(g, w, &format!("long prompt, output {i}"));
+    }
+    eprintln!("a {LONG}-token prompt through the pair: {} outputs, every logit identical", got.len());
+}

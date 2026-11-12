@@ -495,6 +495,11 @@ pub struct GpuSession<'c, 'm> {
     /// match the rows this stage captures (`df_feat_ok`; when they do not the drafter skips the pass, as after any hole)
     feat_in: Option<Vec<f32>>,
     df_feat_ok: bool,
+    /// The hop between two stages through pinned host memory (STATUS 104): the first stage leaves a description of where its rows are (`hop_src`), the second copies
+    /// them down into `hop_buf` and up into its own row storage in chunks, the event marking when the buffer is free again.
+    hop_buf: Option<crate::driver::PinnedHost>,
+    hop_src: Option<HopSrc<'c>>,
+    hop_done: Event<'c>,
     /// The tokens the session held when it was last `reset` (not emptied by a second reset): the drafter's K/V ring still describes them, so a
     /// snapshot restore right after the reset can keep the positions the two share (`restore`, STATUS 98)
     reset_tokens: Vec<u32>,
@@ -650,6 +655,68 @@ struct Prefetch<'c> {
 
 /// The mapped staging region for small uploads (`GpuSession::upload_to`).
 const STAGE_BYTES: usize = 4 << 20;
+
+/// Rows per copy through the hop's pinned buffer (a chunk is at most `HOP_CHUNK_ROWS` x `NFEAT` floats = 50 MiB of pinned memory, taken at the first hop).
+const HOP_CHUNK_ROWS: usize = 1024;
+
+/// `HOP_CHUNK_ROWS`, or `SHADOW_HOP_CHUNK=N` rows (the tests make it small to run the chunked path on short passes).
+fn hop_chunk_rows() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| std::env::var("SHADOW_HOP_CHUNK").ok().and_then(|v| v.parse::<usize>().ok()).filter(|&n| n >= 1).map_or(HOP_CHUNK_ROWS, |n| n.min(HOP_CHUNK_ROWS)))
+}
+
+/// What the first stage leaves for the second at the layer boundary: where in its own memory the pass's residual streams are (runs of consecutive rows: first row,
+/// rows, device address) and, for the drafter, its feature rows (consecutive, `NFEAT` floats each).
+pub(crate) struct HopSrc<'c> {
+    ctx: &'c Context,
+    runs: Vec<(usize, usize, u64)>,
+    feat_ptr: Option<u64>,
+    feat_rows: usize,
+}
+
+/// `SHADOW_HOP=0`: the hand-off through host `Vec`s and a copy a row, as before STATUS 104.
+fn hop_pinned() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| !std::env::var("SHADOW_HOP").is_ok_and(|v| v == "0"))
+}
+
+/// `SHADOW_HOP_TIME=1`: what the hand-off between two stages costs (STATUS 104), by the size of the pass: 1 row, 2..=8 (a verify pass), more (a prompt).  Per bucket
+/// [hops, rows, bytes, ns waiting for the sending stage's GPU, ns copying down + packing, ns queueing the upload]
+static HOP_T: [[std::sync::atomic::AtomicU64; 6]; 3] = [const { [const { std::sync::atomic::AtomicU64::new(0) }; 6] }; 3];
+static HOP_BUCKET: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+fn hop_time() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("SHADOW_HOP_TIME").is_ok_and(|v| v == "1"))
+}
+
+/// Sets the bucket of the hop about to be timed (the sender knows the rows; the receiver adds to the same one).
+fn hop_rows(rows: usize) {
+    HOP_BUCKET.store(if rows <= 1 { 0 } else if rows <= 8 { 1 } else { 2 }, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn hop_add(slot: usize, v: u64) {
+    HOP_T[HOP_BUCKET.load(std::sync::atomic::Ordering::Relaxed)][slot].fetch_add(v, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn hop_report() {
+    use std::sync::atomic::Ordering::Relaxed;
+    let total: u64 = HOP_T.iter().map(|t| t[0].load(Relaxed)).sum();
+    if total == 0 || total % 10 != 0 {
+        return;
+    }
+    let mut line = String::from("hop:");
+    for (name, t) in ["1 row", "2-8 rows", "more"].iter().zip(&HOP_T) {
+        let n = t[0].load(Relaxed);
+        if n == 0 {
+            continue;
+        }
+        let g = |i: usize| t[i].load(Relaxed) as f64 / n as f64;
+        line += &format!(" [{name}: {n} hops, {:.1} rows, {:.0} KB; sender GPU wait {:.0} us, copy down {:.0} us, upload queued {:.0} us]",
+                         g(1), g(2) / 1e3, g(3) / 1e3, g(4) / 1e3, g(5) / 1e3);
+    }
+    eprintln!("{line}");
+}
 
 /// A session's state at a token boundary (`GpuSession::snapshot`).
 pub struct Snapshot<'c> {
@@ -1906,6 +1973,9 @@ impl<'c, 'm> GpuSession<'c, 'm> {
             tap_feat,
             feat_in: None,
             df_feat_ok: true,
+            hop_buf: None,
+            hop_src: None,
+            hop_done: ctx.event().map_err(e)?,
             graphs: HashMap::new(),
             multi: HashMap::new(),
             fuse: tiers.fuse.or_else(|| std::env::var("SHADOW_FUSE").ok().and_then(|v| v.parse().ok())).unwrap_or(0),
@@ -2630,6 +2700,101 @@ impl<'c, 'm> GpuSession<'c, 'm> {
         self.peer.as_deref()
     }
 
+    /// The pinned buffer of the hop, made at the first use; whether it exists.
+    fn hop_ensure(&mut self) -> bool {
+        if self.hop_buf.is_none() {
+            let bytes = HOP_CHUNK_ROWS * (self.m.cfg.hidden * self.m.cfg.streams).max(crate::dflash::NFEAT) * 4;
+            match crate::driver::PinnedHost::new(self.ctx, bytes) {
+                Ok(buf) => self.hop_buf = Some(buf),
+                Err(err) => {
+                    eprintln!("hop: {err}: the stages hand over through host vectors");
+                    return false;
+                }
+            }
+        }
+        true
+    }
+
+    /// The second stage: the first one's `m` rows of residual streams (and its drafter feature rows) into this stage's row storage (`row_ptr(j)`), copied down into
+    /// the pinned buffer and up from it a chunk at a time, the upload asynchronous.  Returns whether the feature rows were taken (`own_feat_rows` = the rows this
+    /// stage's taps are about to fill: they must be the same ones).
+    fn hop_pull(&self, src: &HopSrc<'c>, row_ptr: &dyn Fn(usize) -> u64, own_feat_rows: usize) -> bool {
+        let buf = self.hop_buf.as_ref().expect("hop_ensure first");
+        let row_b = self.m.cfg.hidden * self.m.cfg.streams * 4;
+        let api = self.ctx.api;
+        let timed = hop_time();
+        let (mut t_down, mut t_up) = (0u64, 0u64);
+        // the copies: `bytes` bytes inside the pinned buffer (a chunk is at most HOP_CHUNK_ROWS rows of the larger row size) and inside the sender's rows / this stage's row
+        // storage; the buffer is not written again before `hop_done` says the uploads from it have run
+        let down = |dev: u64, bytes: usize, t: &mut u64| {
+            self.hop_done.synchronize().unwrap();
+            let t0 = timed.then(std::time::Instant::now);
+            src.ctx.bind().unwrap();
+            // SAFETY: see above.
+            let r = unsafe { (api.cuMemcpyDtoH)(buf.p, dev, bytes) };
+            assert_eq!(r, 0, "hop: cuMemcpyDtoH failed ({r})");
+            self.ctx.bind().unwrap();
+            if let Some(t0) = t0 {
+                *t += t0.elapsed().as_nanos() as u64;
+            }
+        };
+        let up = |dst: u64, off: usize, bytes: usize| {
+            // SAFETY: see above.
+            let r = unsafe { (api.cuMemcpyHtoDAsync)(dst, (buf.p as *const u8).add(off) as *const std::ffi::c_void, bytes, std::ptr::null_mut()) };
+            assert_eq!(r, 0, "hop: cuMemcpyHtoDAsync failed ({r})");
+        };
+        for &(j0, n, dev) in &src.runs {
+            let mut k = 0;
+            while k < n {
+                let cnt = (n - k).min(hop_chunk_rows());
+                down(dev + (k * row_b) as u64, cnt * row_b, &mut t_down);
+                let t0 = timed.then(std::time::Instant::now);
+                // consecutive rows here may be several runs in this stage's storage (its sub-chunk parts)
+                let mut a = 0;
+                while a < cnt {
+                    let start = row_ptr(j0 + k + a);
+                    let mut e = a + 1;
+                    while e < cnt && row_ptr(j0 + k + e) == start + ((e - a) * row_b) as u64 {
+                        e += 1;
+                    }
+                    up(start, a * row_b, (e - a) * row_b);
+                    a = e;
+                }
+                self.hop_done.record(None).unwrap();
+                if let Some(t0) = t0 {
+                    t_up += t0.elapsed().as_nanos() as u64;
+                }
+                k += cnt;
+            }
+        }
+        let mut feats_ok = true;
+        if let (Some(fp), Some(df)) = (src.feat_ptr, self.dflash.as_ref()) {
+            if src.feat_rows == own_feat_rows {
+                let fb = crate::dflash::NFEAT * 4;
+                let mut k = 0;
+                while k < src.feat_rows {
+                    let cnt = (src.feat_rows - k).min(hop_chunk_rows());
+                    down(fp + (k * fb) as u64, cnt * fb, &mut t_down);
+                    let t0 = timed.then(std::time::Instant::now);
+                    up(df.bufs.feat.ptr + (k * fb) as u64, 0, cnt * fb);
+                    self.hop_done.record(None).unwrap();
+                    if let Some(t0) = t0 {
+                        t_up += t0.elapsed().as_nanos() as u64;
+                    }
+                    k += cnt;
+                }
+            } else {
+                feats_ok = false;
+            }
+        }
+        if timed {
+            hop_add(4, t_down);
+            hop_add(5, t_up);
+            hop_report();
+        }
+        feats_ok
+    }
+
     pub fn step_prefill(&mut self, token: u32) {
         self.step_opt(token, false);
     }
@@ -2660,10 +2825,20 @@ impl<'c, 'm> GpuSession<'c, 'm> {
             self.rec_host("embed".into(), &emb);
         } else {
             // a later stage starts from the previous one's residual streams
-            let r = self.layers_in.take().expect("a stage after the first needs the previous stage's residual streams (step_stage)");
-            assert_eq!(r.len(), h * cs, "the residual streams are {} floats", h * cs);
-            self.upload_to(self.b.r.ptr, &f32s(&r));
-            self.feat_in_upload(1);
+            if let Some(src) = self.hop_src.take() {
+                let rp = self.b.r.ptr;
+                self.df_feat_ok = self.hop_pull(&src, &|_| rp, 1);
+            } else {
+                let r = self.layers_in.take().expect("a stage after the first needs the previous stage's residual streams (step_stage)");
+                assert_eq!(r.len(), h * cs, "the residual streams are {} floats", h * cs);
+                let t_hop = hop_time().then(std::time::Instant::now);
+                self.upload_to(self.b.r.ptr, &f32s(&r));
+                self.feat_in_upload(1);
+                if let Some(t) = t_hop {
+                    hop_add(5, t.elapsed().as_nanos() as u64);
+                    hop_report();
+                }
+            }
         }
         self.mark("embedding");
 
@@ -2725,9 +2900,38 @@ impl<'c, 'm> GpuSession<'c, 'm> {
         }
         if hi < c.n_layer {
             // not the last stage: the streams go to the next one (and the drafter's features of the taps in this stage's layers)
+            if hop_pinned() {
+                let src = HopSrc { ctx: self.ctx, runs: vec![(0, 1, self.b.r.ptr)], feat_ptr: self.tap_feat.as_ref().map(|b| b.ptr), feat_rows: 1 };
+                if let Some(p) = self.peer.as_mut().and_then(|p| if p.hop_ensure() { Some(p) } else { None }) {
+                    if hop_time() {
+                        hop_rows(1);
+                        let t0 = std::time::Instant::now();
+                        self.ctx.synchronize().unwrap();
+                        hop_add(3, t0.elapsed().as_nanos() as u64);
+                        hop_add(0, 1);
+                        hop_add(1, 1);
+                        hop_add(2, (h * cs * 4 + src.feat_ptr.map_or(0, |_| crate::dflash::NFEAT * 4)) as u64);
+                    }
+                    p.hop_src = Some(src);
+                    return p.step_opt(token, with_logits);
+                }
+            }
+            let t_hop = hop_time().then(|| {
+                hop_rows(1);
+                let t0 = std::time::Instant::now();
+                self.ctx.synchronize().unwrap();
+                hop_add(3, t0.elapsed().as_nanos() as u64);
+                std::time::Instant::now()
+            });
             let mut out = vec![0u8; h * cs * 4];
             self.download(self.b.r.ptr, &mut out);
             let feats = self.tap_feats_out(1);
+            if let Some(t) = t_hop {
+                hop_add(0, 1);
+                hop_add(1, 1);
+                hop_add(2, (out.len() + feats.as_ref().map_or(0, |f| f.len() * 4)) as u64);
+                hop_add(4, t.elapsed().as_nanos() as u64);
+            }
             if let Some(p) = self.peer.as_mut() {
                 p.layers_in = Some(floats(&out));
                 p.feat_in = feats;
@@ -4605,19 +4809,29 @@ impl<'c, 'm> GpuSession<'c, 'm> {
         assert!(sub_mode || m <= self.rows, "a pass of {m} rows with temporaries for {}", self.rows);
         // row j's residual streams are at storage row j + pad (the first sub-chunk, the remainder, ends part 0): a sub-chunk is inside one part
         let pad = if sub_mode { (self.rows - m % self.rows) % self.rows } else { 0 };
-        let stage_in = if lo > 0 { Some(self.layers_in.take().expect("a stage after the first needs the previous stage's residual streams (step_batch_stage)")) } else { None };
+        let hop = if lo > 0 { self.hop_src.take() } else { None };
+        let stage_in = if lo > 0 && hop.is_none() { Some(self.layers_in.take().expect("a stage after the first needs the previous stage's residual streams (step_batch_stage)")) } else { None };
         let row_ptr = |j: usize| -> u64 {
             if sub_mode { self.rparts[(j + pad) / self.rows].ptr + (((j + pad) % self.rows) * ch * 4) as u64 } else { self.bb.r.ptr + (j * ch * 4) as u64 }
         };
-        if let Some(r) = stage_in.as_ref() {
+        if let Some(src) = hop.as_ref() {
+            // the rows this stage's own taps will fill are the last ones of the pass's last sub-chunk (`df_capture`)
+            let last = *subs.last().unwrap();
+            self.df_feat_ok = self.hop_pull(src, &row_ptr, last.1.min(crate::dflash::DF_ROWS));
+        } else if let Some(r) = stage_in.as_ref() {
             // a stage after the first starts from the previous stage's residual streams, one row of `ch` floats a token
             assert_eq!(r.len(), m * ch, "{m} tokens' residual streams are {} floats", m * ch);
+            let t_hop = hop_time().then(std::time::Instant::now);
             for j in 0..m {
                 self.upload_to(row_ptr(j), &f32s(&r[j * ch..(j + 1) * ch]));
             }
             // the rows this stage's own taps will fill are the last ones of the pass's last sub-chunk (`df_capture`)
             let last = *subs.last().unwrap();
             self.feat_in_upload(last.1.min(crate::dflash::DF_ROWS));
+            if let Some(t) = t_hop {
+                hop_add(5, t.elapsed().as_nanos() as u64);
+                hop_report();
+            }
         } else {
             let (t, bytes) = self.m.dense("token_embd.weight");
             let (qk, qb) = t.ty.block().unwrap();
@@ -4816,6 +5030,41 @@ impl<'c, 'm> GpuSession<'c, 'm> {
             let rp = |j: usize| -> u64 {
                 if sub_mode { self.rparts[(j + pad) / self.rows].ptr + (((j + pad) % self.rows) * ch * 4) as u64 } else { self.bb.r.ptr + (j * ch * 4) as u64 }
             };
+            if hop_pinned() {
+                // consecutive rows of this stage's storage go as one run (a sub-chunked pass has one per part)
+                let mut runs: Vec<(usize, usize, u64)> = vec![];
+                for j in 0..m {
+                    match runs.last_mut() {
+                        Some((j0, n, dev)) if *dev + (*n * ch * 4) as u64 == rp(j) && *j0 + *n == j => *n += 1,
+                        _ => runs.push((j, 1, rp(j))),
+                    }
+                }
+                let feat_rows = m_obs.min(crate::dflash::DF_ROWS);
+                let src = HopSrc { ctx: self.ctx, runs, feat_ptr: self.tap_feat.as_ref().map(|b| b.ptr), feat_rows };
+                if let Some(p) = self.peer.as_mut().and_then(|p| if p.hop_ensure() { Some(p) } else { None }) {
+                    if hop_time() {
+                        hop_rows(m);
+                        let t0 = std::time::Instant::now();
+                        self.ctx.synchronize().unwrap();
+                        hop_add(3, t0.elapsed().as_nanos() as u64);
+                        hop_add(0, 1);
+                        hop_add(1, m as u64);
+                        hop_add(2, (m * ch * 4 + src.feat_ptr.map_or(0, |_| feat_rows * crate::dflash::NFEAT * 4)) as u64);
+                    }
+                    p.hop_src = Some(src);
+                    p.logits_last = self.logits_last;
+                    let logits = p.batch(toks, with_logits);
+                    p.logits_last = false;
+                    return logits;
+                }
+            }
+            let t_hop = hop_time().then(|| {
+                hop_rows(m);
+                let t0 = std::time::Instant::now();
+                self.ctx.synchronize().unwrap();
+                hop_add(3, t0.elapsed().as_nanos() as u64);
+                std::time::Instant::now()
+            });
             let mut out = Vec::with_capacity(m * ch);
             for j in 0..m {
                 let mut bytes = vec![0u8; ch * 4];
@@ -4823,6 +5072,12 @@ impl<'c, 'm> GpuSession<'c, 'm> {
                 out.extend(floats(&bytes));
             }
             let feats = self.tap_feats_out(m_obs.min(crate::dflash::DF_ROWS));
+            if let Some(t) = t_hop {
+                hop_add(0, 1);
+                hop_add(1, m as u64);
+                hop_add(2, ((out.len() + feats.as_ref().map_or(0, |f| f.len())) * 4) as u64);
+                hop_add(4, t.elapsed().as_nanos() as u64);
+            }
             if let Some(p) = self.peer.as_mut() {
                 p.layers_in = Some(out);
                 p.feat_in = feats;

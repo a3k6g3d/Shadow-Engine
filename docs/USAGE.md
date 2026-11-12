@@ -112,6 +112,9 @@ Defaults are right for normal use; these are for measurement and diagnosis.
 | `SHADOW_LTIME=1`, `SHADOW_KTIME=1`, `SHADOW_PROFILE=1` | time a batched pass by segment / each kernel / the single-token step (these synchronize: they slow the run) |
 | `SHADOW_DF_TIME=1` | time the phases of the DFlash draft round |
 | `SHADOW_DF_KEEP=0` | the old behaviour: any conversation-snapshot restore switches the DFlash drafter off for the rest of the session (decode -17% to -38%, STATUS 98-99). Default on: the drafter keeps the K/V it still has after a restore |
+| `SHADOW_HOP=0` | the hand-off between two stages (`--gpus A,B`) through host vectors and a copy a row, as before STATUS 104 (default: one copy of a chunk through a pinned buffer) |
+| `SHADOW_HOP_TIME=1` | per hop, by pass size: the wait for the sending stage's GPU, the copy down, the upload queued (a line every 10 hops) |
+| `SHADOW_HOP_CHUNK=N` | rows per copy through the hop's pinned buffer (default and maximum 1,024; the tests use small ones) |
 | `SHADOW_DF_DUMP=DIR` | write the drafter's features and tokens (`feats.bin`) for training and the reference check; `SHADOW_DF_DUMP_DRAFTS=1` also each draft |
 | `SHADOW_RECORD_ROUTING=FILE` | `serve` rewrites a routing profile of everything it has read after each answer |
 | `SHADOW_NO_PREFIX=1` | no shared-prefix snapshots (every new conversation reads its whole prompt) |
