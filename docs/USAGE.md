@@ -112,6 +112,7 @@ Defaults are right for normal use; these are for measurement and diagnosis.
 | `SHADOW_LTIME=1`, `SHADOW_KTIME=1`, `SHADOW_PROFILE=1` | time a batched pass by segment / each kernel / the single-token step (these synchronize: they slow the run) |
 | `SHADOW_DF_TIME=1` | time the phases of the DFlash draft round |
 | `SHADOW_DF_KEEP=0` | the old behaviour: any conversation-snapshot restore switches the DFlash drafter off for the rest of the session (decode -17% to -38%, STATUS 98-99). Default on: the drafter keeps the K/V it still has after a restore |
+| `SHADOW_GROUPED_UNROLL=0` | the grouped expert kernels' plain column loop for the gate / up shape too (default: unrolled 8 times, 23-29% faster kernels, the same results bit for bit, +1.7% decode; STATUS 114) |
 | `SHADOW_INT8_DECODE=0` | the dense projections of a verify pass (2..=8 rows) back on the float `matvec_cols_*` kernels; default in fast mode: llama.cpp's int8 `mul_mat_vec_q` (1-3 rows) and MMQ (4-8), needs `native/mmq/shadow_mmq.dll` built with `mmvq.cu` (+3.4% decode, STATUS 112; `--exact` never takes it) |
 | `SHADOW_NCU_RANGE=from:n` | for Nsight Compute started with `--profile-from-start off`: the profiler range covers batched passes of 2..=`MAX_VERIFY` rows number `from` .. `from + n` (`--launch-skip` makes each skipped launch cost ~2 s here; `tools/ncu_decode.ps1` uses this; STATUS 108) |
 | `SHADOW_VTIME=1` | the host's time in each verify layer's MoE, by part, in microseconds a layer (a line every 480 layers; STATUS 107) |

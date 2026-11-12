@@ -1464,6 +1464,12 @@ extern "C" __global__ void hc_down_inject_cols_bf16(const u8* w_down, float* dow
 }
 
 // ------------------------------------------------------------------------------------- matrices on their own inputs
+#ifndef GROUPED_UNROLL
+#define GROUPED_UNROLL 8
+#endif
+#ifndef GROUPED_UNROLL_COLS
+#define GROUPED_UNROLL_COLS 1024
+#endif
 // A batch's routed experts: group g = blockIdx.y is matrix wtab[g] on its own inputs.  gtab[17 g] = n (<= 8), then
 // 8 input rows and 8 output rows: input j at x + xi[j] * xs, output j at y + yi[j] * ys.  Same sums as
 // matvec_cols_m (dotm), so each one is matvec_fast_rows' on that input, bit for bit.  The inputs must be 16-byte
@@ -1486,7 +1492,8 @@ static __device__ __forceinline__ void grouped_m(const u8* w, const float* x, un
     for (unsigned int k = 0; k < RW; k++)
 #pragma unroll
         for (unsigned int j = 0; j < M; j++) acc[k][j] = 0.0f;
-    for (unsigned int c = lane; c < cols / 8; c += 32) {
+    // one chunk of 8 columns of every input against this lane's rows (the same operations in the same order whichever way the loop around it is unrolled)
+    auto chunk = [&](unsigned int c) {
         float xr[M * 8];
 #pragma unroll
         for (unsigned int j = 0; j < M; j++) {
@@ -1498,6 +1505,28 @@ static __device__ __forceinline__ void grouped_m(const u8* w, const float* x, un
 #pragma unroll
         for (unsigned int k = 0; k < RW; k++)
             if (k < nr) Fast<Q>::template dotm<M>(w + (row0 + k) * rb, c * 8, xr, 8, acc[k]);
+    };
+    // The gate / up shape (rows of 2,560 columns: 10 chunks a lane) runs the loop unrolled GROUPED_UNROLL times, so the loads of several chunks are in flight together (the plain loop waited
+    // for each chunk's loads before issuing the next: 19-29% of a verify pass's grouped gate / up kernels, bit for bit the same results, STATUS 114); the down shape (2-3 chunks a lane)
+    // gains nothing from it and keeps the plain loop.  `SHADOW_GROUPED_UNROLL=0` makes every shape take the plain loop (GROUPED_UNROLL_COLS is then out of reach).
+    if (cols >= GROUPED_UNROLL_COLS) {
+#pragma unroll GROUPED_UNROLL
+        for (unsigned int c = lane; c < cols / 8; c += 32) chunk(c);
+    } else {
+        // the plain loop as it was (a lambda around it changed the code the compiler made for the Q2_0 down shape: +9.5%)
+        for (unsigned int c = lane; c < cols / 8; c += 32) {
+            float xr[M * 8];
+#pragma unroll
+            for (unsigned int j = 0; j < M; j++) {
+                const float4* p = (const float4*) (xp[j] + c * 8);
+                float4 a = p[0], b = p[1];
+                xr[j * 8 + 0] = a.x; xr[j * 8 + 1] = a.y; xr[j * 8 + 2] = a.z; xr[j * 8 + 3] = a.w;
+                xr[j * 8 + 4] = b.x; xr[j * 8 + 5] = b.y; xr[j * 8 + 6] = b.z; xr[j * 8 + 7] = b.w;
+            }
+#pragma unroll
+            for (unsigned int k = 0; k < RW; k++)
+                if (k < nr) Fast<Q>::template dotm<M>(w + (row0 + k) * rb, c * 8, xr, 8, acc[k]);
+        }
     }
 #pragma unroll
     for (unsigned int k = 0; k < RW; k++) {

@@ -320,6 +320,12 @@ pub fn file(name: &str) -> Option<&'static File> {
 /// The whole program NVRTC compiles for one file: the prelude, its headers, then the file.
 pub fn program_source(f: &File) -> String {
     let mut s = String::from(PRELUDE);
+    // `SHADOW_GROUPED_UNROLL=0`: the grouped expert kernels' plain column loop for every shape (the unrolled one for long rows is the default, STATUS 114); the source is part of the cache key
+    if std::env::var("SHADOW_GROUPED_UNROLL").is_ok_and(|v| v == "0") {
+        s += "
+#define GROUPED_UNROLL_COLS 4294967295u
+";
+    }
     for h in f.headers {
         s += &format!("\n#line 1 \"{}\"\n{}", h.file, h.source);
     }
