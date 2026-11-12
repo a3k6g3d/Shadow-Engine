@@ -129,6 +129,18 @@ Defaults are right for normal use; these are for measurement and diagnosis.
 | `SHADOW_GRAPHS=0`, `SHADOW_OVERLAP=0`, `SHADOW_BATCH=n`, `SHADOW_REF_ORDER=1` | switch off CUDA graphs / overlapped copies / batching / use the reference sum order |
 | `SHADOW_FUSE`, `SHADOW_ZERO_COPY`, `SHADOW_SYNC`, `SHADOW_HUGE_PAGES` | opt-in experiments (all measured; see STATUS.md) |
 
+## Permission modes of the chat page
+
+The button next to "Windows Tools" in the chat page's bar sets what Shadow's tool calls may do without asking you (kept per browser in local storage, `shadow_perm_mode`):
+
+| mode | runs without asking | asks first |
+|---|---|---|
+| **Auto** | reads (`read_file`, `glob`, `grep`, `search`, `recall`, `notes`, `memory_list`, `web_search`, `web_fetch`, the time tools), file edits (`edit_file`, `replace_lines`, `write_file`, `memory_save` / `memory_forget`) and `cmd` lines judged safe: listing / reading (`dir`, `Get-ChildItem`, `Get-Content`, `Select-String` ...), `git status / diff / log / show`, `cargo check / build / test`, `python file.py`, `node file.js`, `pytest`, `mkdir` | every other command (anything that deletes, redirects with `>`, downloads, starts a process, changes git history, installs, or whose first word is not on the list; `$`, braces and `..\` also make a line ask) and every other tool (the browser tools, unknown MCP tools) |
+| **Accept edits** | reads and file edits | every `cmd` and every other tool |
+| **Bypass permissions** (default: how the page behaved before the button) | everything | nothing |
+
+A call that asks shows a box in its tool card with the command or arguments and three buttons: **Allow**, **Always allow this command / this tool in this chat** (forgotten when the chat changes), **Deny**. A denied call is answered to the model as "the user denied this call, do not repeat it, use another way or ask", and the task goes on; **Stop** while a box is open ends the task. The modes are the page's: the HTTP API (`/v1/tools/execute`) runs whatever it is asked, as before, and the safe-command list is a convenience, not a sandbox (a script file you allow can do anything).
+
 ## Closing an agent task: the `finish` tool
 
 A task that used tools should end with what is finished, what is **not** done or not verified and, only when the model cannot go on without the user, one question with its options. The server offers one tool for that, `finish` (in `GET /v1/tools`), with string fields `done`, `pending`, `question`, `options` (one item a line, or a JSON array as text; only `done` is required and an empty status is refused).

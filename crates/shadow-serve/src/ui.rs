@@ -488,6 +488,20 @@ canvas.spark { width: 100%; height: 64px; display: block; }
       color: #a7f3d0;
     }
 
+    /* Permission mode: the selector's wrapper and the approval box inside a tool card */
+    .perm-wrap { position: relative; display: inline-flex; }
+    .menu-pill-btn.perm-auto .perm-dot { color: var(--accent); }
+    .menu-pill-btn.perm-accept .perm-dot { color: var(--warning); }
+    .menu-pill-btn.perm-bypass .perm-dot { color: var(--danger); }
+    .perm-box { margin-top: 0.5rem; padding: 0.5rem 0.65rem; border: 1px solid var(--warning); border-radius: 0.4rem; background: rgba(245, 158, 11, 0.08); color: var(--text); font-weight: normal; }
+    .perm-box .perm-why { font-size: 0.8rem; color: var(--text-muted); margin-bottom: 0.35rem; }
+    .perm-box .perm-what { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; font-size: 0.8rem; white-space: pre-wrap; max-height: 140px; overflow-y: auto; margin-bottom: 0.45rem; }
+    .perm-box .perm-btns { display: flex; flex-wrap: wrap; gap: 0.4rem; }
+    .perm-box button { background: var(--surface-elevated); border: 1px solid var(--border); color: var(--text); border-radius: 0.4rem; padding: 0.25rem 0.7rem; cursor: pointer; font: inherit; font-size: 0.82rem; }
+    .perm-box button.allow { border-color: var(--success); }
+    .perm-box button.deny { border-color: var(--danger); }
+    .perm-box button:hover { background: var(--surface-hover); }
+
     /* The closing status of an agent task (the finish tool) */
     .finish-card {
       border: 1px solid var(--border);
@@ -1249,6 +1263,48 @@ canvas.spark { width: 100%; height: 64px; display: block; }
               <span id="tools-btn-label">Windows Tools: ON</span>
             </button>
 
+            <!-- Permission mode: Auto / Accept edits / Bypass permissions -->
+            <div class="perm-wrap">
+              <button class="menu-pill-btn perm-bypass" id="perm-btn" onclick="togglePermDropdown(event)" title="What Shadow may do with its tools without asking you">
+                <span class="perm-dot">&#9679;</span>
+                <span id="perm-btn-label">Bypass permissions</span>
+                <svg class="caret" viewBox="0 0 24 24"><path d="M7 10l5 5 5-5z"/></svg>
+              </button>
+              <div class="dropdown-popup" id="perm-dropdown">
+                <div class="dropdown-popup-header">Permission mode</div>
+                <div class="dropdown-item" data-perm="auto" onclick="selectPermMode('auto')">
+                  <div class="item-left">
+                    <div class="item-icon">&#9889;</div>
+                    <div class="item-info">
+                      <div class="item-title">Auto</div>
+                      <div class="item-desc">Reads, file edits and safe commands (listing, git status, builds, tests) run; anything else asks</div>
+                    </div>
+                  </div>
+                  <div class="item-check">&#10003;</div>
+                </div>
+                <div class="dropdown-item" data-perm="acceptEdits" onclick="selectPermMode('acceptEdits')">
+                  <div class="item-left">
+                    <div class="item-icon">&#9998;</div>
+                    <div class="item-info">
+                      <div class="item-title">Accept edits</div>
+                      <div class="item-desc">Reads and file edits run; every command and other tool asks</div>
+                    </div>
+                  </div>
+                  <div class="item-check">&#10003;</div>
+                </div>
+                <div class="dropdown-item active" data-perm="bypass" onclick="selectPermMode('bypass')">
+                  <div class="item-left">
+                    <div class="item-icon">&#9888;</div>
+                    <div class="item-info">
+                      <div class="item-title">Bypass permissions</div>
+                      <div class="item-desc">Everything runs without asking (the way it was before this button)</div>
+                    </div>
+                  </div>
+                  <div class="item-check">&#10003;</div>
+                </div>
+              </div>
+            </div>
+
             <!-- Pinned notes -->
             <button class="menu-pill-btn" id="notes-toggle-btn" onclick="toggleNotes()" title="Pinned notes for this chat: shown to Shadow at the end of every request, never shortened">
               <span>📝</span>
@@ -1515,6 +1571,118 @@ canvas.spark { width: 100%; height: 64px; display: block; }
       }
       return [...msgs.slice(0, -1), { ...last, content: c }];
     }
+
+    // ---- Permission mode (docs/STATUS.md 110): what a tool call may do without asking the user.  auto: reads, file edits and commands judged safe run, the rest asks;
+    // acceptEdits: reads and file edits run, commands and other tools ask; bypass: everything runs (the behaviour before the button, and the default).
+    const PERM_MODES = { auto: 'Auto', acceptEdits: 'Accept edits', bypass: 'Bypass permissions' };
+    let permMode = localStorage.getItem('shadow_perm_mode');
+    if (!PERM_MODES[permMode]) permMode = 'bypass';
+    const READ_TOOLS = new Set(['read_file', 'glob', 'grep', 'search', 'recall', 'notes', 'memory_list', 'web_search', 'web_fetch', 'finish', 'mcp__time__get_current_time', 'mcp__time__convert_time', 'mcp__time__get_time_ago']);
+    const EDIT_TOOLS = new Set(['edit_file', 'replace_lines', 'write_file', 'memory_save', 'memory_forget']);
+    // commands of Auto mode: the first word of every part of a command line must be one of these (a listing, a read, a build or a test), the arguments must not redirect,
+    // delete, download or start anything, and no script block may hide another command
+    const SAFE_CMD_WORDS = new Set(['get-childitem', 'gci', 'ls', 'dir', 'get-content', 'gc', 'cat', 'type', 'select-string', 'sls', 'findstr', 'get-location', 'pwd', 'echo', 'write-output',
+      'write-host', 'get-item', 'test-path', 'measure-object', 'sort-object', 'select-object', 'get-date', 'where', 'hostname', 'whoami', 'get-command', 'get-process', 'resolve-path',
+      'split-path', 'join-path', 'mkdir', 'get-filehash', 'format-table', 'format-list', 'out-string', 'head', 'tail', 'wc']);
+    const SAFE_GIT = new Set(['status', 'diff', 'log', 'show', 'rev-parse', 'ls-files', 'blame', 'branch', 'remote', 'describe', 'shortlog']);
+    const SAFE_CARGO = new Set(['check', 'build', 'test', 'tree', 'metadata', 'doc']);
+    const DANGEROUS_CMD = /(^|[\s;|&(])(remove-item|rm|ri|del|erase|rmdir|rd|format|diskpart|stop-process|kill|taskkill|shutdown|restart-computer|stop-computer|restart-service|stop-service|set-service|new-service|sc|reg|regedit|setx|set-itemproperty|new-itemproperty|remove-itemproperty|invoke-expression|iex|invoke-webrequest|iwr|invoke-restmethod|irm|curl|wget|start-process|start|saps|start-bitstransfer|move-item|mv|mi|copy-item|cp|copy|move|rename-item|ren|set-content|add-content|out-file|clear-content|new-item|ni|set-location|cd|chdir|pushd|popd|set-executionpolicy|powershell|pwsh|cmd|bash|wsl|msiexec|winget|choco|pip|npm|npx|yarn|cargo-install|icacls|takeown|attrib|net|netsh|schtasks|certutil|bitsadmin)(\s|$)/i;
+    function commandIsSafe(cmd) {
+      const c = String(cmd || '').trim();
+      if (!c || c.length > 600) return false;
+      if (/[{}`$]|>|<|\.\.\\|\.\.\//.test(c.replace(/2>&1/g, ''))) return false;   // redirects, script blocks, variables / sub-expressions, climbing out of the folder
+      if (DANGEROUS_CMD.test(c.replace(/^\s*mkdir\b/i, ''))) return false;
+      const parts = c.split(/\r?\n|;|&&|\|\||\|/).map(x => x.trim()).filter(Boolean);
+      if (!parts.length) return false;
+      return parts.every(part => {
+        const w = part.split(/\s+/).map(x => x.replace(/^['"]|['"]$/g, ''));
+        const first = (w[0] || '').toLowerCase().replace(/\.exe$/, '');
+        if (first === 'git') return SAFE_GIT.has((w[1] || '').toLowerCase()) && !/(^|\s)(-d|-D|--delete|-m|-M|--set-upstream-to|--unset-upstream)(\s|$)/.test(part);
+        if (first === 'cargo') return SAFE_CARGO.has((w[1] || '').toLowerCase());
+        if (first === 'python' || first === 'py' || first === 'python3') return w.length >= 2 && /^[\w\\/.:-]+\.py$/i.test(w[1]) || (w[1] === '-m' && /^(pytest|unittest)$/.test(w[2] || ''));
+        if (first === 'node') return w.length >= 2 && /^[\w\\/.:-]+\.js$/i.test(w[1]);
+        if (first === 'pytest') return true;
+        return SAFE_CMD_WORDS.has(first);
+      });
+    }
+    // null: the call runs; else why it asks
+    function permissionReason(tc) {
+      if (permMode === 'bypass') return null;
+      const name = tc.name;
+      if (READ_TOOLS.has(name) || EDIT_TOOLS.has(name)) return null;
+      if (name === 'cmd') {
+        if (permMode === 'auto' && commandIsSafe((tc.arguments || {}).command)) return null;
+        return permMode === 'auto' ? 'This command is not on the list of safe ones (listing, reading, git status / diff / log, builds, tests, running a script file).' : 'Accept edits mode: commands ask.';
+      }
+      return (permMode === 'auto' ? 'Auto mode: ' : 'Accept edits mode: ') + name + ' is not a read or a file edit.';
+    }
+    const permAllowed = new Set();   // "always allow in this chat": a tool name, or the exact command of a cmd call
+    let permChat = null;
+    function permKey(tc) { return tc.name === 'cmd' ? 'cmd:' + String((tc.arguments || {}).command || '') : tc.name; }
+    // asks the user inside the tool card: resolves 'allow' or 'deny'; Stop ends the wait as an abort
+    function askPermission(tc, toolCard, reason) {
+      return new Promise((resolve, reject) => {
+        const sig = currentAbortController ? currentAbortController.signal : null;
+        const box = document.createElement('div');
+        box.className = 'perm-box';
+        const what = tc.name === 'cmd' ? String((tc.arguments || {}).command || '') : JSON.stringify(tc.arguments || {}, null, 1).slice(0, 1500);
+        box.innerHTML = '<div class="perm-why">Shadow asks before running <strong>' + escapeHtml(tc.name) + '</strong>. ' + escapeHtml(reason || '') + '</div>' +
+          '<div class="perm-what">' + escapeHtml(what) + '</div>' +
+          '<div class="perm-btns"><button type="button" class="allow" data-a="allow">Allow</button>' +
+          '<button type="button" data-a="always">Always allow ' + (tc.name === 'cmd' ? 'this command' : escapeHtml(tc.name)) + ' in this chat</button>' +
+          '<button type="button" class="deny" data-a="deny">Deny</button></div>';
+        toolCard.appendChild(box);
+        const head = toolCard.querySelector('.tool-header span:last-child');
+        if (head) head.textContent = 'Waiting for you';
+        toolCard.classList.remove('running');
+        scrollToBottom(false);
+        let done = false;
+        const finish = (v, err) => { if (done) return; done = true; box.remove(); if (sig) sig.removeEventListener('abort', onAbort); if (err) reject(err); else resolve(v); };
+        const onAbort = () => { const h = toolCard.querySelector('.tool-header span:last-child'); if (h) h.textContent = 'Stopped'; finish(null, new DOMException('Stopped', 'AbortError')); };
+        if (sig) { if (sig.aborted) return onAbort(); sig.addEventListener('abort', onAbort); }
+        box.querySelectorAll('button').forEach(b => b.onclick = () => {
+          const a = b.dataset.a;
+          if (a === 'always') permAllowed.add(permKey(tc));
+          finish(a === 'deny' ? 'deny' : 'allow');
+        });
+      });
+    }
+    async function permissionGate(tc, toolCard) {
+      if (permChat !== currentChatId) { permAllowed.clear(); permChat = currentChatId; }
+      const reason = permissionReason(tc);
+      if (reason === null || permAllowed.has(permKey(tc))) return 'allow';
+      return askPermission(tc, toolCard, reason);
+    }
+    function deniedResult(tc) {
+      return { name: tc.name, output: 'The user denied this call (permission mode: ' + PERM_MODES[permMode] + '): it was not run. Do not repeat it. Use another way, or say what you wanted to do and ask the user.', is_error: true };
+    }
+    function updatePermUI() {
+      const btn = document.getElementById('perm-btn');
+      if (!btn) return;
+      document.getElementById('perm-btn-label').textContent = PERM_MODES[permMode];
+      btn.classList.remove('perm-auto', 'perm-accept', 'perm-bypass');
+      btn.classList.add(permMode === 'auto' ? 'perm-auto' : permMode === 'acceptEdits' ? 'perm-accept' : 'perm-bypass');
+      document.querySelectorAll('#perm-dropdown .dropdown-item').forEach(el => el.classList.toggle('active', el.dataset.perm === permMode));
+    }
+    function togglePermDropdown(e) {
+      document.documentElement.style.setProperty('--bar-h', document.querySelector('.input-box').offsetHeight + 'px');
+      e.stopPropagation();
+      document.getElementById('perm-dropdown').classList.toggle('open');
+      document.getElementById('perm-btn').classList.toggle('open');
+    }
+    function selectPermMode(m) {
+      if (!PERM_MODES[m]) return;
+      permMode = m;
+      localStorage.setItem('shadow_perm_mode', m);
+      updatePermUI();
+      document.getElementById('perm-dropdown').classList.remove('open');
+      document.getElementById('perm-btn').classList.remove('open');
+    }
+    document.addEventListener('click', (e) => {
+      const dd = document.getElementById('perm-dropdown'), b = document.getElementById('perm-btn');
+      if (dd && !dd.contains(e.target) && !b.contains(e.target)) { dd.classList.remove('open'); b.classList.remove('open'); }
+    });
+    updatePermUI();
 
     // ---- The closing status of an agent task (docs/STATUS.md 109): a task that used tools ends with a `finish` call (done / pending / question with options), drawn as a card
     // and ending the turn.  The tool comes from the server (GET /v1/tools; SHADOW_FINISH_TOOL=0 removes it there), this switch is the page's own (Settings).
@@ -2394,7 +2562,7 @@ canvas.spark { width: 100%; height: 64px; display: block; }
             sameCalls = callSig === lastCallSig ? sameCalls + 1 : 1;
             lastCallSig = callSig;
 
-            let finished = false;
+            let finished = false, stoppedAtGate = false;
             for (const tc of toolCalls) {
               // finish: the status of the task as a card, no tool run; refused (a tool result the model reads) when it came with other calls or says nothing
               const fin = tc.name === 'finish' && finishActive() ? checkFinish(tc.arguments, toolCalls.length) : null;
@@ -2417,7 +2585,21 @@ canvas.spark { width: 100%; height: 64px; display: block; }
               bubbleEl.appendChild(toolCard);
               scrollToBottom(false);
 
-              const result = fin ? { name: 'finish', output: fin.output, is_error: true } : await executeLocalTool(tc.name, tc.arguments);
+              let result;
+              if (fin) result = { name: 'finish', output: fin.output, is_error: true };
+              else {
+                let verdict;
+                try { verdict = await permissionGate(tc, toolCard); }
+                catch (e) {
+                  // Stop while waiting for the user: the call gets an answer, the task ends (the abort path below would push the same reply twice)
+                  if (e && e.name !== 'AbortError') throw e;
+                  history.push({ role: 'tool', content: '<tool_response>\nThe user stopped the task before this call ran.\n</tool_response>' });
+                  stoppedAtGate = true;
+                  break;
+                }
+                if (verdict === 'deny') { result = deniedResult(tc); toolCard.dataset.denied = '1'; }
+                else { toolCard.classList.add('running'); result = await executeLocalTool(tc.name, tc.arguments); }
+              }
               // the same call again: its result is not new - say so, or a model that lost the earlier result to the shortening reads it a third and fourth time
               const callKey = tc.name + '|' + JSON.stringify(tc.arguments);
               const timesCalled = (callCounts.get(callKey) || 0) + 1;
@@ -2431,7 +2613,7 @@ canvas.spark { width: 100%; height: 64px; display: block; }
               if (tc.name.startsWith('mcp__browser__')) browserNote(result.output);
               toolCard.classList.remove('running');
               const outputEl = toolCard.querySelector('.tool-output');
-              toolCard.querySelector('.tool-header span:last-child').textContent = (result.is_error ? 'Error' : 'Complete') + ' ▾';
+              toolCard.querySelector('.tool-header span:last-child').textContent = (toolCard.dataset.denied ? 'Denied' : result.is_error ? 'Error' : 'Complete') + ' ▾';
               outputEl.textContent = result.output;
 
               // Append tool response turn to history
@@ -2440,6 +2622,7 @@ canvas.spark { width: 100%; height: 64px; display: block; }
                 content: `<tool_response>\n${result.output}\n</tool_response>`
               });
             }
+            if (stoppedAtGate) { timingInfo.textContent = 'Generation stopped by user'; break; }
             // the status was given: the task ends here (no further model step)
             if (finished) break;
             // the same call again and again: the model is stuck, not working - stop and say so (the history keeps the results, "continue" resumes)
