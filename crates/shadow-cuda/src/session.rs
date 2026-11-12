@@ -702,6 +702,48 @@ fn verify_graphs() -> bool {
     *ON.get_or_init(|| !std::env::var("SHADOW_VERIFY_GRAPHS").is_ok_and(|v| v == "0"))
 }
 
+/// `SHADOW_VTIME=1` (STATUS 107): the host's time in `moe_batch` for a verify pass, by part, in ns summed over layers: [layers, wait for the router logits, `route_all`,
+/// the routing bookkeeping (counters, rank / tail skip), names + tensor infos + sizes, building the group's expert set, the cache's slot bookkeeping, `grouped_plan` + its
+/// upload, the first (resident) launches, the fetch copies, the second launches + combine].
+const VT_N: usize = 12;
+const VT_NAMES: [&str; VT_N] = ["layers", "wait for the router", "route_all", "routing bookkeeping", "names / infos / sizes", "group set", "cache slots", "plan + upload", "first launches", "fetch copies", "second launches + combine", "shared expert launches"];
+static VT: [std::sync::atomic::AtomicU64; VT_N] = [const { std::sync::atomic::AtomicU64::new(0) }; VT_N];
+
+fn vtime_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("SHADOW_VTIME").is_ok_and(|v| v == "1"))
+}
+
+fn vt_lap(t: &mut Option<std::time::Instant>, slot: usize) {
+    if let Some(t0) = t.as_mut() {
+        VT[slot].fetch_add(t0.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+        *t0 = std::time::Instant::now();
+    }
+}
+
+fn vt_report() {
+    use std::sync::atomic::Ordering::Relaxed;
+    let n = VT[0].load(Relaxed);
+    if n > 0 && n % 480 == 0 {
+        let g = |i: usize| VT[i].load(Relaxed) as f64 / n as f64 / 1e3;
+        let parts: Vec<String> = (2..VT_N).map(|i| format!("{} {:.1}", VT_NAMES[i], g(i))).collect();
+        eprintln!("vtime: {n} verify layers; per layer in us: wait for the router {:.0}; host {:.0} = {}", g(1), (2..VT_N).map(g).sum::<f64>(), parts.join(", "));
+    }
+}
+
+/// `SHADOW_SHARED_EARLY=0`: the batched MoE queues the shared expert after it has the router's logits on the host (STATUS 107: by default it is queued behind the logits' copy, before
+/// the host's wait, so its launches cost nothing and its kernels run while the host routes).
+fn shared_early() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| !std::env::var("SHADOW_SHARED_EARLY").is_ok_and(|v| v == "0"))
+}
+
+/// `SHADOW_FETCH_FIRST=0`: the batched MoE issues a group's expert copies after it has built the plan and launched the resident experts (STATUS 107: by default before).
+fn fetch_first() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| !std::env::var("SHADOW_FETCH_FIRST").is_ok_and(|v| v == "0"))
+}
+
 /// Rows per copy through the hop's pinned buffer (a chunk is at most `HOP_CHUNK_ROWS` x `NFEAT` floats = 50 MiB of pinned memory, taken at the first hop).
 const HOP_CHUNK_ROWS: usize = 1024;
 
@@ -2560,6 +2602,12 @@ impl<'c, 'm> GpuSession<'c, 'm> {
     /// Device floats to the host without the copy engine: a copy kernel writes each `(ptr, n)` into the mapped region
     /// (one after another), the host waits for the default stream's event and reads them back.
     fn download_mapped(&self, srcs: &[(u64, usize)]) -> Vec<Vec<f32>> {
+        self.download_mapped_with(srcs, &|| {})
+    }
+
+    /// `download_mapped`, calling `between` once the copy kernels and the event are queued and before the host waits for it: launches queued there run on the GPU while the
+    /// host is waiting (and then routing), instead of costing launch time after the wait.
+    fn download_mapped_with(&self, srcs: &[(u64, usize)], between: &dyn Fn()) -> Vec<Vec<f32>> {
         let mut at = 0usize;
         for &(ptr, n) in srcs {
             assert!((at + n) * 4 <= self.mapped.len(), "mapped download too big");
@@ -2567,6 +2615,7 @@ impl<'c, 'm> GpuSession<'c, 'm> {
             at += n;
         }
         self.mapped_event.record(None).unwrap();
+        between();
         self.mapped_event.synchronize().unwrap();
         self.stage_at.set(0); // the default stream has drained: every staged upload has been copied
         let base = self.mapped.as_slice().as_ptr() as *const f32;
@@ -6073,6 +6122,16 @@ impl<'c, 'm> GpuSession<'c, 'm> {
     }
 
     /// `router_done`: `moe_router_batch` already ran (in a graph).
+    /// The shared expert of layer `l` for the batch's m rows (gate / up projections, SwiGLU, down projection into `bb.so`).
+    fn shared_expert_batch(&self, l: usize, m: usize) {
+        let c = &self.m.cfg;
+        let (h, sff) = (c.hidden, c.shared_ff);
+        let bb = &self.bb;
+        self.multi_cols(l, 2, false, m);
+        self.k1("swiglu", m * sff, &[Arg::Ptr(bb.sg.ptr), Arg::Ptr(bb.su.ptr), Arg::Ptr(bb.sa.ptr), Arg::U32((m * sff) as u32)]);
+        self.mv_cols(&format!("blk.{l}.ffn_down_shexp.weight"), bb.sa.ptr, sff, bb.so.ptr, h, m);
+    }
+
     fn moe_batch(&mut self, l: usize, m: usize, logs: &mut [Vec<u16>], router_done: bool, ticket: Option<usize>) {
         let c = &self.m.cfg;
         let p = format!("blk.{l}");
@@ -6098,11 +6157,13 @@ impl<'c, 'm> GpuSession<'c, 'm> {
             }
         }
         let t_wait = std::time::Instant::now();
+        let mut vt = (vtime_on() && self.replay.on.get() && m <= MAX_VERIFY).then(std::time::Instant::now);
         // SHADOW_TIMING_NO_SYNC=1 (timing only, wrong output): last time's router logits, no wait for the GPU
         let stale = self.timing_no_sync && self.stale_logits.get(&(l, m)).is_some();
         // the hybrid's CPU experts in a verify pass need the MoE input on the host
         let want_u = self.want_u_rows(m) && !stale;
         let mut u_host: Option<Vec<f32>> = None;
+        let mut shared_done = false;
         if self.pipe_active {
             // the copies below reuse slots the previous group's experts may still be reading: the copy stream waits for them
             self.ctx.stream_wait_event(Some(&self.copy_stream), &self.group_event).unwrap();
@@ -6118,7 +6179,14 @@ impl<'c, 'm> GpuSession<'c, 'm> {
             if want_u {
                 srcs.push((self.bb.u.ptr, m * h));
             }
-            let mut got = self.download_mapped(&srcs);
+            // the shared expert does not depend on the routing: queued behind the copy, it runs on the GPU while the host waits and routes (`SHADOW_SHARED_EARLY=0`: after the wait)
+            let early = shared_early();
+            let mut got = if early {
+                shared_done = true;
+                self.download_mapped_with(&srcs, &|| self.shared_expert_batch(l, m))
+            } else {
+                self.download_mapped(&srcs)
+            };
             if want_u {
                 u_host = Some(got.remove(1));
             }
@@ -6131,16 +6199,16 @@ impl<'c, 'm> GpuSession<'c, 'm> {
         };
         self.waits[0] += t_wait.elapsed().as_secs_f64();
         let t_woke = std::time::Instant::now();
+        vt_lap(&mut vt, 1);
         self.mark("batch: router + logits down");
-        {
+        if !shared_done {
             // the shared expert, on the GPU while the host routes and the copies run
-            let bb = &self.bb;
-            self.multi_cols(l, 2, false, m);
-            self.k1("swiglu", m * sff, &[Arg::Ptr(bb.sg.ptr), Arg::Ptr(bb.su.ptr), Arg::Ptr(bb.sa.ptr), Arg::U32((m * sff) as u32)]);
-            self.mv_cols(&format!("{p}.ffn_down_shexp.weight"), bb.sa.ptr, sff, bb.so.ptr, h, m);
+            self.shared_expert_batch(l, m);
         }
+        vt_lap(&mut vt, 11);
         let t_routed0 = t_woke.elapsed();
         let mut tops: Vec<Vec<(usize, f64)>> = route_all(&logits, k, if self.router_bias != 0.0 { Some((&self.cache.map, l, self.router_bias)) } else { None });
+        vt_lap(&mut vt, 2);
         for (j, top) in tops.iter().enumerate() {
             for &(e, _) in top {
                 self.routing.add(l, e);
@@ -6180,6 +6248,7 @@ impl<'c, 'm> GpuSession<'c, 'm> {
                 self.tail_skipped += (before - top.len()) as u64;
             }
         }
+        vt_lap(&mut vt, 3);
         let names = [format!("{p}.ffn_gate_exps.weight"), format!("{p}.ffn_up_exps.weight"), format!("{p}.ffn_down_exps.weight")];
         let infos: Vec<TensorInfo> = names.iter().map(|n| self.expert_info(n)).collect();
         let sizes: Vec<usize> = names.iter().map(|n| self.m.expert_bytes(n)).collect();
@@ -6211,6 +6280,7 @@ impl<'c, 'm> GpuSession<'c, 'm> {
                 }
             }
         }
+        vt_lap(&mut vt, 4);
         // Hybrid MoE in a verify pass: up to `cpu_experts` of the layer's cache misses that the RAM tier holds and that
         // ONE token routes to (the CPU computes an expert per token; a copy serves every token that uses it) are computed
         // on the CPU from the pinned bytes while the GPU runs the resident experts and the copies run.  Their rank rows of
@@ -6313,6 +6383,7 @@ impl<'c, 'm> GpuSession<'c, 'm> {
                 set = cand;
                 end += 1;
             }
+            vt_lap(&mut vt, 5);
             if start > 0 {
                 // the previous group's matvecs may still be reading slots this group's misses take
                 self.ctx.synchronize().unwrap();
@@ -6363,11 +6434,34 @@ impl<'c, 'm> GpuSession<'c, 'm> {
                 };
                 copying.push((e, base));
             }
+            vt_lap(&mut vt, 6);
             // grouped and overlapped: each union expert once, on all of the group's tokens that route to it - the
             // resident ones while the misses copy, then (the GPU waiting for the copies) the copied ones
             let overlap = self.overlap && self.prof.is_none() && infos[0].ty == infos[1].ty && infos[0].dims == infos[1].dims;
             let part = [0u64, sizes[0] as u64, (sizes[0] + sizes[1]) as u64];
             let mut plan = None;
+            // the copies are the long pole of a layer with misses: their calls go out before the plan is built and the resident experts are launched (`SHADOW_FETCH_FIRST=0`: after, as
+            // before STATUS 107); the resident experts' kernels run while the copies do either way
+            let fetch_first = fetch_first();
+            if fetch_first {
+                // the group's RAM-tier misses keep their ring slots: a promotion for one of its file reads must not
+                // evict an expert the group is about to copy (it would turn into a file read past the staging slots)
+                for &(e, _) in &copying {
+                    if let Some(&off) = self.ram.at.get(&(l, e)).filter(|off| self.ram.ring_by_off.contains_key(off)) {
+                        self.ram.claimed.insert(off);
+                    }
+                }
+                let mut n_file = 0;
+                if self.pipe_active && copying.iter().any(|&(e, _)| !self.ram.at.contains_key(&(l, e))) {
+                    // a file read may reuse a pinned slot an earlier group's copy is still reading
+                    self.copy_stream.synchronize().unwrap();
+                }
+                for &(e, base) in &copying {
+                    let from_file = !self.ram.at.contains_key(&(l, e));
+                    self.fetch_expert(l, e, n_file, &names, &sizes, [base, base + part[1], base + part[2]]);
+                    n_file += from_file as usize;
+                }
+            }
             if overlap {
                 let addr = |e: usize| match self.cache.map.get(&(l, e)) {
                     Some(&s) => arena + self.cache.slot_offset[s],
@@ -6382,25 +6476,29 @@ impl<'c, 'm> GpuSession<'c, 'm> {
                     self.plan_lat.0 += 1;
                     self.plan_lat.1 += t_woke.elapsed().as_secs_f64();
                 }
+                vt_lap(&mut vt, 7);
                 self.routed_grouped(&p, 0, start, end, &infos);
                 plan = Some(p);
             }
-            // the group's RAM-tier misses keep their ring slots: a promotion for one of its file reads must not
-            // evict an expert the group is about to copy (it would turn into a file read past the staging slots)
-            for &(e, _) in &copying {
-                if let Some(&off) = self.ram.at.get(&(l, e)).filter(|off| self.ram.ring_by_off.contains_key(off)) {
-                    self.ram.claimed.insert(off);
+            vt_lap(&mut vt, 8);
+            if !fetch_first {
+                // the group's RAM-tier misses keep their ring slots: a promotion for one of its file reads must not
+                // evict an expert the group is about to copy (it would turn into a file read past the staging slots)
+                for &(e, _) in &copying {
+                    if let Some(&off) = self.ram.at.get(&(l, e)).filter(|off| self.ram.ring_by_off.contains_key(off)) {
+                        self.ram.claimed.insert(off);
+                    }
                 }
-            }
-            let mut n_file = 0;
-            if self.pipe_active && copying.iter().any(|&(e, _)| !self.ram.at.contains_key(&(l, e))) {
-                // a file read may reuse a pinned slot an earlier group's copy is still reading
-                self.copy_stream.synchronize().unwrap();
-            }
-            for &(e, base) in &copying {
-                let from_file = !self.ram.at.contains_key(&(l, e));
-                self.fetch_expert(l, e, n_file, &names, &sizes, [base, base + part[1], base + part[2]]);
-                n_file += from_file as usize;
+                let mut n_file = 0;
+                if self.pipe_active && copying.iter().any(|&(e, _)| !self.ram.at.contains_key(&(l, e))) {
+                    // a file read may reuse a pinned slot an earlier group's copy is still reading
+                    self.copy_stream.synchronize().unwrap();
+                }
+                for &(e, base) in &copying {
+                    let from_file = !self.ram.at.contains_key(&(l, e));
+                    self.fetch_expert(l, e, n_file, &names, &sizes, [base, base + part[1], base + part[2]]);
+                    n_file += from_file as usize;
+                }
             }
             self.read_drive(&names, &sizes);
             if cpu_pending {
@@ -6416,6 +6514,7 @@ impl<'c, 'm> GpuSession<'c, 'm> {
                 self.cpu_host.1 += t_up.elapsed().as_secs_f64();
                 cpu_pending = false;
             }
+            vt_lap(&mut vt, 9);
             if let Some(p) = plan.as_ref() {
                 if !copying.is_empty() {
                     self.copy_event.record(Some(&self.copy_stream)).unwrap();
@@ -6440,6 +6539,11 @@ impl<'c, 'm> GpuSession<'c, 'm> {
                 }
             }
             start = end;
+            vt_lap(&mut vt, 10);
+            if vt.is_some() && start == m {
+                VT[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                vt_report();
+            }
         }
         if self.pipe_active {
             self.group_event.record(None).unwrap();

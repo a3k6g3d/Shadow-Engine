@@ -112,6 +112,9 @@ Defaults are right for normal use; these are for measurement and diagnosis.
 | `SHADOW_LTIME=1`, `SHADOW_KTIME=1`, `SHADOW_PROFILE=1` | time a batched pass by segment / each kernel / the single-token step (these synchronize: they slow the run) |
 | `SHADOW_DF_TIME=1` | time the phases of the DFlash draft round |
 | `SHADOW_DF_KEEP=0` | the old behaviour: any conversation-snapshot restore switches the DFlash drafter off for the rest of the session (decode -17% to -38%, STATUS 98-99). Default on: the drafter keeps the K/V it still has after a restore |
+| `SHADOW_VTIME=1` | the host's time in each verify layer's MoE, by part, in microseconds a layer (a line every 480 layers; STATUS 107) |
+| `SHADOW_SHARED_EARLY=0` | queue the batched MoE's shared expert after the host has the router's logits, as before STATUS 107 (default: before the host's wait, +2.3% decode) |
+| `SHADOW_FETCH_FIRST=0` | issue a group's expert copies after the plan and the resident experts' launches, as before STATUS 107 (default: before, +1.25% decode) |
 | `SHADOW_VERIFY_GRAPHS=0` | verify passes (batches of at most `MAX_VERIFY` rows) run their DeltaNet segments eagerly instead of as CUDA graphs (default on: +2.5% decode, STATUS 106; prompt passes are unaffected, `SHADOW_BATCH_GRAPHS=1` is still their opt-in) |
 | `SHADOW_SPEC_BYTES=1` | per verify pass: the experts copied, by the lowest row that routes to them, the share copied only for drafts that were rejected, and what a rank-1 verify from each depth would skip (a line every 100 passes; STATUS 105) |
 | `SHADOW_HOP=0` | the hand-off between two stages (`--gpus A,B`) through host vectors and a copy a row, as before STATUS 104 (default: one copy of a chunk through a pinned buffer) |
