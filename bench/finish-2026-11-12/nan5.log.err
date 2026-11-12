@@ -1,0 +1,171 @@
+shadow serve: --exact: no speculation, no inexact modes
+RAM tier: no --placement, so an arbitrary (uniform) choice of experts
+shadow serve: starting 2 MCP server(s) from mcp.json
+shadow serve: listening on http://127.0.0.1:8091
+shadow serve: MCP server time: 3 tools
+shadow serve: MCP server browser: 10 tools
+shadow serve: ready in 5.5 s; expert cache: 2355 slots x 1.95 MiB = 4.49 GiB; 0 hits, 0 misses (0.0% hits); 0 slice uploads; RAM tier: 4193 experts, 8.00 GiB pinned (filled in 2.5 s), misses served 0 from RAM, 0 from the file; host waits per step: router 0.0 ms, copies 0.0 ms, file 0.0 ms; kernel launches per step 0, 0.0 ms of host time in them
+shadow serve: 42 conversation snapshot(s) on disk in J:/ShadowConvCache (19.33 GiB)
+NANP L0 delta m=3 qkv rows (after multi_cols): all 30720 finite, max abs 3.111e1
+NANP L0 delta m=3 beta: all 144 finite, max abs 7.357e0
+NANP L0 delta m=3 alpha: all 144 finite, max abs 8.395e0
+NANP L0 delta m=3 conv state BEFORE: all 30720 finite, max abs 0.000e0
+NANP L0 delta m=3 recurrent state BEFORE: all 786432 finite, max abs 0.000e0
+NANP L0 delta m=3 conv out (bb.x) before l2norm: all 30720 finite, max abs 3.652e0
+NANP L0 delta m=3 conv state AFTER conv: all 30720 finite, max abs 3.111e1
+NANP L0 delta m=3 conv out after l2norm: all 30720 finite, max abs 3.652e0
+NANP L0 delta m=3 recurrence out (bb.o) before gated norm: all 18432 finite, max abs 5.634e-2
+NANP L0 delta m=3 recurrent state AFTER: all 786432 finite, max abs 2.329e0
+NANCHECK layer 0: m=3 router logits finite, max abs 1.246e1
+NANP L0 moe m=3 rows 0..3 u (router input): all 7680 finite, max abs 7.499e0
+NANP L0 moe m=3 rows 0..3 shared expert gate logit (sgl): all 3 finite, max abs 4.181e-1
+NANP L0 moe m=3 rows 0..3 shared expert out (so): all 7680 finite, max abs 5.885e0
+NANP L0 moe m=3 rows 0..3 shared swiglu act (sa): all 1920 finite, max abs 1.169e1
+NANP L0 moe m=3 rows 0..3 routed outputs (eo): all 76800 finite, max abs 1.860e0
+NANP L0 moe m=3 rows 0..3 combined y: all 7680 finite, max abs 3.231e0
+NANP L0 delta m=2048 qkv rows (after multi_cols): all 20971520 finite, max abs 3.747e1
+NANP L0 delta m=2048 beta: all 98304 finite, max abs 8.839e0
+NANP L0 delta m=2048 alpha: all 98304 finite, max abs 1.012e1
+NANP L0 delta m=2048 conv state BEFORE: all 30720 finite, max abs 3.111e1
+NANP L0 delta m=2048 recurrent state BEFORE: all 786432 finite, max abs 2.329e0
+NANP L0 delta m=2048 conv out (bb.x) before l2norm: all 20971520 finite, max abs 6.230e0
+NANP L0 delta m=2048 conv state AFTER conv: all 30720 finite, max abs 3.128e1
+NANP L0 delta m=2048 conv out after l2norm: all 20971520 finite, max abs 6.230e0
+NANP L0 delta m=2048 recurrence out (bb.o) before gated norm: all 12582912 finite, max abs 7.022e-1
+NANP L0 delta m=2048 recurrent state AFTER: all 786432 finite, max abs 5.994e0
+NANCHECK layer 0: m=2048 router logits finite, max abs 1.639e1
+NANP L0 delta m=2048 qkv rows (after multi_cols): all 20971520 finite, max abs 3.681e1
+NANP L0 delta m=2048 beta: all 98304 finite, max abs 8.920e0
+NANP L0 delta m=2048 alpha: all 98304 finite, max abs 1.047e1
+NANP L0 delta m=2048 conv state BEFORE: all 30720 finite, max abs 3.128e1
+NANP L0 delta m=2048 recurrent state BEFORE: all 786432 finite, max abs 5.994e0
+NANP L0 delta m=2048 conv out (bb.x) before l2norm: all 20971520 finite, max abs 6.125e0
+NANP L0 delta m=2048 conv state AFTER conv: all 30720 finite, max abs 3.623e1
+NANP L0 delta m=2048 conv out after l2norm: all 20971520 finite, max abs 6.125e0
+NANP L0 delta m=2048 recurrence out (bb.o) before gated norm: all 12582912 finite, max abs 8.207e-1
+NANP L0 delta m=2048 recurrent state AFTER: all 786432 finite, max abs 7.432e0
+NANCHECK layer 0: m=2048 router logits finite, max abs 1.630e1
+NANP L0 delta m=2048 qkv rows (after multi_cols): all 20971520 finite, max abs 3.789e1
+NANP L0 delta m=2048 beta: all 98304 finite, max abs 8.802e0
+NANP L0 delta m=2048 alpha: all 98304 finite, max abs 1.652e1
+NANP L0 delta m=2048 conv state BEFORE: all 30720 finite, max abs 3.623e1
+NANP L0 delta m=2048 recurrent state BEFORE: all 786432 finite, max abs 7.432e0
+NANP L0 delta m=2048 conv out (bb.x) before l2norm: all 20971520 finite, max abs 7.294e0
+NANP L0 delta m=2048 conv state AFTER conv: all 30720 finite, max abs 2.680e1
+NANP L0 delta m=2048 conv out after l2norm: all 20971520 finite, max abs 7.294e0
+NANP L0 delta m=2048 recurrence out (bb.o) before gated norm: all 12582912 finite, max abs 1.116e0
+NANP L0 delta m=2048 recurrent state AFTER: all 786432 finite, max abs 9.381e0
+NANCHECK layer 0: m=2048 router logits finite, max abs 1.645e1
+NANP L1 delta m=3 qkv rows (after multi_cols): all 30720 finite, max abs 1.886e1
+NANP L1 delta m=3 beta: all 144 finite, max abs 4.957e0
+NANP L1 delta m=3 alpha: all 144 finite, max abs 4.494e0
+NANP L1 delta m=3 conv state BEFORE: all 30720 finite, max abs 0.000e0
+NANP L1 delta m=3 recurrent state BEFORE: all 786432 finite, max abs 0.000e0
+NANP L1 delta m=3 conv out (bb.x) before l2norm: all 30720 finite, max abs 6.705e-1
+NANP L1 delta m=3 conv state AFTER conv: all 30720 finite, max abs 1.886e1
+NANP L1 delta m=3 conv out after l2norm: all 30720 finite, max abs 9.464e-1
+NANP L1 delta m=3 recurrence out (bb.o) before gated norm: all 18432 finite, max abs 2.182e-2
+NANP L1 delta m=3 recurrent state AFTER: all 786432 finite, max abs 2.205e-1
+NANP L1 moe m=3 rows 0..3 u (router input): all 7680 finite, max abs 2.575e0
+NANP L1 moe m=3 rows 0..3 shared expert gate logit (sgl): all 3 finite, max abs 1.845e0
+NANP L1 moe m=3 rows 0..3 shared expert out (so): all 7680 finite, max abs 4.384e-1
+NANP L1 moe m=3 rows 0..3 shared swiglu act (sa): all 1920 finite, max abs 1.871e0
+NANP L1 moe m=3 rows 0..3 routed outputs (eo): all 76800 finite, max abs 5.964e-1
+NANP L1 moe m=3 rows 0..3 combined y: all 7680 finite, max abs 2.436e-1
+NANP L1 delta m=2048 qkv rows (after multi_cols): 20971520 of 20971520 non-finite, first at 0, last at 20971519, max abs finite 0.000e0
+NANP L1 delta m=2048 beta: 98304 of 98304 non-finite, first at 0, last at 98303, max abs finite 0.000e0
+NANP L1 delta m=2048 alpha: 98304 of 98304 non-finite, first at 0, last at 98303, max abs finite 0.000e0
+NANP L1 delta m=2048 conv state BEFORE: all 30720 finite, max abs 1.886e1
+NANP L1 delta m=2048 recurrent state BEFORE: all 786432 finite, max abs 2.205e-1
+NANP L1 delta m=2048 conv out (bb.x) before l2norm: 20971520 of 20971520 non-finite, first at 0, last at 20971519, max abs finite 0.000e0
+NANP L1 delta m=2048 conv state AFTER conv: 30720 of 30720 non-finite, first at 0, last at 30719, max abs finite 0.000e0
+NANP L1 delta m=2048 conv out after l2norm: 20971520 of 20971520 non-finite, first at 0, last at 20971519, max abs finite 0.000e0
+NANP L1 delta m=2048 recurrence out (bb.o) before gated norm: 12582912 of 12582912 non-finite, first at 0, last at 12582911, max abs finite 0.000e0
+NANP L1 delta m=2048 recurrent state AFTER: 786432 of 786432 non-finite, first at 0, last at 786431, max abs finite 0.000e0
+NANCHECK layer 1: m=2048, 2048 of 2048 router rows non-finite, first token 0 (512 of 512 logits bad), last bad token 2047
+
+thread '<unnamed>' (5180) panicked at crates\shadow-model\src\forward.rs:928:65:
+called `Option::unwrap()` on a `None` value
+stack backtrace:
+note: Some details are omitted, run with `RUST_BACKTRACE=full` for a verbose backtrace.
+
+thread '<unnamed>' (21580) panicked at crates\shadow-model\src\forward.rs:928:65:
+called `Option::unwrap()` on a `None` value
+stack backtrace:
+note: Some details are omitted, run with `RUST_BACKTRACE=full` for a verbose backtrace.
+
+thread '<unnamed>' (30784) panicked at crates\shadow-model\src\forward.rs:928:65:
+called `Option::unwrap()` on a `None` value
+stack backtrace:
+note: Some details are omitted, run with `RUST_BACKTRACE=full` for a verbose backtrace.
+
+thread '<unnamed>' (33924) panicked at crates\shadow-model\src\forward.rs:928:65:
+called `Option::unwrap()` on a `None` value
+stack backtrace:
+note: Some details are omitted, run with `RUST_BACKTRACE=full` for a verbose backtrace.
+
+thread '<unnamed>' (17784) panicked at crates\shadow-model\src\forward.rs:928:65:
+called `Option::unwrap()` on a `None` value
+stack backtrace:
+note: Some details are omitted, run with `RUST_BACKTRACE=full` for a verbose backtrace.
+
+thread '<unnamed>' (26148) panicked at crates\shadow-model\src\forward.rs:928:65:
+called `Option::unwrap()` on a `None` value
+stack backtrace:
+note: Some details are omitted, run with `RUST_BACKTRACE=full` for a verbose backtrace.
+
+thread '<unnamed>' (3760) panicked at crates\shadow-model\src\forward.rs:928:65:
+called `Option::unwrap()` on a `None` value
+stack backtrace:
+note: Some details are omitted, run with `RUST_BACKTRACE=full` for a verbose backtrace.
+
+thread '<unnamed>' (33108) panicked at crates\shadow-model\src\forward.rs:928:65:
+called `Option::unwrap()` on a `None` value
+stack backtrace:
+note: Some details are omitted, run with `RUST_BACKTRACE=full` for a verbose backtrace.
+
+thread '<unnamed>' (4008) panicked at crates\shadow-model\src\forward.rs:928:65:
+called `Option::unwrap()` on a `None` value
+stack backtrace:
+note: Some details are omitted, run with `RUST_BACKTRACE=full` for a verbose backtrace.
+
+thread '<unnamed>' (27936) panicked at crates\shadow-model\src\forward.rs:928:65:
+called `Option::unwrap()` on a `None` value
+stack backtrace:
+note: Some details are omitted, run with `RUST_BACKTRACE=full` for a verbose backtrace.
+
+thread '<unnamed>' (14892) panicked at crates\shadow-model\src\forward.rs:928:65:
+called `Option::unwrap()` on a `None` value
+stack backtrace:
+note: Some details are omitted, run with `RUST_BACKTRACE=full` for a verbose backtrace.
+
+thread '<unnamed>' (12408) panicked at crates\shadow-model\src\forward.rs:928:65:
+called `Option::unwrap()` on a `None` value
+stack backtrace:
+note: Some details are omitted, run with `RUST_BACKTRACE=full` for a verbose backtrace.
+
+thread '<unnamed>' (21528) panicked at crates\shadow-model\src\forward.rs:928:65:
+called `Option::unwrap()` on a `None` value
+stack backtrace:
+note: Some details are omitted, run with `RUST_BACKTRACE=full` for a verbose backtrace.
+
+thread '<unnamed>' (26408) panicked at crates\shadow-model\src\forward.rs:928:65:
+called `Option::unwrap()` on a `None` value
+stack backtrace:
+note: Some details are omitted, run with `RUST_BACKTRACE=full` for a verbose backtrace.
+
+thread '<unnamed>' (17256) panicked at crates\shadow-model\src\forward.rs:928:65:
+called `Option::unwrap()` on a `None` value
+stack backtrace:
+note: Some details are omitted, run with `RUST_BACKTRACE=full` for a verbose backtrace.
+
+thread '<unnamed>' (23268) panicked at crates\shadow-model\src\forward.rs:928:65:
+called `Option::unwrap()` on a `None` value
+stack backtrace:
+note: Some details are omitted, run with `RUST_BACKTRACE=full` for a verbose backtrace.
+
+thread 'shadow-engine' (9224) panicked at crates\shadow-cuda\src\session.rs:1501:5:
+a scoped thread panicked
+stack backtrace:
+note: Some details are omitted, run with `RUST_BACKTRACE=full` for a verbose backtrace.
+shadow serve: the engine hit an internal error (a scoped thread panicked); the session was reset

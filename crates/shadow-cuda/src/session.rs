@@ -1485,6 +1485,22 @@ struct GroupedPlan {
 }
 
 #[allow(clippy::too_many_arguments)]
+/// The sub-chunks of a prompt pass of `m` rows over temporaries of `rows` rows, as (first row, rows), and the first one's length (the residual streams' storage starts
+/// `rows - first` rows into part 0, so every sub-chunk lies inside one part).  The first sub-chunk takes the remainder, so the rest are full ones - except that a remainder of
+/// `MAX_VERIFY` rows or fewer would make a first sub-chunk that runs the small-batch MoE path, which stages no experts, while the sub-chunks after it (`sub_fast`) take
+/// the layer's experts to be staged already: they read whatever the stage buffers held (stale weights: a silently wrong answer; uninitialized ones: NaN, or an illegal
+/// address in the fused path - docs/STATUS.md 111).  Such a remainder is given `MAX_VERIFY + 8` more rows, taken from the last sub-chunk.
+fn prompt_subchunks(m: usize, rows: usize) -> (Vec<(usize, usize)>, usize) {
+    let r = m % rows;
+    let first = if r > 0 && r <= MAX_VERIFY && m > rows { r + MAX_VERIFY + 8 } else { r };
+    let mut v = vec![];
+    if first > 0 {
+        v.push((0, first));
+    }
+    v.extend((first..m).step_by(rows).map(|s0| (s0, rows.min(m - s0))));
+    (v, first)
+}
+
 /// `route` (or `route_biased`) for every token's logits, spread over the CPU's threads when there are many (a long prompt's pass: 4,000+ tokens x 512 f64 exponentials
 /// was ~27 ms of one thread a layer with the GPU idle); each token is routed by the same code on one thread, so the result is bit for bit the sequential one.
 fn route_all(logits: &[Vec<f32>], k: usize, bias: Option<(&HashMap<(usize, usize), usize>, usize, f32)>) -> Vec<Vec<(usize, f64)>> {
@@ -4946,21 +4962,10 @@ impl<'c, 'm> GpuSession<'c, 'm> {
         // a pass bigger than the temporaries' rows runs layer by layer in sub-chunks (the first takes the remainder, so the last is a full one), the residual streams
         // of every row in `rbig`; `bb.r` is a view of the sub-chunk being run
         let sub_mode = m > self.rows && !self.rparts.is_empty() && !self.pipeline_ok(m);
-        let subs: Vec<(usize, usize)> = if sub_mode {
-            let s = self.rows;
-            let first = m % s;
-            let mut v = vec![];
-            if first > 0 {
-                v.push((0, first));
-            }
-            v.extend((first..m).step_by(s).map(|s0| (s0, s)));
-            v
-        } else {
-            vec![(0, m)]
-        };
+        let (subs, first_rows): (Vec<(usize, usize)>, usize) = if sub_mode { prompt_subchunks(m, self.rows) } else { (vec![(0, m)], 0) };
         assert!(sub_mode || m <= self.rows, "a pass of {m} rows with temporaries for {}", self.rows);
         // row j's residual streams are at storage row j + pad (the first sub-chunk, the remainder, ends part 0): a sub-chunk is inside one part
-        let pad = if sub_mode { (self.rows - m % self.rows) % self.rows } else { 0 };
+        let pad = if sub_mode { (self.rows - first_rows) % self.rows } else { 0 };
         let hop = if lo > 0 { self.hop_src.take() } else { None };
         let stage_in = if lo > 0 && hop.is_none() { Some(self.layers_in.take().expect("a stage after the first needs the previous stage's residual streams (step_batch_stage)")) } else { None };
         let row_ptr = |j: usize| -> u64 {
@@ -7052,5 +7057,39 @@ impl Stepper for GpuSession<'_, '_> {
                     .collect();
                 format!("\n  profile over {} steps, {:.1} ms/step (synchronized): {}", n, 1e3 * total / n, parts.join(", "))
             }).unwrap_or_default()
+    }
+}
+
+#[cfg(test)]
+mod subchunk_tests {
+    use super::*;
+
+    /// Every shape of prompt pass: the sub-chunks tile the pass, each fits the temporaries and lies inside one part of the residual storage, and the first is never a
+    /// small-batch one (docs/STATUS.md 111).
+    #[test]
+    fn a_prompt_pass_never_starts_with_a_small_batch_sub_chunk() {
+        for rows in [64usize, 2048, 16384] {
+            for m in (rows + 1)..(3 * rows + 40) {
+                let (v, first) = prompt_subchunks(m, rows);
+                assert_eq!(v.iter().map(|&(_, n)| n).sum::<usize>(), m, "m={m} rows={rows}");
+                let pad = (rows - first) % rows;
+                let mut at = 0;
+                for &(s0, n) in &v {
+                    assert_eq!(s0, at);
+                    assert!(n >= 1 && n <= rows, "m={m} rows={rows}: sub-chunk of {n}");
+                    assert_eq!((s0 + pad) / rows, (s0 + pad + n - 1) / rows, "m={m} rows={rows}: sub-chunk {s0}+{n} spans two parts");
+                    at += n;
+                }
+                assert_eq!(v[0].1, if first == 0 { rows } else { first });
+                assert!(first == 0 || first > MAX_VERIFY, "m={m} rows={rows}: first sub-chunk of {first} rows");
+            }
+        }
+        // the shape of the crash: 3 rows over three full sub-chunks (6,147 rows of 2,048)
+        let (v, first) = prompt_subchunks(3 * 2048 + 3, 2048);
+        assert_eq!(first, 19);
+        assert_eq!(v.iter().map(|&(_, n)| n).collect::<Vec<_>>(), vec![19, 2048, 2048, 2032]);
+        // an exact multiple and an ordinary remainder are as before
+        assert_eq!(prompt_subchunks(2 * 2048, 2048).0, vec![(0, 2048), (2048, 2048)]);
+        assert_eq!(prompt_subchunks(2048 + 100, 2048).0, vec![(0, 100), (100, 2048)]);
     }
 }

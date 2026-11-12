@@ -1,0 +1,414 @@
+shadow serve: --exact: no speculation, no inexact modes
+RAM tier: no --placement, so an arbitrary (uniform) choice of experts
+shadow serve: starting 2 MCP server(s) from mcp.json
+shadow serve: listening on http://127.0.0.1:8091
+shadow serve: MCP server time: 3 tools
+shadow serve: MCP server browser: 10 tools
+shadow serve: ready in 6.0 s; expert cache: 2355 slots x 1.95 MiB = 4.49 GiB; 0 hits, 0 misses (0.0% hits); 0 slice uploads; RAM tier: 4193 experts, 8.00 GiB pinned (filled in 2.9 s), misses served 0 from RAM, 0 from the file; host waits per step: router 0.0 ms, copies 0.0 ms, file 0.0 ms; kernel launches per step 0, 0.0 ms of host time in them
+shadow serve: 34 conversation snapshot(s) on disk in J:/ShadowConvCache (19.14 GiB)
+NANCHECK layer 0: m=3 router logits finite, max abs 1.246e1
+NANCHECK layer 0: m=2048 router logits finite, max abs 1.639e1
+NANCHECK layer 0: m=2048 router logits finite, max abs 1.630e1
+NANCHECK layer 0: m=2048 router logits finite, max abs 1.645e1
+NANCHECK layer 1: m=2048, 2048 of 2048 router rows non-finite, first token 0 (512 of 512 logits bad), last bad token 2047
+
+thread '<unnamed>' (17572) panicked at crates\shadow-model\src\forward.rs:928:65:
+called `Option::unwrap()` on a `None` value
+stack backtrace:
+note: Some details are omitted, run with `RUST_BACKTRACE=full` for a verbose backtrace.
+
+thread '<unnamed>' (9264) panicked at crates\shadow-model\src\forward.rs:928:65:
+called `Option::unwrap()` on a `None` value
+stack backtrace:
+note: Some details are omitted, run with `RUST_BACKTRACE=full` for a verbose backtrace.
+
+thread '<unnamed>' (428) panicked at crates\shadow-model\src\forward.rs:928:65:
+called `Option::unwrap()` on a `None` value
+stack backtrace:
+note: Some details are omitted, run with `RUST_BACKTRACE=full` for a verbose backtrace.
+
+thread '<unnamed>' (17832) panicked at crates\shadow-model\src\forward.rs:928:65:
+called `Option::unwrap()` on a `None` value
+stack backtrace:
+note: Some details are omitted, run with `RUST_BACKTRACE=full` for a verbose backtrace.
+
+thread '<unnamed>' (26544) panicked at crates\shadow-model\src\forward.rs:928:65:
+called `Option::unwrap()` on a `None` value
+stack backtrace:
+note: Some details are omitted, run with `RUST_BACKTRACE=full` for a verbose backtrace.
+
+thread '<unnamed>' (5876) panicked at crates\shadow-model\src\forward.rs:928:65:
+called `Option::unwrap()` on a `None` value
+stack backtrace:
+note: Some details are omitted, run with `RUST_BACKTRACE=full` for a verbose backtrace.
+
+thread '<unnamed>' (19364) panicked at crates\shadow-model\src\forward.rs:928:65:
+called `Option::unwrap()` on a `None` value
+stack backtrace:
+note: Some details are omitted, run with `RUST_BACKTRACE=full` for a verbose backtrace.
+
+thread '<unnamed>' (10112) panicked at crates\shadow-model\src\forward.rs:928:65:
+called `Option::unwrap()` on a `None` value
+stack backtrace:
+note: Some details are omitted, run with `RUST_BACKTRACE=full` for a verbose backtrace.
+
+thread '<unnamed>' (23144) panicked at crates\shadow-model\src\forward.rs:928:65:
+called `Option::unwrap()` on a `None` value
+stack backtrace:
+note: Some details are omitted, run with `RUST_BACKTRACE=full` for a verbose backtrace.
+
+thread '<unnamed>' (27020) panicked at crates\shadow-model\src\forward.rs:928:65:
+called `Option::unwrap()` on a `None` value
+stack backtrace:
+note: Some details are omitted, run with `RUST_BACKTRACE=full` for a verbose backtrace.
+
+thread '<unnamed>' (26664) panicked at crates\shadow-model\src\forward.rs:928:65:
+called `Option::unwrap()` on a `None` value
+stack backtrace:
+note: Some details are omitted, run with `RUST_BACKTRACE=full` for a verbose backtrace.
+
+thread '<unnamed>' (14440) panicked at crates\shadow-model\src\forward.rs:928:65:
+called `Option::unwrap()` on a `None` value
+stack backtrace:
+note: Some details are omitted, run with `RUST_BACKTRACE=full` for a verbose backtrace.
+
+thread '<unnamed>' (11356) panicked at crates\shadow-model\src\forward.rs:928:65:
+called `Option::unwrap()` on a `None` value
+stack backtrace:
+note: Some details are omitted, run with `RUST_BACKTRACE=full` for a verbose backtrace.
+
+thread '<unnamed>' (22424) panicked at crates\shadow-model\src\forward.rs:928:65:
+called `Option::unwrap()` on a `None` value
+stack backtrace:
+note: Some details are omitted, run with `RUST_BACKTRACE=full` for a verbose backtrace.
+
+thread '<unnamed>' (17624) panicked at crates\shadow-model\src\forward.rs:928:65:
+called `Option::unwrap()` on a `None` value
+stack backtrace:
+note: Some details are omitted, run with `RUST_BACKTRACE=full` for a verbose backtrace.
+
+thread '<unnamed>' (3456) panicked at crates\shadow-model\src\forward.rs:928:65:
+called `Option::unwrap()` on a `None` value
+stack backtrace:
+note: Some details are omitted, run with `RUST_BACKTRACE=full` for a verbose backtrace.
+
+thread 'shadow-engine' (26424) panicked at crates\shadow-cuda\src\session.rs:1501:5:
+a scoped thread panicked
+stack backtrace:
+note: Some details are omitted, run with `RUST_BACKTRACE=full` for a verbose backtrace.
+shadow serve: the engine hit an internal error (a scoped thread panicked); the session was reset
+NANCHECK layer 0: m=1616 router logits finite, max abs 1.389e1
+NANCHECK layer 0: m=2048 router logits finite, max abs 1.394e1
+NANCHECK layer 0: m=2048 router logits finite, max abs 1.394e1
+NANCHECK layer 8: m=1616 router logits finite, max abs 1.226e1
+NANCHECK layer 8: m=2048 router logits finite, max abs 9.649e0
+NANCHECK layer 8: m=2048 router logits finite, max abs 9.912e0
+NANCHECK layer 16: m=1616 router logits finite, max abs 1.273e1
+NANCHECK layer 16: m=2048 router logits finite, max abs 1.137e1
+NANCHECK layer 16: m=2048 router logits finite, max abs 1.057e1
+NANCHECK layer 24: m=1616 router logits finite, max abs 1.501e1
+NANCHECK layer 24: m=2048 router logits finite, max abs 1.312e1
+NANCHECK layer 24: m=2048 router logits finite, max abs 1.260e1
+NANCHECK layer 32: m=1616 router logits finite, max abs 1.840e1
+NANCHECK layer 32: m=2048 router logits finite, max abs 1.731e1
+NANCHECK layer 32: m=2048 router logits finite, max abs 1.713e1
+NANCHECK layer 40: m=1616 router logits finite, max abs 1.266e1
+NANCHECK layer 40: m=2048 router logits finite, max abs 1.255e1
+NANCHECK layer 40: m=2048 router logits finite, max abs 1.196e1
+NANCHECK layer 47: m=1616 router logits finite, max abs 1.870e1
+NANCHECK layer 47: m=2048 router logits finite, max abs 1.629e1
+NANCHECK layer 47: m=2048 router logits finite, max abs 1.605e1
+shadow serve: conversation snapshot of 5712 tokens (0.41 GiB) in 0.12 s; 1 kept
+shadow serve: conversation snapshot written to disk (0.41 GiB in 0.33 s; 35 on disk)
+NANCHECK layer 0: m=1607 router logits finite, max abs 1.389e1
+NANCHECK layer 0: m=2048 router logits finite, max abs 1.394e1
+NANCHECK layer 0: m=2048 router logits finite, max abs 1.394e1
+NANCHECK layer 8: m=1607 router logits finite, max abs 1.226e1
+NANCHECK layer 8: m=2048 router logits finite, max abs 9.660e0
+NANCHECK layer 8: m=2048 router logits finite, max abs 8.685e0
+NANCHECK layer 16: m=1607 router logits finite, max abs 1.273e1
+NANCHECK layer 16: m=2048 router logits finite, max abs 1.137e1
+NANCHECK layer 16: m=2048 router logits finite, max abs 1.057e1
+NANCHECK layer 24: m=1607 router logits finite, max abs 1.501e1
+NANCHECK layer 24: m=2048 router logits finite, max abs 1.312e1
+NANCHECK layer 24: m=2048 router logits finite, max abs 1.260e1
+NANCHECK layer 32: m=1607 router logits finite, max abs 1.840e1
+NANCHECK layer 32: m=2048 router logits finite, max abs 1.731e1
+NANCHECK layer 32: m=2048 router logits finite, max abs 1.713e1
+NANCHECK layer 40: m=1607 router logits finite, max abs 1.266e1
+NANCHECK layer 40: m=2048 router logits finite, max abs 1.255e1
+NANCHECK layer 40: m=2048 router logits finite, max abs 1.196e1
+NANCHECK layer 47: m=1607 router logits finite, max abs 1.870e1
+NANCHECK layer 47: m=2048 router logits finite, max abs 1.629e1
+NANCHECK layer 47: m=2048 router logits finite, max abs 1.605e1
+NANCHECK layer 0: m=28 router logits finite, max abs 1.394e1
+NANCHECK layer 8: m=28 router logits finite, max abs 9.921e0
+NANCHECK layer 16: m=28 router logits finite, max abs 1.026e1
+NANCHECK layer 24: m=28 router logits finite, max abs 1.168e1
+NANCHECK layer 32: m=28 router logits finite, max abs 1.591e1
+NANCHECK layer 40: m=28 router logits finite, max abs 1.162e1
+NANCHECK layer 47: m=28 router logits finite, max abs 1.490e1
+shadow serve: conversation snapshot of 5731 tokens (0.41 GiB) in 0.12 s; 1 kept
+NANCHECK layer 0: m=19 router logits finite, max abs 1.394e1
+shadow serve: conversation snapshot written to disk (0.41 GiB in 0.52 s; 36 on disk)
+NANCHECK layer 8: m=19 router logits finite, max abs 8.591e0
+NANCHECK layer 16: m=19 router logits finite, max abs 9.654e0
+NANCHECK layer 24: m=19 router logits finite, max abs 1.168e1
+NANCHECK layer 32: m=19 router logits finite, max abs 1.591e1
+NANCHECK layer 40: m=19 router logits finite, max abs 1.162e1
+NANCHECK layer 47: m=19 router logits finite, max abs 1.456e1
+NANCHECK layer 0: m=256 router logits finite, max abs 1.394e1
+NANCHECK layer 8: m=256 router logits finite, max abs 8.531e0
+NANCHECK layer 16: m=256 router logits finite, max abs 1.021e1
+NANCHECK layer 24: m=256 router logits finite, max abs 1.292e1
+NANCHECK layer 32: m=256 router logits finite, max abs 1.564e1
+NANCHECK layer 40: m=256 router logits finite, max abs 1.181e1
+NANCHECK layer 47: m=256 router logits finite, max abs 1.501e1
+NANCHECK layer 0: m=170 router logits finite, max abs 1.394e1
+NANCHECK layer 8: m=170 router logits finite, max abs 9.841e0
+NANCHECK layer 16: m=170 router logits finite, max abs 1.087e1
+NANCHECK layer 24: m=170 router logits finite, max abs 1.242e1
+NANCHECK layer 32: m=170 router logits finite, max abs 1.599e1
+NANCHECK layer 40: m=170 router logits finite, max abs 1.178e1
+NANCHECK layer 47: m=170 router logits finite, max abs 1.551e1
+shadow serve: conversation snapshot of 6148 tokens (0.44 GiB) in 0.13 s; 1 kept
+NANCHECK layer 0: m=256 router logits finite, max abs 1.394e1
+shadow serve: conversation snapshot written to disk (0.44 GiB in 0.37 s; 36 on disk)
+NANCHECK layer 8: m=256 router logits finite, max abs 8.531e0
+NANCHECK layer 16: m=256 router logits finite, max abs 1.021e1
+NANCHECK layer 24: m=256 router logits finite, max abs 1.292e1
+NANCHECK layer 32: m=256 router logits finite, max abs 1.564e1
+NANCHECK layer 40: m=256 router logits finite, max abs 1.181e1
+NANCHECK layer 47: m=256 router logits finite, max abs 1.501e1
+NANCHECK layer 0: m=160 router logits finite, max abs 1.394e1
+NANCHECK layer 8: m=160 router logits finite, max abs 9.096e0
+NANCHECK layer 16: m=160 router logits finite, max abs 1.087e1
+NANCHECK layer 24: m=160 router logits finite, max abs 1.242e1
+NANCHECK layer 32: m=160 router logits finite, max abs 1.599e1
+NANCHECK layer 40: m=160 router logits finite, max abs 1.178e1
+NANCHECK layer 47: m=160 router logits finite, max abs 1.551e1
+NANCHECK layer 0: m=9 router logits finite, max abs 1.353e1
+NANCHECK layer 8: m=9 router logits finite, max abs 9.840e0
+NANCHECK layer 16: m=9 router logits finite, max abs 1.029e1
+NANCHECK layer 24: m=9 router logits finite, max abs 1.082e1
+NANCHECK layer 32: m=9 router logits finite, max abs 1.381e1
+NANCHECK layer 40: m=9 router logits finite, max abs 1.142e1
+NANCHECK layer 47: m=9 router logits finite, max abs 1.411e1
+shadow serve: conversation snapshot of 6147 tokens (0.44 GiB) in 0.09 s; 1 kept
+shadow serve: conversation snapshot written to disk (0.44 GiB in 0.37 s; 37 on disk)
+NANCHECK layer 0: m=2041 router logits finite, max abs 1.391e1
+NANCHECK layer 0: m=2048 router logits finite, max abs 1.394e1
+NANCHECK layer 0: m=2048 router logits finite, max abs 1.394e1
+NANCHECK layer 8: m=2041 router logits finite, max abs 1.226e1
+NANCHECK layer 8: m=2048 router logits finite, max abs 9.411e0
+NANCHECK layer 8: m=2048 router logits finite, max abs 9.096e0
+NANCHECK layer 16: m=2041 router logits finite, max abs 1.273e1
+NANCHECK layer 16: m=2048 router logits finite, max abs 1.117e1
+NANCHECK layer 16: m=2048 router logits finite, max abs 1.087e1
+NANCHECK layer 24: m=2041 router logits finite, max abs 1.501e1
+NANCHECK layer 24: m=2048 router logits finite, max abs 1.260e1
+NANCHECK layer 24: m=2048 router logits finite, max abs 1.292e1
+NANCHECK layer 32: m=2041 router logits finite, max abs 1.840e1
+NANCHECK layer 32: m=2048 router logits finite, max abs 1.714e1
+NANCHECK layer 32: m=2048 router logits finite, max abs 1.713e1
+NANCHECK layer 40: m=2041 router logits finite, max abs 1.266e1
+NANCHECK layer 40: m=2048 router logits finite, max abs 1.255e1
+NANCHECK layer 40: m=2048 router logits finite, max abs 1.186e1
+NANCHECK layer 47: m=2041 router logits finite, max abs 1.870e1
+NANCHECK layer 47: m=2048 router logits finite, max abs 1.629e1
+NANCHECK layer 47: m=2048 router logits finite, max abs 1.605e1
+NANCHECK layer 0: m=9 router logits finite, max abs 1.353e1
+NANCHECK layer 8: m=9 router logits finite, max abs 9.828e0
+NANCHECK layer 16: m=9 router logits finite, max abs 1.029e1
+NANCHECK layer 24: m=9 router logits finite, max abs 1.083e1
+NANCHECK layer 32: m=9 router logits finite, max abs 1.375e1
+NANCHECK layer 40: m=9 router logits finite, max abs 1.155e1
+NANCHECK layer 47: m=9 router logits finite, max abs 1.418e1
+shadow serve: conversation snapshot of 6146 tokens (0.44 GiB) in 0.09 s; 1 kept
+NANCHECK layer 0: m=2040 router logits finite, max abs 1.391e1
+NANCHECK layer 0: m=2048 router logits finite, max abs 1.394e1
+NANCHECK layer 0: m=2048 router logits finite, max abs 1.394e1
+shadow serve: conversation snapshot written to disk (0.44 GiB in 1.85 s; 37 on disk)
+NANCHECK layer 8: m=2040 router logits finite, max abs 1.226e1
+NANCHECK layer 8: m=2048 router logits finite, max abs 9.411e0
+NANCHECK layer 8: m=2048 router logits finite, max abs 9.096e0
+NANCHECK layer 16: m=2040 router logits finite, max abs 1.273e1
+NANCHECK layer 16: m=2048 router logits finite, max abs 1.117e1
+NANCHECK layer 16: m=2048 router logits finite, max abs 1.087e1
+NANCHECK layer 24: m=2040 router logits finite, max abs 1.501e1
+NANCHECK layer 24: m=2048 router logits finite, max abs 1.260e1
+NANCHECK layer 24: m=2048 router logits finite, max abs 1.292e1
+NANCHECK layer 32: m=2040 router logits finite, max abs 1.840e1
+NANCHECK layer 32: m=2048 router logits finite, max abs 1.714e1
+NANCHECK layer 32: m=2048 router logits finite, max abs 1.713e1
+NANCHECK layer 40: m=2040 router logits finite, max abs 1.266e1
+NANCHECK layer 40: m=2048 router logits finite, max abs 1.255e1
+NANCHECK layer 40: m=2048 router logits finite, max abs 1.186e1
+NANCHECK layer 47: m=2040 router logits finite, max abs 1.870e1
+NANCHECK layer 47: m=2048 router logits finite, max abs 1.629e1
+NANCHECK layer 47: m=2048 router logits finite, max abs 1.605e1
+NANCHECK layer 0: m=9 router logits finite, max abs 1.354e1
+NANCHECK layer 8: m=9 router logits finite, max abs 9.828e0
+NANCHECK layer 16: m=9 router logits finite, max abs 1.029e1
+NANCHECK layer 24: m=9 router logits finite, max abs 1.079e1
+NANCHECK layer 32: m=9 router logits finite, max abs 1.383e1
+NANCHECK layer 40: m=9 router logits finite, max abs 1.139e1
+NANCHECK layer 47: m=9 router logits finite, max abs 1.431e1
+shadow serve: conversation snapshot of 6145 tokens (0.44 GiB) in 0.09 s; 1 kept
+NANCHECK layer 0: m=13 router logits finite, max abs 1.353e1
+NANCHECK layer 8: m=13 router logits finite, max abs 9.839e0
+NANCHECK layer 16: m=13 router logits finite, max abs 1.050e1
+NANCHECK layer 24: m=13 router logits finite, max abs 1.087e1
+NANCHECK layer 32: m=13 router logits finite, max abs 1.369e1
+NANCHECK layer 40: m=13 router logits finite, max abs 1.192e1
+shadow serve: conversation snapshot written to disk (0.44 GiB in 0.48 s; 38 on disk)
+NANCHECK layer 47: m=13 router logits finite, max abs 1.419e1
+shadow serve: conversation snapshot of 6149 tokens (0.44 GiB) in 0.09 s; 1 kept
+NANCHECK layer 0: m=2006 router logits finite, max abs 1.391e1
+shadow serve: conversation snapshot written to disk (0.44 GiB in 0.47 s; 38 on disk)
+NANCHECK layer 0: m=2048 router logits finite, max abs 1.394e1
+NANCHECK layer 0: m=2048 router logits finite, max abs 1.394e1
+NANCHECK layer 8: m=2006 router logits finite, max abs 1.226e1
+NANCHECK layer 8: m=2048 router logits finite, max abs 9.440e0
+NANCHECK layer 8: m=2048 router logits finite, max abs 8.685e0
+NANCHECK layer 16: m=2006 router logits finite, max abs 1.273e1
+NANCHECK layer 16: m=2048 router logits finite, max abs 1.137e1
+NANCHECK layer 16: m=2048 router logits finite, max abs 1.046e1
+NANCHECK layer 24: m=2006 router logits finite, max abs 1.501e1
+NANCHECK layer 24: m=2048 router logits finite, max abs 1.260e1
+NANCHECK layer 24: m=2048 router logits finite, max abs 1.292e1
+NANCHECK layer 32: m=2006 router logits finite, max abs 1.840e1
+NANCHECK layer 32: m=2048 router logits finite, max abs 1.714e1
+NANCHECK layer 32: m=2048 router logits finite, max abs 1.713e1
+NANCHECK layer 40: m=2006 router logits finite, max abs 1.266e1
+NANCHECK layer 40: m=2048 router logits finite, max abs 1.255e1
+NANCHECK layer 40: m=2048 router logits finite, max abs 1.186e1
+NANCHECK layer 47: m=2006 router logits finite, max abs 1.870e1
+NANCHECK layer 47: m=2048 router logits finite, max abs 1.629e1
+NANCHECK layer 47: m=2048 router logits finite, max abs 1.605e1
+NANCHECK layer 0: m=49 router logits finite, max abs 1.394e1
+NANCHECK layer 8: m=49 router logits finite, max abs 9.825e0
+NANCHECK layer 16: m=49 router logits finite, max abs 1.089e1
+NANCHECK layer 24: m=49 router logits finite, max abs 1.186e1
+NANCHECK layer 32: m=49 router logits finite, max abs 1.578e1
+NANCHECK layer 40: m=49 router logits finite, max abs 1.178e1
+NANCHECK layer 47: m=49 router logits finite, max abs 1.473e1
+shadow serve: conversation snapshot of 6151 tokens (0.44 GiB) in 0.10 s; 1 kept
+NANCHECK layer 0: m=1622 router logits finite, max abs 1.393e1
+shadow serve: conversation snapshot written to disk (0.44 GiB in 0.51 s; 39 on disk)
+NANCHECK layer 0: m=2048 router logits finite, max abs 1.397e1
+NANCHECK layer 0: m=2048 router logits finite, max abs 1.408e1
+NANCHECK layer 8: m=1622 router logits finite, max abs 1.199e1
+NANCHECK layer 8: m=2048 router logits finite, max abs 9.080e0
+NANCHECK layer 8: m=2048 router logits finite, max abs 9.868e0
+NANCHECK layer 16: m=1622 router logits finite, max abs 1.344e1
+NANCHECK layer 16: m=2048 router logits finite, max abs 1.126e1
+NANCHECK layer 16: m=2048 router logits finite, max abs 1.077e1
+NANCHECK layer 24: m=1622 router logits finite, max abs 1.467e1
+NANCHECK layer 24: m=2048 router logits finite, max abs 1.298e1
+NANCHECK layer 24: m=2048 router logits finite, max abs 1.243e1
+NANCHECK layer 32: m=1622 router logits finite, max abs 1.801e1
+NANCHECK layer 32: m=2048 router logits finite, max abs 1.664e1
+NANCHECK layer 32: m=2048 router logits finite, max abs 1.609e1
+NANCHECK layer 40: m=1622 router logits finite, max abs 1.260e1
+NANCHECK layer 40: m=2048 router logits finite, max abs 1.214e1
+NANCHECK layer 40: m=2048 router logits finite, max abs 1.223e1
+NANCHECK layer 47: m=1622 router logits finite, max abs 1.735e1
+NANCHECK layer 47: m=2048 router logits finite, max abs 1.561e1
+NANCHECK layer 47: m=2048 router logits finite, max abs 1.538e1
+shadow serve: conversation snapshot of 5718 tokens (0.41 GiB) in 0.09 s; 1 kept
+NANCHECK layer 0: m=59 router logits finite, max abs 1.394e1
+shadow serve: conversation snapshot written to disk (0.41 GiB in 0.51 s; 39 on disk)
+NANCHECK layer 8: m=59 router logits finite, max abs 9.834e0
+NANCHECK layer 16: m=59 router logits finite, max abs 1.089e1
+NANCHECK layer 24: m=59 router logits finite, max abs 1.186e1
+NANCHECK layer 32: m=59 router logits finite, max abs 1.578e1
+NANCHECK layer 40: m=59 router logits finite, max abs 1.178e1
+NANCHECK layer 47: m=59 router logits finite, max abs 1.473e1
+shadow serve: conversation snapshot of 6161 tokens (0.44 GiB) in 0.09 s; 1 kept
+NANCHECK layer 0: m=1641 router logits finite, max abs 1.393e1
+NANCHECK layer 0: m=2048 router logits finite, max abs 1.397e1
+NANCHECK layer 0: m=2048 router logits finite, max abs 1.408e1
+shadow serve: conversation snapshot written to disk (0.44 GiB in 2.16 s; 40 on disk)
+NANCHECK layer 8: m=1641 router logits finite, max abs 1.199e1
+NANCHECK layer 8: m=2048 router logits finite, max abs 9.068e0
+NANCHECK layer 8: m=2048 router logits finite, max abs 9.878e0
+NANCHECK layer 16: m=1641 router logits finite, max abs 1.344e1
+NANCHECK layer 16: m=2048 router logits finite, max abs 1.116e1
+NANCHECK layer 16: m=2048 router logits finite, max abs 1.078e1
+NANCHECK layer 24: m=1641 router logits finite, max abs 1.467e1
+NANCHECK layer 24: m=2048 router logits finite, max abs 1.298e1
+NANCHECK layer 24: m=2048 router logits finite, max abs 1.243e1
+NANCHECK layer 32: m=1641 router logits finite, max abs 1.801e1
+NANCHECK layer 32: m=2048 router logits finite, max abs 1.664e1
+NANCHECK layer 32: m=2048 router logits finite, max abs 1.609e1
+NANCHECK layer 40: m=1641 router logits finite, max abs 1.260e1
+NANCHECK layer 40: m=2048 router logits finite, max abs 1.206e1
+NANCHECK layer 40: m=2048 router logits finite, max abs 1.223e1
+NANCHECK layer 47: m=1641 router logits finite, max abs 1.735e1
+NANCHECK layer 47: m=2048 router logits finite, max abs 1.561e1
+NANCHECK layer 47: m=2048 router logits finite, max abs 1.531e1
+shadow serve: conversation snapshot of 5737 tokens (0.41 GiB) in 0.09 s; 1 kept
+NANCHECK layer 0: m=1626 router logits finite, max abs 1.393e1
+shadow serve: conversation snapshot written to disk (0.41 GiB in 0.42 s; 41 on disk)
+NANCHECK layer 0: m=2048 router logits finite, max abs 1.397e1
+NANCHECK layer 0: m=2048 router logits finite, max abs 1.397e1
+NANCHECK layer 8: m=1626 router logits finite, max abs 1.199e1
+NANCHECK layer 8: m=2048 router logits finite, max abs 9.080e0
+NANCHECK layer 8: m=2048 router logits finite, max abs 8.728e0
+NANCHECK layer 16: m=1626 router logits finite, max abs 1.344e1
+NANCHECK layer 16: m=2048 router logits finite, max abs 1.126e1
+NANCHECK layer 16: m=2048 router logits finite, max abs 1.068e1
+NANCHECK layer 24: m=1626 router logits finite, max abs 1.467e1
+NANCHECK layer 24: m=2048 router logits finite, max abs 1.298e1
+NANCHECK layer 24: m=2048 router logits finite, max abs 1.243e1
+NANCHECK layer 32: m=1626 router logits finite, max abs 1.801e1
+NANCHECK layer 32: m=2048 router logits finite, max abs 1.664e1
+NANCHECK layer 32: m=2048 router logits finite, max abs 1.609e1
+NANCHECK layer 40: m=1626 router logits finite, max abs 1.260e1
+NANCHECK layer 40: m=2048 router logits finite, max abs 1.214e1
+NANCHECK layer 40: m=2048 router logits finite, max abs 1.223e1
+NANCHECK layer 47: m=1626 router logits finite, max abs 1.735e1
+NANCHECK layer 47: m=2048 router logits finite, max abs 1.561e1
+NANCHECK layer 47: m=2048 router logits finite, max abs 1.484e1
+NANCHECK layer 0: m=425 router logits finite, max abs 1.397e1
+NANCHECK layer 8: m=425 router logits finite, max abs 9.770e0
+NANCHECK layer 16: m=425 router logits finite, max abs 1.082e1
+NANCHECK layer 24: m=425 router logits finite, max abs 1.153e1
+NANCHECK layer 32: m=425 router logits finite, max abs 1.542e1
+NANCHECK layer 40: m=425 router logits finite, max abs 1.191e1
+NANCHECK layer 47: m=425 router logits finite, max abs 1.512e1
+shadow serve: conversation snapshot of 6147 tokens (0.44 GiB) in 0.09 s; 1 kept
+NANCHECK layer 0: m=256 router logits finite, max abs 1.397e1
+shadow serve: conversation snapshot written to disk (0.44 GiB in 0.79 s; 41 on disk)
+NANCHECK layer 8: m=256 router logits finite, max abs 8.551e0
+NANCHECK layer 16: m=256 router logits finite, max abs 1.065e1
+NANCHECK layer 24: m=256 router logits finite, max abs 1.153e1
+NANCHECK layer 32: m=256 router logits finite, max abs 1.541e1
+NANCHECK layer 40: m=256 router logits finite, max abs 1.172e1
+NANCHECK layer 47: m=256 router logits finite, max abs 1.398e1
+NANCHECK layer 0: m=153 router logits finite, max abs 1.397e1
+NANCHECK layer 8: m=153 router logits finite, max abs 8.965e0
+NANCHECK layer 16: m=153 router logits finite, max abs 1.075e1
+NANCHECK layer 24: m=153 router logits finite, max abs 1.151e1
+NANCHECK layer 32: m=153 router logits finite, max abs 1.542e1
+NANCHECK layer 40: m=153 router logits finite, max abs 1.191e1
+NANCHECK layer 47: m=153 router logits finite, max abs 1.423e1
+NANCHECK layer 0: m=15 router logits finite, max abs 1.367e1
+NANCHECK layer 8: m=15 router logits finite, max abs 9.760e0
+NANCHECK layer 16: m=15 router logits finite, max abs 1.080e1
+NANCHECK layer 24: m=15 router logits finite, max abs 1.101e1
+NANCHECK layer 32: m=15 router logits finite, max abs 1.301e1
+NANCHECK layer 40: m=15 router logits finite, max abs 1.030e1
+NANCHECK layer 47: m=15 router logits finite, max abs 1.547e1
+shadow serve: conversation snapshot of 6146 tokens (0.44 GiB) in 0.10 s; 1 kept
+NANCHECK layer 0: m=19 router logits finite, max abs 1.367e1
+NANCHECK layer 8: m=19 router logits finite, max abs 9.784e0
+NANCHECK layer 16: m=19 router logits finite, max abs 1.081e1
+NANCHECK layer 24: m=19 router logits finite, max abs 1.105e1
+NANCHECK layer 32: m=19 router logits finite, max abs 1.330e1
+NANCHECK layer 40: m=19 router logits finite, max abs 1.185e1
+NANCHECK layer 47: m=19 router logits finite, max abs 1.521e1
+shadow serve: conversation snapshot of 6150 tokens (0.44 GiB) in 0.09 s; 1 kept
+shadow serve: conversation snapshot written to disk (0.44 GiB in 3.25 s; 42 on disk)
+shadow serve: conversation snapshot written to disk (0.44 GiB in 0.30 s; 42 on disk)
