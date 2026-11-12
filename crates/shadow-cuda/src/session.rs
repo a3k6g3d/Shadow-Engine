@@ -774,6 +774,13 @@ fn ncu_pass(ctx: &Context, rows: usize) {
     }
 }
 
+/// `SHADOW_INT8_DECODE=0` (STATUS 109): the dense projections of a verify pass (2..=8 inputs) run on llama.cpp's int8 kernels in fast mode, as the prompt path's do from 128 rows: `mul_mat_vec_q` for
+/// 1-3 inputs (and for Q8_0 / IQ4_NL, which the MMQ wrapper lacks), the int8 MMQ from 4.  The activations are quantized to int8 (~0.4% a product), so `--exact` (no `--tensor-prompt`) never takes this path.
+fn int8_decode() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| !std::env::var("SHADOW_INT8_DECODE").is_ok_and(|v| v == "0"))
+}
+
 /// Rows per copy through the hop's pinned buffer (a chunk is at most `HOP_CHUNK_ROWS` x `NFEAT` floats = 50 MiB of pinned memory, taken at the first hop).
 const HOP_CHUNK_ROWS: usize = 1024;
 
@@ -2495,6 +2502,8 @@ impl<'c, 'm> GpuSession<'c, 'm> {
         if let Err(e) = self.batch_graphs[&key].launch(&self.gstream) {
             panic!("batch graph (layer {}, rn_ready {}, m {}, on {}, rows {}): {e}", key.0, key.1, key.2, key.3, key.4);
         }
+        // the graph's launches may have quantized other activations into `mmq_y` (a captured projection quantizes every time): the host's note of what it holds is stale
+        self.mmq_y_tag.set((0, 0, 0, 0, 0));
     }
 
     fn graph_segment(&mut self, key: (usize, bool), f: impl FnOnce(&Self)) {
@@ -2507,6 +2516,7 @@ impl<'c, 'm> GpuSession<'c, 'm> {
             self.graphs.insert(key, g);
         }
         self.graphs[&key].launch(&self.gstream).unwrap();
+        self.mmq_y_tag.set((0, 0, 0, 0, 0));
     }
 
     /// A point on the default stream for `SHADOW_LTIME`: the time since the previous point is charged to `name`.
@@ -5277,6 +5287,47 @@ impl<'c, 'm> GpuSession<'c, 'm> {
         logits
     }
 
+    /// `mv_cols` for a verify pass's 2..=8 inputs on the native int8 kernels (see `int8_decode`); false when this projection / buffer does not qualify (the float kernels then run).
+    #[allow(clippy::too_many_arguments)]
+    fn int8_small_cols(&self, name: &str, ty: &str, wptr: u64, rows: usize, k: usize, x: u64, xs: usize, y: u64, ys: usize, m: usize) -> bool {
+        let Some(mq) = self.mmq.as_ref() else { return false };
+        if !self.tensor_prompt || !(2..=8).contains(&m) || !int8_decode() || xs % 4 != 0 || x % 16 != 0 || k % 32 != 0 || ys < rows {
+            return false;
+        }
+        let mmq_ty = crate::mmq::Mmq::ggml_type(ty).filter(|_| k % 256 == 0);
+        let mmvq_ty = if mq.has_mmvq() { crate::mmq::Mmq::mmvq_type(ty) } else { None };
+        let use_mmvq = mmvq_ty.is_some() && (m <= 3 || mmq_ty.is_none());
+        if !use_mmvq && mmq_ty.is_none() {
+            return false;
+        }
+        // the plain-q8_1 layout of `mmvq` is its own class of what `mmq_y` holds (the MMQ layouts are 0 and 1)
+        let (layout, bytes) = if use_mmvq { (2u8, mq.mmvq_y_bytes(k, m)) } else { (crate::mmq::Mmq::ds_layout(mmq_ty.unwrap()), mq.y_bytes(k, m)) };
+        if bytes > self.mmq_y.bytes {
+            return false;
+        }
+        static REUSE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let reuse = *REUSE.get_or_init(|| !std::env::var("SHADOW_MMQ_REUSE").is_ok_and(|v| v == "0"));
+        let stream = self.ls().map_or(0, |s| s.raw() as u64);
+        let tag = (x, k, m, xs, layout);
+        // SAFETY: x holds m rows of k floats xs apart (the caller's buffers), the quantized copy fits mmq_y (checked), the weights are `rows` rows of k values in their GGUF layout, y holds m rows
+        // of `rows` floats ys apart (ys >= rows, checked).
+        unsafe {
+            if !reuse || self.capturing.get() || self.mmq_y_tag.get() != tag {
+                let q = if use_mmvq { mq.mmvq_quantize(x, self.mmq_y.ptr, k, m, xs, stream) } else { mq.quantize(x, self.mmq_y.ptr, k, m, xs, mmq_ty.unwrap(), stream) };
+                q.unwrap_or_else(|e| panic!("{name}: {e}"));
+                if !self.capturing.get() {
+                    self.mmq_y_tag.set(tag);
+                }
+            }
+            let r = if use_mmvq { mq.mmvq(mmvq_ty.unwrap(), wptr, self.mmq_y.ptr, y, rows, k, m, ys, stream) } else { mq.gemm(mmq_ty.unwrap(), wptr, self.mmq_y.ptr, y, rows, k, m, ys, stream) };
+            r.unwrap_or_else(|e| panic!("{name}: {e}"));
+        }
+        if y == x {
+            self.mmq_y_tag.set((0, 0, 0, 0, 0));
+        }
+        true
+    }
+
     /// y_j = W x_j for j < m (x_j at x + j * xs floats, y_j at y + j * ys): bit for bit what `mv` gives each input,
     /// in one launch where a matvec_cols kernel computes the same sums (`mv` per input otherwise).
     fn mv_cols(&self, name: &str, x: u64, xs: usize, y: u64, ys: usize, m: usize) {
@@ -5342,6 +5393,9 @@ impl<'c, 'm> GpuSession<'c, 'm> {
                     return;
                 }
             }
+        }
+        if entry.starts_with("matvec_cols_") && !entry.starts_with("matvec_cols_ref_") && self.int8_small_cols(name, &ty, wptr, rows, t.dims[0] as usize, x, xs, y, ys, m) {
+            return;
         }
         static MMA_NL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         // on since the device planner (the pass is no longer paced by the copies: the shared experts' IQ4_NL down projection took 331 ms of a 3.5 s kernel window as 8-column launches); `SHADOW_MMA_NL=0` off

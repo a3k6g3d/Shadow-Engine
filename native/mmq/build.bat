@@ -6,5 +6,5 @@ call "C:\Program Files\Microsoft Visual Studio\18\Community\VC\Auxiliary\Build\v
 cd /d %~dp0
 set G=%GGML_DIR%
 set T=%G%/src/ggml-cuda/template-instances
-nvcc -shared -arch=sm_120 -std=c++17 -O2 --expt-relaxed-constexpr -DGGML_CUDA_NO_VMM -I%G%/include -I%G%/src -I%G%/src/ggml-cuda -o shadow_mmq.dll shadow_mmq.cu %G%/src/ggml-cuda/quantize.cu %T%/mmq-instance-q4_k.cu %T%/mmq-instance-q5_k.cu %T%/mmq-instance-q6_k.cu %T%/mmq-instance-iq4_xs.cu 2>&1 | findstr /i "error LNK fatal"
+nvcc -shared -arch=sm_120 -std=c++17 -O2 --expt-relaxed-constexpr -DGGML_CUDA_NO_VMM -I%G%/include -I%G%/src -I%G%/src/ggml-cuda -o shadow_mmq.dll shadow_mmq.cu %G%/src/ggml-cuda/quantize.cu %G%/src/ggml-cuda/mmvq.cu %T%/mmq-instance-q4_k.cu %T%/mmq-instance-q5_k.cu %T%/mmq-instance-q6_k.cu %T%/mmq-instance-iq4_xs.cu 2>&1 | findstr /i "error LNK fatal"
 if exist shadow_mmq.dll (echo built shadow_mmq.dll) else (echo BUILD FAILED)

@@ -9,6 +9,8 @@ use std::path::PathBuf;
 type QuantizeFn = unsafe extern "C" fn(x: u64, yq: u64, k: i64, ntok: i64, xs: i64, ty: i32, stream: u64) -> i32;
 type GemmFn = unsafe extern "C" fn(ty: i32, w: u64, yq: u64, dst: u64, rows: i64, k: i64, ntok: i64, dst_stride: i64, stream: u64) -> i32;
 type BytesFn = unsafe extern "C" fn(k: i64, ntok: i64) -> usize;
+type MmvqQuantizeFn = unsafe extern "C" fn(x: u64, yq: u64, k: i64, ntok: i64, xs: i64, stream: u64) -> i32;
+type MmvqFn = unsafe extern "C" fn(ty: i32, w: u64, yq: u64, dst: u64, rows: i64, k: i64, ntok: i64, dst_stride: i64, stream: u64) -> i32;
 type MoeBytesFn = unsafe extern "C" fn(k: i64, ny_groups: i64, chunk: i64) -> usize;
 type MoeFn = unsafe extern "C" fn(ty: i32, xtab: u64, rec: u64, ngroups: i64, ny_groups: i64, chunk: i64, x: u64, xs: i64, k: i64, rows: i64, dst: u64, dst_stride: i64, scratch: u64, stream: u64) -> i32;
 
@@ -17,6 +19,8 @@ pub struct Mmq {
     gemm: GemmFn,
     y_bytes: BytesFn,
     moe: Option<(MoeFn, MoeBytesFn)>,
+    /// llama.cpp's `mul_mat_vec_q` for 1..=8 inputs (STATUS 109): quantize to plain q8_1 blocks, then the product; None in a DLL built before it
+    mmvq: Option<(MmvqQuantizeFn, MmvqFn, BytesFn)>,
     _lib: Dylib,
 }
 
@@ -64,8 +68,19 @@ impl Mmq {
                 _ => None,
             }
         };
-        eprintln!("mmq: loaded {} (int8 tensor-core projections for the prompt path{})", path.display(), if moe.is_some() { ", grouped experts" } else { "" });
-        Some(Mmq { quantize, gemm, y_bytes, moe, _lib: lib })
+        // SAFETY: the exported functions have exactly these C signatures (native/mmq/shadow_mmq.cu, `shadow_mmvq_*`).
+        let mmvq = unsafe {
+            match (lib.sym("shadow_mmvq_quantize"), lib.sym("shadow_mmvq_gemv"), lib.sym("shadow_mmvq_y_bytes")) {
+                (Some(a), Some(b), Some(c)) => Some((
+                    std::mem::transmute::<*mut std::ffi::c_void, MmvqQuantizeFn>(a),
+                    std::mem::transmute::<*mut std::ffi::c_void, MmvqFn>(b),
+                    std::mem::transmute::<*mut std::ffi::c_void, BytesFn>(c),
+                )),
+                _ => None,
+            }
+        };
+        eprintln!("mmq: loaded {} (int8 tensor-core projections for the prompt path{}{})", path.display(), if moe.is_some() { ", grouped experts" } else { "" }, if mmvq.is_some() { ", mul_mat_vec_q" } else { "" });
+        Some(Mmq { quantize, gemm, y_bytes, moe, mmvq, _lib: lib })
     }
 
     /// The ggml type number of a quantization the DLL can multiply, by the name `TensorInfo::ty.name()` gives.
@@ -77,6 +92,53 @@ impl Mmq {
             "IQ4_XS" => Some(23),
             _ => None,
         }
+    }
+
+    /// The ggml type number of a quantization `mmvq` can multiply (llama.cpp's `mul_mat_vec_q`), by the name `TensorInfo::ty.name()` gives.
+    pub fn mmvq_type(name: &str) -> Option<i32> {
+        match name {
+            "Q8_0" => Some(8),
+            "Q4_K" => Some(12),
+            "Q5_K" => Some(13),
+            "Q6_K" => Some(14),
+            "IQ4_NL" => Some(20),
+            "IQ4_XS" => Some(23),
+            _ => None,
+        }
+    }
+
+    /// Whether the DLL has the `mul_mat_vec_q` entry points.
+    pub fn has_mmvq(&self) -> bool {
+        self.mmvq.is_some()
+    }
+
+    /// Bytes of the plain-q8_1 activation buffer `mmvq_quantize` fills for `ntok` rows of `k` floats.
+    pub fn mmvq_y_bytes(&self, k: usize, ntok: usize) -> usize {
+        // SAFETY: a pure function of its arguments.
+        self.mmvq.map_or(usize::MAX, |(_, _, b)| unsafe { b(k as i64, ntok as i64) })
+    }
+
+    /// Quantizes `ntok` rows of `k` floats (rows `xs` floats apart at `x`) into plain q8_1 blocks at `yq` for `mmvq`.
+    ///
+    /// # Safety
+    /// `x` and `yq` are device addresses of this context with the sizes above; `stream` a CUstream of it (0 = the default stream).
+    pub unsafe fn mmvq_quantize(&self, x: u64, yq: u64, k: usize, ntok: usize, xs: usize, stream: u64) -> Result<(), String> {
+        let (f, _, _) = self.mmvq.ok_or("no mul_mat_vec_q in this DLL")?;
+        // SAFETY: the caller's contract.
+        let r = unsafe { f(x, yq, k as i64, ntok as i64, xs as i64, stream) };
+        if r == 0 { Ok(()) } else { Err(format!("shadow_mmvq_quantize: {r}")) }
+    }
+
+    /// `dst[t * dst_stride + r] = sum over k of w[r][k] * x[t][k]` for 1..=8 inputs, the weights `w` in GGUF layout of type `ty`, the inputs quantized by `mmvq_quantize`.
+    ///
+    /// # Safety
+    /// As `gemm`, with `yq` made by `mmvq_quantize` for (`k`, `ntok`) and `ntok` at most 8.
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn mmvq(&self, ty: i32, w: u64, yq: u64, dst: u64, rows: usize, k: usize, ntok: usize, dst_stride: usize, stream: u64) -> Result<(), String> {
+        let (_, f, _) = self.mmvq.ok_or("no mul_mat_vec_q in this DLL")?;
+        // SAFETY: the caller's contract.
+        let r = unsafe { f(ty, w, yq, dst, rows as i64, k as i64, ntok as i64, dst_stride as i64, stream) };
+        if r == 0 { Ok(()) } else { Err(format!("shadow_mmvq_gemv: {r}")) }
     }
 
     /// The `mmq_q8_1_ds_layout` class of `gty` (`mmq_get_q8_1_ds_layout` in `mmq.cuh`): projections sharing an input buffer and layout class produce identical `mmq_y` bytes.

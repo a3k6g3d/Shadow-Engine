@@ -11,6 +11,7 @@
 #include "common.cuh"
 #include "mmq.cuh"
 #include "quantize.cuh"
+#include "mmvq.cuh"
 
 #include <cstdio>
 #include <cstdlib>
@@ -94,6 +95,71 @@ EXPORT int shadow_mmq_gemm(int type, const void * w, const void * yq, float * ds
         case GGML_TYPE_IQ4_XS: run<GGML_TYPE_IQ4_XS>(args, s); break;
         default: return 1;
     }
+    return cudaGetLastError() == cudaSuccess ? 0 : 3;
+}
+
+// ---- ggml's host-side helpers mmvq.cu links against.  Only `ggml_cuda_mul_mat_vec_q` (the ggml_tensor entry, which Shadow does not call) and `ggml_cuda_should_use_mmvq` use most of them;
+// `ggml_blck_size` is read by the launchers.  Correct for the types the exports below accept, harmless stubs for the rest.
+extern "C" {
+int64_t ggml_blck_size(enum ggml_type t) {
+    switch (t) {
+        case GGML_TYPE_Q8_0: case GGML_TYPE_IQ4_NL: case GGML_TYPE_Q8_1: case GGML_TYPE_Q4_0: case GGML_TYPE_Q4_1: case GGML_TYPE_Q5_0: case GGML_TYPE_Q5_1: return 32;
+        case GGML_TYPE_Q4_K: case GGML_TYPE_Q5_K: case GGML_TYPE_Q6_K: case GGML_TYPE_IQ4_XS: case GGML_TYPE_Q2_K: case GGML_TYPE_Q3_K: return 256;
+        default: return 1;
+    }
+}
+size_t ggml_type_size(enum ggml_type t) {
+    switch (t) {
+        case GGML_TYPE_F32: return 4;
+        case GGML_TYPE_Q8_0: return 34;
+        case GGML_TYPE_Q8_1: return 36;
+        case GGML_TYPE_IQ4_NL: return 18;
+        case GGML_TYPE_Q4_K: return 144;
+        case GGML_TYPE_Q5_K: return 176;
+        case GGML_TYPE_Q6_K: return 210;
+        case GGML_TYPE_IQ4_XS: return 136;
+        default: return 0;
+    }
+}
+bool ggml_is_quantized(enum ggml_type t) { return t != GGML_TYPE_F32 && t != GGML_TYPE_F16 && t != GGML_TYPE_BF16; }
+int64_t ggml_nelements(const struct ggml_tensor * x) { return x->ne[0] * x->ne[1] * x->ne[2] * x->ne[3]; }
+size_t ggml_nbytes(const struct ggml_tensor * x) { return (size_t) (ggml_nelements(x) / ggml_blck_size(x->type) * ggml_type_size(x->type)); }
+bool ggml_is_contiguous(const struct ggml_tensor *) { return true; }
+bool ggml_is_contiguously_allocated(const struct ggml_tensor *) { return true; }
+bool ggml_are_same_stride(const struct ggml_tensor *, const struct ggml_tensor *) { return true; }
+size_t ggml_backend_buffer_get_alloc_size(ggml_backend_buffer_t, const struct ggml_tensor * t) { return ggml_nbytes(t); }
+enum ggml_backend_buffer_usage ggml_backend_buffer_get_usage(ggml_backend_buffer_t) { return GGML_BACKEND_BUFFER_USAGE_ANY; }
+}
+
+// llama.cpp's mul_mat_vec_q (ggml-cuda/mmvq.cu) for 1..=8 inputs, the decode / verify-pass projections (STATUS 109): the inputs are quantized to plain q8_1 blocks
+// (`shadow_mmvq_quantize`), then one pass over the weights multiplies them with all of the inputs (`shadow_mmvq_gemv`).  Types: Q8_0 8, Q4_K 12, Q5_K 13, Q6_K 14, IQ4_NL 20, IQ4_XS 23.
+//   size_t shadow_mmvq_y_bytes(int64_t k, int64_t ntok)
+//   int    shadow_mmvq_quantize(const float* x, void* yq, int64_t k, int64_t ntok, int64_t xs, void* stream)
+//   int    shadow_mmvq_gemv(int type, const void* w, const void* yq, float* dst, int64_t rows, int64_t k, int64_t ntok, int64_t dst_stride, void* stream)
+EXPORT size_t shadow_mmvq_y_bytes(int64_t k, int64_t ntok) {
+    const int64_t k_pad = GGML_PAD(k, MATRIX_ROW_PADDING);
+    return (size_t) ntok * (k_pad / QK8_1) * sizeof(block_q8_1) + 4096;
+}
+
+EXPORT int shadow_mmvq_quantize(const float * x, void * yq, int64_t k, int64_t ntok, int64_t xs, void * stream) {
+    if (k % QK8_1 != 0 || ntok < 1 || ntok > MMVQ_MAX_BATCH_SIZE) return 2;
+    const int64_t k_pad = GGML_PAD(k, MATRIX_ROW_PADDING);
+    quantize_row_q8_1_cuda(x, nullptr, yq, GGML_TYPE_F32, k, xs, xs * ntok, xs * ntok, k_pad, ntok, 1, 1, (cudaStream_t) stream);
+    return cudaGetLastError() == cudaSuccess ? 0 : 3;
+}
+
+EXPORT int shadow_mmvq_gemv(int type, const void * w, const void * yq, float * dst, int64_t rows, int64_t k, int64_t ntok, int64_t dst_stride, void * stream) {
+    if (ntok < 1 || ntok > MMVQ_MAX_BATCH_SIZE || k % QK8_1 != 0 || dst_stride < rows) return 2;
+    switch ((ggml_type) type) {
+        case GGML_TYPE_Q8_0: case GGML_TYPE_Q4_K: case GGML_TYPE_Q5_K: case GGML_TYPE_Q6_K: case GGML_TYPE_IQ4_NL: case GGML_TYPE_IQ4_XS: break;
+        default: return 1;
+    }
+    ggml_tensor src0 = {}, src1 = {}, d = {};
+    src0.type = (ggml_type) type; src0.ne[0] = k; src0.ne[1] = rows;
+    src1.type = GGML_TYPE_Q8_1; src1.ne[0] = k; src1.ne[1] = ntok;
+    d.type = GGML_TYPE_F32; d.ne[0] = dst_stride; d.ne[1] = ntok;
+    const int64_t k_pad = GGML_PAD(k, MATRIX_ROW_PADDING);
+    ggml_cuda_op_mul_mat_vec_q(ctx(), &src0, &src1, &d, (const char *) w, nullptr, (const char *) yq, dst, 0, rows, ntok, k_pad, (cudaStream_t) stream);
     return cudaGetLastError() == cudaSuccess ? 0 : 3;
 }
 
