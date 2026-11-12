@@ -32,7 +32,9 @@ fn floats(b: &[u8]) -> Vec<f32> {
 
 #[test]
 fn int8_paths_match_the_float_kernels_on_real_tensors() {
-    let ctx = match Context::new(0) {
+    // `INT8_GPU=1`: the same checks on the second card (the native library keeps its state per device, STATUS 113)
+    let ordinal: i32 = std::env::var("INT8_GPU").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+    let ctx = match Context::new(ordinal) {
         Ok(c) => c,
         Err(e) => return eprintln!("SKIPPED, not passed: no CUDA device ({e})"),
     };

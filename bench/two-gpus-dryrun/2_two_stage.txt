@@ -1,0 +1,11 @@
+
+running 6 tests
+test a_long_prompt_through_the_pair_equals_one_session ... ok
+test a_pair_driven_through_the_first_stage_equals_one_session ... ok
+test batches_through_two_stages_equal_one_session ... ok
+test the_drafter_across_two_stages_drafts_what_one_session_drafts ... ok
+test two_stages_on_one_card_equal_one_session ... ok
+test verify_and_rollback_through_two_stages_equal_one_session ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 168.13s
+

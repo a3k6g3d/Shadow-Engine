@@ -9,6 +9,13 @@ use shadow_model::forward::Model;
 use shadow_model::gguf::Gguf;
 use std::path::Path;
 
+/// The card the second stage runs on: `SHADOW_PEER_GPU=1` puts it on the second card (default 0: both stages on one card, as before the second card arrived).  The first stage and the
+/// single-session reference are always on card 0.
+fn peer_ctx() -> Option<Context> {
+    let o: i32 = std::env::var("SHADOW_PEER_GPU").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+    (o != 0).then(|| Context::new(o).unwrap_or_else(|e| panic!("SHADOW_PEER_GPU={o}: {e}")))
+}
+
 const MODEL: &str =
     "J:/Strata-work/models/swift15/IQ3_S/Swift-Qwen3.8-Flash-Next-GSQ-RCO-abliterated-IQ3_S-00001-of-00002.gguf";
 const TOKENS: [u32; 6] = [1000, 2345, 56, 78901, 4, 12345];
@@ -42,6 +49,8 @@ fn two_stages_on_one_card_equal_one_session() {
         }
     };
     let model = Model::load_lean(Gguf::open(Path::new(&p)).unwrap()).unwrap();
+    let ctx_b = peer_ctx();
+    let cb = ctx_b.as_ref().unwrap_or(&ctx);
     let n_layer = model.cfg.n_layer;
     // the reference: one session owning every layer
     let want: Vec<Vec<f32>> = {
@@ -50,7 +59,7 @@ fn two_stages_on_one_card_equal_one_session() {
     };
     for split in [1usize, 24, n_layer - 1] {
         let mut a = GpuSession::with_tiers(&ctx, &model, CAP, tiers(Some((0, split)))).unwrap();
-        let mut b = GpuSession::with_tiers(&ctx, &model, CAP, tiers(Some((split, n_layer)))).unwrap();
+        let mut b = GpuSession::with_tiers(cb, &model, CAP, tiers(Some((split, n_layer)))).unwrap();
         assert_eq!((a.layers(), b.layers()), ((0, split), (split, n_layer)));
         for (i, &t) in TOKENS.iter().enumerate() {
             let streams = a.step_stage(t, None);
@@ -83,6 +92,8 @@ fn batches_through_two_stages_equal_one_session() {
         }
     };
     let model = Model::load_lean(Gguf::open(Path::new(&p)).unwrap()).unwrap();
+    let ctx_b = peer_ctx();
+    let cb = ctx_b.as_ref().unwrap_or(&ctx);
     let n_layer = model.cfg.n_layer;
     let passes: [&[u32]; 2] = [&TOKENS[..5], &[777, 31337, 99]];
     let want: Vec<Vec<Vec<f32>>> = {
@@ -91,7 +102,7 @@ fn batches_through_two_stages_equal_one_session() {
     };
     for split in [1usize, 24, n_layer - 1] {
         let mut a = GpuSession::with_tiers(&ctx, &model, CAP, tiers_cached(Some((0, split)))).unwrap();
-        let mut b = GpuSession::with_tiers(&ctx, &model, CAP, tiers_cached(Some((split, n_layer)))).unwrap();
+        let mut b = GpuSession::with_tiers(cb, &model, CAP, tiers_cached(Some((split, n_layer)))).unwrap();
         for (pi, toks) in passes.iter().enumerate() {
             let StageOut::Streams(streams) = a.step_batch_stage(toks, None) else { panic!("stage A is not the last") };
             let StageOut::Logits(got) = b.step_batch_stage(toks, Some(&streams)) else { panic!("stage B is the last") };
@@ -167,6 +178,8 @@ fn verify_and_rollback_through_two_stages_equal_one_session() {
         }
     };
     let model = Model::load_lean(Gguf::open(Path::new(&p)).unwrap()).unwrap();
+    let ctx_b = peer_ctx();
+    let cb = ctx_b.as_ref().unwrap_or(&ctx);
     let n_layer = model.cfg.n_layer;
     const V: [u32; 4] = [11, 22, 33, 44];
     const V2: [u32; 3] = [66, 77, 88];
@@ -186,7 +199,7 @@ fn verify_and_rollback_through_two_stages_equal_one_session() {
     };
     for split in [1usize, 24, n_layer - 1] {
         let mut a = GpuSession::with_tiers(&ctx, &model, CAP, tiers_cached(Some((0, split)))).unwrap();
-        let mut b = GpuSession::with_tiers(&ctx, &model, CAP, tiers_cached(Some((split, n_layer)))).unwrap();
+        let mut b = GpuSession::with_tiers(cb, &model, CAP, tiers_cached(Some((split, n_layer)))).unwrap();
         pair_batch(&mut a, &mut b, &TOKENS[..2]);
         let snaps = (a.snapshot(false).unwrap(), b.snapshot(false).unwrap());
         let v = pair_verify(&mut a, &mut b, &V);
@@ -244,6 +257,8 @@ fn a_pair_driven_through_the_first_stage_equals_one_session() {
         }
     };
     let model = Model::load_lean(Gguf::open(Path::new(&p)).unwrap()).unwrap();
+    let ctx_b = peer_ctx();
+    let cb = ctx_b.as_ref().unwrap_or(&ctx);
     let n_layer = model.cfg.n_layer;
     let want = {
         let mut s = GpuSession::with_tiers(&ctx, &model, CAP, tiers_cached(None)).unwrap();
@@ -251,7 +266,7 @@ fn a_pair_driven_through_the_first_stage_equals_one_session() {
     };
     for split in [1usize, 24, n_layer - 1] {
         let mut a = GpuSession::with_tiers(&ctx, &model, CAP, tiers_cached(Some((0, split)))).unwrap();
-        let b = GpuSession::with_tiers(&ctx, &model, CAP, tiers_cached(Some((split, n_layer)))).unwrap();
+        let b = GpuSession::with_tiers(cb, &model, CAP, tiers_cached(Some((split, n_layer)))).unwrap();
         a.attach_peer(b).unwrap();
         let got = script(&mut a);
         assert_eq!(got.len(), want.len());
@@ -329,6 +344,8 @@ fn the_drafter_across_two_stages_drafts_what_one_session_drafts() {
         }
     };
     let model = Model::load_lean(Gguf::open(Path::new(&p)).unwrap()).unwrap();
+    let ctx_b = peer_ctx();
+    let cb = ctx_b.as_ref().unwrap_or(&ctx);
     let n_layer = model.cfg.n_layer;
     let want = {
         let mut t = tiers_drafter(None, &dir, false);
@@ -340,7 +357,7 @@ fn the_drafter_across_two_stages_drafts_what_one_session_drafts() {
     assert!(drafted >= want.len() - 1, "the reference session drafted in only {drafted} of {} rounds: {want:?}", want.len());
     for split in [1usize, 20, 40, n_layer - 1] {
         let mut a = GpuSession::with_tiers(&ctx, &model, CAP, tiers_drafter(Some((0, split)), &dir, true)).unwrap();
-        let b = GpuSession::with_tiers(&ctx, &model, CAP, tiers_drafter(Some((split, n_layer)), &dir, false)).unwrap();
+        let b = GpuSession::with_tiers(cb, &model, CAP, tiers_drafter(Some((split, n_layer)), &dir, false)).unwrap();
         a.attach_peer(b).unwrap();
         assert!(a.drafter().is_some());
         let got = draft_script(&mut a);
@@ -368,6 +385,8 @@ fn a_long_prompt_through_the_pair_equals_one_session() {
         }
     };
     let model = Model::load_lean(Gguf::open(Path::new(&p)).unwrap()).unwrap();
+    let ctx_b = peer_ctx();
+    let cb = ctx_b.as_ref().unwrap_or(&ctx);
     let n_layer = model.cfg.n_layer;
     const LONG: usize = 1300;
     let prompt: Vec<u32> = (0..LONG as u32).map(|i| 1000 + (i * 7919) % 9000).collect();
@@ -400,7 +419,7 @@ fn a_long_prompt_through_the_pair_equals_one_session() {
         run(&mut s, "one session")
     };
     let mut a = GpuSession::with_tiers(&ctx, &model, LONG + 8, big(Some((0, 24)))).unwrap();
-    let b = GpuSession::with_tiers(&ctx, &model, LONG + 8, big(Some((24, n_layer)))).unwrap();
+    let b = GpuSession::with_tiers(cb, &model, LONG + 8, big(Some((24, n_layer)))).unwrap();
     a.attach_peer(b).unwrap();
     let got = run(&mut a, "pair");
     assert_eq!(got.len(), want.len());

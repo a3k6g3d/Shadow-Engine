@@ -132,6 +132,8 @@ pair: nothing that needs no card except the drafter across stages (phase 3) and 
 
 **Update (STATUS 104): the hop now goes through a pinned buffer in chunks (22x faster for prompt passes on one card, -0.2 ms a verify pass; `SHADOW_HOP=0` is the old one). Nothing is left that needs no card except overlapping the two stages' work (phase 5's territory) and measuring.**
 
+**Update (STATUS 113): the card is now due 2026-11-14. Run `powershell -File tools\bringup_two_gpus.ps1` once it is in (it dry-ran on one card: `-Peer 0`); the native MMQ library's state is per device now and the pair tests take `SHADOW_PEER_GPU=1`. The unverified part is exactly what needs the card: MMQ / `mmvq` / the fused kernels on device 1, the real hop, the bench arms.**
+
 **Phase 0a (before the card arrives, no hardware): the probe tool and the baseline.**
 `shadow gpus`: list devices (name, UUID, compute capability, VRAM, driver, PCIe gen/width now and max), and per device:
 pinned host -> device and device -> host bandwidth alone, both cards at the same time (does the chipset path hurt the CPU

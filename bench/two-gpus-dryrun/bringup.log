@@ -1,0 +1,21 @@
+﻿17:00:35 == two-card bring-up, NVIDIA GeForce RTX 5070, 12227 MiB, 250.00 W
+17:00:35 power: if the two cards plus the CPU trip the 650 W supply, cap them first, e.g.  nvidia-smi -i 0 -pl 200   and   nvidia-smi -i 1 -pl 140   (run by you, as administrator; not done here)
+17:00:35 building the dev binaries (target-dev)
+17:00:37       Compiling shadow-bench v0.1.36 (J:\Shadow\crates\shadow-bench)
+17:00:37        Finished `release` profile [optimized] target(s) in 1.85s
+17:00:37 -- 1 gpus
+17:00:37      [0] NVIDIA GeForce RTX 5070  cc 12.0  48 SMs  11.9 GiB  PCI 0000:01:00  192-bit bus, memory clock 14001 MHz (~672 GB/s at 2 transfers a clock)  GPU-c78d59cb-b832-bc00-3a4b-e9b5efc4f52f
+17:00:37    host <-> device bandwidth, 256 MiB copies from pinned memory, median of 8 (GB/s):
+17:00:38    hop: device -> pinned host -> device, microseconds (median / 99th percentile / max):
+17:00:38 -- 2 pair tests, second stage on card 0
+17:03:27    exit 0, wall 168 s, min available 35.9 GiB, peak working set 9.8 GiB (cap 20)
+17:03:27    result: test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 168.13s
+17:03:27 -- 3 native int8 kernels on card 0
+17:03:32    exit 0, wall 5 s, min available 48.6 GiB, peak working set 0.3 GiB (cap 20)
+17:03:32    result: test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.82s
+17:03:32 -- 4 exact: single card against the pair
+17:08:31    exact replies identical, single card vs the pair: 10 of 10
+17:08:31 -- 5 fast mode on the pair
+17:10:04    conversation finished; speculation lines: shadow serve: speculation: 15 passes (1 drafted by lookup), 24 of 34 drafted tokens accepted, 40 tokens in 1.1 s                    (drafting 0.07 s,  || shadow serve: speculation: 8 passes (0 drafted by lookup), 18 of 24 drafted tokens accepted, 26 tokens in 0.7 s                    (drafting 0.04 s, c || shadow serve: speculation: 16 passes (4 drafted by lookup), 23 of 41 drafted tokens accepted, 40 tokens in 1.2 s                    (drafting 0.08 s, 
+17:10:04    dflash on the pair: dflash: loaded the drafter from models/dflash2 (~1.2 GB VRAM)
+17:10:04 done - everything is in bench\two-gpus-dryrun (bringup.log first).  Peak card power / temperature:  W

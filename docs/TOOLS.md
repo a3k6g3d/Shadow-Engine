@@ -24,6 +24,7 @@ CUDA index, `safetensors`, `numpy`, `matplotlib`).
 | `tools/autotune.py` | coordinate ascent over serving flags with paired bench rounds; adopts only what clears the noise |
 | `tools/bench_vs_strata.ps1`, `run_strata.ps1`, `strata_bench_cfg.py` | the same bench against a Strata install, as an interleaved arm, with its server under the RAM floor |
 | `tools/cache_sim.py` | replays a routing log through VRAM expert-cache policies and prints each one's hit rate (`SHADOW_ROUTE_LOG`, `SHADOW_CACHE_DUMP`) |
+| `tools/bringup_two_gpus.ps1` | the one-command bring-up of a second card: `shadow gpus`, the pair tests and the int8 kernels on card 1, exact and fast conversations on the pair, a decode bench (single / pair / pair without the drafter), power and temperature logged; `-Peer 0` is a dry run on one card (STATUS 113) |
 | `tools/ncu_decode.ps1` | Nsight Compute on one verify pass's biggest decode kernels (SpeedOfLight, stall, occupancy, memory sections), elevated PowerShell; uses `SHADOW_NCU_RANGE` + `--profile-from-start off` because `--launch-skip` hangs (STATUS 108) |
 | `tools/nsys_decode_rounds.py X.sqlite` | decode only from an Nsight Systems export (`--cuda-graph-trace=node`): per DFlash round the kernel, copy and idle time, the kernels by name, the gaps by size and by the CUDA call running in them |
 | `tools/spec_probe.py` | what speculation could buy from routing logs: expert-union size per verify pass, accepted tokens per pass |

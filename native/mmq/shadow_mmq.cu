@@ -27,35 +27,57 @@ extern "C" void ggml_abort(const char * file, int line, const char * fmt, ...) {
 void ggml_cuda_error(const char * stmt, const char * func, const char * file, int line, const char * msg) {
     fprintf(stderr, "shadow_mmq: CUDA error: %s in %s at %s:%d: %s\n", stmt, func, file, line, msg); exit(1);
 }
+// Per-device state (STATUS 113): a pair of sessions on two cards loads this one DLL in one process, each stage with its own primary context current on the calling thread.  Everything that was
+// one static for device 0 is now looked up by `cudaGetDevice()` (the runtime follows the driver context the engine made current): the device properties, the ggml context and its
+// stream-k scratch buffer, which must live in the memory of the device whose kernels use it.
 static ggml_cuda_device_info g_info;
 const ggml_cuda_device_info & ggml_cuda_info() {
     static std::once_flag once;
     std::call_once(once, []() {
-        cudaDeviceProp p; cudaGetDeviceProperties(&p, 0);
-        g_info.device_count = 1; g_info.physical_device_count = 1;
-        auto & d = g_info.devices[0];
-        d.cc = 100 * p.major + 10 * p.minor; d.nsm = p.multiProcessorCount; d.smpb = p.sharedMemPerBlock; d.smpbo = p.sharedMemPerBlockOptin;
-        d.integrated = false; d.vmm = false; d.vmm_granularity = 0; d.total_vram = p.totalGlobalMem; d.warp_size = p.warpSize;
-        d.supports_cooperative_launch = false; d.physical_device = 0; d.physical_share_count = 1; d.virtual_index = 0;
+        int n = 0; cudaGetDeviceCount(&n);
+        if (n > GGML_CUDA_MAX_DEVICES) n = GGML_CUDA_MAX_DEVICES;
+        g_info.device_count = n; g_info.physical_device_count = n;
+        for (int i = 0; i < n; i++) {
+            cudaDeviceProp p; cudaGetDeviceProperties(&p, i);
+            auto & d = g_info.devices[i];
+            d.cc = 100 * p.major + 10 * p.minor; d.nsm = p.multiProcessorCount; d.smpb = p.sharedMemPerBlock; d.smpbo = p.sharedMemPerBlockOptin;
+            d.integrated = false; d.vmm = false; d.vmm_granularity = 0; d.total_vram = p.totalGlobalMem; d.warp_size = p.warpSize;
+            d.supports_cooperative_launch = false; d.physical_device = i; d.physical_share_count = 1; d.virtual_index = i;
+        }
     });
     return g_info;
 }
-void ggml_cuda_set_device(int) {}
-int ggml_cuda_get_device() { return 0; }
+void ggml_cuda_set_device(int device) { cudaSetDevice(device); }
+int ggml_cuda_get_device() { int d = 0; cudaGetDevice(&d); return d; }
 ggml_backend_cuda_context::~ggml_backend_cuda_context() {}
 
-// the stream-k fixup scratch: one buffer, handed out again on every call (all calls are on one stream, so the uses are ordered)
+// the stream-k fixup scratch: one buffer a device, handed out again on every call (all of a device's calls are on one stream, so the uses are ordered)
 struct scratch_pool : ggml_cuda_pool {
+    int device = 0;
     void * buf = nullptr; size_t cap = 0;
+    explicit scratch_pool(int dev) : device(dev) {}
     void * alloc(size_t size, size_t * actual) override {
-        if (size > cap) { if (buf) cudaFree(buf); cap = size > (size_t) 16 << 20 ? size : (size_t) 16 << 20; if (cudaMalloc(&buf, cap) != cudaSuccess) { fprintf(stderr, "shadow_mmq: scratch alloc failed\n"); exit(1); } }
+        if (size > cap) {
+            int prev = 0; cudaGetDevice(&prev); cudaSetDevice(device);
+            if (buf) cudaFree(buf);
+            cap = size > (size_t) 16 << 20 ? size : (size_t) 16 << 20;
+            if (cudaMalloc(&buf, cap) != cudaSuccess) { fprintf(stderr, "shadow_mmq: scratch alloc failed\n"); exit(1); }
+            cudaSetDevice(prev);
+        }
         *actual = cap; return buf;
     }
     void free(void *, size_t) override {}
 };
-std::unique_ptr<ggml_cuda_pool> ggml_backend_cuda_context::new_pool_for_device(int, int) { return std::make_unique<scratch_pool>(); }
+std::unique_ptr<ggml_cuda_pool> ggml_backend_cuda_context::new_pool_for_device(int device, int) { return std::make_unique<scratch_pool>(device); }
 
-static ggml_backend_cuda_context & ctx() { static ggml_backend_cuda_context c(0); return c; }
+static ggml_backend_cuda_context & ctx() {
+    static std::mutex mu;
+    static ggml_backend_cuda_context * c[GGML_CUDA_MAX_DEVICES] = {};
+    const int d = ggml_cuda_get_device();
+    std::lock_guard<std::mutex> lock(mu);
+    if (!c[d]) c[d] = new ggml_backend_cuda_context(d);
+    return *c[d];
+}
 
 EXPORT int shadow_mmq_version() { return 1; }
 

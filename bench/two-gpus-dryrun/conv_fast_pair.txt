@@ -1,0 +1,10 @@
+﻿0 A 418 0 16 'The text repeats the same description of the harbour town of'
+1 A 26 434 40 '```python\nclass Point2D:\n    def __init__(self, x=0, y=0):\n '
+2 A 66 500 14 "Recognize the phrase 'I need a blue shirt, size medium'."
+3 A 24 580 40 'Here is a list of efficient tips for better communication, c'
+4 A 32 644 18 '```python\nclass Rectangle:\n    def __init__(self, width, hei'
+5 B 370 0 34 'The text repeats the same description of the monastery of Ka'
+6 B 29 404 40 'Physical education is not merely a supplementary activity in'
+7 A 286 436 40 'The two objects are **different**.\n\nWhile both are equids (m'
+8 B 500 0 26 'Here are the animals sorted by their primary habitat:\n\n*   *'
+9 A 366 436 40 'Here are 3 pros and 3 cons for using a mobile phone for long'

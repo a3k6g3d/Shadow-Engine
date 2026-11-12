@@ -43,8 +43,8 @@ static __global__ void shadow_moe_q(
 template <ggml_type type, int J, bool fallback>
 static int launch_moe(const unsigned long long * xtab, const int * y, const unsigned int * rec, float * dst, int64_t rows, int64_t k, int64_t ncols_y,
                       int64_t dst_stride, int64_t ngroups, int64_t ny_groups, cudaStream_t s) {
-    const int cc = ggml_cuda_info().devices[0].cc;
-    const int warp_size = ggml_cuda_info().devices[0].warp_size;
+    const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+    const int warp_size = ggml_cuda_info().devices[ggml_cuda_get_device()].warp_size;
     const ggml_cuda_mmq_config config = ggml_cuda_mmq_get_config(type, J, fallback, cc);
     if (config.type == GGML_TYPE_COUNT) return 4;
     const int nwarps = config.nthreads / warp_size;
