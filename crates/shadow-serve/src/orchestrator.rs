@@ -1179,7 +1179,7 @@ pub fn tool_definitions() -> Value {
 fn finish_tool_definition() -> Value {
     json!({
         "name": "finish",
-        "description": "End a task that needed tools by reporting its status, instead of a closing message: what you did, what is NOT done or NOT verified, and - only if you cannot go on without the user - one question. Call it alone, after you have seen the results of your other tool calls. Do not use it to answer a plain question.",
+        "description": "Close a task that used tools with its status: what is done, what is NOT done or NOT verified and, only if you need the user, one question. Call it alone, after the results of your other calls. Not for plain questions.",
         "input_schema": {
             "type": "object",
             "properties": {

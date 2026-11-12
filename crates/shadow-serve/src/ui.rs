@@ -1523,10 +1523,10 @@ canvas.spark { width: 100%; height: 64px; display: block; }
     function setFinishOn(on) { finishOn = on; localStorage.setItem('shadow_finish_on', on); }
     // the tools of a request: without the page's finish switch the model never sees the tool
     function requestTools() { return finishOn ? availableTools : availableTools.filter(t => t.name !== 'finish'); }
-    const FINISH_HINT = 'When a task needed your tools (you read, changed or ran something), end it by calling the finish tool once, alone, after you have seen the results of your other calls, instead of a closing message. ' +
-      'done: what you actually did, one short item a line (file names, what changed). pending: what is NOT done, NOT tested or NOT verified, one item a line (if you did not run the code or the tests, say so; never claim something works that you did not run). ' +
-      'question and options: only when you cannot go on without the user (one question, the answers one a line, your recommendation first); otherwise leave them out. ' +
-      'Do not call finish for a plain question or a conversation: answer those in text.';
+    const FINISH_HINT = 'End a task that used your tools with one call to finish (alone, after you have seen the results of your other calls), not with a closing message. ' +
+      'done: what you actually did, a short item a line. pending: what is NOT done, NOT tested or NOT verified, an item a line (say so if you did not run the code; never claim what you did not run). ' +
+      'question and options: only if you cannot go on without the user (the answers a line each, your recommendation first). ' +
+      'For a plain question or chat, answer in text.';
     // a status field as a list: a JSON array or lines (bullets and numbers stripped), at most 12 items of 400 characters
     function finishItems(v) {
       if (v === undefined || v === null) return [];

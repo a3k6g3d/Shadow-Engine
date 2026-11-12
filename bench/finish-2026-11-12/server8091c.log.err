@@ -1,0 +1,24 @@
+shadow serve: fastest-mode defaults: --tail-skip 3 --tensor-prompt --verify-rank 2 --ram-floor-gib 3.5 --placement profiles/routing-varied300.shrc (--exact for the exact path)
+RAM floor: 3.5 GiB (default 4): a pinned tier cannot be paged out, and this PC has frozen hard at 0.4 GiB free
+placement: profiles/routing-varied300.shrc, 34990 tokens of routing
+shadow serve: starting 2 MCP server(s) from mcp.json
+shadow serve: listening on http://127.0.0.1:8091
+shadow serve: MCP server time: 3 tools
+shadow serve: MCP server browser: 10 tools
+shadow serve: ready in 8.0 s; expert cache: 2344 slots x 1.96 MiB = 4.49 GiB; 0 hits, 0 misses (0.0% hits); 0 slice uploads; RAM tier: 8386 experts, 16.00 GiB pinned (filled in 5.1 s), misses served 0 from RAM, 0 from the file; tail skip (rank >= 3): 0 routed experts skipped; host waits per step: router 0.0 ms, copies 0.0 ms, file 0.0 ms; kernel launches per step 0, 0.0 ms of host time in them
+shadow serve: 33 conversation snapshot(s) on disk in J:/ShadowConvCache (19.72 GiB)
+
+thread 'shadow-engine' (25216) panicked at crates\shadow-cuda\src\session.rs:2687:9:
+assertion `left == right` failed: cuMemcpyHtoDAsync failed (700)
+  left: 700
+ right: 0
+stack backtrace:
+note: Some details are omitted, run with `RUST_BACKTRACE=full` for a verbose backtrace.
+shadow serve: the engine hit an internal error (assertion `left == right` failed: cuMemcpyHtoDAsync failed (700)
+  left: 700
+ right: 0); the session was reset
+
+thread 'shadow-engine' (25216) panicked at crates\shadow-cuda\src\session.rs:4218:32:
+called `Result::unwrap()` on an `Err` value: CudaError { code: 700, call: "cuCtxSynchronize", name: "CUDA_ERROR_ILLEGAL_ADDRESS" }
+stack backtrace:
+note: Some details are omitted, run with `RUST_BACKTRACE=full` for a verbose backtrace.

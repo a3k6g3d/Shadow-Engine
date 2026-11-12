@@ -1,0 +1,269 @@
+shadow serve: --exact: no speculation, no inexact modes
+RAM tier: no --placement, so an arbitrary (uniform) choice of experts
+shadow serve: starting 2 MCP server(s) from mcp.json
+shadow serve: listening on http://127.0.0.1:8091
+shadow serve: MCP server time: 3 tools
+shadow serve: MCP server browser: 10 tools
+shadow serve: ready in 9.2 s; expert cache: 2355 slots x 1.95 MiB = 4.49 GiB; 0 hits, 0 misses (0.0% hits); 0 slice uploads; RAM tier: 4193 experts, 8.00 GiB pinned (filled in 4.8 s), misses served 0 from RAM, 0 from the file; host waits per step: router 0.0 ms, copies 0.0 ms, file 0.0 ms; kernel launches per step 0, 0.0 ms of host time in them
+shadow serve: 32 conversation snapshot(s) on disk in J:/ShadowConvCache (19.25 GiB)
+shadow serve: conversation snapshot of 5720 tokens (0.41 GiB) in 0.15 s; 1 kept
+shadow serve: conversation snapshot written to disk (0.41 GiB in 0.33 s; 32 on disk)
+
+thread '<unnamed>' (24720) panicked at crates\shadow-model\src\forward.rs:928:65:
+called `Option::unwrap()` on a `None` value
+stack backtrace:
+note: Some details are omitted, run with `RUST_BACKTRACE=full` for a verbose backtrace.
+
+thread '<unnamed>' (30680) panicked at crates\shadow-model\src\forward.rs:928:65:
+called `Option::unwrap()` on a `None` value
+stack backtrace:
+note: Some details are omitted, run with `RUST_BACKTRACE=full` for a verbose backtrace.
+
+thread '<unnamed>' (16164) panicked at crates\shadow-model\src\forward.rs:928:65:
+called `Option::unwrap()` on a `None` value
+stack backtrace:
+note: Some details are omitted, run with `RUST_BACKTRACE=full` for a verbose backtrace.
+
+thread '<unnamed>' (6628) panicked at crates\shadow-model\src\forward.rs:928:65:
+called `Option::unwrap()` on a `None` value
+stack backtrace:
+note: Some details are omitted, run with `RUST_BACKTRACE=full` for a verbose backtrace.
+
+thread '<unnamed>' (8992) panicked at crates\shadow-model\src\forward.rs:928:65:
+called `Option::unwrap()` on a `None` value
+stack backtrace:
+note: Some details are omitted, run with `RUST_BACKTRACE=full` for a verbose backtrace.
+
+thread '<unnamed>' (11724) panicked at crates\shadow-model\src\forward.rs:928:65:
+called `Option::unwrap()` on a `None` value
+stack backtrace:
+note: Some details are omitted, run with `RUST_BACKTRACE=full` for a verbose backtrace.
+
+thread '<unnamed>' (1492) panicked at crates\shadow-model\src\forward.rs:928:65:
+called `Option::unwrap()` on a `None` value
+stack backtrace:
+note: Some details are omitted, run with `RUST_BACKTRACE=full` for a verbose backtrace.
+
+thread '<unnamed>' (5020) panicked at crates\shadow-model\src\forward.rs:928:65:
+called `Option::unwrap()` on a `None` value
+stack backtrace:
+note: Some details are omitted, run with `RUST_BACKTRACE=full` for a verbose backtrace.
+
+thread '<unnamed>' (30688) panicked at crates\shadow-model\src\forward.rs:928:65:
+called `Option::unwrap()` on a `None` value
+stack backtrace:
+note: Some details are omitted, run with `RUST_BACKTRACE=full` for a verbose backtrace.
+
+thread '<unnamed>' (11512) panicked at crates\shadow-model\src\forward.rs:928:65:
+called `Option::unwrap()` on a `None` value
+stack backtrace:
+note: Some details are omitted, run with `RUST_BACKTRACE=full` for a verbose backtrace.
+
+thread '<unnamed>' (20104) panicked at crates\shadow-model\src\forward.rs:928:65:
+called `Option::unwrap()` on a `None` value
+stack backtrace:
+note: Some details are omitted, run with `RUST_BACKTRACE=full` for a verbose backtrace.
+
+thread '<unnamed>' (20820) panicked at crates\shadow-model\src\forward.rs:928:65:
+called `Option::unwrap()` on a `None` value
+stack backtrace:
+note: Some details are omitted, run with `RUST_BACKTRACE=full` for a verbose backtrace.
+
+thread '<unnamed>' (24968) panicked at crates\shadow-model\src\forward.rs:928:65:
+called `Option::unwrap()` on a `None` value
+stack backtrace:
+note: Some details are omitted, run with `RUST_BACKTRACE=full` for a verbose backtrace.
+
+thread '<unnamed>' (25368) panicked at crates\shadow-model\src\forward.rs:928:65:
+called `Option::unwrap()` on a `None` value
+stack backtrace:
+note: Some details are omitted, run with `RUST_BACKTRACE=full` for a verbose backtrace.
+
+thread '<unnamed>' (11960) panicked at crates\shadow-model\src\forward.rs:928:65:
+called `Option::unwrap()` on a `None` value
+stack backtrace:
+note: Some details are omitted, run with `RUST_BACKTRACE=full` for a verbose backtrace.
+
+thread '<unnamed>' (33700) panicked at crates\shadow-model\src\forward.rs:928:65:
+called `Option::unwrap()` on a `None` value
+stack backtrace:
+note: Some details are omitted, run with `RUST_BACKTRACE=full` for a verbose backtrace.
+
+thread 'shadow-engine' (32336) panicked at crates\shadow-cuda\src\session.rs:1501:5:
+a scoped thread panicked
+stack backtrace:
+note: Some details are omitted, run with `RUST_BACKTRACE=full` for a verbose backtrace.
+shadow serve: the engine hit an internal error (a scoped thread panicked); the session was reset
+
+thread '<unnamed>' (28908) panicked at crates\shadow-model\src\forward.rs:928:65:
+called `Option::unwrap()` on a `None` value
+stack backtrace:
+note: Some details are omitted, run with `RUST_BACKTRACE=full` for a verbose backtrace.
+
+thread '<unnamed>' (32468) panicked at crates\shadow-model\src\forward.rs:928:65:
+called `Option::unwrap()` on a `None` value
+stack backtrace:
+note: Some details are omitted, run with `RUST_BACKTRACE=full` for a verbose backtrace.
+
+thread '<unnamed>' (16888) panicked at crates\shadow-model\src\forward.rs:928:65:
+called `Option::unwrap()` on a `None` value
+stack backtrace:
+note: Some details are omitted, run with `RUST_BACKTRACE=full` for a verbose backtrace.
+
+thread '<unnamed>' (3120) panicked at crates\shadow-model\src\forward.rs:928:65:
+called `Option::unwrap()` on a `None` value
+stack backtrace:
+note: Some details are omitted, run with `RUST_BACKTRACE=full` for a verbose backtrace.
+
+thread '<unnamed>' (29624) panicked at crates\shadow-model\src\forward.rs:928:65:
+called `Option::unwrap()` on a `None` value
+stack backtrace:
+note: Some details are omitted, run with `RUST_BACKTRACE=full` for a verbose backtrace.
+
+thread '<unnamed>' (34468) panicked at crates\shadow-model\src\forward.rs:928:65:
+called `Option::unwrap()` on a `None` value
+stack backtrace:
+note: Some details are omitted, run with `RUST_BACKTRACE=full` for a verbose backtrace.
+
+thread '<unnamed>' (31016) panicked at crates\shadow-model\src\forward.rs:928:65:
+called `Option::unwrap()` on a `None` value
+stack backtrace:
+note: Some details are omitted, run with `RUST_BACKTRACE=full` for a verbose backtrace.
+
+thread '<unnamed>' (25644) panicked at crates\shadow-model\src\forward.rs:928:65:
+called `Option::unwrap()` on a `None` value
+stack backtrace:
+note: Some details are omitted, run with `RUST_BACKTRACE=full` for a verbose backtrace.
+
+thread '<unnamed>' (9376) panicked at crates\shadow-model\src\forward.rs:928:65:
+called `Option::unwrap()` on a `None` value
+stack backtrace:
+note: Some details are omitted, run with `RUST_BACKTRACE=full` for a verbose backtrace.
+
+thread '<unnamed>' (10032) panicked at crates\shadow-model\src\forward.rs:928:65:
+called `Option::unwrap()` on a `None` value
+stack backtrace:
+note: Some details are omitted, run with `RUST_BACKTRACE=full` for a verbose backtrace.
+
+thread '<unnamed>' (17068) panicked at crates\shadow-model\src\forward.rs:928:65:
+called `Option::unwrap()` on a `None` value
+stack backtrace:
+note: Some details are omitted, run with `RUST_BACKTRACE=full` for a verbose backtrace.
+
+thread '<unnamed>' (12156) panicked at crates\shadow-model\src\forward.rs:928:65:
+called `Option::unwrap()` on a `None` value
+stack backtrace:
+note: Some details are omitted, run with `RUST_BACKTRACE=full` for a verbose backtrace.
+
+thread '<unnamed>' (4160) panicked at crates\shadow-model\src\forward.rs:928:65:
+called `Option::unwrap()` on a `None` value
+stack backtrace:
+note: Some details are omitted, run with `RUST_BACKTRACE=full` for a verbose backtrace.
+
+thread '<unnamed>' (14892) panicked at crates\shadow-model\src\forward.rs:928:65:
+called `Option::unwrap()` on a `None` value
+stack backtrace:
+note: Some details are omitted, run with `RUST_BACKTRACE=full` for a verbose backtrace.
+
+thread '<unnamed>' (5568) panicked at crates\shadow-model\src\forward.rs:928:65:
+called `Option::unwrap()` on a `None` value
+stack backtrace:
+note: Some details are omitted, run with `RUST_BACKTRACE=full` for a verbose backtrace.
+
+thread '<unnamed>' (29040) panicked at crates\shadow-model\src\forward.rs:928:65:
+called `Option::unwrap()` on a `None` value
+stack backtrace:
+note: Some details are omitted, run with `RUST_BACKTRACE=full` for a verbose backtrace.
+
+thread 'shadow-engine' (32336) panicked at crates\shadow-cuda\src\session.rs:1501:5:
+a scoped thread panicked
+stack backtrace:
+note: Some details are omitted, run with `RUST_BACKTRACE=full` for a verbose backtrace.
+shadow serve: the engine hit an internal error (a scoped thread panicked); the session was reset
+
+thread '<unnamed>' (26152) panicked at crates\shadow-model\src\forward.rs:928:65:
+called `Option::unwrap()` on a `None` value
+stack backtrace:
+note: Some details are omitted, run with `RUST_BACKTRACE=full` for a verbose backtrace.
+
+thread '<unnamed>' (21176) panicked at crates\shadow-model\src\forward.rs:928:65:
+called `Option::unwrap()` on a `None` value
+stack backtrace:
+note: Some details are omitted, run with `RUST_BACKTRACE=full` for a verbose backtrace.
+
+thread '<unnamed>' (2044) panicked at crates\shadow-model\src\forward.rs:928:65:
+called `Option::unwrap()` on a `None` value
+stack backtrace:
+note: Some details are omitted, run with `RUST_BACKTRACE=full` for a verbose backtrace.
+
+thread '<unnamed>' (13416) panicked at crates\shadow-model\src\forward.rs:928:65:
+called `Option::unwrap()` on a `None` value
+stack backtrace:
+note: Some details are omitted, run with `RUST_BACKTRACE=full` for a verbose backtrace.
+
+thread '<unnamed>' (1500) panicked at crates\shadow-model\src\forward.rs:928:65:
+called `Option::unwrap()` on a `None` value
+stack backtrace:
+note: Some details are omitted, run with `RUST_BACKTRACE=full` for a verbose backtrace.
+
+thread '<unnamed>' (26544) panicked at crates\shadow-model\src\forward.rs:928:65:
+called `Option::unwrap()` on a `None` value
+stack backtrace:
+note: Some details are omitted, run with `RUST_BACKTRACE=full` for a verbose backtrace.
+
+thread '<unnamed>' (30884) panicked at crates\shadow-model\src\forward.rs:928:65:
+called `Option::unwrap()` on a `None` value
+stack backtrace:
+note: Some details are omitted, run with `RUST_BACKTRACE=full` for a verbose backtrace.
+
+thread '<unnamed>' (23444) panicked at crates\shadow-model\src\forward.rs:928:65:
+called `Option::unwrap()` on a `None` value
+stack backtrace:
+note: Some details are omitted, run with `RUST_BACKTRACE=full` for a verbose backtrace.
+
+thread '<unnamed>' (16948) panicked at crates\shadow-model\src\forward.rs:928:65:
+called `Option::unwrap()` on a `None` value
+stack backtrace:
+note: Some details are omitted, run with `RUST_BACKTRACE=full` for a verbose backtrace.
+
+thread '<unnamed>' (25996) panicked at crates\shadow-model\src\forward.rs:928:65:
+called `Option::unwrap()` on a `None` value
+stack backtrace:
+note: Some details are omitted, run with `RUST_BACKTRACE=full` for a verbose backtrace.
+
+thread '<unnamed>' (10784) panicked at crates\shadow-model\src\forward.rs:928:65:
+called `Option::unwrap()` on a `None` value
+stack backtrace:
+note: Some details are omitted, run with `RUST_BACKTRACE=full` for a verbose backtrace.
+
+thread '<unnamed>' (26060) panicked at crates\shadow-model\src\forward.rs:928:65:
+called `Option::unwrap()` on a `None` value
+stack backtrace:
+note: Some details are omitted, run with `RUST_BACKTRACE=full` for a verbose backtrace.
+
+thread '<unnamed>' (14564) panicked at crates\shadow-model\src\forward.rs:928:65:
+called `Option::unwrap()` on a `None` value
+stack backtrace:
+note: Some details are omitted, run with `RUST_BACKTRACE=full` for a verbose backtrace.
+
+thread '<unnamed>' (26860) panicked at crates\shadow-model\src\forward.rs:928:65:
+called `Option::unwrap()` on a `None` value
+stack backtrace:
+note: Some details are omitted, run with `RUST_BACKTRACE=full` for a verbose backtrace.
+
+thread '<unnamed>' (1900) panicked at crates\shadow-model\src\forward.rs:928:65:
+called `Option::unwrap()` on a `None` value
+stack backtrace:
+note: Some details are omitted, run with `RUST_BACKTRACE=full` for a verbose backtrace.
+
+thread '<unnamed>' (25220) panicked at crates\shadow-model\src\forward.rs:928:65:
+called `Option::unwrap()` on a `None` value
+stack backtrace:
+note: Some details are omitted, run with `RUST_BACKTRACE=full` for a verbose backtrace.
+
+thread 'shadow-engine' (32336) panicked at crates\shadow-cuda\src\session.rs:1501:5:
+a scoped thread panicked
+stack backtrace:
+note: Some details are omitted, run with `RUST_BACKTRACE=full` for a verbose backtrace.
+shadow serve: the engine hit an internal error (a scoped thread panicked); the session was reset
+shadow serve: conversation snapshot of 5858 tokens (0.42 GiB) in 0.09 s; 1 kept

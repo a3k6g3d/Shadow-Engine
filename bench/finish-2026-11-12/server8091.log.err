@@ -1,0 +1,76 @@
+shadow serve: fastest-mode defaults: --tail-skip 3 --tensor-prompt --verify-rank 2 --ram-floor-gib 3.5 --placement profiles/routing-varied300.shrc --dflash models/dflash2 --spec 3 --dflash-min-p 0.5 (--exact for the exact path)
+RAM floor: 3.5 GiB (default 4): a pinned tier cannot be paged out, and this PC has frozen hard at 0.4 GiB free
+placement: profiles/routing-varied300.shrc, 34990 tokens of routing
+shadow serve: starting 2 MCP server(s) from mcp.json
+shadow serve: listening on http://127.0.0.1:8091
+shadow serve: MCP server time: 3 tools
+shadow serve: MCP server browser: 10 tools
+mmq: loaded J:\Shadow\native\mmq\shadow_mmq.dll (int8 tensor-core projections for the prompt path, mul_mat_vec_q)
+fused: loaded J:\Shadow\native\fused\shadow_fused.dll (Strata's int8 fused experts for the prompt path)
+ram watchdog: available RAM is under the 3.5 GiB floor: asking the tier to give back 3 GiB
+dflash: loaded the drafter from models/dflash2 (~1.2 GB VRAM)
+shadow serve: ready in 35.2 s; expert cache: 1843 slots x 1.96 MiB = 3.53 GiB; 0 hits, 0 misses (0.0% hits); 0 slice uploads; RAM tier: 8386 experts, 16.00 GiB pinned (filled in 14.8 s), misses served 0 from RAM, 0 from the file; tail skip (rank >= 3): 0 routed experts skipped; host waits per step: router 0.0 ms, copies 0.0 ms, file 0.0 ms; kernel launches per step 0, 0.0 ms of host time in them
+shadow serve: 33 conversation snapshot(s) on disk in J:/ShadowConvCache (19.72 GiB)
+RAM tier: gave back 3 GiB under RAM pressure (1576 experts dropped; tier now 13 GiB, 6810 experts); available RAM 24.37 -> 27.37 GiB
+fused experts: taken: gate/up IQ3_XXS + down IQ4_NL, phase 1
+
+thread 'shadow-engine' (23232) panicked at crates\shadow-cuda\src\session.rs:2519:35:
+hc_write: cuModuleGetFunction failed: CUDA_ERROR_ILLEGAL_ADDRESS (700)
+stack backtrace:
+   0: std::panicking::panic_handler
+             at /rustc/b940084d7eb6a299eb4bfeb8e34901bc051e7ac4/library\std\src\panicking.rs:679
+   1: core::panicking::panic_fmt
+             at /rustc/b940084d7eb6a299eb4bfeb8e34901bc051e7ac4/library\core\src\panicking.rs:80
+   2: core::panicking::assert_failed::<u32, u32>
+   3: <shadow_cuda::session::GpuSession>::expert_info
+   4: <shadow_cuda::session::GpuSession>::restore_cache
+   5: <shadow_cuda::session::GpuSession>::step
+   6: <shadow_cuda::session::GpuSession>::step_batch_opt
+   7: <shadow_cuda::session::GpuSession>::prefill_batch
+   8: shadow_serve::engine::start
+   9: shadow_serve::engine::run
+note: Some details are omitted, run with `RUST_BACKTRACE=full` for a verbose backtrace.
+shadow serve: the engine hit an internal error (hc_write: cuModuleGetFunction failed: CUDA_ERROR_ILLEGAL_ADDRESS (700)); the session was reset
+
+thread 'shadow-engine' (23232) panicked at crates\shadow-cuda\src\session.rs:4228:32:
+called `Result::unwrap()` on an `Err` value: CudaError { code: 700, call: "cuCtxSynchronize", name: "CUDA_ERROR_ILLEGAL_ADDRESS" }
+stack backtrace:
+   0: std::panicking::panic_handler
+             at /rustc/b940084d7eb6a299eb4bfeb8e34901bc051e7ac4/library\std\src\panicking.rs:679
+   1: core::panicking::panic_fmt
+             at /rustc/b940084d7eb6a299eb4bfeb8e34901bc051e7ac4/library\core\src\panicking.rs:80
+   2: core::result::unwrap_failed
+             at /rustc/b940084d7eb6a299eb4bfeb8e34901bc051e7ac4/library\core\src\result.rs:1871
+   3: <shadow_cuda::session::GpuSession>::step_batch_verify
+   4: shadow_serve::engine::run
+note: Some details are omitted, run with `RUST_BACKTRACE=full` for a verbose backtrace.
+
+thread 'shadow-engine' (23232) panicked at crates\shadow-cuda\src\session.rs:2519:35:
+copy_words: cuModuleGetFunction failed: CUDA_ERROR_ILLEGAL_ADDRESS (700)
+stack backtrace:
+   0: std::panicking::panic_handler
+             at /rustc/b940084d7eb6a299eb4bfeb8e34901bc051e7ac4/library\std\src\panicking.rs:679
+   1: core::panicking::panic_fmt
+             at /rustc/b940084d7eb6a299eb4bfeb8e34901bc051e7ac4/library\core\src\panicking.rs:80
+   2: core::panicking::assert_failed::<u32, u32>
+   3: <shadow_cuda::session::GpuSession>::step_opt
+   4: <shadow_cuda::session::GpuSession>::step
+   5: <shadow_cuda::session::GpuSession>::step_batch_opt
+   6: <shadow_cuda::session::GpuSession>::prefill_batch
+   7: shadow_serve::engine::start
+   8: shadow_serve::engine::run
+note: Some details are omitted, run with `RUST_BACKTRACE=full` for a verbose backtrace.
+shadow serve: the engine hit an internal error (copy_words: cuModuleGetFunction failed: CUDA_ERROR_ILLEGAL_ADDRESS (700)); the session was reset
+
+thread 'shadow-engine' (23232) panicked at crates\shadow-cuda\src\session.rs:2269:22:
+called `Result::unwrap()` on an `Err` value: CudaError { code: 700, call: "cuMemsetD8", name: "CUDA_ERROR_ILLEGAL_ADDRESS" }
+stack backtrace:
+   0: std::panicking::panic_handler
+             at /rustc/b940084d7eb6a299eb4bfeb8e34901bc051e7ac4/library\std\src\panicking.rs:679
+   1: core::panicking::panic_fmt
+             at /rustc/b940084d7eb6a299eb4bfeb8e34901bc051e7ac4/library\core\src\panicking.rs:80
+   2: core::result::unwrap_failed
+             at /rustc/b940084d7eb6a299eb4bfeb8e34901bc051e7ac4/library\core\src\result.rs:1871
+   3: <shadow_cuda::session::GpuSession>::reset
+   4: shadow_serve::engine::run
+note: Some details are omitted, run with `RUST_BACKTRACE=full` for a verbose backtrace.
