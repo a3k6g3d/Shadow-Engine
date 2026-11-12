@@ -694,6 +694,14 @@ impl SpecBytes {
     }
 }
 
+/// `SHADOW_VERIFY_GRAPHS=0`: a verify pass (and any batch of at most `MAX_VERIFY` rows) runs its DeltaNet segments eagerly, as every batch has since
+/// `SHADOW_BATCH_GRAPHS` went off for prompts (STATUS 58, which measured prompts only).  A verify pass has a handful of shapes, so its graphs are captured once
+/// (STATUS 106).
+fn verify_graphs() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| !std::env::var("SHADOW_VERIFY_GRAPHS").is_ok_and(|v| v == "0"))
+}
+
 /// Rows per copy through the hop's pinned buffer (a chunk is at most `HOP_CHUNK_ROWS` x `NFEAT` floats = 50 MiB of pinned memory, taken at the first hop).
 const HOP_CHUNK_ROWS: usize = 1024;
 
@@ -4959,7 +4967,7 @@ impl<'c, 'm> GpuSession<'c, 'm> {
             // `SHADOW_BATCH_GRAPHS=1`: CUDA graphs for the prompt path (off by default since 2026-11-07).  A graph is keyed by buffer addresses and row counts, which a new prompt mostly
             // changes, so a long prompt instantiates ~500 (18 ms each) and a repeated shape then runs 10% faster (follow-up of 5,609 tokens: 481-509 against 444-451 tok/s,
             // docs/STATUS.md 2026-11-05 (30)); a new prompt ties at 0.5k-9.6k tokens and loses 10% at 15k (A-B-B-A, STATUS 58).
-            && std::env::var("SHADOW_BATCH_GRAPHS").is_ok_and(|v| v == "1");
+            && (std::env::var("SHADOW_BATCH_GRAPHS").is_ok_and(|v| v == "1") || (m <= MAX_VERIFY && verify_graphs()));
         if self.batch_graphs.len() > 4000 {
             // the cache would grow with every new prompt shape
             self.batch_graphs.clear();
