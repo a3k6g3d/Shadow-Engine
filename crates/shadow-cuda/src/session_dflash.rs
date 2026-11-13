@@ -13,9 +13,18 @@ fn df_keep() -> bool {
     *KEEP.get_or_init(|| !std::env::var("SHADOW_DF_KEEP").is_ok_and(|v| v == "0"))
 }
 
+/// `SHADOW_INT8_DRAFTER=0` (STATUS 116): the drafter's Q8_0 matrices back on the float `matvec_cols_q8_0` kernel (default: llama.cpp's `mul_mat_vec_q` in fast mode).
+fn drafter_int8() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| !std::env::var("SHADOW_INT8_DRAFTER").is_ok_and(|v| v == "0"))
+}
+
 impl<'c, 'm> GpuSession<'c, 'm> {
     /// y_j = W x_j (a BF16 matrix of `rows` x `cols` at `w`) for j < m, x_j at x + j * xs floats, y_j at y + j * ys.
     fn df_mv_ptr(&self, w: u64, q8: bool, rows: usize, cols: usize, x: u64, xs: usize, y: u64, ys: usize, m: usize) {
+        if q8 && self.df_mv_int8(w, rows, cols, x, xs, y, ys, m) {
+            return;
+        }
         let entry = if q8 { "matvec_cols_q8_0" } else { "matvec_cols_bf16" };
         for j0 in (0..m).step_by(COLS_MAX) {
             let n = (m - j0).min(COLS_MAX);
@@ -29,6 +38,30 @@ impl<'c, 'm> GpuSession<'c, 'm> {
             }
             .unwrap_or_else(|err| panic!("dflash matvec: {err}"));
         }
+    }
+
+    /// The drafter's Q8_0 matrices on llama.cpp's `mul_mat_vec_q` (STATUS 116): the inputs are quantized to int8 once per call (the drafter's buffers are rewritten between calls, so no reuse of
+    /// the quantized copy), up to 8 inputs a launch.  The drafts only propose: the main model verifies every token, so the int8 activations can only change how many drafts are accepted.
+    /// Fast mode only (`tensor_prompt`, like `int8_decode`); false when the native library lacks `mmvq` or the buffers do not qualify (the float kernel runs).
+    #[allow(clippy::too_many_arguments)]
+    fn df_mv_int8(&self, w: u64, rows: usize, cols: usize, x: u64, xs: usize, y: u64, ys: usize, m: usize) -> bool {
+        let Some(mq) = self.mmq.as_ref() else { return false };
+        if !self.tensor_prompt || !super::int8_decode() || !drafter_int8() || !mq.has_mmvq() || xs % 4 != 0 || x % 16 != 0 || cols % 32 != 0 || ys < rows || mq.mmvq_y_bytes(cols, 8) > self.mmq_y.bytes {
+            return false;
+        }
+        let stream = self.ls().map_or(0, |s| s.raw() as u64);
+        for j0 in (0..m).step_by(8) {
+            let n = (m - j0).min(8);
+            // SAFETY: x + j0 * xs holds n rows of `cols` floats xs apart (the drafter's buffers), the quantized copy fits mmq_y (checked for 8 inputs), w is `rows` rows of `cols` Q8_0 values,
+            // y + j0 * ys holds n rows of `rows` floats ys apart (ys >= rows).
+            unsafe {
+                mq.mmvq_quantize(x + (j0 * xs * 4) as u64, self.mmq_y.ptr, cols, n, xs, stream).unwrap_or_else(|e| panic!("dflash matvec: {e}"));
+                mq.mmvq(8, w, self.mmq_y.ptr, y + (j0 * ys * 4) as u64, rows, cols, n, ys, stream).unwrap_or_else(|e| panic!("dflash matvec: {e}"));
+            }
+        }
+        // `mmq_y` now holds the drafter's activations: whatever the main model's projections noted about it is stale
+        self.mmq_y_tag.set((0, 0, 0, 0, 0));
+        true
     }
 
     fn df_mv(&self, name: &str, x: u64, xs: usize, y: u64, ys: usize, m: usize) {
