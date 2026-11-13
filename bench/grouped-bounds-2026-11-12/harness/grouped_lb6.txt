@@ -1,0 +1,11 @@
+28 groups, 41 token-expert pairs, 4 token rows
+IQ4_NL   down   2560 rows x 640     25.8 MB: repo   170.3 us (  151 GB/s), err 1.5e-8; variant   104.8 us (-38.5%), 0 bytes differ
+IQ3_XXS  gate    640 rows x 2560    17.6 MB: repo    87.8 us (  200 GB/s), err 7.6e-9; variant    89.8 us (+2.2%), 0 bytes differ
+IQ3_XXS  up      640 rows x 2560    17.6 MB: repo    88.0 us (  200 GB/s), err 1.0e-8; variant    90.0 us (+2.3%), 0 bytes differ
+Q2_0     down   2560 rows x 640     12.9 MB: repo   135.7 us (   95 GB/s), err 1.8e-8; variant    87.0 us (-35.9%), 0 bytes differ
+IQ2_S    gate    640 rows x 2560    14.7 MB: repo    87.0 us (  169 GB/s), err 8.4e-9; variant    94.1 us (+8.2%), 0 bytes differ
+IQ2_S    up      640 rows x 2560    14.7 MB: repo    87.0 us (  169 GB/s), err 1.2e-8; variant    93.8 us (+7.8%), 0 bytes differ
+IQ3_S    gate    640 rows x 2560    19.7 MB: repo    94.7 us (  208 GB/s), err 8.5e-9; variant   113.0 us (+19.3%), 0 bytes differ
+IQ3_S    up      640 rows x 2560    19.7 MB: repo    94.7 us (  208 GB/s), err 6.4e-9; variant   113.0 us (+19.3%), 0 bytes differ
+IQ4_XS   gate    640 rows x 2560    24.4 MB: repo    92.6 us (  263 GB/s), err 9.2e-9; variant    97.9 us (+5.8%), 0 bytes differ
+IQ4_XS   up      640 rows x 2560    24.4 MB: repo    92.5 us (  263 GB/s), err 1.1e-8; variant    97.9 us (+5.8%), 0 bytes differ

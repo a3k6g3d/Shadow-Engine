@@ -1470,6 +1470,14 @@ extern "C" __global__ void hc_down_inject_cols_bf16(const u8* w_down, float* dow
 #ifndef GROUPED_UNROLL_COLS
 #define GROUPED_UNROLL_COLS 1024
 #endif
+// Registers: the grouped kernels asked for 88-114 a thread (2 blocks of 256 an SM, 30% occupancy); capping them so 4 blocks fit makes the down shape 36% and the gate / up shape 15-17% faster in
+// the harness with the same bits (5 and 6 blocks help the down shape a little more and hurt gate / up).  `SHADOW_GROUPED_BOUNDS=0` (GROUPED_NO_BOUNDS) leaves the attribute off, the old allocation
+// (a bound of (256, 1) is NOT the same: the compiler then takes more registers and the kernels run 80% slower).
+#ifdef GROUPED_NO_BOUNDS
+#define GROUPED_LB
+#else
+#define GROUPED_LB __launch_bounds__(256, 4)
+#endif
 // A batch's routed experts: group g = blockIdx.y is matrix wtab[g] on its own inputs.  gtab[17 g] = n (<= 8), then
 // 8 input rows and 8 output rows: input j at x + xi[j] * xs, output j at y + yi[j] * ys.  Same sums as
 // matvec_cols_m (dotm), so each one is matvec_fast_rows' on that input, bit for bit.  The inputs must be 16-byte
@@ -1564,16 +1572,16 @@ static __device__ __forceinline__ void grouped_rows(const u64* wtab, const unsig
     }
 }
 
-extern "C" __global__ void matvec_grouped_q4_k(const u64* wtab, const unsigned int* gtab, const float* x, unsigned int xs, float* y, unsigned int ys, unsigned int rows, unsigned int cols) { grouped_rows<Q4K>(wtab, gtab, x, xs, y, ys, rows, cols); }
-extern "C" __global__ void matvec_grouped_q5_k(const u64* wtab, const unsigned int* gtab, const float* x, unsigned int xs, float* y, unsigned int ys, unsigned int rows, unsigned int cols) { grouped_rows<Q5K>(wtab, gtab, x, xs, y, ys, rows, cols); }
-extern "C" __global__ void matvec_grouped_q6_k(const u64* wtab, const unsigned int* gtab, const float* x, unsigned int xs, float* y, unsigned int ys, unsigned int rows, unsigned int cols) { grouped_rows<Q6K>(wtab, gtab, x, xs, y, ys, rows, cols); }
-extern "C" __global__ void matvec_grouped_iq4_nl(const u64* wtab, const unsigned int* gtab, const float* x, unsigned int xs, float* y, unsigned int ys, unsigned int rows, unsigned int cols) { grouped_rows<IQ4NL>(wtab, gtab, x, xs, y, ys, rows, cols); }
-extern "C" __global__ void matvec_grouped_iq4_xs(const u64* wtab, const unsigned int* gtab, const float* x, unsigned int xs, float* y, unsigned int ys, unsigned int rows, unsigned int cols) { grouped_rows<IQ4XS>(wtab, gtab, x, xs, y, ys, rows, cols); }
-extern "C" __global__ void matvec_grouped_q2_0(const u64* wtab, const unsigned int* gtab, const float* x, unsigned int xs, float* y, unsigned int ys, unsigned int rows, unsigned int cols) { grouped_rows<Q20>(wtab, gtab, x, xs, y, ys, rows, cols); }
-extern "C" __global__ void matvec_grouped_q8_0(const u64* wtab, const unsigned int* gtab, const float* x, unsigned int xs, float* y, unsigned int ys, unsigned int rows, unsigned int cols) { grouped_rows<Q80>(wtab, gtab, x, xs, y, ys, rows, cols); }
-extern "C" __global__ void matvec_grouped_iq2_s(const u64* wtab, const unsigned int* gtab, const float* x, unsigned int xs, float* y, unsigned int ys, unsigned int rows, unsigned int cols) { grouped_rows<IQ2S>(wtab, gtab, x, xs, y, ys, rows, cols); }
-extern "C" __global__ void matvec_grouped_iq3_xxs(const u64* wtab, const unsigned int* gtab, const float* x, unsigned int xs, float* y, unsigned int ys, unsigned int rows, unsigned int cols) { grouped_rows<IQ3XXS>(wtab, gtab, x, xs, y, ys, rows, cols); }
-extern "C" __global__ void matvec_grouped_iq3_s(const u64* wtab, const unsigned int* gtab, const float* x, unsigned int xs, float* y, unsigned int ys, unsigned int rows, unsigned int cols) { grouped_rows<IQ3S>(wtab, gtab, x, xs, y, ys, rows, cols); }
+extern "C" __global__ void GROUPED_LB matvec_grouped_q4_k(const u64* wtab, const unsigned int* gtab, const float* x, unsigned int xs, float* y, unsigned int ys, unsigned int rows, unsigned int cols) { grouped_rows<Q4K>(wtab, gtab, x, xs, y, ys, rows, cols); }
+extern "C" __global__ void GROUPED_LB matvec_grouped_q5_k(const u64* wtab, const unsigned int* gtab, const float* x, unsigned int xs, float* y, unsigned int ys, unsigned int rows, unsigned int cols) { grouped_rows<Q5K>(wtab, gtab, x, xs, y, ys, rows, cols); }
+extern "C" __global__ void GROUPED_LB matvec_grouped_q6_k(const u64* wtab, const unsigned int* gtab, const float* x, unsigned int xs, float* y, unsigned int ys, unsigned int rows, unsigned int cols) { grouped_rows<Q6K>(wtab, gtab, x, xs, y, ys, rows, cols); }
+extern "C" __global__ void GROUPED_LB matvec_grouped_iq4_nl(const u64* wtab, const unsigned int* gtab, const float* x, unsigned int xs, float* y, unsigned int ys, unsigned int rows, unsigned int cols) { grouped_rows<IQ4NL>(wtab, gtab, x, xs, y, ys, rows, cols); }
+extern "C" __global__ void GROUPED_LB matvec_grouped_iq4_xs(const u64* wtab, const unsigned int* gtab, const float* x, unsigned int xs, float* y, unsigned int ys, unsigned int rows, unsigned int cols) { grouped_rows<IQ4XS>(wtab, gtab, x, xs, y, ys, rows, cols); }
+extern "C" __global__ void GROUPED_LB matvec_grouped_q2_0(const u64* wtab, const unsigned int* gtab, const float* x, unsigned int xs, float* y, unsigned int ys, unsigned int rows, unsigned int cols) { grouped_rows<Q20>(wtab, gtab, x, xs, y, ys, rows, cols); }
+extern "C" __global__ void GROUPED_LB matvec_grouped_q8_0(const u64* wtab, const unsigned int* gtab, const float* x, unsigned int xs, float* y, unsigned int ys, unsigned int rows, unsigned int cols) { grouped_rows<Q80>(wtab, gtab, x, xs, y, ys, rows, cols); }
+extern "C" __global__ void GROUPED_LB matvec_grouped_iq2_s(const u64* wtab, const unsigned int* gtab, const float* x, unsigned int xs, float* y, unsigned int ys, unsigned int rows, unsigned int cols) { grouped_rows<IQ2S>(wtab, gtab, x, xs, y, ys, rows, cols); }
+extern "C" __global__ void GROUPED_LB matvec_grouped_iq3_xxs(const u64* wtab, const unsigned int* gtab, const float* x, unsigned int xs, float* y, unsigned int ys, unsigned int rows, unsigned int cols) { grouped_rows<IQ3XXS>(wtab, gtab, x, xs, y, ys, rows, cols); }
+extern "C" __global__ void GROUPED_LB matvec_grouped_iq3_s(const u64* wtab, const unsigned int* gtab, const float* x, unsigned int xs, float* y, unsigned int ys, unsigned int rows, unsigned int cols) { grouped_rows<IQ3S>(wtab, gtab, x, xs, y, ys, rows, cols); }
 
 // ------------------------------------------------------------------------- BF16 hc projections in the dot8 order
 // hc_down_inject_bf16 with matvec_fast_rows' sums (dot8 over 8 consecutive weights a lane) instead of the reference

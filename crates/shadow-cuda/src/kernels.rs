@@ -326,6 +326,12 @@ pub fn program_source(f: &File) -> String {
 #define GROUPED_UNROLL_COLS 4294967295u
 ";
     }
+    // `SHADOW_GROUPED_BOUNDS=0`: the grouped kernels without the register cap that fits 4 blocks of 256 an SM (STATUS 115)
+    if std::env::var("SHADOW_GROUPED_BOUNDS").is_ok_and(|v| v == "0") {
+        s += "
+#define GROUPED_NO_BOUNDS 1
+";
+    }
     for h in f.headers {
         s += &format!("\n#line 1 \"{}\"\n{}", h.file, h.source);
     }

@@ -1,0 +1,101 @@
+[14824] grouped_bench-6b09db3520ee8b9c.exe@127.0.0.1
+  matvec_grouped_iq4_nl (320, 28, 1)x(256, 1, 1), Context 1, Stream 7, Device 0, CC 12.0
+    Section: GPU Speed Of Light Throughput
+    Metric Name             Metric Unit Metric Value
+    DRAM Frequency                  Ghz        13.78
+    SM Frequency                    Ghz         2.54
+    Elapsed Cycles                cycle      443,724
+    Memory Throughput                 %        32.50
+    DRAM Throughput                   %        22.39
+    Duration                         us       174.82
+    L1/TEX Cache Throughput           %        32.92
+    L2 Cache Throughput               %         8.70
+    SM Active Cycles              cycle   437,592.04
+    Compute (SM) Throughput           %        41.78
+    OPT   This workload exhibits low compute throughput and memory bandwidth utilization relative to the peak           
+    Section: Memory Workload Analysis
+    Metric Name                             Metric Unit Metric Value
+    Local Memory Spilling Requests                                 0
+    Local Memory Spilling Request Overhead            %            0
+    L2 Sector Promotion Misses                        %            0
+    Shared Memory Spilling Requests                                0
+    Shared Memory Spilling Request Overhead           %            0
+    Memory Throughput                           Gbyte/s       148.15
+    Mem Busy                                          %        32.50
+    Max Bandwidth                                     %        25.94
+    L1/TEX Hit Rate                                   %        96.12
+    L2 Persisting Size                            Mbyte         9.44
+    L2 Compression Success Rate                       %            0
+    L2 Compression Ratio                                           0
+    L2 Compression Input Sectors                 sector            0
+    L2 Hit Rate                                       %        13.65
+    Mem Pipes Busy                                    %        25.94
+    Section: Scheduler Statistics
+    Metric Name                  Metric Unit Metric Value
+    One or More Eligible                   %        42.19
+    Issued Warp Per Scheduler                        0.42
+    No Eligible                            %        57.81
+    Active Warps Per Scheduler          warp         3.54
+    Eligible Warps Per Scheduler        warp         0.66
+    OPT   Est. Speedup: 57.81%                                                                                          
+    Section: Warp State Statistics
+    Metric Name                              Metric Unit Metric Value
+    Warp Cycles Per Issued Instruction             cycle         8.39
+    Warp Cycles Per Executed Instruction           cycle         8.39
+    Avg. Active Threads Per Warp                                26.72
+    Avg. Not Predicated Off Threads Per Warp                    25.84
+    OPT   Est. Speedup: 30.35%                                                                                          
+    INF   Check the Warp Stall Sampling (All Samples) table for the top stall locations in your source based on         
+    Section: Instruction Statistics
+    Metric Name                              Metric Unit Metric Value
+    Local Memory Spilling Requests                  byte            0
+    Shared Memory Spilling Requests                 byte            0
+    Avg. Executed Instructions Per Scheduler        inst   185,186.67
+    Executed Instructions                           inst   35,555,840
+    Avg. Issued Instructions Per Scheduler          inst   185,186.67
+    Issued Instructions                             inst   35,555,840
+    OPT   Est. Local Speedup: 25.2%                                                                                     
+    Section: Launch Statistics
+    Metric Name                          Metric Unit    Metric Value
+    Block Size                                                   256
+    Cluster Scheduling Policy                           PolicySpread
+    Cluster Size                                                   0
+    # Launches                                                     1
+    Function Cache Configuration                     CachePreferNone
+    Grid Size                                                  8,960
+    Preferred Cluster Size                                         0
+    Registers Per Thread             register/thread             114
+    Shared Memory Configuration Size           Kbyte           16.38
+    Driver Shared Memory Per Block       Kbyte/block            1.02
+    Dynamic Shared Memory Per Block       byte/block               0
+    Static Shared Memory Per Block        byte/block               0
+    # SMs                                         SM              48
+    Stack Size                                                 1,024
+    Threads                                   thread       2,293,760
+    # TPCs                                                        24
+    Enabled TPC IDs                                              all
+    Uses Green Context                                             0
+    Waves Per SM                                               93.33
+    Section: Occupancy
+    Metric Name                     Metric Unit Metric Value
+    Max Active Clusters                 cluster            0
+    Max Cluster Size                      block            8
+    Overall GPU Occupancy                     %            0
+    Cluster Occupancy                         %            0
+    Block Limit Barriers                  block           24
+    Block Limit SM                        block           24
+    Block Limit Registers                 block            2
+    Block Limit Shared Mem                block           16
+    Block Limit Warps                     block            6
+    Theoretical Active Warps per SM        warp           16
+    Theoretical Occupancy                     %        33.33
+    Achieved Occupancy                        %        29.75
+    Achieved Active Warps Per SM           warp        14.28
+    OPT   Est. Speedup: 38.54%                                                                                          
+    Section: Source Counters
+    Metric Name               Metric Unit Metric Value
+    Branch Instructions Ratio           %         0.03
+    Branch Instructions              inst    1,105,920
+    Branch Efficiency                   %        82.77
+    Avg. Divergent Branches      branches       546.67
+    OPT   Est. Speedup: 50.7%                                                                                           
