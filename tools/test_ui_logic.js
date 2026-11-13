@@ -16,11 +16,16 @@ function grabConst(name) {
   return ui.slice(i, ui.indexOf(';', i) + 1);
 }
 const src = ['READ_ONLY_TOOLS', 'PROGRESS_TOOLS'].map(grabConst).join('\n') + '\n' + names.map(grab).join('\n');
+// the page's own defaults for the two shortening levers (STATUS 126), so the tests follow them
+const lev = /let ctxPreviewChars = (\d+), ctxWorkShare = ([\d.]+);/.exec(ui);
+if (!lev) throw new Error('no ctx levers');
+const LEVERS = { ctxPreviewChars: +lev[1], ctxWorkShare: +lev[2] };
 const factory = new Function('state', `
   const NOTES_MAX = 6000;
   let scratchpad = state.scratchpad;
   const history = state.history;
   let serverCtx = state.serverCtx;
+  let ctxPreviewChars = state.ctxPreviewChars, ctxWorkShare = state.ctxWorkShare;
   const renderNotes = () => {}, saveCurrent = () => {};
   const timingInfo = { textContent: '' }, document = { getElementById: () => ({}) };
   ${src}
@@ -30,7 +35,7 @@ let fails = 0;
 const ok = (c, m) => { if (!c) { fails++; console.log('FAIL:', m); } else console.log('ok:  ', m); };
 
 // ---- notes tool and injection
-const st = { scratchpad: '', history: [], serverCtx: 25600 };
+const st = { scratchpad: '', history: [], serverCtx: 25600, ...LEVERS };
 const t = factory(st);
 ok(t.runNotesTool({}).output === 'Your notes are empty.', 'empty notes are reported');
 ok(t.runNotesTool({ text: 'PLAN: edit ui.rs line 2415' }).output.startsWith('Notes saved'), 'text replaces the notes');
@@ -69,7 +74,7 @@ for (let k = 1; k <= 14; k++) {
   h.push({ role: 'tool', content: '<tool_response>\n(output #' + k + ')\n' + 'listing '.repeat(120) + '\n</tool_response>' });
 }
 h.push({ role: 'user', content: 'What did we find?' });
-const f = factory({ scratchpad: '', history: h, serverCtx: 8000 });
+const f = factory({ scratchpad: '', history: h, serverCtx: 8000, ...LEVERS });
 const out = f.buildContextMessages(h);
 const first = out[0].content;
 ok(/\[Earlier conversation summary/.test(first) && /recall message=N/.test(first), 'the summary says how to read a turn in full');
@@ -85,7 +90,7 @@ for (let k = 1; k <= 85; k++) {
   run.push({ role: 'assistant', content: `Step ${k}: reading the part I need.\n<tool_call>\n<function=read_file>\n<parameter=path>\ncrates/shadow-serve/src/ui.rs\n</parameter>\n<parameter=start>\n${k * 10}\n</parameter>\n<parameter=end>\n${k * 10 + 40}\n</parameter>\n</function>\n</tool_call>` });
   run.push({ role: 'tool', content: `<tool_response>\n(output #${k})\n` + `line of code number ${k} `.repeat(300) + '\n</tool_response>' });
 }
-const g = factory({ scratchpad: '', history: run, serverCtx: 25600 });
+const g = factory({ scratchpad: '', history: run, serverCtx: 25600, ...LEVERS });
 const sz = m => (typeof m.content === 'string' ? m.content.length : 0);
 const room = Math.max(6000, (25600 - 3800) * 3);
 const folded = g.buildContextMessages(run);
@@ -107,7 +112,7 @@ for (let k = 1; k <= 260; k++) {
   longRun.push({ role: 'assistant', content: ['Step ' + k + '.', '<tool_call>', '<function=grep>', '<parameter=pattern>', 'foo' + k, '</parameter>', '</function>', '</tool_call>'].join(NL) });
   longRun.push({ role: 'tool', content: ['<tool_response>', '(output #' + k + ')', 'match line '.repeat(200), '</tool_response>'].join(NL) });
 }
-const foldedLong = factory({ scratchpad: '', history: longRun, serverCtx: 25600 }).buildContextMessages(longRun);
+const foldedLong = factory({ scratchpad: '', history: longRun, serverCtx: 25600, ...LEVERS }).buildContextMessages(longRun);
 const lines = foldedLong[0].content.split(NL).filter(l => l.startsWith('- m'));
 ok(lines.length <= 41 && /^- m1-m\d+: \d+ earlier steps \(grepx\d+\)/.test(lines[0]), 'the oldest steps are merged into one line: ' + lines[0]);
 ok(foldedLong.reduce((n, m) => n + sz(m), 0) < room * 0.8, 'the 260-step run fits too');
@@ -122,7 +127,7 @@ for (let k = 1; k <= 10; k++) {
   ws.push({ role: 'assistant', content: ['Step ' + k + '.', '<tool_call>', '<function=read_file>', '<parameter=path>', 'a.rs', '</parameter>', '</function>', '</tool_call>'].join(NL2) });
   ws.push({ role: 'tool', content: ['<tool_response>', '(output #' + k + ')', 'x'.repeat(4200), '</tool_response>'].join(NL2) });
 }
-const wsOut = factory({ scratchpad: '', history: ws, serverCtx: 14000 }).buildContextMessages(ws);
+const wsOut = factory({ scratchpad: '', history: ws, serverCtx: 14000, ...LEVERS }).buildContextMessages(ws);
 const wsTools = wsOut.filter(m => m.role === 'tool');
 const wsWhole = wsTools.map(m => m.content.length > 4000);
 ok(wsWhole.length === 10 && wsWhole[9] && wsWhole[8], 'the newest two tool outputs stay whole (a working set of more than one)');
@@ -132,7 +137,7 @@ const wsBudget = Math.max(6000, (14000 - 3800) * 3) * 0.3;
 ok(wsTools.filter(m => m.content.length > 4000).length * 4300 <= wsBudget + 4300 * 1 + 1, 'the whole outputs fit the budget (the last step always stays)');
 
 // ---- the read-only treadmill: a note after 8 and again from 14, reset by notes or an edit
-const tm = factory({ scratchpad: '', history: [], serverCtx: 25600 });
+const tm = factory({ scratchpad: '', history: [], serverCtx: 25600, ...LEVERS });
 let streak = 0;
 const notes = [];
 for (let i = 1; i <= 20; i++) {

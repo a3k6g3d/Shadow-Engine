@@ -3551,6 +3551,10 @@ html('d-ramfree', gib(ram.system_available_bytes || 0) + '<small>GiB free</small
     // context payload that preserves the system prompt prefix (so `prefix.snap` always hits) and folds older
     // turns/tool outputs into a rolling summary whenever the conversation grows near `serverCtx`.
     let serverCtx = 16384;
+    // the two levers of the shortening of older tool outputs (STATUS 125/126): how much of a shortened output stays as its preview, and the share of the room the newest outputs may keep whole
+    // default (STATUS 126): a 600-character preview and a working set of 45% of the room; localStorage shadow_ctx_old=1 brings back the old 160 / 30%
+    let ctxPreviewChars = 600, ctxWorkShare = 0.45;
+    try { if (localStorage.getItem('shadow_ctx_old') === '1') { ctxPreviewChars = 160; ctxWorkShare = 0.3; } } catch (_) {}
     function buildContextMessages(hist) {
       const size = m => Array.isArray(m.content) ? m.content.reduce((n, p) => n + (p.text ? p.text.length : 1800), 0) : String(m.content || '').length;
       const room = Math.max(6000, (serverCtx - 3800) * 3); // system prompt + tool schemas + reply headroom
@@ -3569,7 +3573,7 @@ html('d-ramfree', gib(ram.system_available_bytes || 0) + '<small>GiB free</small
       for (let i = cloned.length - 1; i >= 0; i--) {
         if (cloned[i].role !== 'tool') continue;
         const sz = size(cloned[i]);
-        if (i < lastNonTool && wsUsed + sz > room * 0.3) break;
+        if (i < lastNonTool && wsUsed + sz > room * ctxWorkShare) break;
         wsUsed += sz;
         keepWhole.add(i);
       }
@@ -3581,7 +3585,7 @@ html('d-ramfree', gib(ram.system_available_bytes || 0) + '<small>GiB free</small
         const unwrapped = unwrapToolResponse(m.content);
         const num = /^\(output #(\d+)\)\s*/.exec(unwrapped);   // the server's log of tool outputs: `recall` reads that one again
         const raw = (num ? unwrapped.slice(num[0].length) : unwrapped).replace(/\s+/g, ' ').trim();
-        const preview = raw.length > 160 ? raw.slice(0, 160) + '…' : raw;
+        const preview = raw.length > ctxPreviewChars ? raw.slice(0, ctxPreviewChars) + '…' : raw;
         m.content = num
           ? `<tool_response>\n[earlier tool output #${num[1]} (${was} chars), shortened to save context; it began: ${preview} - call recall with id ${num[1]} to read it again (a line range, or a text to search for)]\n</tool_response>`
           : `<tool_response>\n[earlier tool output (${was} chars), shortened to save context; it began: ${preview} - call recall with message ${i} to read it in full]\n</tool_response>`;
