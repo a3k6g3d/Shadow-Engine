@@ -2116,6 +2116,21 @@ canvas.spark { width: 100%; height: 64px; display: block; }
       if (g.dataset.live === '1' && !g.dataset.touched) g.classList.toggle('open', running);
       if (cards.some(c => c.dataset.waiting === '1')) g.classList.add('open');
     }
+    // a reply that only called tools hands its group to the next reply that calls tools, so a run of tool-only replies reads as one group (at the last of them)
+    function absorbPreviousToolGroup(row) {
+      const g = row && row.querySelector(':scope > .bubble > .tool-group');
+      const prev = row && row.previousElementSibling;
+      if (!g || !prev || !prev.classList.contains('assistant')) return;
+      const pg = prev.querySelector(':scope > .bubble > .tool-group');
+      if (!pg) return;
+      const prose = prev.querySelector(':scope > .bubble > .msg-content');
+      if (prose && prose.textContent.trim()) return;
+      const body = g.querySelector('.tool-group-body');
+      Array.from(pg.querySelectorAll('.tool-call-block')).reverse().forEach(c => body.prepend(c));
+      if (pg.dataset.touched) { g.dataset.touched = '1'; if (pg.classList.contains('open')) g.classList.add('open'); }
+      pg.remove();
+      refreshToolGroup(g);
+    }
     function refreshToolGroupOf(card) { refreshToolGroup(card && card.closest('.tool-group')); }
     function toggleToolGroup(head) {
       const g = head.closest('.tool-group');
@@ -2737,6 +2752,7 @@ canvas.spark { width: 100%; height: 64px; display: block; }
               toolGrp.dataset.live = '1';
               toolGrp.querySelector('.tool-group-body').appendChild(toolCard);
               refreshToolGroup(toolGrp);
+              if (toolGrp.querySelectorAll('.tool-call-block').length === 1) absorbPreviousToolGroup(bubbleEl.closest('.msg-row'));
               scrollToBottom(false);
 
               let result;
@@ -3035,6 +3051,7 @@ canvas.spark { width: 100%; height: 64px; display: block; }
         row.innerHTML = `<div class="avatar">S</div><div class="bubble">${proseHtml}${cardsHtml}</div>`;
       }
       messagesEl.appendChild(row);
+      absorbPreviousToolGroup(row);
       if (truncOn) row.querySelectorAll('.tool-output').forEach(markClipped);
     }
     function openChat(id) {
