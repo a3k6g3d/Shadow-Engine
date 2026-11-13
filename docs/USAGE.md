@@ -177,7 +177,7 @@ A request with none of these is decoded greedily (the likeliest token every time
 (the penalties look at the reply so far, thinking included, last 512 tokens), `seed`. The model's own recommendation, which the GGUF carries, is temperature 1.0, top-k 20, top-p 0.95; `GET /props` lists
 it as `sampling_defaults`. The same seed on the same conversation gives the same reply (bit for bit in `--exact`; in the fast modes the numerics of the speculative passes can still change a token).
 Speculative decoding stays on while sampling: a drafted token is accepted when it is the token the model would have drawn at that position (STATUS 118), so acceptance is lower than greedy (about 56% against 79% in
-the one measurement) and decode a little slower. The chat page sends its own from Settings > Sampling (model default / focused / greedy / custom).
+the one measurement) and decode a little slower. The chat page sends its own from Settings > Sampling (focused by default; model default / greedy / custom).
 
 ## MCP tools
 

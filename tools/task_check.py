@@ -4,7 +4,7 @@
 
 48 short tasks from a fixed seed: arithmetic, word problems, string work, sorting, counting, facts.  The answer is graded by looking for the expected token in
 the reply; the model is asked for only the final answer."""
-import json, random, re, sys, urllib.request
+import json, os, random, re, sys, urllib.request
 
 port = int(sys.argv[1]) if len(sys.argv) > 1 else 8081
 rng = random.Random(20261104)
@@ -40,6 +40,8 @@ fails = []
 for kind, prompt, expect in tasks:
     body = {'messages': [{'role': 'user', 'content': prompt + ' Answer with only the final answer.'}], 'max_tokens': 60, 'temperature': 0, 'stream': False,
             'chat_template_kwargs': {'enable_thinking': False}}
+    if os.environ.get('TASK_SAMPLING'):  # e.g. '{"temperature": 1.0, "top_k": 20, "top_p": 0.95}': the request's sampling parameters instead of greedy (STATUS 121)
+        body.update(json.loads(os.environ['TASK_SAMPLING']))
     r = json.load(urllib.request.urlopen(urllib.request.Request(f'http://127.0.0.1:{port}/v1/chat/completions', json.dumps(body).encode(), {'Content-Type': 'application/json'}), timeout=600))
     txt = r['choices'][0]['message']['content'] or ''
     good = re.search(expect, txt, re.I) is not None

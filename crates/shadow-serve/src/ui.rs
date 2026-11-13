@@ -1151,8 +1151,8 @@ canvas.spark { width: 100%; height: 64px; display: block; }
           <h3>Sampling <span class="tag" id="set-samp-note"></span></h3>
           <div class="set-row">
             <select id="set-samp-preset" aria-label="Sampling preset" style="max-inline-size:100%" onchange="setSamplingPreset(this.value)">
-              <option value="model">Model default (temperature 1.0, top-k 20, top-p 0.95)</option>
-              <option value="focused">Focused (temperature 0.6, top-k 20, top-p 0.95): code and tools</option>
+              <option value="focused">Focused (temperature 0.6, top-k 20, top-p 0.95): code and tools, the default</option>
+              <option value="model">Model default (temperature 1.0, top-k 20, top-p 0.95): more varied, fewer exact answers</option>
               <option value="greedy">Greedy (always the likeliest token, repeats itself more)</option>
               <option value="custom">Custom</option>
             </select>
@@ -1346,7 +1346,7 @@ canvas.spark { width: 100%; height: 64px; display: block; }
             </div>
 
             <!-- Pinned notes -->
-            <button class="menu-pill-btn" id="regen-btn" onclick="regenerateLast()" title="Throw the last reply away and ask again (with sampling on, the answer will differ)">
+            <button class="menu-pill-btn" id="regen-btn" onclick="regenerateLast()" title="Throw the last reply away and ask again (with sampling on, the answer will differ). Not offered after a reply that used tools: they would run again.">
               <span>↻</span>
               <span>Regenerate</span>
             </button>
@@ -3226,7 +3226,7 @@ html('d-ramfree', gib(ram.system_available_bytes || 0) + '<small>GiB free</small
       greedy: { temperature: 0 },
     };
     const SAMPLING_FIELDS = ['temperature', 'top_k', 'top_p', 'min_p', 'presence_penalty', 'repeat_penalty', 'seed'];
-    let sampling = { preset: 'model', custom: { temperature: 1.0, top_k: 20, top_p: 0.95 } };
+    let sampling = { preset: 'focused', custom: { temperature: 0.6, top_k: 20, top_p: 0.95 } }; // Focused is the default: STATUS 121 (the model default lost tasks)
     try { const s0 = JSON.parse(localStorage.getItem('shadow_sampling') || 'null'); if (s0 && s0.preset) sampling = s0; } catch (_) {}
     function requestSampling() {
       if (sampling.preset !== 'custom') return Object.assign({}, SAMPLING_PRESETS[sampling.preset] || SAMPLING_PRESETS.model);
@@ -3289,8 +3289,14 @@ html('d-ramfree', gib(ram.system_available_bytes || 0) + '<small>GiB free</small
     applyTrunc();
 
     // ---- Regenerate: drop the last reply (everything after the last user message) and ask again
+    // a turn that ran tools is not asked again: the calls (writes, edits, commands) would run a second time
+    function lastTurnUsedTools() {
+      let i = history.length - 1;
+      while (i >= 0 && history[i].role !== 'user') i--;
+      return history.slice(i + 1).some(m => m.role === 'tool' || (m.role === 'assistant' && parseToolCallsFromText(messageText(m)).length > 0));
+    }
     function regenerateLast() {
-      if (isGenerating) return;
+      if (isGenerating || lastTurnUsedTools()) return;
       let i = history.length - 1;
       while (i >= 0 && history[i].role !== 'user') i--;
       if (i < 0) return;
@@ -3304,7 +3310,7 @@ html('d-ramfree', gib(ram.system_available_bytes || 0) + '<small>GiB free</small
     }
     setInterval(() => {
       const b = document.getElementById('regen-btn');
-      if (b) b.style.display = (!isGenerating && history.length > 0 && history[history.length - 1].role === 'assistant') ? 'inline-flex' : 'none';
+      if (b) b.style.display = (!isGenerating && history.length > 0 && history[history.length - 1].role === 'assistant' && !lastTurnUsedTools()) ? 'inline-flex' : 'none';
     }, 400);
 
     function settingsOpen() {
