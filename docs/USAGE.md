@@ -108,6 +108,8 @@ Defaults are right for normal use; these are for measurement and diagnosis.
 | variable | effect |
 |---|---|
 | `SHADOW_NVRTC`, `SHADOW_KERNEL_CACHE` | where NVRTC and the CUBIN cache are |
+| `SHADOW_DEFAULT_SAMPLING=model` | requests that send no sampling parameter are sampled with the model's recommended values (temperature 1.0, top-k 20, top-p 0.95) instead of greedy (STATUS 118; the chat page always sends its own) |
+| `SHADOW_CONV_DIR`, `SHADOW_CONV_DISK_GIB` | where the conversation snapshots on disk go (default `ShadowConvCache` at the root of the model's drive, one subfolder a model) and how many GiB of them one model may use (default 20; 0 = no disk copy); STATUS 120 |
 | `SHADOW_REPORT=1` | print the session report after each answer (tier hits, verify pass times, launches) |
 | `SHADOW_LTIME=1`, `SHADOW_KTIME=1`, `SHADOW_PROFILE=1` | time a batched pass by segment / each kernel / the single-token step (these synchronize: they slow the run) |
 | `SHADOW_DF_TIME=1` | time the phases of the DFlash draft round |
@@ -162,11 +164,20 @@ machine pass `--ram-tier-gib` explicitly (or `auto`), or `--exact` with a small 
 
 ## The API
 
-OpenAI-compatible: `POST /v1/chat/completions` (streaming and not; `reasoning_effort`, `chat_template_kwargs.enable_thinking`),
+OpenAI-compatible: `POST /v1/chat/completions` (streaming and not; `reasoning_effort`, `chat_template_kwargs.enable_thinking`, and the sampling parameters below),
 `GET /v1/models`, `/health`, `/metrics` (Prometheus), `/v1/status` (throughput, queue, memory tiers), `/v1/telemetry`
 (CPU, RAM, GPU, expert-cache stats), `/v1/tools` and `/v1/tools/execute` (the native Windows agent tools). The response
 carries llama.cpp-style `timings` (`predicted_n`, `predicted_ms`, `predicted_per_second`, `prompt_n`, ...), which
 `shadow-bench` reads.
+
+### Sampling
+
+A request with none of these is decoded greedily (the likeliest token every time: what `--exact` and the benchmarks use). Any of them switches sampling on (temperature 1.0 unless given):
+`temperature` (0 = greedy), `top_k` (0 = all), `top_p`, `min_p`, `repeat_penalty` (or `repetition_penalty`; llama.cpp's multiplicative penalty, 1 = off), `presence_penalty`, `frequency_penalty`
+(the penalties look at the reply so far, thinking included, last 512 tokens), `seed`. The model's own recommendation, which the GGUF carries, is temperature 1.0, top-k 20, top-p 0.95; `GET /props` lists
+it as `sampling_defaults`. The same seed on the same conversation gives the same reply (bit for bit in `--exact`; in the fast modes the numerics of the speculative passes can still change a token).
+Speculative decoding stays on while sampling: a drafted token is accepted when it is the token the model would have drawn at that position (STATUS 118), so acceptance is lower than greedy (about 56% against 79% in
+the one measurement) and decode a little slower. The chat page sends its own from Settings > Sampling (model default / focused / greedy / custom).
 
 ## MCP tools
 

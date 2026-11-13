@@ -2,7 +2,7 @@
 //! server-sent events, with tool definitions and `<tool_call>` parsing), `/health`, `/v1/models`, `/v1/status`, `/props`
 //! and `/metrics`, over hyper, in front of one engine thread (engine.rs).  Requests queue; one is answered at a time.
 //!
-//! Not yet: sampling (greedy only), images.
+//! Sampling: see sampler.rs.
 
 pub mod convdisk;
 pub mod cpuinfo;
@@ -10,6 +10,7 @@ pub mod engine;
 pub mod mcp;
 pub mod memory;
 pub mod orchestrator;
+pub mod sampler;
 pub mod semsearch;
 pub mod telemetry;
 pub mod ui;
@@ -158,7 +159,8 @@ async fn handle(req: Request<Incoming>, app: Arc<App>) -> Result<Response<Body>,
                 StatusCode::OK,
                 &json!({
                     "model_path": s.model, "n_ctx": s.n_ctx, "engine": "shadow", "version": env!("CARGO_PKG_VERSION"),
-                    "sampling": "greedy only (temperature, top_p, seed are accepted and ignored)",
+                    "sampling": "temperature, top_k, top_p, min_p, repeat_penalty / repetition_penalty, presence_penalty, frequency_penalty, seed; greedy when none is sent or temperature is 0",
+                    "sampling_defaults": {"temperature": sampler::MODEL_TEMP, "top_k": sampler::MODEL_TOP_K, "top_p": sampler::MODEL_TOP_P},
                     "tools": true, "streaming": true, "default_generation_settings": {"n_ctx": s.n_ctx},
                 }),
             )
@@ -600,6 +602,24 @@ pub fn parse_chat(body: &Value) -> Result<(Vec<Message>, Options, usize, bool), 
     Ok((out, opts, max_tokens, stream))
 }
 
+/// The sampling parameters of a request body (OpenAI names, plus llama.cpp's `top_k`, `min_p`, `repeat_penalty`).
+fn parse_sampling(body: &Value) -> sampler::Sampling {
+    let f = |k: &str| body.get(k).and_then(Value::as_f64).map(|v| v as f32);
+    let seed = body
+        .get("seed")
+        .and_then(|v| v.as_u64().or_else(|| v.as_i64().map(|i| i as u64)));
+    sampler::Sampling {
+        temperature: f("temperature"),
+        top_k: body.get("top_k").and_then(Value::as_u64).map(|v| v as usize),
+        top_p: f("top_p"),
+        min_p: f("min_p"),
+        repeat_penalty: f("repeat_penalty").or_else(|| f("repetition_penalty")),
+        presence_penalty: f("presence_penalty"),
+        frequency_penalty: f("frequency_penalty"),
+        seed,
+    }
+}
+
 fn usage(st: &engine::Stats) -> (Value, Value) {
     (
         json!({"prompt_tokens": st.prompt_tokens, "completion_tokens": st.completion_tokens,
@@ -710,6 +730,7 @@ async fn chat(req: Request<Incoming>, app: Arc<App>) -> Response<Body> {
         .get("cache_prompt")
         .and_then(Value::as_bool)
         .unwrap_or(true);
+    let sampling = parse_sampling(&body);
     let model = app.status.lock().unwrap().model.clone();
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
     app.sent.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -723,6 +744,7 @@ async fn chat(req: Request<Incoming>, app: Arc<App>) -> Response<Body> {
             max_tokens,
             images,
             cache_prompt,
+            sampling,
             tx,
         })
         .is_err()

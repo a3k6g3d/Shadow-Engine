@@ -488,6 +488,19 @@ canvas.spark { width: 100%; height: 64px; display: block; }
       color: #a7f3d0;
     }
 
+    /* Settings > Display: shorten long thinking and tool output (a click on the clipped text shows all of it) */
+    body.trunc-on .think-content { max-height: calc(var(--trunc-lines, 8) * 1.5em); overflow: hidden; }
+    body.trunc-on .tool-output { max-height: calc(var(--trunc-lines, 8) * 1.4em + 1em); overflow: hidden; }
+    body.trunc-on .think-content.clipped, body.trunc-on .tool-output.clipped { cursor: pointer; -webkit-mask-image: linear-gradient(#000 75%, transparent); mask-image: linear-gradient(#000 75%, transparent); }
+    body.trunc-on .think-content.expanded, body.trunc-on .tool-output.expanded { max-height: none; -webkit-mask-image: none; mask-image: none; overflow-y: auto; }
+    body.trunc-on .tool-output.expanded { max-height: 60vh; }
+    .set-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 0.6rem; }
+    .set-grid label { display: flex; flex-direction: column; gap: 0.25rem; font-size: 0.78rem; color: var(--text-muted); }
+    .set-grid input[type=number] { background: var(--bg); border: 1px solid var(--border); border-radius: 0.5rem; padding: 0.45rem 0.6rem; color: var(--text); font: inherit; font-size: 0.88rem; min-inline-size: 0; }
+    .set-grid input[type=number]:focus { border-color: var(--accent); outline: none; }
+    .set-grid.off { opacity: 0.45; pointer-events: none; }
+    #regen-btn { display: none; }
+
     /* Permission mode: the selector's wrapper and the approval box inside a tool card */
     .perm-wrap { position: relative; display: inline-flex; }
     .menu-pill-btn.perm-auto .perm-dot { color: var(--accent); }
@@ -1135,6 +1148,33 @@ canvas.spark { width: 100%; height: 64px; display: block; }
           <p class="set-help">This is the starting point of every chat. For a one-off, just say it in the chat: "act as a software engineer and design this", "review this like a security auditor", "be brief". The persona itself changes only here.</p>
         </div>
         <div class="dcard">
+          <h3>Sampling <span class="tag" id="set-samp-note"></span></h3>
+          <div class="set-row">
+            <select id="set-samp-preset" aria-label="Sampling preset" style="max-inline-size:100%" onchange="setSamplingPreset(this.value)">
+              <option value="model">Model default (temperature 1.0, top-k 20, top-p 0.95)</option>
+              <option value="focused">Focused (temperature 0.6, top-k 20, top-p 0.95): code and tools</option>
+              <option value="greedy">Greedy (always the likeliest token, repeats itself more)</option>
+              <option value="custom">Custom</option>
+            </select>
+          </div>
+          <div class="set-grid" id="set-samp-grid">
+            <label>Temperature<input type="number" id="set-samp-temperature" min="0" max="2" step="0.05" oninput="samplingFieldChanged()"></label>
+            <label>Top-k (0 = all)<input type="number" id="set-samp-top_k" min="0" max="1000" step="1" oninput="samplingFieldChanged()"></label>
+            <label>Top-p<input type="number" id="set-samp-top_p" min="0" max="1" step="0.01" oninput="samplingFieldChanged()"></label>
+            <label>Min-p<input type="number" id="set-samp-min_p" min="0" max="1" step="0.01" oninput="samplingFieldChanged()"></label>
+            <label>Presence penalty<input type="number" id="set-samp-presence_penalty" min="-2" max="2" step="0.1" oninput="samplingFieldChanged()"></label>
+            <label>Repeat penalty<input type="number" id="set-samp-repeat_penalty" min="1" max="2" step="0.05" oninput="samplingFieldChanged()"></label>
+            <label>Seed (empty = random)<input type="number" id="set-samp-seed" min="0" step="1" oninput="samplingFieldChanged()"></label>
+          </div>
+          <p class="set-help">How Shadow picks each word. Greedy always takes the single likeliest token, which on a 3-bit model is what makes it circle back on itself while thinking; sampling picks among the likely ones instead, so a reply can differ each time (Regenerate asks again). The presence and repeat penalties push down tokens the reply has already used. Temperature 0 is greedy. The draft model still speeds sampled replies up, a little less than greedy ones. Applies from your next message.</p>
+        </div>
+        <div class="dcard">
+          <h3>Display</h3>
+          <label class="set-toggle"><input type="checkbox" id="set-trunc-on" onchange="setTruncOn(this.checked)"> Shorten long thinking and tool output in the chat</label>
+          <div class="set-row"><span class="set-help">Lines to show:</span> <input type="number" id="set-trunc-lines" min="2" max="60" step="1" style="width:5rem" onchange="setTruncLines(this.value)"></div>
+          <p class="set-help">Thinking shows its latest lines and tool results their first ones; click the clipped text to open all of it, click again to close it. This is only how the page draws them: Shadow still reads the full text.</p>
+        </div>
+        <div class="dcard">
           <h3>Task status</h3>
           <label class="set-toggle"><input type="checkbox" id="set-finish-on" onchange="setFinishOn(this.checked)"> End tasks that use tools with a status card</label>
           <p class="set-help">When Shadow has used its tools it closes the task with what it did, what is not done or not verified and, only if it needs you, one question with buttons for the answers. Off: it ends with a plain message as before. Takes effect in a new chat (the instruction is part of the start of the prompt).</p>
@@ -1306,6 +1346,10 @@ canvas.spark { width: 100%; height: 64px; display: block; }
             </div>
 
             <!-- Pinned notes -->
+            <button class="menu-pill-btn" id="regen-btn" onclick="regenerateLast()" title="Throw the last reply away and ask again (with sampling on, the answer will differ)">
+              <span>↻</span>
+              <span>Regenerate</span>
+            </button>
             <button class="menu-pill-btn" id="notes-toggle-btn" onclick="toggleNotes()" title="Pinned notes for this chat: shown to Shadow at the end of every request, never shortened">
               <span>📝</span>
               <span id="notes-btn-label">Notes</span>
@@ -2416,6 +2460,7 @@ canvas.spark { width: 100%; height: 64px; display: block; }
           reasoning_effort: currentEffort,
           chat_template_kwargs: { enable_thinking: currentEffort !== 'off' }
         };
+        Object.assign(requestBody, requestSampling());
         if (toolsEnabled && availableTools.length > 0) {
           requestBody.tools = requestTools();
         }
@@ -2470,6 +2515,7 @@ canvas.spark { width: 100%; height: 64px; display: block; }
                     }
                     rawThinking += delta.reasoning_content;
                     thinkContent.textContent = rawThinking;
+                    tailThinking(thinkContent);
                     const elapsed = ((performance.now() - thinkStart) / 1000).toFixed(1);
                     const timerEl = thinkBlock.querySelector('.think-timer');
                     if (timerEl) timerEl.textContent = `(${elapsed}s)`;
@@ -2615,6 +2661,7 @@ canvas.spark { width: 100%; height: 64px; display: block; }
               const outputEl = toolCard.querySelector('.tool-output');
               toolCard.querySelector('.tool-header span:last-child').textContent = (toolCard.dataset.denied ? 'Denied' : result.is_error ? 'Error' : 'Complete') + ' ▾';
               outputEl.textContent = result.output;
+              markClipped(outputEl);
 
               // Append tool response turn to history
               history.push({
@@ -2884,6 +2931,7 @@ canvas.spark { width: 100%; height: 64px; display: block; }
         row.innerHTML = `<div class="avatar">S</div><div class="bubble">${proseHtml}${cardsHtml}</div>`;
       }
       messagesEl.appendChild(row);
+      if (truncOn) row.querySelectorAll('.tool-output').forEach(markClipped);
     }
     function openChat(id) {
       const c = chats.find(x => x.id === id);
@@ -3171,7 +3219,98 @@ html('d-ramfree', gib(ram.system_available_bytes || 0) + '<small>GiB free</small
       if (await memCall('POST', '/v1/memory', { text: inp.value, kind: document.getElementById('set-mem-kind').value })) { inp.value = ''; document.getElementById('set-learn-note').textContent = ''; }
     }
     function setMemoryOn(on) { memoryOn = on; localStorage.setItem('shadow_memory_on', on); }
+    // ---- sampling (Settings > Sampling): the parameters sent with every request
+    const SAMPLING_PRESETS = {
+      model: { temperature: 1.0, top_k: 20, top_p: 0.95 },
+      focused: { temperature: 0.6, top_k: 20, top_p: 0.95 },
+      greedy: { temperature: 0 },
+    };
+    const SAMPLING_FIELDS = ['temperature', 'top_k', 'top_p', 'min_p', 'presence_penalty', 'repeat_penalty', 'seed'];
+    let sampling = { preset: 'model', custom: { temperature: 1.0, top_k: 20, top_p: 0.95 } };
+    try { const s0 = JSON.parse(localStorage.getItem('shadow_sampling') || 'null'); if (s0 && s0.preset) sampling = s0; } catch (_) {}
+    function requestSampling() {
+      if (sampling.preset !== 'custom') return Object.assign({}, SAMPLING_PRESETS[sampling.preset] || SAMPLING_PRESETS.model);
+      const o = {};
+      for (const k of SAMPLING_FIELDS) { const v = sampling.custom[k]; if (v !== undefined && v !== null && v !== '' && !isNaN(Number(v))) o[k] = Number(v); }
+      return o;
+    }
+    function saveSampling() { localStorage.setItem('shadow_sampling', JSON.stringify(sampling)); showSamplingNote(); }
+    function showSamplingNote() {
+      const n = document.getElementById('set-samp-note');
+      if (!n) return;
+      const r = requestSampling();
+      n.textContent = r.temperature === 0 ? 'greedy' : 'temperature ' + (r.temperature === undefined ? '1.0 (model default)' : r.temperature);
+    }
+    function fillSamplingFields() {
+      const grid = document.getElementById('set-samp-grid');
+      const vals = sampling.preset === 'custom' ? sampling.custom : SAMPLING_PRESETS[sampling.preset];
+      for (const k of SAMPLING_FIELDS) { const el = document.getElementById('set-samp-' + k); if (el) el.value = vals[k] === undefined ? '' : vals[k]; }
+      grid.classList.toggle('off', sampling.preset !== 'custom');
+      document.getElementById('set-samp-preset').value = sampling.preset;
+    }
+    function setSamplingPreset(p) {
+      // picking Custom starts from what the preset showed, so a tweak does not lose the other fields
+      if (p === 'custom' && sampling.preset !== 'custom') sampling.custom = Object.assign({}, requestSampling());
+      sampling.preset = p;
+      fillSamplingFields();
+      saveSampling();
+    }
+    function samplingFieldChanged() {
+      const c = {};
+      for (const k of SAMPLING_FIELDS) c[k] = document.getElementById('set-samp-' + k).value;
+      sampling.custom = c;
+      saveSampling();
+    }
+
+    // ---- shorten long thinking / tool output (Settings > Display)
+    let truncOn = localStorage.getItem('shadow_trunc_on') === 'true';
+    let truncLines = Math.max(2, Math.min(60, Number(localStorage.getItem('shadow_trunc_lines')) || 8));
+    function applyTrunc() {
+      document.body.classList.toggle('trunc-on', truncOn);
+      document.body.style.setProperty('--trunc-lines', truncLines);
+      document.querySelectorAll('.think-content, .tool-output').forEach(markClipped);
+    }
+    function setTruncOn(on) { truncOn = on; localStorage.setItem('shadow_trunc_on', on); applyTrunc(); }
+    function setTruncLines(v) { truncLines = Math.max(2, Math.min(60, Number(v) || 8)); localStorage.setItem('shadow_trunc_lines', truncLines); document.getElementById('set-trunc-lines').value = truncLines; applyTrunc(); }
+    // marks a block whose text is cut by the line limit (for the fade and the click); thinking shows its latest lines while it streams
+    function markClipped(el) {
+      if (!el) return;
+      const clip = truncOn && !el.classList.contains('expanded') && el.scrollHeight > el.clientHeight + 2;
+      el.classList.toggle('clipped', clip);
+      if (clip) el.title = 'Click to show all';
+    }
+    function tailThinking(el) { if (truncOn && !el.classList.contains('expanded')) { el.scrollTop = el.scrollHeight; markClipped(el); } }
+    document.addEventListener('click', ev => {
+      const el = ev.target.closest && ev.target.closest('.think-content, .tool-output');
+      if (!el || !truncOn || String(window.getSelection()).length) return;
+      if (el.classList.contains('clipped') || el.classList.contains('expanded')) { el.classList.toggle('expanded'); el.title = el.classList.contains('expanded') ? 'Click to shorten' : 'Click to show all'; markClipped(el); }
+    });
+
+    applyTrunc();
+
+    // ---- Regenerate: drop the last reply (everything after the last user message) and ask again
+    function regenerateLast() {
+      if (isGenerating) return;
+      let i = history.length - 1;
+      while (i >= 0 && history[i].role !== 'user') i--;
+      if (i < 0) return;
+      history.length = i + 1;
+      const rows = Array.from(messagesEl.querySelectorAll('.msg-row'));
+      let lastUser = -1;
+      rows.forEach((r, k) => { if (r.classList.contains('user')) lastUser = k; });
+      rows.slice(lastUser + 1).forEach(r => r.remove());
+      resumeOnly = true;
+      sendMessage();
+    }
+    setInterval(() => {
+      const b = document.getElementById('regen-btn');
+      if (b) b.style.display = (!isGenerating && history.length > 0 && history[history.length - 1].role === 'assistant') ? 'inline-flex' : 'none';
+    }, 400);
+
     function settingsOpen() {
+      fillSamplingFields(); showSamplingNote();
+      document.getElementById('set-trunc-on').checked = truncOn;
+      document.getElementById('set-trunc-lines').value = truncLines;
       document.getElementById('set-persona').value = currentPersona;
       document.getElementById('set-mem-on').checked = memoryOn;
       document.getElementById('set-finish-on').checked = finishOn;

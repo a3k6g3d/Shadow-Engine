@@ -843,6 +843,295 @@ fn hop_report() {
     eprintln!("{line}");
 }
 
+// ---------------------------------------------------------------------------------------------------------------------------------------------
+// The disk format of the conversation cache (`shadow-serve/src/convdisk.rs`): a snapshot is split into its per-position rows (the attention layers' keys, values,
+// indexer rows and pooled blocks, the draft layer's K/V), which depend only on the tokens before them and so are stored once for every conversation that starts
+// the same way, and the rest (the DeltaNet states, the PLE state, the draft layer's pending residual), which is a point in one conversation and is stored per
+// snapshot.  Strides (bytes a position or a block takes) are in the state part so the loader can allocate the whole snapshot before the rows arrive.
+
+/// What a snapshot's per-position rows (for positions `a..b`) hold, in order: for each attention layer with a KV: K, V, indexer rows (positions `a..b`),
+/// the pooled blocks that positions `a..b` complete; then the draft layer's K and V.  The lengths follow from the state part and `a`, `b`.
+struct RowGeom {
+    /// per attention layer: (K / V bytes a position, indexer bytes a position (= bytes a block), positions a block)
+    layers: Vec<Option<(usize, usize, usize)>>,
+    /// the draft layer's K / V bytes a position, when it has a KV
+    mtp: Option<usize>,
+}
+
+impl RowGeom {
+    fn blocks(ratio: usize, x: usize) -> usize {
+        if ratio == 0 { 0 } else { x / ratio }
+    }
+    /// The byte lengths of positions `a..b` in each row buffer, in the order of the rows payload.
+    fn lens(&self, a: usize, b: usize) -> Vec<usize> {
+        let mut o = Vec::new();
+        for (kst, rst, ratio) in self.layers.iter().flatten().copied() {
+            o.push((b - a) * kst);
+            o.push((b - a) * kst);
+            o.push((b - a) * rst);
+            o.push((Self::blocks(ratio, b) - Self::blocks(ratio, a)) * rst);
+        }
+        if let Some(m) = self.mtp {
+            o.push((b - a) * m);
+            o.push((b - a) * m);
+        }
+        o
+    }
+}
+
+fn host_slice<'a, 'c>(s: &'a Saved<'c>) -> Result<&'a [u8], String> {
+    match s {
+        Saved::Host(v) => Ok(v),
+        Saved::Dev(..) => Err("a snapshot kept on the device cannot be written to a file".into()),
+    }
+}
+
+impl<'c> Snapshot<'c> {
+    /// The snapshot for the conversation cache (host snapshot with the KV only): `(state, rows)`, the rows being the per-position buffers' rows for the positions
+    /// `base..len` (what an earlier snapshot of the same start does not already hold) in the order `SnapBuilder::add_rows` takes them.
+    pub fn disk_parts(&self, base: usize) -> Result<(Vec<u8>, Vec<u8>), String> {
+        fn put_u64(o: &mut Vec<u8>, v: usize) {
+            o.extend_from_slice(&(v as u64).to_le_bytes());
+        }
+        fn blob(o: &mut Vec<u8>, s: &Saved) -> Result<(), String> {
+            let v = host_slice(s)?;
+            put_u64(o, v.len());
+            o.extend_from_slice(v);
+            Ok(())
+        }
+        if self.peer.is_some() {
+            return Err("the snapshot of a pair of sessions is not written to a file yet".into());
+        }
+        let n = self.tokens.len();
+        if base > n {
+            return Err("disk_parts: base past the end".into());
+        }
+        let per = |len: usize, what: &str| -> Result<usize, String> {
+            if n == 0 || len == 0 {
+                Ok(0)
+            } else if len % n != 0 {
+                Err(format!("disk_parts: the {what} buffer is not a whole number of positions"))
+            } else {
+                Ok(len / n)
+            }
+        };
+        let mut st = Vec::with_capacity(1 << 20);
+        let mut rows: Vec<u8> = Vec::new();
+        put_u64(&mut st, n);
+        put_u64(&mut st, self.delta.len());
+        for d in &self.delta {
+            match d {
+                Some((a, b)) => {
+                    st.push(1);
+                    blob(&mut st, a)?;
+                    blob(&mut st, b)?;
+                }
+                None => st.push(0),
+            }
+        }
+        blob(&mut st, &self.ple)?;
+        put_u64(&mut st, self.kv.len());
+        for k in &self.kv {
+            match k {
+                None => st.push(0),
+                Some(k) => {
+                    let (kk, vv, raw, blocks) = (host_slice(&k.k)?, host_slice(&k.v)?, host_slice(&k.raw)?, host_slice(&k.blocks)?);
+                    let kst = per(kk.len(), "K")?;
+                    let rst = per(raw.len(), "indexer")?;
+                    if vv.len() != kk.len() {
+                        return Err("disk_parts: K and V differ in size".into());
+                    }
+                    if rst > 0 && (k.ratio == 0 || blocks.len() != RowGeom::blocks(k.ratio, n) * rst) {
+                        return Err("disk_parts: the pooled blocks are not those of the positions held".into());
+                    }
+                    if rst == 0 && !blocks.is_empty() {
+                        return Err("disk_parts: blocks without an indexer".into());
+                    }
+                    st.push(1);
+                    put_u64(&mut st, kst);
+                    put_u64(&mut st, rst);
+                    put_u64(&mut st, k.ratio);
+                    put_u64(&mut st, k.nblocks);
+                    let ratio = if rst > 0 { k.ratio } else { 0 };
+                    rows.extend_from_slice(&kk[base * kst..n * kst]);
+                    rows.extend_from_slice(&vv[base * kst..n * kst]);
+                    rows.extend_from_slice(&raw[base * rst..n * rst]);
+                    rows.extend_from_slice(&blocks[RowGeom::blocks(ratio, base) * rst..RowGeom::blocks(ratio, n) * rst]);
+                }
+            }
+        }
+        put_u64(&mut st, self.nblocks.len());
+        for &x in &self.nblocks {
+            put_u64(&mut st, x);
+        }
+        match &self.mtp {
+            None => st.push(0),
+            Some((last, pending, kv)) => {
+                st.push(1);
+                blob(&mut st, last)?;
+                st.push(*pending as u8);
+                match kv {
+                    None => st.push(0),
+                    Some((k, v)) => {
+                        let (kk, vv) = (host_slice(k)?, host_slice(v)?);
+                        let m = per(kk.len(), "draft K")?;
+                        if vv.len() != kk.len() {
+                            return Err("disk_parts: the draft layer's K and V differ in size".into());
+                        }
+                        st.push(1);
+                        put_u64(&mut st, m);
+                        rows.extend_from_slice(&kk[base * m..n * m]);
+                        rows.extend_from_slice(&vv[base * m..n * m]);
+                    }
+                }
+            }
+        }
+        Ok((st, rows))
+    }
+
+    /// The start of the snapshot `disk_parts` wrote: its state part and tokens in, a builder (every row buffer allocated, zeroed) out; `SnapBuilder::add_rows` fills it.
+    pub fn builder_from_disk(state: &[u8], tokens: Vec<u32>) -> Result<SnapBuilder<'c>, String> {
+        struct R<'a> {
+            b: &'a [u8],
+            at: usize,
+        }
+        impl R<'_> {
+            fn take(&mut self, n: usize) -> Result<&[u8], String> {
+                if self.at.checked_add(n).is_none_or(|e| e > self.b.len()) {
+                    return Err("the snapshot state is cut short".into());
+                }
+                let s = &self.b[self.at..self.at + n];
+                self.at += n;
+                Ok(s)
+            }
+            fn u64(&mut self) -> Result<usize, String> {
+                Ok(u64::from_le_bytes(self.take(8)?.try_into().unwrap()) as usize)
+            }
+            fn u8(&mut self) -> Result<u8, String> {
+                Ok(self.take(1)?[0])
+            }
+            fn saved<'c>(&mut self) -> Result<Saved<'c>, String> {
+                let n = self.u64()?;
+                Ok(Saved::Host(self.take(n)?.to_vec()))
+            }
+        }
+        let mut r = R { b: state, at: 0 };
+        let n = r.u64()?;
+        if n != tokens.len() {
+            return Err("the snapshot state and its tokens disagree".into());
+        }
+        let alloc = |bytes: usize| -> Result<Saved<'c>, String> {
+            if bytes > (1usize << 36) {
+                return Err("a snapshot buffer of an implausible size".into());
+            }
+            Ok(Saved::Host(vec![0u8; bytes]))
+        };
+        let nd = r.u64()?;
+        let mut delta = Vec::with_capacity(nd.min(1024));
+        for _ in 0..nd {
+            delta.push(if r.u8()? == 1 { Some((r.saved()?, r.saved()?)) } else { None });
+        }
+        let ple = r.saved()?;
+        let nk = r.u64()?;
+        let mut kv = Vec::with_capacity(nk.min(1024));
+        let mut layers = Vec::with_capacity(nk.min(1024));
+        for _ in 0..nk {
+            if r.u8()? == 1 {
+                let (kst, rst, ratio, nblocks) = (r.u64()?, r.u64()?, r.u64()?, r.u64()?);
+                let nb = RowGeom::blocks(if rst > 0 { ratio } else { 0 }, n);
+                kv.push(Some(SnapKv { k: alloc(n * kst)?, v: alloc(n * kst)?, raw: alloc(n * rst)?, blocks: alloc(nb * rst)?, nblocks, ratio }));
+                layers.push(Some((kst, rst, if rst > 0 { ratio } else { 0 })));
+            } else {
+                kv.push(None);
+                layers.push(None);
+            }
+        }
+        let nn = r.u64()?;
+        let mut nblocks = Vec::with_capacity(nn.min(1024));
+        for _ in 0..nn {
+            nblocks.push(r.u64()?);
+        }
+        let (mtp, mgeom) = if r.u8()? == 1 {
+            let last = r.saved()?;
+            let pending = r.u8()? == 1;
+            if r.u8()? == 1 {
+                let m = r.u64()?;
+                (Some((last, pending, Some((alloc(n * m)?, alloc(n * m)?)))), Some(m))
+            } else {
+                (Some((last, pending, None)), None)
+            }
+        } else {
+            (None, None)
+        };
+        Ok(SnapBuilder {
+            snap: Snapshot { tokens, delta, ple, kv, nblocks, mtp, peer: None },
+            geom: RowGeom { layers, mtp: mgeom },
+            have: 0,
+        })
+    }
+}
+
+/// A snapshot being read back from the conversation cache: its rows arrive in position order, a range at a time (`add_rows`), each copied into place.
+pub struct SnapBuilder<'c> {
+    snap: Snapshot<'c>,
+    geom: RowGeom,
+    have: usize,
+}
+
+impl<'c> SnapBuilder<'c> {
+    /// The rows of positions `a..b` as `Snapshot::disk_parts` laid them out; `a` must be where the previous range ended.
+    pub fn add_rows(&mut self, a: usize, b: usize, rows: &[u8]) -> Result<(), String> {
+        self.add_segment_rows(a, b, a, b, rows)
+    }
+
+    /// Positions `a..b`, taken from a stored segment: `payload` holds the rows of positions `start..end` (`a..b` inside them) laid out as `disk_parts` does.
+    pub fn add_segment_rows(&mut self, a: usize, b: usize, start: usize, end: usize, payload: &[u8]) -> Result<(), String> {
+        let n = self.snap.tokens.len();
+        if a != self.have || b < a || start > a || b > end || b > n {
+            return Err(format!("the snapshot's rows arrive out of order (have {}, got {a}..{b} of a segment {start}..{end}, {n} positions)", self.have));
+        }
+        let lens = self.geom.lens(start, end);
+        if lens.iter().sum::<usize>() != payload.len() {
+            return Err("a stored range of rows is not the size its positions need".into());
+        }
+        // where each buffer's rows start in the payload
+        let mut offs = Vec::with_capacity(lens.len());
+        let mut acc = 0usize;
+        for l in &lens {
+            offs.push(acc);
+            acc += l;
+        }
+        let mut j = 0usize;
+        let geom = &self.geom;
+        for (kv, g) in self.snap.kv.iter_mut().zip(&geom.layers) {
+            let (Some(k), Some((kst, rst, ratio))) = (kv.as_mut(), g) else { continue };
+            let (Saved::Host(kb), Saved::Host(vb), Saved::Host(rb), Saved::Host(bb)) = (&mut k.k, &mut k.v, &mut k.raw, &mut k.blocks) else {
+                return Err("a builder holds host buffers only".into());
+            };
+            kb[a * kst..b * kst].copy_from_slice(&payload[offs[j] + (a - start) * kst..offs[j] + (b - start) * kst]);
+            vb[a * kst..b * kst].copy_from_slice(&payload[offs[j + 1] + (a - start) * kst..offs[j + 1] + (b - start) * kst]);
+            rb[a * rst..b * rst].copy_from_slice(&payload[offs[j + 2] + (a - start) * rst..offs[j + 2] + (b - start) * rst]);
+            let (b0, b1, bs) = (RowGeom::blocks(*ratio, a), RowGeom::blocks(*ratio, b), RowGeom::blocks(*ratio, start));
+            bb[b0 * rst..b1 * rst].copy_from_slice(&payload[offs[j + 3] + (b0 - bs) * rst..offs[j + 3] + (b1 - bs) * rst]);
+            j += 4;
+        }
+        if let (Some((_, _, Some((Saved::Host(kb), Saved::Host(vb))))), Some(m)) = (self.snap.mtp.as_mut(), geom.mtp) {
+            kb[a * m..b * m].copy_from_slice(&payload[offs[j] + (a - start) * m..offs[j] + (b - start) * m]);
+            vb[a * m..b * m].copy_from_slice(&payload[offs[j + 1] + (a - start) * m..offs[j + 1] + (b - start) * m]);
+        }
+        self.have = b;
+        Ok(())
+    }
+
+    /// The snapshot, once every position's rows have been added.
+    pub fn finish(self) -> Result<Snapshot<'c>, String> {
+        if self.have != self.snap.tokens.len() {
+            return Err(format!("the stored rows end at position {} of {}", self.have, self.snap.tokens.len()));
+        }
+        Ok(self.snap)
+    }
+}
+
 /// A session's state at a token boundary (`GpuSession::snapshot`).
 pub struct Snapshot<'c> {
     tokens: Vec<u32>,
@@ -862,6 +1151,8 @@ struct SnapKv<'c> {
     raw: Saved<'c>,
     blocks: Saved<'c>,
     nblocks: usize,
+    /// Positions per pooled block of this layer (0: unknown, a snapshot read from the old file format): what `disk_parts` needs to say which blocks a range of positions completes.
+    ratio: usize,
 }
 
 /// The first bytes of a device buffer, kept on the device (fast, costs VRAM) or in host memory (costs a PCIe trip).
@@ -998,7 +1289,7 @@ impl Snapshot<'_> {
         for _ in 0..nk {
             kv.push(if r.u8()? == 1 {
                 let (k, v, raw, blocks) = (r.saved()?, r.saved()?, r.saved()?, r.saved()?);
-                Some(SnapKv { k, v, raw, blocks, nblocks: r.u64()? })
+                Some(SnapKv { k, v, raw, blocks, nblocks: r.u64()?, ratio: 0 })
             } else {
                 None
             });
@@ -2328,13 +2619,14 @@ impl<'c, 'm> GpuSession<'c, 'm> {
             });
         }
         let mut kv = Vec::with_capacity(self.attn.len());
-        for a in &self.attn {
+        for (l, a) in self.attn.iter().enumerate() {
             kv.push(match a.as_ref().filter(|_| with_kv) {
                 Some(a) => {
                     let id = if a.raw.bytes > 0 { a.raw.bytes / self.cap } else { 0 };
                     Some(SnapKv {
                         k: copy(&a.k, n * kvd * 4)?, v: copy(&a.v, n * kvd * 4)?, raw: copy(&a.raw, n * id)?,
                         blocks: copy(&a.blocks, (a.nblocks * id).min(a.blocks.bytes))?, nblocks: a.nblocks,
+                        ratio: c.compress.get(l).map_or(0, |r| (*r).max(1)),
                     })
                 }
                 None => None,
@@ -7145,5 +7437,97 @@ mod subchunk_tests {
         // an exact multiple and an ordinary remainder are as before
         assert_eq!(prompt_subchunks(2 * 2048, 2048).0, vec![(0, 2048), (2048, 2048)]);
         assert_eq!(prompt_subchunks(2048 + 100, 2048).0, vec![(0, 100), (100, 2048)]);
+    }
+}
+
+/// A made-up host snapshot (two attention layers, one with an indexer pooled 4 positions a block, one without a KV, a draft layer) of `tokens`, for tests of the
+/// conversation cache: a position's rows depend on its index only, as a real KV's depend on the tokens before it, so snapshots of a shorter and a longer start of
+/// the same tokens hold the same rows for the shared positions.
+#[doc(hidden)]
+pub fn test_snapshot<'c>(tokens: Vec<u32>) -> Snapshot<'c> {
+    let n = tokens.len();
+    let rows = |seed: u8, count: usize, stride: usize| -> Saved<'c> {
+        Saved::Host((0..count * stride).map(|i| (i as u8).wrapping_mul(31).wrapping_add(seed).wrapping_add((i / stride.max(1)) as u8 ^ 0x5a)).collect())
+    };
+    let ratio = 4;
+    let layer = |seed: u8, kst: usize, rst: usize| SnapKv {
+        k: rows(seed, n, kst),
+        v: rows(seed.wrapping_add(1), n, kst),
+        raw: rows(seed.wrapping_add(2), n, rst),
+        blocks: rows(seed.wrapping_add(3), n / ratio, rst),
+        nblocks: n / ratio,
+        ratio,
+    };
+    Snapshot {
+        tokens,
+        delta: vec![Some((Saved::Host(vec![n as u8; 40]), Saved::Host(vec![9; 12]))), None],
+        ple: Saved::Host(vec![3; 24]),
+        kv: vec![None, Some(layer(10, 16, 8)), Some(SnapKv { raw: Saved::Host(vec![]), blocks: Saved::Host(vec![]), nblocks: 0, ratio: 0, ..layer(20, 8, 0) })],
+        nblocks: vec![0, n / ratio, 0],
+        mtp: Some((Saved::Host(vec![5; 6]), true, Some((rows(40, n, 12), rows(41, n, 12))))),
+        peer: None,
+    }
+}
+
+#[cfg(test)]
+mod snapshot_disk_tests {
+    use super::*;
+
+    fn snap<'c>(n: usize) -> Snapshot<'c> {
+        test_snapshot((0..n as u32).map(|i| i * 7 % 1000).collect())
+    }
+
+    fn hosts<'a>(s: &'a Snapshot) -> Vec<&'a [u8]> {
+        let h = |x: &'a Saved| match x { Saved::Host(v) => v.as_slice(), _ => panic!() };
+        let mut o = vec![];
+        for (a, b) in s.delta.iter().flatten() {
+            o.push(h(a));
+            o.push(h(b));
+        }
+        o.push(h(&s.ple));
+        for k in s.kv.iter().flatten() {
+            o.extend([h(&k.k), h(&k.v), h(&k.raw), h(&k.blocks)]);
+        }
+        if let Some((l, _, Some((k, v)))) = &s.mtp {
+            o.extend([h(l), h(k), h(v)]);
+        }
+        o
+    }
+
+    #[test]
+    fn a_snapshot_split_into_pieces_and_read_back_is_the_snapshot() {
+        let full = snap(203);
+        // two pieces cut at a position that is not a multiple of the block size, then a third at a block boundary
+        let cuts = [0usize, 70, 160, 203];
+        let mut builder = None;
+        let (state, _) = full.disk_parts(0).unwrap();
+        for w in cuts.windows(2) {
+            // the rows of positions w[0]..w[1] come from the snapshot that was current at w[1] (any longer one holds the same rows)
+            let at_end = snap(w[1]);
+            let (_, rows) = at_end.disk_parts(w[0]).unwrap();
+            let b = builder.get_or_insert_with(|| Snapshot::builder_from_disk(&state, full.tokens.clone()).unwrap());
+            b.add_rows(w[0], w[1], &rows).unwrap();
+        }
+        let back = builder.unwrap().finish().unwrap();
+        assert_eq!(back.tokens, full.tokens);
+        assert_eq!(back.nblocks, full.nblocks);
+        assert_eq!(hosts(&back), hosts(&full));
+        assert_eq!(back.mtp.as_ref().map(|m| m.1), Some(true));
+        assert_eq!(back.kv[1].as_ref().unwrap().nblocks, 203 / 4);
+    }
+
+    #[test]
+    fn rows_out_of_order_or_short_are_refused() {
+        let full = snap(50);
+        let (state, rows) = full.disk_parts(0).unwrap();
+        let mut b = Snapshot::builder_from_disk(&state, full.tokens.clone()).unwrap();
+        assert!(b.add_rows(10, 50, &rows).is_err(), "must start where the previous range ended");
+        assert!(b.add_rows(0, 49, &rows).is_err(), "a range with the wrong number of bytes");
+        let b2 = Snapshot::builder_from_disk(&state, full.tokens.clone()).unwrap();
+        assert!(b2.finish().is_err(), "no rows added");
+        let mut b3 = Snapshot::builder_from_disk(&state, full.tokens.clone()).unwrap();
+        b3.add_rows(0, 50, &rows).unwrap();
+        assert!(b3.finish().is_ok());
+        assert!(Snapshot::builder_from_disk(&state[..state.len() - 5], full.tokens.clone()).is_err(), "a cut state");
     }
 }

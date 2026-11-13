@@ -2,8 +2,8 @@
 //!
 //! The session is kept between requests.  If a new prompt's tokens begin with exactly the tokens the session has
 //! already read (a conversation that grew by a turn), only the new tokens are read - the DeltaNet states cannot be
-//! rewound, so anything less than an exact prefix resets the session and reads the prompt whole.  Greedy decoding
-//! only (the plan's open item); a request's sampling parameters are accepted and not used, and `/props` says so.
+//! rewound, so anything less than an exact prefix resets the session and reads the prompt whole.  Decoding is greedy
+//! unless the request carries sampling parameters (`sampler.rs`: temperature, top-k, top-p, min-p, penalties, seed).
 
 use shadow_cuda::session::{GpuSession, Tiers};
 use shadow_model::chat::{render_for_arch, Message, Options};
@@ -22,6 +22,8 @@ pub struct Request {
     pub images: Vec<Vec<u8>>,
     /// Whether to take shared-prefix and conversation snapshots for future turns (default `true`; `false` when `"cache_prompt": false` is sent).
     pub cache_prompt: bool,
+    /// What the request asked for in sampling (`sampler::Sampling`); empty = greedy.
+    pub sampling: crate::sampler::Sampling,
     pub tx: tokio::sync::mpsc::UnboundedSender<Event>,
 }
 
@@ -234,9 +236,8 @@ fn spill(prefix: &mut PrefixCache<'_>) {
     ) else {
         return;
     };
-    match s.to_bytes() {
-        Ok(b) => d.save(&t, b),
-        Err(e) => eprintln!("shadow serve: conversation snapshot not written ({e})"),
+    if let Err(e) = d.save_snapshot(s) {
+        eprintln!("shadow serve: conversation snapshot not written ({e})");
     }
 }
 
@@ -1194,8 +1195,7 @@ fn answer<'c>(
                 .disk
                 .as_ref()
                 .unwrap()
-                .load(&path)
-                .and_then(|b| shadow_cuda::session::Snapshot::from_bytes(&b));
+                .load(&path);
             match snap.and_then(|s| sess.restore_conv(&s)) {
                 Ok(()) => {
                     cached = n; // the drafter keeps its K/V where it can (`GpuSession::restore`, STATUS 98)
@@ -1368,11 +1368,8 @@ fn answer<'c>(
                         prefix.convs.push(s);
                     } else if let Some(d) = prefix.disk.as_ref() {
                         // too big for the RAM pool: straight to disk
-                        match s.to_bytes() {
-                            Ok(b) => d.save(&ids, b),
-                            Err(e) => {
-                                eprintln!("shadow serve: conversation snapshot not written ({e})")
-                            }
+                        if let Err(e) = d.save_snapshot(&s) {
+                            eprintln!("shadow serve: conversation snapshot not written ({e})");
                         }
                     }
                 }
@@ -1410,6 +1407,17 @@ fn answer<'c>(
     } else {
         spec
     };
+    // sampling (temperature, top-k, ...): `None` = greedy.  The draw at an output position depends only on the logits, the reply so far, the seed and the
+    // position, so a drafted token is accepted when it is what the target would have drawn there (see `sampler`)
+    let mut sampler = req.sampling.resolve(
+        std::env::var("SHADOW_DEFAULT_SAMPLING").is_ok_and(|v| v == "model"),
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(1, |d| d.as_nanos() as u64),
+    );
+    if let Some(s) = &sampler {
+        eprintln!("shadow serve: sampling: temperature {} top_k {} top_p {} min_p {} repeat {} presence {} frequency {} seed {}",
+                  s.temperature, if s.top_k == usize::MAX { 0 } else { s.top_k }, s.top_p, s.min_p, s.repeat_penalty, s.presence_penalty, s.frequency_penalty, s.seed);
+    }
+    let mut gen: Vec<u32> = Vec::new(); // the reply so far (what the penalties look at); kept only when sampling
     // a chain stops after a draft the layer is less sure of than this (`SHADOW_SPEC_MIN_P`)
     let spec_min_p: f32 = std::env::var("SHADOW_SPEC_MIN_P")
         .ok()
@@ -1496,12 +1504,18 @@ fn answer<'c>(
             *last_logits = sess.step_batch(&closer).pop().unwrap();
             continue;
         }
-        let next = argmax(last_logits);
+        let next = match sampler.as_mut() {
+            Some(sm) => sm.sample(last_logits, n, &gen),
+            None => argmax(last_logits),
+        };
         if tok.is_eog(next) || stops.contains(&next) {
             finish = "stop";
             break;
         }
         n += 1;
+        if sampler.is_some() {
+            gen.push(next);
+        }
         if loop_guard {
             made.push(next);
         }
@@ -1554,10 +1568,17 @@ fn answer<'c>(
             for (i, &d) in draft.iter().enumerate() {
                 spec_pos[i.min(7)].0 += 1;
                 // a stop token is left for the top of the loop to see, as without speculation
-                if argmax(&outs[i]) != d || tok.is_eog(d) || stops.contains(&d) {
+                let want = match sampler.as_mut() {
+                    Some(sm) => sm.sample(&outs[i], n, &gen),
+                    None => argmax(&outs[i]),
+                };
+                if want != d || tok.is_eog(d) || stops.contains(&d) {
                     break;
                 }
                 n += 1;
+                if sampler.is_some() {
+                    gen.push(d);
+                }
                 keep += 1;
                 spec_pos[i.min(7)].1 += 1;
                 hist.push(d);
