@@ -1404,6 +1404,7 @@ fn builtin_tool_definitions_core() -> Value {
                 "type": "object",
                 "properties": {
                     "command": { "type": "string", "description": "PowerShell command to run on Windows" },
+                    "description": { "type": "string", "description": "A few words saying what this command does, shown to the user instead of the command line (for example: Run the unit tests)" },
                     "cwd": { "type": "string", "description": "Working directory" }
                 },
                 "required": ["command"]

@@ -456,6 +456,27 @@ canvas.spark { width: 100%; height: 64px; display: block; }
       line-height: 1.5;
     }
 
+    /* Tool calls, Claude Code style: a group a turn ("Ran 2 commands"), a line a call, `$ command` and the output when a call is opened */
+    .tool-group { margin: 0.55rem 0; }
+    .tool-group-head { display: flex; align-items: center; gap: 0.4rem; cursor: pointer; color: var(--text-muted); font-size: 0.86rem; user-select: none; padding: 0.15rem 0; }
+    .tool-group-head:hover { color: var(--text); }
+    .tool-group-chev { font-size: 0.7rem; display: inline-block; transition: transform 0.15s; }
+    .tool-group.open > .tool-group-head .tool-group-chev { transform: rotate(90deg); }
+    .tool-group.running > .tool-group-head .tool-group-label { animation: throb 1.8s ease-in-out infinite; }
+    .tool-group-body { display: none; border-left: 2px solid var(--tool-border); margin-left: 0.3rem; padding-left: 0.75rem; }
+    .tool-group.open > .tool-group-body { display: block; }
+    .tool-group .tool-call-block { background: none; border: none; border-radius: 0; padding: 0.1rem 0; margin: 0.25rem 0; }
+    .tool-group .tool-header { font-weight: 400; justify-content: flex-start; gap: 0.5rem; }
+    .tool-step { min-inline-size: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .tool-step b { font-weight: 600; margin-right: 0.3rem; }
+    .tool-step code { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; font-size: 0.8rem; opacity: 0.9; }
+    .tool-status { margin-left: auto; font-size: 0.72rem; opacity: 0.7; white-space: nowrap; flex: none; }
+    .tool-call-block[data-state=error] .tool-status, .tool-call-block[data-state=denied] .tool-status { color: var(--danger); opacity: 1; }
+    .tool-detail { display: none; }
+    .tool-call-block.open > .tool-detail { display: block; }
+    .tool-cmd { margin-top: 0.4rem; font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; font-size: 0.8rem; white-space: pre-wrap; word-break: break-word; color: var(--text); }
+    .tool-cmd .tool-prompt { color: var(--accent); margin-right: 0.35rem; }
+
     /* Tool Call Card */
     .tool-call-block {
       background: var(--tool-bg);
@@ -1403,7 +1424,7 @@ canvas.spark { width: 100%; height: 64px; display: block; }
     // after the persona when tools are on.  LEGACY_PERSONA is the one-piece default of before STATUS 122 (kept to recognise a saved copy of it and to run the old arm of the A-B test).
     const LEGACY_PERSONA = "You are Shadow, a capable AI assistant running locally on the user's Windows PC: nothing you are told leaves this machine. Be direct and accurate, keep answers as short as the question allows, and say so when you are unsure. You can use tools: read_file, glob, grep, edit_file, write_file, cmd (PowerShell), web_search and web_fetch (use these for anything current or that you are not sure of, and cite the page), and any mcp__ tools you are given. When asked to look at, test or change files, use the tools instead of describing what you would do. If the user asks you to take a role for a task (for example 'act as a software engineer and design this'), do that for the task. Your context window is small. Earlier tool outputs are shortened to a preview that says how to read them again (recall with id=N or message=N, optionally a line range or a text to search for), old turns become one-line summaries that name their messages (recall with message=N), and recall with only a text searches everything earlier (search finds files and earlier outputs by keyword, ranked by BM25 and path match). Keep pinned notes with the notes tool (the plan, the decisions, the facts you will need with file and line numbers): they are shown to you at the end of every request and never shortened. To change code: read just the lines you need with read_file (about 100), then replace them by line number with replace_lines (give expect, a piece of the old text, so a stale number cannot overwrite the wrong lines), or use edit_file with the exact old text. After reading something you will need later, put the facts in your notes, and do not read the same part twice; after about eight reads in a row, stop reading, save your notes and make the edit. Work in small steps and finish with an answer.";
     const DEFAULT_PERSONA = "You are Shadow, a capable assistant running locally on the user's Windows PC; nothing you are told leaves this machine. Be direct and accurate, and keep answers as short as the question allows. Say so when you are unsure, and never claim you ran, tested or verified something you did not. Answer ordinary questions directly, and use tools only when the task is about files, commands or current information. Think briefly: if you notice you are repeating a point you already reasoned through, stop and commit to an answer. Use markdown and fenced code blocks for code. Reply in the user's language. If asked to take a role for a task (for example 'act as a software engineer and design this'), do that for the task.";
-    const ENGINE_RULES = "Use tools for anything about files, commands or current information: web_search and web_fetch for anything current or that you are not sure of (and cite the page), and any mcp__ tools you are given. When asked to look at, test or change files, use the tools instead of describing what you would do. Your context window is small. Earlier tool outputs are shortened to a preview that says how to read them again (recall with id=N or message=N, optionally a line range or a text to search for), old turns become one-line summaries that name their messages (recall with message=N), and recall with only a text searches everything earlier (search finds files and earlier outputs by keyword, ranked by BM25 and path match). Keep pinned notes with the notes tool (the plan, the decisions, the facts you will need with file and line numbers): they are shown to you at the end of every request and never shortened. To change code: read just the lines you need with read_file (about 100), then replace them by line number with replace_lines (give expect, a piece of the old text, so a stale number cannot overwrite the wrong lines), or use edit_file with the exact old text. After reading something you will need later, put the facts in your notes, and do not read the same part twice; after about eight reads in a row, stop reading, save your notes and make the edit. Work in small steps and finish with an answer.";
+    const ENGINE_RULES = "Use tools for anything about files, commands or current information: web_search and web_fetch for anything current or that you are not sure of (and cite the page), and any mcp__ tools you are given. When asked to look at, test or change files, use the tools instead of describing what you would do. Give every cmd call a short description (what it does, in a few words). Your context window is small. Earlier tool outputs are shortened to a preview that says how to read them again (recall with id=N or message=N, optionally a line range or a text to search for), old turns become one-line summaries that name their messages (recall with message=N), and recall with only a text searches everything earlier (search finds files and earlier outputs by keyword, ranked by BM25 and path match). Keep pinned notes with the notes tool (the plan, the decisions, the facts you will need with file and line numbers): they are shown to you at the end of every request and never shortened. To change code: read just the lines you need with read_file (about 100), then replace them by line number with replace_lines (give expect, a piece of the old text, so a stale number cannot overwrite the wrong lines), or use edit_file with the exact old text. After reading something you will need later, put the facts in your notes, and do not read the same part twice; after about eight reads in a row, stop reading, save your notes and make the edit. Work in small steps and finish with an answer.";
     let currentPersona = localStorage.getItem('shadow_persona') || DEFAULT_PERSONA;
     {
       const saved = currentPersona.trim();
@@ -1477,6 +1498,8 @@ canvas.spark { width: 100%; height: 64px; display: block; }
       }
       isGenerating = false;
       document.querySelectorAll('.msg-row.working, .tool-call-block.running').forEach(r => r.classList.remove('working', 'running'));
+      document.querySelectorAll('.tool-call-block[data-state=running]').forEach(c => { c.dataset.state = 'stopped'; const st = c.querySelector('.tool-status'); if (st) st.textContent = 'Stopped'; });
+      document.querySelectorAll('.tool-group.running').forEach(refreshToolGroup);
       sendBtn.textContent = 'Send';
       sendBtn.style.display = 'flex';
       stopBtn.style.display = 'none';
@@ -1685,13 +1708,15 @@ canvas.spark { width: 100%; height: 64px; display: block; }
           '<button type="button" data-a="always">Always allow ' + (tc.name === 'cmd' ? 'this command' : escapeHtml(tc.name)) + ' in this chat</button>' +
           '<button type="button" class="deny" data-a="deny">Deny</button></div>';
         toolCard.appendChild(box);
-        const head = toolCard.querySelector('.tool-header span:last-child');
+        const head = toolCard.querySelector('.tool-status');
         if (head) head.textContent = 'Waiting for you';
         toolCard.classList.remove('running');
+        toolCard.dataset.waiting = '1';
+        refreshToolGroupOf(toolCard);
         scrollToBottom(false);
         let done = false;
-        const finish = (v, err) => { if (done) return; done = true; box.remove(); if (sig) sig.removeEventListener('abort', onAbort); if (err) reject(err); else resolve(v); };
-        const onAbort = () => { const h = toolCard.querySelector('.tool-header span:last-child'); if (h) h.textContent = 'Stopped'; finish(null, new DOMException('Stopped', 'AbortError')); };
+        const finish = (v, err) => { if (done) return; done = true; box.remove(); delete toolCard.dataset.waiting; toolCard.dataset.state = 'running'; refreshToolGroupOf(toolCard); if (sig) sig.removeEventListener('abort', onAbort); if (err) reject(err); else resolve(v); };
+        const onAbort = () => { const h = toolCard.querySelector('.tool-status'); if (h) h.textContent = 'Stopped'; finish(null, new DOMException('Stopped', 'AbortError')); toolCard.dataset.state = 'stopped'; refreshToolGroupOf(toolCard); };
         if (sig) { if (sig.aborted) return onAbort(); sig.addEventListener('abort', onAbort); }
         box.querySelectorAll('button').forEach(b => b.onclick = () => {
           const a = b.dataset.a;
@@ -2024,13 +2049,90 @@ canvas.spark { width: 100%; height: 64px; display: block; }
       }).join(' · ');
     }
 
+    // ---- how a tool call is shown (like Claude Code): one group a reply ("Ran 2 commands"), one line a call (what it did, to what), `$ command` and the output when it is opened
+    const baseName = p => String(p === undefined || p === null ? '' : p).replace(/[\\/]+$/, '').split(/[\\/]/).pop() || String(p);
+    const clipText = (s, n) => { s = String(s === undefined || s === null ? '' : s).replace(/\s+/g, ' ').trim(); return s.length > n ? s.slice(0, n - 1) + '\u2026' : s; };
+    function toolKind(name) {
+      return { cmd: 'cmd', read_file: 'read', edit_file: 'edit', replace_lines: 'edit', write_file: 'write', grep: 'search', glob: 'search', search: 'search', web_search: 'web', web_fetch: 'fetch', recall: 'recall', notes: 'notes' }[name] || 'other';
+    }
+    // [verb, target, target is code]
+    function toolStep(tc) {
+      const a = tc.arguments || {}, k = toolKind(tc.name);
+      if (k === 'cmd') return a.description ? [clipText(a.description, 110), '', false] : ['Ran', clipText(a.command, 110), true];
+      if (k === 'read') return ['Read', baseName(a.path || a.file), true];
+      if (k === 'edit') return ['Edited', baseName(a.path || a.file), true];
+      if (k === 'write') return ['Wrote', baseName(a.path || a.file), true];
+      if (tc.name === 'grep') return ['Searched for', clipText(a.pattern || a.query, 70) + (a.path ? ' in ' + baseName(a.path) : ''), true];
+      if (tc.name === 'glob') return ['Listed files', clipText(a.pattern || a.path, 70), true];
+      if (tc.name === 'search') return ['Searched the project for', clipText(a.query, 70), false];
+      if (k === 'web') return ['Searched the web for', clipText(a.query, 70), false];
+      if (k === 'fetch') return ['Fetched', clipText(a.url, 90), true];
+      if (k === 'recall') return ['Recalled', clipText(a.query || (a.message !== undefined ? 'message ' + a.message : a.id !== undefined ? 'output #' + a.id : ''), 70), false];
+      if (k === 'notes') return ['Updated the notes', '', false];
+      return ['Used', clipText(tc.name.replace(/^mcp__/, '').replace(/__/g, ' / '), 60), true];
+    }
+    // the opened call: the command (`$ ...`), or the arguments, then (separately) the output
+    function toolDetailHtml(tc) {
+      const a = tc.arguments || {};
+      if (tc.name === 'cmd') return '<span class="tool-prompt">$</span>' + escapeHtml(String(a.command || '')) + (a.cwd ? '\n<span style="opacity:0.7">in ' + escapeHtml(String(a.cwd)) + '</span>' : '');
+      const keys = Object.keys(a);
+      return keys.length ? keys.map(key => '<span style="opacity:0.7">' + escapeHtml(key) + ':</span> ' + escapeHtml(clipText(a[key], 400))).join('\n') : '';
+    }
+    function toolCardHtml(tc, state, status, out) {
+      const [verb, target, code] = toolStep(tc);
+      return `<div class="tool-call-block${state === 'running' ? ' running' : ''}" data-kind="${toolKind(tc.name)}" data-state="${state}">` +
+        `<div class="tool-header" onclick="toggleToolOutput(this)"><span class="tool-step"><b>${escapeHtml(verb)}</b>${target ? (code ? '<code>' + escapeHtml(target) + '</code>' : escapeHtml(target)) : ''}</span><span class="tool-status">${escapeHtml(status)}</span></div>` +
+        `<div class="tool-detail"><div class="tool-cmd">${toolDetailHtml(tc)}</div><div class="tool-output">${escapeHtml(out)}</div></div></div>`;
+    }
+    // "Ran 2 commands, read 3 files"
+    function toolGroupText(kinds, failed, running) {
+      const n = new Map();
+      kinds.forEach(k => n.set(k, (n.get(k) || 0) + 1));
+      const pl = (c, one, many) => c + ' ' + (c === 1 ? one : many);
+      const phrase = { cmd: c => 'ran ' + pl(c, 'command', 'commands'), read: c => 'read ' + pl(c, 'file', 'files'), edit: c => 'edited ' + pl(c, 'file', 'files'), write: c => 'wrote ' + pl(c, 'file', 'files'),
+        search: c => 'searched ' + pl(c, 'time', 'times'), web: c => c === 1 ? 'searched the web' : 'searched the web ' + c + ' times', fetch: c => 'fetched ' + pl(c, 'page', 'pages'),
+        recall: () => 'recalled earlier output', notes: () => 'updated the notes', other: c => 'used ' + pl(c, 'tool', 'tools') };
+      let t = Array.from(n.entries()).map(([k, c]) => phrase[k](c)).join(', ');
+      t = t.charAt(0).toUpperCase() + t.slice(1);
+      return t + (failed ? ' \u00b7 ' + failed + ' failed' : '') + (running ? '\u2026' : '');
+    }
+    function toolGroupFor(bubbleEl) {
+      let g = bubbleEl.querySelector(':scope > .tool-group');
+      if (!g) {
+        g = document.createElement('div');
+        g.className = 'tool-group';
+        g.innerHTML = '<div class="tool-group-head" onclick="toggleToolGroup(this)"><span class="tool-group-chev">\u25b8</span><span class="tool-group-label"></span></div><div class="tool-group-body"></div>';
+        bubbleEl.appendChild(g);
+      }
+      return g;
+    }
+    // the group's line follows its calls; a group being worked on is open (and a call waiting for the user keeps it open), a finished one closes unless the user opened it
+    function refreshToolGroup(g) {
+      if (!g) return;
+      const cards = Array.from(g.querySelectorAll('.tool-call-block'));
+      const running = cards.some(c => c.dataset.state === 'running' || c.dataset.waiting === '1');
+      g.classList.toggle('running', running);
+      g.querySelector('.tool-group-label').textContent = toolGroupText(cards.map(c => c.dataset.kind), cards.filter(c => c.dataset.state === 'error').length, running);
+      if (g.dataset.live === '1' && !g.dataset.touched) g.classList.toggle('open', running);
+      if (cards.some(c => c.dataset.waiting === '1')) g.classList.add('open');
+    }
+    function refreshToolGroupOf(card) { refreshToolGroup(card && card.closest('.tool-group')); }
+    function toggleToolGroup(head) {
+      const g = head.closest('.tool-group');
+      g.classList.toggle('open');
+      g.dataset.touched = '1';
+    }
+    // a restored reply's calls: one closed group
+    function toolGroupHtml(items) {
+      const cards = items.map(it => toolCardHtml(it.tc, it.state, it.state === 'error' ? 'Error' : 'Done', it.out)).join('');
+      return `<div class="tool-group"><div class="tool-group-head" onclick="toggleToolGroup(this)"><span class="tool-group-chev">\u25b8</span><span class="tool-group-label">${escapeHtml(toolGroupText(items.map(it => toolKind(it.tc.name)), items.filter(it => it.state === 'error').length, false))}</span></div><div class="tool-group-body">${cards}</div></div>`;
+    }
+
     function toggleToolOutput(headerEl) {
       const card = headerEl.closest('.tool-call-block');
       if (!card) return;
-      const out = card.querySelector('.tool-output');
-      if (!out) return;
-      const hidden = out.style.display === 'none';
-      out.style.display = hidden ? 'block' : 'none';
+      card.classList.toggle('open');
+      card.querySelectorAll('.tool-output').forEach(markClipped);
     }
 
     // Execute tool on Windows via /v1/tools/execute
@@ -2628,16 +2730,13 @@ canvas.spark { width: 100%; height: 64px; display: block; }
                 scrollToBottom(false);
                 continue;
               }
-              const argSummary = formatToolArgsSummary(tc.arguments);
-              const toolCard = document.createElement('div');
-              toolCard.className = 'tool-call-block running';
-              toolCard.innerHTML = `
-                <div class="tool-header" onclick="toggleToolOutput(this)">
-                  <span>⚡ Windows Tool: <strong>${escapeHtml(tc.name)}</strong>${argSummary ? ` <small style="opacity:0.78; font-weight:normal;">(${escapeHtml(argSummary)})</small>` : ''}</span>
-                  <span style="font-size:0.75rem; opacity:0.8;">Running...</span>
-                </div>
-                <div class="tool-output">Executing in PowerShell...</div>`;
-              bubbleEl.appendChild(toolCard);
+              const holder = document.createElement('div');
+              holder.innerHTML = toolCardHtml(tc, 'running', 'Running\u2026', 'Executing\u2026');
+              const toolCard = holder.firstElementChild;
+              const toolGrp = toolGroupFor(bubbleEl);
+              toolGrp.dataset.live = '1';
+              toolGrp.querySelector('.tool-group-body').appendChild(toolCard);
+              refreshToolGroup(toolGrp);
               scrollToBottom(false);
 
               let result;
@@ -2668,9 +2767,11 @@ canvas.spark { width: 100%; height: 64px; display: block; }
               if (tc.name.startsWith('mcp__browser__')) browserNote(result.output);
               toolCard.classList.remove('running');
               const outputEl = toolCard.querySelector('.tool-output');
-              toolCard.querySelector('.tool-header span:last-child').textContent = (toolCard.dataset.denied ? 'Denied' : result.is_error ? 'Error' : 'Complete') + ' ▾';
+              toolCard.dataset.state = toolCard.dataset.denied ? 'denied' : result.is_error ? 'error' : 'done';
+              toolCard.querySelector('.tool-status').textContent = toolCard.dataset.denied ? 'Denied' : result.is_error ? 'Error' : 'Done';
               outputEl.textContent = result.output;
               markClipped(outputEl);
+              refreshToolGroupOf(toolCard);
 
               // Append tool response turn to history
               history.push({
@@ -2912,6 +3013,7 @@ canvas.spark { width: 100%; height: 64px; display: block; }
         // Skip empty assistant entries (e.g. a turn stopped before any content or tool call was produced)
         if (!clean && !toolCalls.length) return;
         let cardsHtml = '';
+        const groupItems = [];
         if (toolCalls.length && Array.isArray(all)) {
           let tCursor = (idx || 0) + 1;
           for (const tc of toolCalls) {
@@ -2925,16 +3027,9 @@ canvas.spark { width: 100%; height: 64px; display: block; }
               cardsHtml += finishCardHtml(parseFinish(tc.arguments));
               continue;
             }
-            const argSummary = formatToolArgsSummary(tc.arguments);
-            cardsHtml += `
-              <div class="tool-call-block">
-                <div class="tool-header" onclick="toggleToolOutput(this)">
-                  <span>⚡ Windows Tool: <strong>${escapeHtml(tc.name)}</strong>${argSummary ? ` <small style="opacity:0.78; font-weight:normal;">(${escapeHtml(argSummary)})</small>` : ''}</span>
-                  <span style="font-size:0.75rem; opacity:0.8;">Complete ▾</span>
-                </div>
-                <div class="tool-output">${escapeHtml(toolOut || '(tool output recorded)')}</div>
-              </div>`;
+            groupItems.push({ tc, out: toolOut || '(tool output recorded)', state: /^error:/i.test(toolOut) ? 'error' : 'done' });
           }
+          if (groupItems.length) cardsHtml += toolGroupHtml(groupItems);
         }
         const proseHtml = clean ? `<div class="msg-content">${renderMarkdown(clean)}</div>` : `<div class="msg-content" style="display:none;"></div>`;
         row.innerHTML = `<div class="avatar">S</div><div class="bubble">${proseHtml}${cardsHtml}</div>`;
