@@ -465,6 +465,7 @@ canvas.spark { width: 100%; height: 64px; display: block; }
     .tool-group.running > .tool-group-head .tool-group-label { animation: throb 1.8s ease-in-out infinite; }
     .tool-group-body { display: none; border-left: 2px solid var(--tool-border); margin-left: 0.3rem; padding-left: 0.75rem; }
     .tool-group.open > .tool-group-body { display: block; }
+    .tool-group-body .think-block { margin: 0.3rem 0; }
     .tool-group .tool-call-block { background: none; border: none; border-radius: 0; padding: 0.1rem 0; margin: 0.25rem 0; }
     .tool-group .tool-header { font-weight: 400; justify-content: flex-start; gap: 0.5rem; }
     .tool-step { min-inline-size: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -2103,6 +2104,9 @@ canvas.spark { width: 100%; height: 64px; display: block; }
         g.className = 'tool-group';
         g.innerHTML = '<div class="tool-group-head" onclick="toggleToolGroup(this)"><span class="tool-group-chev">\u25b8</span><span class="tool-group-label"></span></div><div class="tool-group-body"></div>';
         bubbleEl.appendChild(g);
+        // the reply's thinking goes into the group, in front of its calls (so a run of tool replies is one group with the thinking and the calls in order)
+        const tb = bubbleEl.querySelector(':scope > .think-block');
+        if (tb) g.querySelector('.tool-group-body').appendChild(tb);
       }
       return g;
     }
@@ -2126,7 +2130,7 @@ canvas.spark { width: 100%; height: 64px; display: block; }
       const prose = prev.querySelector(':scope > .bubble > .msg-content');
       if (prose && prose.textContent.trim()) return;
       const body = g.querySelector('.tool-group-body');
-      Array.from(pg.querySelectorAll('.tool-call-block')).reverse().forEach(c => body.prepend(c));
+      Array.from(pg.querySelector('.tool-group-body').children).reverse().forEach(c => body.prepend(c));   // its thinking and its calls, in order
       if (pg.dataset.touched) { g.dataset.touched = '1'; if (pg.classList.contains('open')) g.classList.add('open'); }
       pg.remove();
       refreshToolGroup(g);
