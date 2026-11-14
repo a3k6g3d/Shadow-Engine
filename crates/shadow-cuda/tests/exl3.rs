@@ -1,0 +1,173 @@
+//! The EXL3 GPU kernels (`kernels/exl3.cu`) against the CPU reference (`shadow_model::exl3`): the codebook bit for bit over all
+//! 65,536 states, and the matvec in its three shapes (one input, up to 8 inputs, a table of matrices) at every bit rate on
+//! random blobs and on the two real tensors of `eval/fixtures/exl3_sample.safetensors`.  The GPU sums in f32 in another order
+//! than the CPU's f64, so the bound is relative to the size of the sum.  Skips with no CUDA device.
+
+use shadow_cuda::kernels::{file, Arg, Program};
+use shadow_cuda::{nvrtc, Context};
+use shadow_model::exl3::{blob_len, codebook, matvec_blob, Exl3Linear};
+use shadow_model::half::{f16_to_f32, f32_to_f16};
+use shadow_model::safetensors::SafeTensors;
+
+struct Rng(u64);
+
+impl Rng {
+    fn next(&mut self) -> u64 {
+        self.0 ^= self.0 << 13;
+        self.0 ^= self.0 >> 7;
+        self.0 ^= self.0 << 17;
+        self.0
+    }
+    fn unit(&mut self) -> f32 {
+        (self.next() % 20001) as f32 / 10000.0 - 1.0
+    }
+}
+
+fn random_blob(rng: &mut Rng, inf: usize, outf: usize, bits: usize) -> Vec<u8> {
+    let mut b = Vec::with_capacity(blob_len(inf, outf, bits));
+    for i in 0..inf + outf {
+        // sign vectors are +-1 (suh); the output scales (svh) are small positive numbers
+        let v = if i < inf { if rng.next() & 1 == 0 { 1.0 } else { -1.0 } } else { 0.3 + (rng.next() % 100) as f32 / 100.0 };
+        b.extend_from_slice(&f32_to_f16(v).to_le_bytes());
+    }
+    b.extend_from_slice(&1i32.to_le_bytes());
+    for _ in 0..inf * outf * bits / 8 / 2 {
+        b.extend_from_slice(&(rng.next() as u16).to_le_bytes());
+    }
+    assert_eq!(b.len(), blob_len(inf, outf, bits));
+    b
+}
+
+fn check(got: &[f32], want: &[f32], what: &str) {
+    let scale = want.iter().map(|v| v.abs()).fold(0.0f32, f32::max).max(1e-6);
+    let worst = got.iter().zip(want).map(|(g, w)| (g - w).abs()).fold(0.0f32, f32::max);
+    assert!(worst <= 2e-4 * scale, "{what}: worst difference {worst} against a largest output of {scale}");
+}
+
+fn gpu_ctx() -> Option<Context> {
+    let ctx = match Context::new(0) {
+        Ok(c) => c,
+        Err(e) => return { eprintln!("SKIPPED, not passed: no CUDA device ({e})"); None },
+    };
+    if let Err(e) = nvrtc::version() {
+        eprintln!("SKIPPED, not passed: no NVRTC ({e})");
+        return None;
+    }
+    Some(ctx)
+}
+
+fn floats(b: &[u8]) -> Vec<f32> {
+    b.chunks_exact(4).map(|c| f32::from_le_bytes(c.try_into().unwrap())).collect()
+}
+
+#[test]
+fn the_gpu_codebook_is_the_cpu_codebook_bit_for_bit() {
+    let Some(ctx) = gpu_ctx() else { return };
+    let prog = Program::load(&ctx, file("exl3.cu").unwrap()).unwrap();
+    let out = ctx.alloc(65536 * 4).unwrap();
+    // SAFETY: 65,536 floats at `out`, one thread each.
+    unsafe { prog.launch("exl3_codebook", (256, 1, 1), (256, 1, 1), 0, None, &[Arg::Ptr(out.ptr), Arg::U32(65536)]).unwrap() };
+    ctx.synchronize().unwrap();
+    let mut b = vec![0u8; 65536 * 4];
+    out.download(&mut b).unwrap();
+    for (s, g) in floats(&b).iter().enumerate() {
+        assert_eq!(g.to_bits(), codebook::cb2(s as u32).to_bits(), "state {s}: gpu {g}, cpu {}", codebook::cb2(s as u32));
+    }
+}
+
+#[test]
+fn the_gpu_matvec_matches_the_cpu_on_random_blobs_at_every_bit_rate() {
+    let Some(ctx) = gpu_ctx() else { return };
+    let prog = Program::load(&ctx, file("exl3.cu").unwrap()).unwrap();
+    let mut rng = Rng(0x2545_f491_4f6c_dd1d);
+    for bits in 1..=8usize {
+        for (inf, outf) in [(256usize, 128usize), (640, 256), (384, 384)] {
+            let blob = random_blob(&mut rng, inf, outf, bits);
+            let w = ctx.alloc(blob.len()).unwrap();
+            w.upload(&blob).unwrap();
+            let m = 5usize;
+            let x: Vec<f32> = (0..m * inf).map(|_| rng.unit()).collect();
+            let xb: Vec<u8> = x.iter().flat_map(|v| v.to_le_bytes()).collect();
+            let dx = ctx.alloc(xb.len()).unwrap();
+            dx.upload(&xb).unwrap();
+            let dy = ctx.alloc(m * outf * 4).unwrap();
+            let want: Vec<Vec<f32>> = (0..m).map(|j| matvec_blob(inf, outf, bits, 2, &blob, &x[j * inf..(j + 1) * inf], 2)).collect();
+            let grid = (outf / 128) as u32;
+            let read = |dy: &shadow_cuda::DeviceBuffer, n: usize| -> Vec<f32> {
+                let mut o = vec![0u8; n * 4];
+                dy.download(&mut o).unwrap();
+                floats(&o)
+            };
+            // one input
+            // SAFETY: a blob of this projection at w, `inf` floats at dx, `outf` at dy.
+            unsafe { prog.launch(&format!("matvec_exl3_{bits}"), (grid, 1, 1), (256, 1, 1), 0, None, &[Arg::Ptr(w.ptr), Arg::Ptr(dx.ptr), Arg::Ptr(dy.ptr), Arg::U32(outf as u32), Arg::U32(inf as u32)]).unwrap() };
+            ctx.synchronize().unwrap();
+            check(&read(&dy, outf), &want[0], &format!("matvec_exl3_{bits} {inf}x{outf}"));
+            // m inputs at once, strides wider than the rows
+            let (xs, ys) = (inf + 16, outf + 32);
+            let xpad: Vec<u8> = (0..m).flat_map(|j| x[j * inf..(j + 1) * inf].iter().copied().chain(std::iter::repeat(0.0).take(16))).flat_map(|v: f32| v.to_le_bytes()).collect();
+            let dxp = ctx.alloc(xpad.len()).unwrap();
+            dxp.upload(&xpad).unwrap();
+            let dyp = ctx.alloc(m * ys * 4).unwrap();
+            // SAFETY: m rows of inf floats xs apart at dxp, m rows of outf floats ys apart at dyp.
+            unsafe { prog.launch(&format!("matvec_cols_exl3_{bits}"), (grid, 1, 1), (256, 1, 1), 0, None,
+                                 &[Arg::Ptr(w.ptr), Arg::Ptr(dxp.ptr), Arg::U32(xs as u32), Arg::Ptr(dyp.ptr), Arg::U32(ys as u32), Arg::U32(outf as u32), Arg::U32(inf as u32), Arg::U32(m as u32)]).unwrap() };
+            ctx.synchronize().unwrap();
+            let got = read(&dyp, m * ys);
+            for j in 0..m {
+                check(&got[j * ys..j * ys + outf], &want[j], &format!("matvec_cols_exl3_{bits} {inf}x{outf} input {j}"));
+            }
+            // a table of two different matrices of this shape, one shared input and one input each
+            let blob2 = random_blob(&mut rng, inf, outf, bits);
+            let w2 = ctx.alloc(blob2.len()).unwrap();
+            w2.upload(&blob2).unwrap();
+            let tab: Vec<u8> = [w.ptr, w2.ptr].iter().flat_map(|p| p.to_le_bytes()).collect();
+            let dt = ctx.alloc(tab.len()).unwrap();
+            dt.upload(&tab).unwrap();
+            let dyb = ctx.alloc(2 * outf * 4).unwrap();
+            let want2: Vec<Vec<f32>> = [&blob, &blob2].iter().map(|b| matvec_blob(inf, outf, bits, 2, b, &x[..inf], 2)).collect();
+            for (xstride, name) in [(0usize, "shared input"), (inf, "an input each")] {
+                // SAFETY: a table of two blobs, the inputs at dx (stride xstride), the outputs outf apart at dyb.
+                unsafe { prog.launch(&format!("matvec_batch_exl3_{bits}"), (grid, 2, 1), (256, 1, 1), 0, None,
+                                     &[Arg::Ptr(dt.ptr), Arg::Ptr(dx.ptr), Arg::U32(xstride as u32), Arg::Ptr(dyb.ptr), Arg::U32(outf as u32), Arg::U32(outf as u32), Arg::U32(inf as u32)]).unwrap() };
+                ctx.synchronize().unwrap();
+                let got = read(&dyb, 2 * outf);
+                for b in 0..2 {
+                    let wantb = if xstride == 0 { want2[b].clone() } else { matvec_blob(inf, outf, bits, 2, if b == 0 { &blob } else { &blob2 }, &x[b * inf..(b + 1) * inf], 2) };
+                    check(&got[b * outf..(b + 1) * outf], &wantb, &format!("matvec_batch_exl3_{bits} {inf}x{outf} {name} matrix {b}"));
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn the_gpu_matvec_matches_the_cpu_on_real_tensors() {
+    let Some(ctx) = gpu_ctx() else { return };
+    let prog = Program::load(&ctx, file("exl3.cu").unwrap()).unwrap();
+    let st = SafeTensors::open(&[concat!(env!("CARGO_MANIFEST_DIR"), "/../../eval/fixtures/exl3_sample.safetensors").into()]).unwrap();
+    let mut rng = Rng(0x9e37_79b9_7f4a_7c15);
+    for prefix in ["model.language_model.layers.0.mlp.experts.0.gate_proj", "model.language_model.layers.0.mlp.shared_expert.gate_proj"] {
+        let lin = Exl3Linear::load(&st, prefix).unwrap();
+        let blob = lin.to_blob();
+        let (inf, outf) = (lin.in_features, lin.out_features);
+        let x: Vec<f32> = (0..inf).map(|_| rng.unit()).collect();
+        let want = matvec_blob(inf, outf, lin.bits, 2, &blob, &x, 4);
+        // and against the reconstructed matrix, which does not use the kernels' route at all
+        let w = lin.reconstruct();
+        let direct: Vec<f32> = (0..outf).map(|o| (0..inf).map(|i| x[i] as f64 * w[i * outf + o] as f64).sum::<f64>() as f32).collect();
+        check(&want, &direct, &format!("{prefix}: cpu blob matvec against the matrix"));
+        let dw = ctx.alloc(blob.len()).unwrap();
+        dw.upload(&blob).unwrap();
+        let dx = ctx.alloc(inf * 4).unwrap();
+        dx.upload(&x.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>()).unwrap();
+        let dy = ctx.alloc(outf * 4).unwrap();
+        // SAFETY: the blob of this projection at dw, inf floats at dx, outf at dy.
+        unsafe { prog.launch(&format!("matvec_exl3_{}", lin.bits), ((outf / 128) as u32, 1, 1), (256, 1, 1), 0, None, &[Arg::Ptr(dw.ptr), Arg::Ptr(dx.ptr), Arg::Ptr(dy.ptr), Arg::U32(outf as u32), Arg::U32(inf as u32)]).unwrap() };
+        ctx.synchronize().unwrap();
+        let mut o = vec![0u8; outf * 4];
+        dy.download(&mut o).unwrap();
+        check(&floats(&o), &want, &format!("{prefix} K={}", lin.bits));
+        let _ = f16_to_f32;
+    }
+}

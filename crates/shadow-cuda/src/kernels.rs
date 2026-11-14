@@ -317,6 +317,30 @@ pub const FILES: &[File] = &[
             e("ple_conv_step", &[C, W, C, W, U, U, U]),
         ],
     },
+    // EXL3 trellis matvec kernels (bit rates 1..8, codebook mul1): single input, up to 8 inputs, and a table of matrices
+    File {
+        file: "exl3.cu",
+        source: include_str!("../../../kernels/exl3.cu"),
+        headers: &[],
+        entries: &[
+            matvec("matvec_exl3_1"),
+            cols("matvec_cols_exl3_1"), batch("matvec_batch_exl3_1"),
+            matvec("matvec_exl3_2"),
+            cols("matvec_cols_exl3_2"), batch("matvec_batch_exl3_2"),
+            matvec("matvec_exl3_3"),
+            cols("matvec_cols_exl3_3"), batch("matvec_batch_exl3_3"),
+            matvec("matvec_exl3_4"),
+            cols("matvec_cols_exl3_4"), batch("matvec_batch_exl3_4"),
+            matvec("matvec_exl3_5"),
+            cols("matvec_cols_exl3_5"), batch("matvec_batch_exl3_5"),
+            matvec("matvec_exl3_6"),
+            cols("matvec_cols_exl3_6"), batch("matvec_batch_exl3_6"),
+            matvec("matvec_exl3_7"),
+            cols("matvec_cols_exl3_7"), batch("matvec_batch_exl3_7"),
+            matvec("matvec_exl3_8"),
+            cols("matvec_cols_exl3_8"), batch("matvec_batch_exl3_8"), e("exl3_codebook", &[W, U]),
+        ],
+    },
 ];
 
 pub fn file(name: &str) -> Option<&'static File> {
