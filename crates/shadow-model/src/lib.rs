@@ -5,6 +5,7 @@ pub mod chat;
 pub mod cpu_expert;
 #[cfg(target_arch = "x86_64")]
 pub mod cpu_expert_avx512;
+pub mod exl3;
 pub mod forward;
 pub mod gguf;
 pub mod half;
@@ -14,5 +15,6 @@ pub mod placement;
 pub mod quant;
 pub mod quant_tables;
 pub mod readpool;
+pub mod safetensors;
 pub mod tokenizer;
 pub mod unicode_table;

@@ -30,6 +30,17 @@ From other projects:
                           the IQ quant formats' lookup tables (grids, sign patterns, IQ4_NL
                           values) from ggml (MIT, ggml.ai), generated through the gguf Python
                           package by tools/gen_quant_tables.py. They are the formats' definition.
+  crates/shadow-model/src/exl3.rs
+                          the EXL3 weight format (trellis tiles, the three codebooks, the Hadamard
+                          rotations), written from ExLlamaV3 (MIT, turboderp,
+                          https://github.com/turboderp-org/exllamav3): exllamav3_ext/quant/codebook.cuh,
+                          exl3_dq.cuh, reconstruct.cu and modules/quant/exl3.py. The constants and the
+                          bit layout are the format's definition; the code is ours (Rust, checked against
+                          the GGUF of the same model, crates/shadow-model/tests/exl3_vs_gguf.rs).
+  eval/fixtures/exl3_sample.safetensors
+                          two real tensors (an expert and a shared expert, layer 0) of
+                          turboderp/Qwen3.8-Flash-Next-exl3, branch 2.05bpw_h4_ng4, for the decoder's
+                          regression test.
   crates/shadow-model/src/unicode_table.rs
                           Unicode general categories, generated from Python's unicodedata.
   docs/ARCH.md            written from the GGUF file and from the published reference
