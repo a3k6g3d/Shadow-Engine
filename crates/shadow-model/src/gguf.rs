@@ -136,6 +136,15 @@ const TYPES: &[(u32, &str, u64, u64)] = &[
     (40, "NVFP4", 64, 36),
     (41, "Q1_0", 128, 18),
     (42, "Q2_0", 64, 18),
+    // EXL3 (exl3.rs): not part of upstream ggml.  A projection is one blob (f16 suh, f16 svh, a marker, then K bits a weight of
+    // trellis), so there is no per-row block: the block size is 0 and `block()` says None.  Ids 1000 + 10 c + K for codebook c
+    // (0, 1 or 2 = "mul1", the one every published model uses) and K = 1..8 bits; the names are what the kernels are looked up by.
+    (1001, "EXL3C0_1", 0, 0), (1002, "EXL3C0_2", 0, 0), (1003, "EXL3C0_3", 0, 0), (1004, "EXL3C0_4", 0, 0),
+    (1005, "EXL3C0_5", 0, 0), (1006, "EXL3C0_6", 0, 0), (1007, "EXL3C0_7", 0, 0), (1008, "EXL3C0_8", 0, 0),
+    (1011, "EXL3C1_1", 0, 0), (1012, "EXL3C1_2", 0, 0), (1013, "EXL3C1_3", 0, 0), (1014, "EXL3C1_4", 0, 0),
+    (1015, "EXL3C1_5", 0, 0), (1016, "EXL3C1_6", 0, 0), (1017, "EXL3C1_7", 0, 0), (1018, "EXL3C1_8", 0, 0),
+    (1021, "EXL3_1", 0, 0), (1022, "EXL3_2", 0, 0), (1023, "EXL3_3", 0, 0), (1024, "EXL3_4", 0, 0),
+    (1025, "EXL3_5", 0, 0), (1026, "EXL3_6", 0, 0), (1027, "EXL3_7", 0, 0), (1028, "EXL3_8", 0, 0),
 ];
 
 impl GgmlType {
@@ -160,9 +169,25 @@ impl GgmlType {
         self.entry().map(|e| e.1.to_string()).unwrap_or_else(|| format!("type{}", self.id()))
     }
 
-    /// (elements per block, bytes per block), when the layout is known.
+    /// (elements per block, bytes per block), when the layout is known (an EXL3 blob has none).
     pub fn block(self) -> Option<(u64, u64)> {
-        self.entry().map(|e| (e.2, e.3))
+        self.entry().filter(|e| e.2 > 0).map(|e| (e.2, e.3))
+    }
+
+    /// (bits a weight, codebook) of an EXL3 type.
+    pub fn exl3(self) -> Option<(usize, u8)> {
+        match self.id() {
+            id @ 1001..=1008 => Some(((id - 1000) as usize, 0)),
+            id @ 1011..=1018 => Some(((id - 1010) as usize, 1)),
+            id @ 1021..=1028 => Some(((id - 1020) as usize, 2)),
+            _ => None,
+        }
+    }
+
+    /// The type of an EXL3 tensor of `bits` bits a weight with codebook `cb`.
+    pub fn from_exl3(bits: usize, cb: u8) -> GgmlType {
+        assert!((1..=8).contains(&bits) && cb <= 2, "EXL3 type with K = {bits}, codebook {cb}");
+        GgmlType::Known(1000 + 10 * cb as u32 + bits as u32)
     }
 }
 
@@ -411,6 +436,13 @@ pub fn shard_paths(path: &Path) -> Vec<PathBuf> {
 
 impl Gguf {
     /// Opens a model from any of its shards.
+    /// A model assembled in memory: the files `shards` name hold the bytes the tensors point at (a Hugging Face checkpoint
+    /// presented as a GGUF, `exl3_model.rs`).
+    pub fn from_parts(shards: Vec<Shard>, kv: BTreeMap<String, Value>, tensors: Vec<TensorInfo>) -> Gguf {
+        let index = tensors.iter().enumerate().map(|(i, t)| (t.name.clone(), i)).collect();
+        Gguf { shards, kv, tensors, index }
+    }
+
     pub fn open(path: &Path) -> Result<Gguf, Error> {
         let paths = shard_paths(path);
         let mut shards = Vec::new();

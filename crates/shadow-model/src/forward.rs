@@ -240,6 +240,10 @@ pub struct CpuBackend;
 
 impl Backend for CpuBackend {
     fn matvec(&self, t: &TensorInfo, bytes: &[u8], _key: Option<&str>, x: &[f32]) -> Vec<f32> {
+        if let Some((bits, cb)) = t.ty.exl3() {
+            // an EXL3 projection (a blob): the matvec in the rotated basis; dims are ggml's [in, out]
+            return crate::exl3::matvec_blob(t.dims[0] as usize, t.dims[1] as usize, bits, cb, bytes, x, threads());
+        }
         matvec(&Mat { t, bytes }, x)
     }
 }
@@ -304,6 +308,8 @@ pub struct Model {
     /// Dense tensors not held in RAM (`load_lean`): the GPU session reads each from the file when it uploads it.
     lean: std::collections::HashSet<String>,
     ple_cache: std::sync::RwLock<HashMap<i64, Vec<f32>>>,
+    /// An EXL3 checkpoint's extras (`exl3_model.rs`): computed tensors, the per-expert file table, the n-gram table.  None for a GGUF.
+    pub exl3: Option<Box<crate::exl3_model::Exl3Extra>>,
 }
 
 impl Model {
@@ -319,7 +325,17 @@ impl Model {
         Model::load_with(g, true)
     }
 
+    /// A model from an EXL3 checkpoint directory (`exl3_model.rs`): the engine sees it as a GGUF with `EXL3_K` matrices.
+    pub fn load_exl3(dir: &std::path::Path, lean: bool) -> Result<Model, String> {
+        let m = crate::exl3_model::open(dir)?;
+        Model::load_inner(m.gguf, lean, Some(Box::new(m.extra)))
+    }
+
     fn load_with(g: Gguf, lean_mode: bool) -> Result<Model, String> {
+        Model::load_inner(g, lean_mode, None)
+    }
+
+    fn load_inner(g: Gguf, lean_mode: bool, exl3: Option<Box<crate::exl3_model::Exl3Extra>>) -> Result<Model, String> {
         let cfg = Config::from_gguf(&g)?;
         let files = g.shards.iter().map(|s| File::open(&s.path).map_err(|e| format!("{}: {e}", s.path.display())))
             .collect::<Result<Vec<_>, _>>()?;
@@ -333,14 +349,20 @@ impl Model {
                 lean.insert(t.name.clone());
                 continue;
             }
-            let mut b = vec![0u8; t.nbytes() as usize];
-            read_at(&files[t.shard], &mut b, t.offset).map_err(|e| format!("{}: {e}", t.name))?;
+            let b = match exl3.as_ref().filter(|x| x.computed.contains_key(&t.name)) {
+                Some(x) => x.bytes(&t.name)?,
+                None => {
+                    let mut b = vec![0u8; t.nbytes() as usize];
+                    read_at(&files[t.shard], &mut b, t.offset).map_err(|e| format!("{}: {e}", t.name))?;
+                    b
+                }
+            };
             dense.insert(t.name.clone(), b);
         }
         let paths: Vec<_> = g.shards.iter().map(|s| s.path.clone()).collect();
         let workers = std::env::var("SHADOW_READ_WORKERS").ok().and_then(|v| v.parse::<usize>().ok()).filter(|&n| n >= 1).unwrap_or(READ_WORKERS);
         let pool = ReadPool::new(&paths, workers)?;
-        Ok(Model { g, cfg, files, pool, dense, lean, ple_cache: std::sync::RwLock::new(HashMap::new()) })
+        Ok(Model { g, cfg, files, pool, dense, lean, ple_cache: std::sync::RwLock::new(HashMap::new()), exl3 })
     }
 
     /// The companion `.scale` f32 multiplier of a 2-D tensor (1.0 when the model has no `.scale` tensor).
@@ -365,6 +387,9 @@ impl Model {
     pub fn read_dense(&self, name: &str) -> Result<std::borrow::Cow<'_, [u8]>, String> {
         if let Some(b) = self.dense.get(name) {
             return Ok(std::borrow::Cow::Borrowed(b));
+        }
+        if let Some(x) = self.exl3.as_ref().filter(|x| x.computed.contains_key(name)) {
+            return Ok(std::borrow::Cow::Owned(x.bytes(name)?));
         }
         let t = self.g.tensor(name).ok_or_else(|| format!("no tensor {name}"))?;
         let mut b = vec![0u8; t.nbytes() as usize];
@@ -415,9 +440,14 @@ impl Model {
     }
 
     /// Where one expert's slice of a fused expert tensor lies in the model's files: (shard, byte offset in the file, length).
+    /// A GGUF stacks the experts evenly; an EXL3 checkpoint has one blob per expert, scattered, listed in `exl3.experts`.
     pub fn expert_file_range(&self, name: &str, e: usize) -> (usize, u64, usize) {
         let t = self.g.tensor(name).unwrap_or_else(|| panic!("no tensor {name}"));
         let per = (t.nbytes() / t.dims[2]) as usize;
+        if let Some(table) = self.exl3.as_ref().and_then(|x| x.experts.get(name)) {
+            let (file, off) = table[e];
+            return (file, off, per);
+        }
         (t.shard, t.offset + (e * per) as u64, per)
     }
 
@@ -431,17 +461,17 @@ impl Model {
         let t = self.g.tensor(name).unwrap_or_else(|| panic!("no tensor {name}"));
         let per = (t.nbytes() / t.dims[2]) as usize;
         assert_eq!(out.len(), per, "{name}: {} bytes for a {per}-byte expert slice", out.len());
-        read_at(&self.files[t.shard], out, t.offset + (e * per) as u64).unwrap();
+        let (shard, off, _) = self.expert_file_range(name, e);
+        read_at(&self.files[shard], out, off).unwrap();
     }
 
     /// Several experts' slices at once, `(tensor name, expert, out)`, each `out` exactly `expert_bytes(name)` long:
     /// the same bytes as `expert_into` one by one, read in parallel on the model's read pool.
     pub fn experts_into_many(&self, jobs: &mut [(&str, usize, &mut [u8])]) {
         let mut reads: Vec<(usize, u64, &mut [u8])> = jobs.iter_mut().map(|(name, e, out)| {
-            let t = self.g.tensor(name).unwrap_or_else(|| panic!("no tensor {name}"));
-            let per = (t.nbytes() / t.dims[2]) as usize;
+            let (shard, off, per) = self.expert_file_range(name, *e);
             assert_eq!(out.len(), per, "{name}: {} bytes for a {per}-byte expert slice", out.len());
-            (t.shard, t.offset + (*e * per) as u64, &mut **out)
+            (shard, off, &mut **out)
         }).collect();
         self.pool.read_many(&mut reads).unwrap();
     }
@@ -452,10 +482,9 @@ impl Model {
     /// The buffers must stay allocated and untouched until `experts_wait` has returned.
     pub unsafe fn experts_submit(&self, jobs: &mut [(&str, usize, &mut [u8])]) {
         let mut reads: Vec<(usize, u64, &mut [u8])> = jobs.iter_mut().map(|(name, e, out)| {
-            let t = self.g.tensor(name).unwrap_or_else(|| panic!("no tensor {name}"));
-            let per = (t.nbytes() / t.dims[2]) as usize;
+            let (shard, off, per) = self.expert_file_range(name, *e);
             assert_eq!(out.len(), per, "{name}: {} bytes for a {per}-byte expert slice", out.len());
-            (t.shard, t.offset + (*e * per) as u64, &mut **out)
+            (shard, off, &mut **out)
         }).collect();
         // SAFETY: the caller's contract.
         unsafe { self.pool.submit(&mut reads) };
@@ -480,6 +509,27 @@ impl Model {
             Err(_) => return,
         };
         if missing.len() < 2 {
+            return;
+        }
+        if let Some(x) = self.exl3.as_ref() {
+            let mut bufs: Vec<Vec<u8>> = missing.iter().map(|_| vec![0u8; x.ngram.words_per_row() * 2]).collect();
+            {
+                let mut jobs: Vec<(usize, u64, &mut [u8])> = missing.iter().zip(bufs.iter_mut())
+                    .map(|(&row, b)| {
+                        let (f, o, _) = x.ngram.row_range(row);
+                        (f, o, b.as_mut_slice())
+                    }).collect();
+                if self.pool.read_many(&mut jobs).is_err() {
+                    return;
+                }
+            }
+            if let Ok(mut c) = self.ple_cache.write() {
+                for (&row, b) in missing.iter().zip(&bufs) {
+                    if c.len() < 65536 {
+                        c.insert(row, x.ngram.decode(row, b));
+                    }
+                }
+            }
             return;
         }
         let t = self.g.tensor("per_layer_token_embd.weight").unwrap();
@@ -510,6 +560,18 @@ impl Model {
             if let Some(v) = c.get(&row) {
                 return v.clone();
             }
+        }
+        if let Some(x) = self.exl3.as_ref() {
+            let (f, o, len) = x.ngram.row_range(row);
+            let mut b = vec![0u8; len];
+            read_at(&self.files[f], &mut b, o).unwrap();
+            let y = x.ngram.decode(row, &b);
+            if let Ok(mut c) = self.ple_cache.write() {
+                if c.len() < 65536 {
+                    c.insert(row, y.clone());
+                }
+            }
+            return y;
         }
         let t = self.g.tensor("per_layer_token_embd.weight").unwrap();
         let (be, bb) = t.ty.block().unwrap();

@@ -9,7 +9,7 @@
 //! '^model\.language_model\.layers\.1\.ple\.' '^model\.language_model\.hyper_connection_mixer\.'`) and a GGUF
 //! (`SHADOW_MODEL`); skips otherwise.
 
-use shadow_model::exl3_map::{materialize, source_of, tiled_from_grouped, MapCfg, Source, Tensor};
+use shadow_model::exl3_map::{materialize, source_of, tiled_from_grouped, MapCfg, Source, Tensor, Transform};
 use shadow_model::gguf::Gguf;
 use shadow_model::quant::dequantize;
 use shadow_model::safetensors::SafeTensors;
@@ -44,6 +44,7 @@ fn gguf_f32(g: &Gguf, name: &str) -> Option<(Vec<f32>, Vec<usize>)> {
 fn as_gguf_order(t: &Tensor) -> (Vec<f32>, Vec<usize>) {
     match t {
         Tensor::F32 { data, dims } => (data.clone(), dims.clone()),
+        Tensor::Bf16 { data, dims } => (data.iter().map(|w| shadow_model::half::bf16_to_f32(*w)).collect(), dims.clone()),
         Tensor::Exl3(l) => {
             let w = l.reconstruct(); // [in][out]
             let (ni, no) = (l.in_features, l.out_features);
@@ -82,7 +83,18 @@ fn every_dense_tensor_of_the_sample_layers_matches_the_gguf() {
             continue;
         }
         let src = source_of(name, &c).unwrap_or_else(|| panic!("{name}: no source in the map"));
-        let built = materialize(&st, &src, &c).unwrap_or_else(|e| panic!("{name}: {e}"));
+        let built = match &src {
+            // taken as stored: a file range in the engine, read here and widened
+            Source::Plain { name: hf, transform: Transform::Raw, .. } => {
+                let shape = &st.get(hf).unwrap().shape;
+                let mut dims: Vec<usize> = shape.iter().rev().copied().filter(|&d| d != 1).collect();
+                if dims.is_empty() {
+                    dims.push(shape.iter().product());
+                }
+                Tensor::F32 { data: st.read_f32(hf).unwrap(), dims }
+            }
+            _ => materialize(&st, &src, &c).unwrap_or_else(|e| panic!("{name}: {e}")),
+        };
         let (a, adims) = as_gguf_order(&built);
         let (b, bdims) = gguf_f32(&g, name).unwrap();
         assert_eq!(adims, bdims, "{name}: dims");

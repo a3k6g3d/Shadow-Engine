@@ -52,7 +52,12 @@ pub struct UnitPerm {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Transform {
+    /// Taken as stored (a file range): `embed_tokens` (BF16), `ple.conv1d` (F16).
+    Raw,
+    /// To f32, values unchanged (the router, the hyper-connection norms' companions...).
     Identity,
+    /// To BF16, values unchanged (f16 -> bf16 is exact for values that came from BF16): the matrices the GGUF keeps as BF16.
+    ToBf16,
     /// The GGUF stores `w + 1` (zero-centred RMSNorm weights).
     PlusOne,
     /// The GGUF stores `-exp(w)` (`ssm_a` from `A_log`).
@@ -130,29 +135,29 @@ pub fn source_of(name: &str, c: &MapCfg) -> Option<Source> {
             "ffn_down_exps.weight" => Source::Expert { prefix: format!("{p}.mlp.experts.{{e}}.down_proj") },
             // ---- hyper connections
             "hc_attn_norm.weight" => plain(format!("{p}.attn_hyper_connection.hc_norm.weight"), Transform::PlusOne),
-            "hc_attn_down.weight" => plain(format!("{p}.attn_hyper_connection.input_mix_weight_down.weight"), Transform::Identity),
-            "hc_attn_up.weight" => plain(format!("{p}.attn_hyper_connection.input_mix_weight_up.weight"), Transform::Identity),
-            "hc_attn_inject.weight" => plain(format!("{p}.attn_hyper_connection.block_inject_weight.weight"), Transform::Identity),
+            "hc_attn_down.weight" => plain(format!("{p}.attn_hyper_connection.input_mix_weight_down.weight"), Transform::ToBf16),
+            "hc_attn_up.weight" => plain(format!("{p}.attn_hyper_connection.input_mix_weight_up.weight"), Transform::ToBf16),
+            "hc_attn_inject.weight" => plain(format!("{p}.attn_hyper_connection.block_inject_weight.weight"), Transform::ToBf16),
             "hc_ffn_norm.weight" => plain(format!("{p}.mlp_hyper_connection.hc_norm.weight"), Transform::PlusOne),
-            "hc_ffn_down.weight" => plain(format!("{p}.mlp_hyper_connection.input_mix_weight_down.weight"), Transform::Identity),
-            "hc_ffn_up.weight" => plain(format!("{p}.mlp_hyper_connection.input_mix_weight_up.weight"), Transform::Identity),
-            "hc_ffn_inject.weight" => plain(format!("{p}.mlp_hyper_connection.block_inject_weight.weight"), Transform::Identity),
+            "hc_ffn_down.weight" => plain(format!("{p}.mlp_hyper_connection.input_mix_weight_down.weight"), Transform::ToBf16),
+            "hc_ffn_up.weight" => plain(format!("{p}.mlp_hyper_connection.input_mix_weight_up.weight"), Transform::ToBf16),
+            "hc_ffn_inject.weight" => plain(format!("{p}.mlp_hyper_connection.block_inject_weight.weight"), Transform::ToBf16),
             // ---- PLE (one layer)
-            "ple_key.weight" if l == c.ple_layer => plain(format!("{p}.ple.key_proj.weight"), Transform::Identity),
-            "ple_value.weight" if l == c.ple_layer => plain(format!("{p}.ple.value_proj.weight"), Transform::Identity),
+            "ple_key.weight" if l == c.ple_layer => plain(format!("{p}.ple.key_proj.weight"), Transform::ToBf16),
+            "ple_value.weight" if l == c.ple_layer => plain(format!("{p}.ple.value_proj.weight"), Transform::ToBf16),
             "ple_norm_key.weight" if l == c.ple_layer => plain(format!("{p}.ple.norm_key.weight"), Transform::PlusOne),
             "ple_norm_query.weight" if l == c.ple_layer => plain(format!("{p}.ple.norm_query.weight"), Transform::PlusOne),
             "ple_norm_conv.weight" if l == c.ple_layer => plain(format!("{p}.ple.norm_conv.weight"), Transform::PlusOne),
-            "ple_conv1d.weight" if l == c.ple_layer => plain(format!("{p}.ple.conv1d.weight"), Transform::Identity),
+            "ple_conv1d.weight" if l == c.ple_layer => plain(format!("{p}.ple.conv1d.weight"), Transform::Raw),
             _ => return None,
         });
     }
     Some(match name {
-        "token_embd.weight" => plain(format!("{lm}.embed_tokens.weight"), Transform::Identity),
+        "token_embd.weight" => plain(format!("{lm}.embed_tokens.weight"), Transform::Raw),
         "output.weight" => lin("lm_head".into()),
         "output_hc_norm.weight" => plain(format!("{lm}.hyper_connection_mixer.hc_norm.weight"), Transform::PlusOne),
-        "output_hc_down.weight" => plain(format!("{lm}.hyper_connection_mixer.input_mix_weight_down.weight"), Transform::Identity),
-        "output_hc_up.weight" => plain(format!("{lm}.hyper_connection_mixer.input_mix_weight_up.weight"), Transform::Identity),
+        "output_hc_down.weight" => plain(format!("{lm}.hyper_connection_mixer.input_mix_weight_down.weight"), Transform::ToBf16),
+        "output_hc_up.weight" => plain(format!("{lm}.hyper_connection_mixer.input_mix_weight_up.weight"), Transform::ToBf16),
         _ => return None,
     })
 }
@@ -167,6 +172,8 @@ fn hidden_of(_layer_prefix: &str) -> usize {
 #[derive(Clone, Debug)]
 pub enum Tensor {
     Exl3(Exl3Linear),
+    /// BF16 words in the GGUF's memory order.
+    Bf16 { data: Vec<u16>, dims: Vec<usize> },
     /// f32 in the GGUF's memory order (`dims` in ggml order: dims[0] is the row length).
     F32 { data: Vec<f32>, dims: Vec<usize> },
 }
@@ -201,7 +208,8 @@ pub fn materialize(st: &SafeTensors, src: &Source, cfg: &MapCfg) -> Result<Tenso
             let t = st.get(name).ok_or_else(|| Error(format!("no tensor {name}")))?.clone();
             let mut data = st.read_f32(name)?;
             match transform {
-                Transform::Identity => {}
+                Transform::Raw => return Err(Error(format!("{name}: a raw tensor is read from its file range, not built"))),
+                Transform::Identity | Transform::ToBf16 => {}
                 Transform::PlusOne => data.iter_mut().for_each(|v| *v += 1.0),
                 Transform::NegExp => data.iter_mut().for_each(|v| *v = -((*v as f64).exp()) as f32),
             }
@@ -215,6 +223,9 @@ pub fn materialize(st: &SafeTensors, src: &Source, cfg: &MapCfg) -> Result<Tenso
             let mut dims: Vec<usize> = t.shape.iter().rev().copied().filter(|&d| d != 1).collect();
             if dims.is_empty() {
                 dims.push(data.len());
+            }
+            if *transform == Transform::ToBf16 {
+                return Ok(Tensor::Bf16 { data: data.iter().map(|v| crate::half::f32_to_bf16(*v)).collect(), dims });
             }
             Ok(Tensor::F32 { data, dims })
         }

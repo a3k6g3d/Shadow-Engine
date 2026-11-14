@@ -302,6 +302,235 @@ impl Exl3Linear {
     }
 }
 
+// ---- the model-side view: a projection as one blob, a fast decode and a matvec in the rotated basis -----------------------
+
+/// The 65,536 values of a codebook (f32 holding the exact f16 of each state), built once.
+pub fn codebook_table(cb: u8) -> &'static [f32] {
+    use std::sync::OnceLock;
+    static T: [OnceLock<Vec<f32>>; 3] = [OnceLock::new(), OnceLock::new(), OnceLock::new()];
+    T[(cb as usize).min(2)].get_or_init(|| (0..65536u32).map(|s| codebook::decode(cb.min(2), s)).collect())
+}
+
+/// `tile_pos` of every position, as (row, column).
+fn tile_pos_table() -> &'static [(u8, u8); 256] {
+    use std::sync::OnceLock;
+    static T: OnceLock<[(u8, u8); 256]> = OnceLock::new();
+    T.get_or_init(|| {
+        let mut t = [(0u8, 0u8); 256];
+        for (p, e) in t.iter_mut().enumerate() {
+            let (r, c) = tile_pos(p);
+            *e = (r as u8, c as u8);
+        }
+        t
+    })
+}
+
+/// `decode_tile` with a table for the codebook and 64-bit windows instead of bit loops: the same values.
+pub fn decode_tile_fast(tile: &[u16], bits: usize, lut: &[f32], out: &mut [f32; 256]) {
+    let nw = 8 * bits; // u32 words in the tile's ring
+    let n = 256 * bits;
+    let word = |i: usize| tile[2 * i] as u32 | ((tile[2 * i + 1] as u32) << 16);
+    for (t, o) in out.iter_mut().enumerate() {
+        let s = ((t + 1) * bits + n - 16) % n; // first bit of the window (stream bit 0 = msb of word 0)
+        let (wi, sh) = (s / 32, s % 32);
+        let merged = ((word(wi) as u64) << 32) | word((wi + 1) % nw) as u64;
+        *o = lut[((merged >> (48 - sh)) & 0xffff) as usize];
+    }
+}
+
+/// Bytes of a projection stored as one blob: `suh` (f16 `[in]`), `svh` (f16 `[out]`), `mul1` / `mcg` (4 bytes, a marker),
+/// then the trellis, which is the order the tensors have in a repo's safetensors files (so a blob is one range of the file).
+pub fn blob_len(in_features: usize, out_features: usize, bits: usize) -> usize {
+    2 * in_features + 2 * out_features + 4 + in_features * out_features * bits / 8
+}
+
+/// Byte offsets inside a blob: (svh, marker, trellis).
+pub fn blob_offsets(in_features: usize, out_features: usize) -> (usize, usize, usize) {
+    (2 * in_features, 2 * in_features + 2 * out_features, 2 * in_features + 2 * out_features + 4)
+}
+
+impl Exl3Linear {
+    /// Reads a projection from its blob (see `blob_len`); `cb` is the codebook the model uses.
+    pub fn from_blob(in_features: usize, out_features: usize, bits: usize, cb: u8, blob: &[u8]) -> Exl3Linear {
+        assert_eq!(blob.len(), blob_len(in_features, out_features, bits), "EXL3 blob of {} bytes for {in_features} x {out_features} at K = {bits}", blob.len());
+        let (osv, _, otr) = blob_offsets(in_features, out_features);
+        let h = |b: &[u8]| -> Vec<f32> { b.chunks_exact(2).map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]]))).collect() };
+        Exl3Linear {
+            in_features, out_features, bits, half: false, cb,
+            trellis: blob[otr..].chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect(),
+            suh: h(&blob[..osv]), svh: h(&blob[osv..osv + 2 * out_features]),
+        }
+    }
+
+    /// `x` rotated into the basis of the trellis: `x diag(suh) H` on each 128-block.
+    pub fn rotate_input(&self, x: &[f32]) -> Vec<f32> {
+        assert_eq!(x.len(), self.in_features);
+        let mut xr: Vec<f32> = x.iter().zip(&self.suh).map(|(a, s)| a * s).collect();
+        for b in xr.chunks_exact_mut(128) {
+            wht128(b.try_into().unwrap());
+        }
+        xr
+    }
+
+    /// Output block `ob` (128 outputs) of `y = x W`, given the rotated input: accumulate the block's 8 tile columns tile by
+    /// tile in the rotated basis, then `H` and `diag(svh)`.
+    pub fn matvec_block(&self, xr: &[f32], ob: usize, y: &mut [f32; 128]) {
+        assert!(!self.half, "half-integer bit rates are not decoded yet");
+        let (kt, nt, tw) = (self.in_features / 16, self.out_features / 16, self.tile_words());
+        let (lut, pos) = (codebook_table(self.cb), tile_pos_table());
+        let mut acc = [0f64; 128];
+        let mut vals = [0f32; 256];
+        for c in 0..8 {
+            let n = ob * 8 + c;
+            for k in 0..kt {
+                decode_tile_fast(&self.trellis[(k * nt + n) * tw..(k * nt + n + 1) * tw], self.bits, lut, &mut vals);
+                let xk = &xr[k * 16..k * 16 + 16];
+                for (p, v) in vals.iter().enumerate() {
+                    let (r, col) = pos[p];
+                    acc[c * 16 + col as usize] += xk[r as usize] as f64 * *v as f64;
+                }
+            }
+        }
+        for (a, o) in acc.iter().zip(y.iter_mut()) {
+            *o = *a as f32;
+        }
+        wht128(y);
+        for (o, s) in y.iter_mut().zip(&self.svh[ob * 128..(ob + 1) * 128]) {
+            *o *= s;
+        }
+    }
+
+    /// `y = x W` (`W` is `[in][out]`): the rotated input, then every output block, spread over `threads` threads.
+    pub fn matvec(&self, x: &[f32], threads: usize) -> Vec<f32> {
+        let xr = self.rotate_input(x);
+        let nb = self.out_features / 128;
+        let mut y = vec![0f32; self.out_features];
+        let per = nb.div_ceil(threads.max(1)).max(1);
+        std::thread::scope(|s| {
+            for (ci, chunk) in y.chunks_mut(per * 128).enumerate() {
+                let xr = &xr;
+                s.spawn(move || {
+                    for (bi, out) in chunk.chunks_exact_mut(128).enumerate() {
+                        self.matvec_block(xr, ci * per + bi, out.try_into().unwrap());
+                    }
+                });
+            }
+        });
+        y
+    }
+}
+
+/// One row of an EXL3 n-gram table (`exl3_ngram_trellis`, exllamav3's `ngram_codec.py`): a ring of `dim` = 160 positions,
+/// `1 + dim K / 16` u16 words: word 0 the f16 scale, then the ring bit stream with the low K bits of position i's state at
+/// stream bits `[i K, (i + 1) K)` (least significant bit first inside each word); state i stacks the symbols of positions
+/// i, i - 1, ... from bit 0 up.  `row[i] = cb2[state_i] * scale + bias[i]`.
+pub fn ngram_row(words: &[u16], bits: usize, bias: &[f32], out: &mut [f32]) {
+    let dim = out.len();
+    let nw = words.len() - 1;
+    assert_eq!(nw * 16, dim * bits, "n-gram row of {} words for {dim} values at K = {bits}", words.len());
+    let scale = f16_to_f32(words[0]);
+    let stream = &words[1..];
+    let lut = codebook_table(2);
+    let mask = (1u32 << bits) - 1;
+    let sym = |i: usize| -> u32 {
+        let bit = i * bits;
+        let window = stream[bit >> 4] as u32 | ((stream[((bit >> 4) + 1) % nw] as u32) << 16);
+        (window >> (bit & 15)) & mask
+    };
+    for (i, o) in out.iter_mut().enumerate() {
+        let mut state = 0u32;
+        for j in 0..(15 + bits) / bits {
+            state |= sym((i + dim - j % dim) % dim) << (j * bits);
+        }
+        *o = lut[(state & 0xffff) as usize] * scale + bias[i];
+    }
+}
+
+// ---- blobs: serialize, and a matvec straight from the bytes -------------------------------------------------------------------
+
+impl Exl3Linear {
+    /// The blob (`blob_len` bytes, layout of `blob_len`'s doc) of this projection; the marker is 1 (the repos' own is a scalar tensor).
+    pub fn to_blob(&self) -> Vec<u8> {
+        assert!(!self.half, "half-integer bit rates are not decoded yet");
+        let mut b = Vec::with_capacity(blob_len(self.in_features, self.out_features, self.bits));
+        for v in self.suh.iter().chain(&self.svh) {
+            b.extend_from_slice(&crate::half::f32_to_f16(*v).to_le_bytes());
+        }
+        b.extend_from_slice(&1i32.to_le_bytes());
+        for w in &self.trellis {
+            b.extend_from_slice(&w.to_le_bytes());
+        }
+        b
+    }
+}
+
+/// The trellis of a blob as u16 words: borrowed when the bytes are 2-aligned (a `Vec<u8>` from the allocator is), copied
+/// otherwise.
+fn blob_words(blob: &[u8], from: usize) -> std::borrow::Cow<'_, [u16]> {
+    let bytes = &blob[from..];
+    if (bytes.as_ptr() as usize) % 2 == 0 && cfg!(target_endian = "little") {
+        // SAFETY: the pointer is 2-aligned, the length is even (checked by the caller's blob_len assert), u16 has no invalid bit patterns.
+        std::borrow::Cow::Borrowed(unsafe { std::slice::from_raw_parts(bytes.as_ptr() as *const u16, bytes.len() / 2) })
+    } else {
+        std::borrow::Cow::Owned(bytes.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect())
+    }
+}
+
+/// `y = x W` for a projection given as a blob, without building an `Exl3Linear` (the trellis is read in place): the
+/// reference matvec the GPU kernels are checked against.
+pub fn matvec_blob(in_features: usize, out_features: usize, bits: usize, cb: u8, blob: &[u8], x: &[f32], threads: usize) -> Vec<f32> {
+    assert_eq!(blob.len(), blob_len(in_features, out_features, bits), "EXL3 blob of {} bytes for {in_features} x {out_features} at K = {bits}", blob.len());
+    assert_eq!(x.len(), in_features);
+    let (osv, _, otr) = blob_offsets(in_features, out_features);
+    let h = |b: &[u8]| -> Vec<f32> { b.chunks_exact(2).map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]]))).collect() };
+    let suh = h(&blob[..osv]);
+    let svh = h(&blob[osv..osv + 2 * out_features]);
+    let trellis = blob_words(blob, otr);
+    let mut xr: Vec<f32> = x.iter().zip(&suh).map(|(a, s)| a * s).collect();
+    for b in xr.chunks_exact_mut(128) {
+        wht128(b.try_into().unwrap());
+    }
+    let (kt, nt, tw) = (in_features / 16, out_features / 16, 16 * bits);
+    let (lut, pos) = (codebook_table(cb), tile_pos_table());
+    let block = |ob: usize, y: &mut [f32]| {
+        let mut acc = [0f64; 128];
+        let mut vals = [0f32; 256];
+        for c in 0..8 {
+            let n = ob * 8 + c;
+            for k in 0..kt {
+                decode_tile_fast(&trellis[(k * nt + n) * tw..(k * nt + n + 1) * tw], bits, lut, &mut vals);
+                let xk = &xr[k * 16..k * 16 + 16];
+                for (p, v) in vals.iter().enumerate() {
+                    let (r, col) = pos[p];
+                    acc[c * 16 + col as usize] += xk[r as usize] as f64 * *v as f64;
+                }
+            }
+        }
+        let mut o = [0f32; 128];
+        for (a, v) in acc.iter().zip(o.iter_mut()) {
+            *v = *a as f32;
+        }
+        wht128(&mut o);
+        for (i, v) in o.iter().enumerate() {
+            y[i] = v * svh[ob * 128 + i];
+        }
+    };
+    let nb = out_features / 128;
+    let mut y = vec![0f32; out_features];
+    let per = nb.div_ceil(threads.max(1)).max(1);
+    std::thread::scope(|s| {
+        for (ci, chunk) in y.chunks_mut(per * 128).enumerate() {
+            let block = &block;
+            s.spawn(move || {
+                for (bi, out) in chunk.chunks_exact_mut(128).enumerate() {
+                    block(ci * per + bi, out);
+                }
+            });
+        }
+    });
+    y
+}
+
 /// In-place Walsh-Hadamard transform of 128 values in the natural (Sylvester) order, divided by sqrt(128).
 pub fn wht128(v: &mut [f32; 128]) {
     let mut h = 1;
@@ -338,6 +567,59 @@ mod tests {
         assert_eq!(f64_to_f16_bits(1.0 + 3.0 * 2f64.powi(-11)), 0x3c02);
         for bits in 0u16..0x7c00 {
             assert_eq!(f64_to_f16_bits(f16_to_f32(bits) as f64), bits, "{bits:#x}");
+        }
+    }
+
+    /// A tile of pseudo-random words: the fast decode is the reference decode, at every bit rate and every codebook.
+    #[test]
+    fn the_fast_tile_decode_equals_the_reference() {
+        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        for cb in 0..3u8 {
+            for bits in 1..=8usize {
+                let tile: Vec<u16> = (0..16 * bits).map(|_| next() as u16).collect();
+                let want = decode_tile(&tile, bits, cb);
+                let mut got = [0f32; 256];
+                decode_tile_fast(&tile, bits, codebook_table(cb), &mut got);
+                assert_eq!(got.map(f32::to_bits), want.map(f32::to_bits), "cb {cb} K {bits}");
+            }
+        }
+    }
+
+    /// The matvec in the rotated basis is `x W` with `W` the reconstructed matrix; on a blob, a loaded layer and a built one alike.
+    #[test]
+    fn the_rotated_basis_matvec_equals_the_reconstructed_matrix_times_x() {
+        let mut seed = 0x2545_f491_4f6c_dd1du64;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        for (inf, outf, bits) in [(256usize, 128usize, 2usize), (128, 256, 3), (384, 256, 4)] {
+            let lin = Exl3Linear {
+                in_features: inf, out_features: outf, bits, half: false, cb: 2,
+                trellis: (0..inf / 16 * outf / 16 * 16 * bits).map(|_| next() as u16).collect(),
+                suh: (0..inf).map(|_| if next() & 1 == 0 { 1.0 } else { -1.0 }).collect(),
+                svh: (0..outf).map(|_| f16_to_f32(crate::half::f32_to_f16((next() % 100) as f32 / 50.0 - 1.0))).collect(), // f16 values, as a checkpoint's are
+            };
+            let x: Vec<f32> = (0..inf).map(|_| (next() % 2000) as f32 / 1000.0 - 1.0).collect();
+            let w = lin.reconstruct();
+            let want: Vec<f64> = (0..outf).map(|o| (0..inf).map(|i| x[i] as f64 * w[i * outf + o] as f64).sum()).collect();
+            let blob = lin.to_blob();
+            assert_eq!(blob.len(), blob_len(inf, outf, bits));
+            for (name, got) in [("matvec", lin.matvec(&x, 3)), ("blob", matvec_blob(inf, outf, bits, 2, &blob, &x, 2)),
+                                ("from_blob", Exl3Linear::from_blob(inf, outf, bits, 2, &blob).matvec(&x, 1))] {
+                let scale = want.iter().map(|v| v.abs()).fold(0.0, f64::max).max(1e-9);
+                for (o, (g, w)) in got.iter().zip(&want).enumerate() {
+                    assert!((*g as f64 - w).abs() < 2e-4 * scale, "{name} {inf}x{outf} K={bits} output {o}: {g} against {w}");
+                }
+            }
         }
     }
 
