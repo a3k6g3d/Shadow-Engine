@@ -103,6 +103,14 @@ fn the_gpu_matvec_matches_the_cpu_on_random_blobs_at_every_bit_rate() {
             unsafe { prog.launch(&format!("matvec_exl3_{bits}"), (grid, 1, 1), (256, 1, 1), 0, None, &[Arg::Ptr(w.ptr), Arg::Ptr(dx.ptr), Arg::Ptr(dy.ptr), Arg::U32(outf as u32), Arg::U32(inf as u32)]).unwrap() };
             ctx.synchronize().unwrap();
             check(&read(&dy, outf), &want[0], &format!("matvec_exl3_{bits} {inf}x{outf}"));
+            // the k-sliced kernels (1, 2 and 4 slices of 8 warps; dynamic shared memory for the rotated input)
+            for ks in [1u32, 2, 4] {
+                dy.upload(&vec![0u8; outf * 4]).unwrap();
+                // SAFETY: as above; 256 ks threads, 4 inf bytes of shared memory.
+                unsafe { prog.launch(&format!("matvec_exl3_s{ks}_{bits}"), (grid, 1, 1), (256 * ks, 1, 1), (inf * 4) as u32, None, &[Arg::Ptr(w.ptr), Arg::Ptr(dx.ptr), Arg::Ptr(dy.ptr), Arg::U32(outf as u32), Arg::U32(inf as u32)]).unwrap() };
+                ctx.synchronize().unwrap();
+                check(&read(&dy, outf), &want[0], &format!("matvec_exl3_s{ks}_{bits} {inf}x{outf}"));
+            }
             // m inputs at once, strides wider than the rows
             let (xs, ys) = (inf + 16, outf + 32);
             let xpad: Vec<u8> = (0..m).flat_map(|j| x[j * inf..(j + 1) * inf].iter().copied().chain(std::iter::repeat(0.0).take(16))).flat_map(|v: f32| v.to_le_bytes()).collect();
@@ -117,6 +125,17 @@ fn the_gpu_matvec_matches_the_cpu_on_random_blobs_at_every_bit_rate() {
             for j in 0..m {
                 check(&got[j * ys..j * ys + outf], &want[j], &format!("matvec_cols_exl3_{bits} {inf}x{outf} input {j}"));
             }
+            for ks in [2u32, 4] {
+                dyp.upload(&vec![0u8; m * ys * 4]).unwrap();
+                // SAFETY: as the cols launch above, with the k-sliced kernel.
+                unsafe { prog.launch(&format!("matvec_cols_exl3_s{ks}_{bits}"), (grid, 1, 1), (256 * ks, 1, 1), 0, None,
+                                     &[Arg::Ptr(w.ptr), Arg::Ptr(dxp.ptr), Arg::U32(xs as u32), Arg::Ptr(dyp.ptr), Arg::U32(ys as u32), Arg::U32(outf as u32), Arg::U32(inf as u32), Arg::U32(m as u32)]).unwrap() };
+                ctx.synchronize().unwrap();
+                let got = read(&dyp, m * ys);
+                for j in 0..m {
+                    check(&got[j * ys..j * ys + outf], &want[j], &format!("matvec_cols_exl3_s{ks}_{bits} {inf}x{outf} input {j}"));
+                }
+            }
             // a table of two different matrices of this shape, one shared input and one input each
             let blob2 = random_blob(&mut rng, inf, outf, bits);
             let w2 = ctx.alloc(blob2.len()).unwrap();
@@ -126,6 +145,19 @@ fn the_gpu_matvec_matches_the_cpu_on_random_blobs_at_every_bit_rate() {
             dt.upload(&tab).unwrap();
             let dyb = ctx.alloc(2 * outf * 4).unwrap();
             let want2: Vec<Vec<f32>> = [&blob, &blob2].iter().map(|b| matvec_blob(inf, outf, bits, 2, b, &x[..inf], 2)).collect();
+            for ks in [1u32, 2, 4] {
+                for (xstride, name) in [(0usize, "shared input"), (inf, "an input each")] {
+                    // SAFETY: as below, with the k-sliced kernel.
+                    unsafe { prog.launch(&format!("matvec_batch_exl3_s{ks}_{bits}"), (grid, 2, 1), (256 * ks, 1, 1), (inf * 4) as u32, None,
+                                         &[Arg::Ptr(dt.ptr), Arg::Ptr(dx.ptr), Arg::U32(xstride as u32), Arg::Ptr(dyb.ptr), Arg::U32(outf as u32), Arg::U32(outf as u32), Arg::U32(inf as u32)]).unwrap() };
+                    ctx.synchronize().unwrap();
+                    let got = read(&dyb, 2 * outf);
+                    for b in 0..2 {
+                        let wantb = if xstride == 0 { want2[b].clone() } else { matvec_blob(inf, outf, bits, 2, if b == 0 { &blob } else { &blob2 }, &x[b * inf..(b + 1) * inf], 2) };
+                        check(&got[b * outf..(b + 1) * outf], &wantb, &format!("matvec_batch_exl3_s{ks}_{bits} {inf}x{outf} {name} matrix {b}"));
+                    }
+                }
+            }
             for (xstride, name) in [(0usize, "shared input"), (inf, "an input each")] {
                 // SAFETY: a table of two blobs, the inputs at dx (stride xstride), the outputs outf apart at dyb.
                 unsafe { prog.launch(&format!("matvec_batch_exl3_{bits}"), (grid, 2, 1), (256, 1, 1), 0, None,
@@ -168,6 +200,13 @@ fn the_gpu_matvec_matches_the_cpu_on_real_tensors() {
         let mut o = vec![0u8; outf * 4];
         dy.download(&mut o).unwrap();
         check(&floats(&o), &want, &format!("{prefix} K={}", lin.bits));
+        for ks in [1u32, 2, 4] {
+            // SAFETY: as above, with the k-sliced kernel.
+            unsafe { prog.launch(&format!("matvec_exl3_s{ks}_{}", lin.bits), ((outf / 128) as u32, 1, 1), (256 * ks, 1, 1), (inf * 4) as u32, None, &[Arg::Ptr(dw.ptr), Arg::Ptr(dx.ptr), Arg::Ptr(dy.ptr), Arg::U32(outf as u32), Arg::U32(inf as u32)]).unwrap() };
+            ctx.synchronize().unwrap();
+            dy.download(&mut o).unwrap();
+            check(&floats(&o), &want, &format!("{prefix} K={} k-sliced x{ks}", lin.bits));
+        }
         let _ = f16_to_f32;
     }
 }

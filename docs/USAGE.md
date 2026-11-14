@@ -111,6 +111,7 @@ Defaults are right for normal use; these are for measurement and diagnosis.
 | `SHADOW_DEFAULT_SAMPLING=model` | requests that send no sampling parameter are sampled with the model's recommended values (temperature 1.0, top-k 20, top-p 0.95) instead of greedy (STATUS 118; the chat page always sends its own) |
 | `SHADOW_CONV_DIR`, `SHADOW_CONV_DISK_GIB` | where the conversation snapshots on disk go (default `ShadowConvCache` at the root of the model's drive, one subfolder a model) and how many GiB of them one model may use (default 20; 0 = no disk copy); STATUS 120 |
 | `SHADOW_REPORT=1` | print the session report after each answer (tier hits, verify pass times, launches) |
+| `SHADOW_EXL3_V1=1` | EXL3 checkpoints: the first (one slice a block) trellis kernels instead of the k-sliced ones (STATUS 139) |
 | `SHADOW_LTIME=1`, `SHADOW_KTIME=1`, `SHADOW_PROFILE=1` | time a batched pass by segment / each kernel / the single-token step (these synchronize: they slow the run) |
 | `SHADOW_DF_TIME=1` | time the phases of the DFlash draft round |
 | `SHADOW_DF_KEEP=0` | the old behaviour: any conversation-snapshot restore switches the DFlash drafter off for the rest of the session (decode -17% to -38%, STATUS 98-99). Default on: the drafter keeps the K/V it still has after a restore |
