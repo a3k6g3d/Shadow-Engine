@@ -247,6 +247,61 @@ impl Exl3Linear {
     }
 }
 
+/// Re-layouts that need no decode: 128 outputs or inputs are 8 tile columns or rows and one 128-chunk of `svh` / `suh`,
+/// and 128 is the Hadamard block, so moving whole 128-blocks moves whole blocks of the rotation.
+impl Exl3Linear {
+    /// Output block `first + i` of the result is output block `first + map[i]` of `self` (blocks of 128 outputs).
+    pub fn permute_out_blocks(&mut self, first: usize, map: &[usize]) {
+        let (kt, nt, tw) = (self.in_features / 16, self.out_features / 16, self.tile_words());
+        assert!((first + map.len()) * 8 <= nt, "permute_out_blocks: {} blocks from {first} in {nt} tile columns", map.len());
+        let src = self.trellis.clone();
+        let svh = self.svh.clone();
+        for (i, &m) in map.iter().enumerate() {
+            for c in 0..8 {
+                let (nd, ns) = ((first + i) * 8 + c, (first + m) * 8 + c);
+                for k in 0..kt {
+                    let (d, s) = ((k * nt + nd) * tw, (k * nt + ns) * tw);
+                    self.trellis[d..d + tw].copy_from_slice(&src[s..s + tw]);
+                }
+            }
+            self.svh[(first + i) * 128..(first + i + 1) * 128].copy_from_slice(&svh[(first + m) * 128..(first + m + 1) * 128]);
+        }
+    }
+
+    /// Input block `first + i` of the result is input block `first + map[i]` of `self` (blocks of 128 inputs).
+    pub fn permute_in_blocks(&mut self, first: usize, map: &[usize]) {
+        let (kt, nt, tw) = (self.in_features / 16, self.out_features / 16, self.tile_words());
+        assert!((first + map.len()) * 8 <= kt, "permute_in_blocks: {} blocks from {first} in {kt} tile rows", map.len());
+        let src = self.trellis.clone();
+        let suh = self.suh.clone();
+        let row = nt * tw;
+        for (i, &m) in map.iter().enumerate() {
+            for r in 0..8 {
+                let (kd, ks) = ((first + i) * 8 + r, (first + m) * 8 + r);
+                self.trellis[kd * row..(kd + 1) * row].copy_from_slice(&src[ks * row..(ks + 1) * row]);
+            }
+            self.suh[(first + i) * 128..(first + i + 1) * 128].copy_from_slice(&suh[(first + m) * 128..(first + m + 1) * 128]);
+        }
+    }
+
+    /// The linear layer restricted to output blocks `first .. first + count` (128 outputs each).
+    pub fn slice_out_blocks(&self, first: usize, count: usize) -> Exl3Linear {
+        let (kt, nt, tw) = (self.in_features / 16, self.out_features / 16, self.tile_words());
+        assert!((first + count) * 8 <= nt, "slice_out_blocks: blocks {first}..{} of {nt} tile columns", first + count);
+        let nt2 = count * 8;
+        let mut trellis = Vec::with_capacity(kt * nt2 * tw);
+        for k in 0..kt {
+            for n in first * 8..(first + count) * 8 {
+                trellis.extend_from_slice(&self.trellis[(k * nt + n) * tw..(k * nt + n + 1) * tw]);
+            }
+        }
+        Exl3Linear {
+            in_features: self.in_features, out_features: count * 128, bits: self.bits, half: self.half, cb: self.cb, trellis,
+            suh: self.suh.clone(), svh: self.svh[first * 128..(first + count) * 128].to_vec(),
+        }
+    }
+}
+
 /// In-place Walsh-Hadamard transform of 128 values in the natural (Sylvester) order, divided by sqrt(128).
 pub fn wht128(v: &mut [f32; 128]) {
     let mut h = 1;
