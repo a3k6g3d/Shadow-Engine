@@ -1,0 +1,9 @@
+  item 0 at 0.15: ok (FALCON-1125 / 'FALCON-1125') 9826 tokens
+  item 1 at 0.46: ok (ORCHID-3185 / 'ORCHID-3185') 9825 tokens
+  item 2 at 0.66: ok (MAPLE-6961 / 'MAPLE-6961') 9822 tokens
+  item 3 at 0.85: ok (LANTERN-4794 / 'LANTERN-4794') 9825 tokens
+  item 4 at 0.19: ok (HARBOR-1901 / 'HARBOR-1901') 9827 tokens
+  item 5 at 0.38: ok (ZEBRA-2353 / 'ZEBRA-2353') 9826 tokens
+  item 6 at 0.70: ok (ORCHID-6643 / 'ORCHID-6643') 9826 tokens
+  item 7 at 0.89: ok (ORCHID-8795 / 'ORCHID-8795') 9825 tokens
+found 8/8 []

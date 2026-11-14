@@ -1,0 +1,6 @@
+shadow serve: --exact: no speculation, no inexact modes
+shadow serve: starting 2 MCP server(s) from mcp.json
+shadow serve: listening on http://127.0.0.1:8095
+shadow serve: MCP server time: 3 tools
+shadow serve: MCP server browser: 10 tools
+shadow serve: ready in 4.9 s; expert cache: 2808 slots x 1.66 MiB = 4.56 GiB; 0 hits, 0 misses (0.0% hits); 0 slice uploads; RAM tier: 0 experts, 0.00 GiB pinned (filled in 0.0 s), misses served 0 from RAM, 0 from the file; host waits per step: router 0.0 ms, copies 0.0 ms, file 0.0 ms; kernel launches per step 0, 0.0 ms of host time in them

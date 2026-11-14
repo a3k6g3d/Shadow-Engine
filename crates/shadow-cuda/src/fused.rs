@@ -92,9 +92,14 @@ impl Fused {
         Some(f)
     }
 
-    /// The ggml type number of a gate/up quantization the kernels read (by `TensorInfo::ty.name()`): IQ2_S, IQ3_XXS, IQ3_S, IQ4_XS.
+    /// The ggml type number of a gate/up quantization the kernels read (by `TensorInfo::ty.name()`): IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ4_XS.
+    /// IQ2_XXS and IQ2_XS (the Swift file named IQ3_XXS has them, STATUS 128) are in the DLL too; `SHADOW_FUSED_IQ2XS=0` leaves those layers to the engine's own kernels.
     pub fn gu_type(name: &str) -> Option<i32> {
+        static IQ2XS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let iq2xs = *IQ2XS.get_or_init(|| !std::env::var("SHADOW_FUSED_IQ2XS").is_ok_and(|v| v == "0"));
         match name {
+            "IQ2_XXS" if iq2xs => Some(16),
+            "IQ2_XS" if iq2xs => Some(17),
             "IQ3_XXS" => Some(18),
             "IQ3_S" => Some(21),
             "IQ2_S" => Some(22),
