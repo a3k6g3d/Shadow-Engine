@@ -428,6 +428,8 @@ pub struct GpuSession<'c, 'm> {
     ctx: &'c Context,
     m: &'m Model,
     mvp: Program<'c>,
+    /// The EXL3 trellis kernels (`kernels/exl3.cu`), loaded when the model has EXL3 matrices.
+    ex3: Option<Program<'c>>,
     fw: Program<'c>,
     w: HashMap<String, DeviceBuffer<'c>>,
     v: HashMap<String, DeviceBuffer<'c>>,
@@ -1975,6 +1977,7 @@ impl<'c, 'm> GpuSession<'c, 'm> {
         };
         vm("start");
         let mvp = Program::load(ctx, file("matvec.cu").ok_or("matvec.cu")?)?;
+        let ex3 = if m.g.tensors.iter().any(|t| t.ty.exl3().is_some()) { Some(Program::load(ctx, file("exl3.cu").ok_or("exl3.cu")?)?) } else { None };
         let fw = Program::load(ctx, file("forward.cu").ok_or("forward.cu")?)?;
         let mut w = HashMap::new();
         let mut v = HashMap::new();
@@ -2362,7 +2365,7 @@ impl<'c, 'm> GpuSession<'c, 'm> {
             None
         };
         let mut s = GpuSession {
-            ctx, m, mvp, fw, w, v, b, bb, replay, dscr, mmq, mmq_y, mmq_y_tag: std::cell::Cell::new((0, 0, 0, 0, 0)), fused,
+            ctx, m, mvp, ex3, fw, w, v, b, bb, replay, dscr, mmq, mmq_y, mmq_y_tag: std::cell::Cell::new((0, 0, 0, 0, 0)), fused,
             rparts: Vec::new(), bb_sig: 0, logits_last: false, sub_last: true, sub_first: true,
             devplan: tiers.tensor_prompt && !std::env::var("SHADOW_PREFILL_DEVPLAN").is_ok_and(|v| v == "0"), dp_tidx, dp_cnt, dp_gstart, dp_copied, dp_eaddr, dp_lay, kv_regions, kv_extra: None, kv_extra_reg, vmm_pool: Vec::new(), prompt_hint: 0, kv_rows: 0, kv_halves: false, router_bias: std::env::var("SHADOW_ROUTER_BIAS").ok().and_then(|v| v.parse().ok()).unwrap_or(0.0), batch_scratch, delta, attn, ple_state, tokens: vec![], layers, layers_in: None, layers_out: None, peer: None, reset_tokens: vec![], pictures: vec![], rope_tab: None, rope_on: false, cap, trace: None, stop_after: None,
             resident_bytes, expert_uploads: 0, cache, ram, copy_stream, copy_stream2, copy_ev2, copy_event, staging,
@@ -2844,7 +2847,23 @@ impl<'c, 'm> GpuSession<'c, 'm> {
         self.k(name, (n as u32).div_ceil(256), 256, args);
     }
 
+    /// The EXL3 program and bit rate of an EXL3 matrix (None for any other type).  Only the `mul1` codebook has kernels.
+    fn exl3_prog(&self, t: &TensorInfo) -> Option<(&Program<'c>, usize)> {
+        let (bits, cb) = t.ty.exl3()?;
+        assert_eq!(cb, 2, "{}: only the mul1 codebook has GPU kernels", t.name);
+        Some((self.ex3.as_ref().expect("an EXL3 matrix needs the exl3.cu program"), bits))
+    }
+
     fn matvec(&self, t: &TensorInfo, wptr: u64, rows: usize, x: u64, y: u64) {
+        if let Some((p, bits)) = self.exl3_prog(t) {
+            // SAFETY: a blob of dims[0] x rows weights at wptr (an EXL3 matrix's dims are [in, out]); x holds dims[0] floats, y `rows`.
+            unsafe {
+                p.launch(&format!("matvec_exl3_{bits}"), ((rows as u32).div_ceil(128), 1, 1), (256, 1, 1), 0, self.ls(),
+                         &[Arg::Ptr(wptr), Arg::Ptr(x), Arg::Ptr(y), Arg::U32(rows as u32), Arg::U32(t.dims[0] as u32)])
+            }
+            .unwrap_or_else(|err| panic!("{}: {err}", t.name));
+            return;
+        }
         let ty = t.ty.name();
         // the 8-at-a-time kernel where tests/matvec.rs measured it faster than the reference one (every block-quantized
         // type), and for BF16 / F32 too unless the reference sum order is asked for (`fast_order`)
@@ -2865,8 +2884,10 @@ impl<'c, 'm> GpuSession<'c, 'm> {
     /// y = W x for a resident dense tensor (applying the companion `.scale` scalar when present).
     fn mv(&self, name: &str, x: u64, y: u64) {
         let (t, nbytes) = self.m.dense_meta(name);
-        let (qk, qb) = t.ty.block().unwrap();
-        let rows = nbytes / (t.dims[0] / qk * qb) as usize;
+        let rows = match t.ty.block() {
+            Some((qk, qb)) => nbytes / (t.dims[0] / qk * qb) as usize,
+            None => t.dims[1] as usize, // an EXL3 matrix: dims are [in, out], the bytes are one blob
+        };
         let wptr = self.w.get(name).unwrap_or_else(|| panic!("{name} is not resident")).ptr;
         let s = self.m.scale(name);
         self.matvec(t, wptr, rows, x, y);
@@ -2880,6 +2901,12 @@ impl<'c, 'm> GpuSession<'c, 'm> {
     fn mv_pair(&self, name0: &str, y0: u64, name1: &str, y1: u64, x: u64) {
         let (t0, b0) = self.m.dense_meta(name0);
         let (t1, b1) = self.m.dense_meta(name1);
+        if t0.ty.exl3().is_some() || t1.ty.exl3().is_some() {
+            // an EXL3 matrix rotates the input with its own sign vector, so two matrices cannot share one pass
+            self.mv(name0, x, y0);
+            self.mv(name1, x, y1);
+            return;
+        }
         let ty = t0.ty.name();
         if self.fast_order && matches!(ty.as_str(), "BF16" | "F32") {
             // the pair kernels for these types sum in the reference order
@@ -5630,6 +5657,20 @@ impl<'c, 'm> GpuSession<'c, 'm> {
     /// in one launch where a matvec_cols kernel computes the same sums (`mv` per input otherwise).
     fn mv_cols(&self, name: &str, x: u64, xs: usize, y: u64, ys: usize, m: usize) {
         let (t, nbytes) = self.m.dense_meta(name);
+        if let Some((p, bits)) = self.exl3_prog(t) {
+            let (rows, cols) = (t.dims[1] as usize, t.dims[0] as u32);
+            let wptr = self.w.get(name).unwrap_or_else(|| panic!("{name} is not resident")).ptr;
+            for j0 in (0..m).step_by(COLS_MAX) {
+                let (x, y, n) = (x + (j0 * xs * 4) as u64, y + (j0 * ys * 4) as u64, (m - j0).min(COLS_MAX));
+                // SAFETY: a blob of cols x rows weights at wptr; n inputs of `cols` floats xs apart, n outputs of `rows` floats ys apart.
+                unsafe {
+                    p.launch(&format!("matvec_cols_exl3_{bits}"), ((rows as u32).div_ceil(128), 1, 1), (256, 1, 1), 0, self.ls(),
+                             &[Arg::Ptr(wptr), Arg::Ptr(x), Arg::U32(xs as u32), Arg::Ptr(y), Arg::U32(ys as u32), Arg::U32(rows as u32), Arg::U32(cols), Arg::U32(n as u32)])
+                }
+                .unwrap_or_else(|err| panic!("{name}: {err}"));
+            }
+            return;
+        }
         let (qk, qb) = t.ty.block().unwrap();
         let rows = nbytes / (t.dims[0] / qk * qb) as usize;
         let ty = t.ty.name();
@@ -5823,6 +5864,17 @@ impl<'c, 'm> GpuSession<'c, 'm> {
     /// (xs = 0: shared) into y + n * ys.
     #[allow(clippy::too_many_arguments)]
     fn mv_batch(&self, t: &TensorInfo, tab: u64, count: usize, x: u64, xs: usize, y: u64, ys: usize) {
+        if let Some((p, bits)) = self.exl3_prog(t) {
+            let (rows, cols) = (t.dims[1] as u32, t.dims[0] as u32);
+            // SAFETY: `count` blobs of cols x rows weights from the table at `tab`; `count` inputs of `cols` floats (stride xs, or 0 when shared)
+            // and `count` outputs of `rows` floats (stride ys) inside this session's buffers.
+            unsafe {
+                p.launch(&format!("matvec_batch_exl3_{bits}"), (rows.div_ceil(128), count as u32, 1), (256, 1, 1), 0, self.ls(),
+                         &[Arg::Ptr(tab), Arg::Ptr(x), Arg::U32(xs as u32), Arg::Ptr(y), Arg::U32(ys as u32), Arg::U32(rows), Arg::U32(cols)])
+            }
+            .unwrap_or_else(|err| panic!("{}: {err}", t.name));
+            return;
+        }
         let ty = t.ty.name();
         let entry = FAST_KERNELS.iter().find(|q| q.0 == ty).unwrap_or_else(|| panic!("{}: no batched kernel", t.name)).2;
         let (rows, cols) = (t.dims[1] as u32, t.dims[0] as u32);
@@ -6733,7 +6785,7 @@ impl<'c, 'm> GpuSession<'c, 'm> {
         if cpu_pending {
             self.cpu_host.0 += t_plan.elapsed().as_secs_f64();
         }
-        if self.sp.is_some() && m > MAX_VERIFY && !cpu_pending {
+        if self.sp.is_some() && m > MAX_VERIFY && !cpu_pending && infos[0].ty.exl3().is_none() {
             let t_pre = t_woke.elapsed();
             self.moe_staged(l, m, Some(&tops), &infos, &sizes, &names);
             if m >= 2048 && std::env::var("SHADOW_STAGE_TIME").is_ok_and(|v| v == "1") {
@@ -6825,7 +6877,8 @@ impl<'c, 'm> GpuSession<'c, 'm> {
             vt_lap(&mut vt, 6);
             // grouped and overlapped: each union expert once, on all of the group's tokens that route to it - the
             // resident ones while the misses copy, then (the GPU waiting for the copies) the copied ones
-            let overlap = self.overlap && self.prof.is_none() && infos[0].ty == infos[1].ty && infos[0].dims == infos[1].dims;
+            // (an EXL3 matrix has no grouped kernel yet: its tokens go through `routed_qwen`, one token at a time)
+            let overlap = self.overlap && self.prof.is_none() && infos[0].ty == infos[1].ty && infos[0].dims == infos[1].dims && infos[0].ty.exl3().is_none();
             let part = [0u64, sizes[0] as u64, (sizes[0] + sizes[1]) as u64];
             let mut plan = None;
             // the copies are the long pole of a layer with misses: their calls go out before the plan is built and the resident experts are launched (`SHADOW_FETCH_FIRST=0`: after, as

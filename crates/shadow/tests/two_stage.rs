@@ -16,6 +16,12 @@ fn peer_ctx() -> Option<Context> {
     (o != 0).then(|| Context::new(o).unwrap_or_else(|e| panic!("SHADOW_PEER_GPU={o}: {e}")))
 }
 
+/// A GGUF file, or an EXL3 checkpoint directory (`SHADOW_MODEL` names either).
+fn open_model(p: &str) -> Model {
+    let path = Path::new(p);
+    if path.is_dir() { Model::load_exl3(path, true).unwrap() } else { Model::load_lean(Gguf::open(path).unwrap()).unwrap() }
+}
+
 const MODEL: &str =
     "J:/Strata-work/models/swift15/IQ3_S/Swift-Qwen3.8-Flash-Next-GSQ-RCO-abliterated-IQ3_S-00001-of-00002.gguf";
 const TOKENS: [u32; 6] = [1000, 2345, 56, 78901, 4, 12345];
@@ -37,7 +43,7 @@ fn bits(v: &[f32]) -> Vec<u32> {
 #[test]
 fn two_stages_on_one_card_equal_one_session() {
     let p = std::env::var("SHADOW_MODEL").unwrap_or_else(|_| MODEL.into());
-    if !Path::new(&p).is_file() {
+    if !Path::new(&p).exists() {
         eprintln!("SKIPPED, not passed: no model at {p}");
         return;
     }
@@ -48,7 +54,7 @@ fn two_stages_on_one_card_equal_one_session() {
             return;
         }
     };
-    let model = Model::load_lean(Gguf::open(Path::new(&p)).unwrap()).unwrap();
+    let model = open_model(&p);
     let ctx_b = peer_ctx();
     let cb = ctx_b.as_ref().unwrap_or(&ctx);
     let n_layer = model.cfg.n_layer;
@@ -80,7 +86,7 @@ fn two_stages_on_one_card_equal_one_session() {
 #[test]
 fn batches_through_two_stages_equal_one_session() {
     let p = std::env::var("SHADOW_MODEL").unwrap_or_else(|_| MODEL.into());
-    if !Path::new(&p).is_file() {
+    if !Path::new(&p).exists() {
         eprintln!("SKIPPED, not passed: no model at {p}");
         return;
     }
@@ -91,7 +97,7 @@ fn batches_through_two_stages_equal_one_session() {
             return;
         }
     };
-    let model = Model::load_lean(Gguf::open(Path::new(&p)).unwrap()).unwrap();
+    let model = open_model(&p);
     let ctx_b = peer_ctx();
     let cb = ctx_b.as_ref().unwrap_or(&ctx);
     let n_layer = model.cfg.n_layer;
@@ -166,7 +172,7 @@ fn same(got: &[f32], want: &[f32], what: &str) {
 #[test]
 fn verify_and_rollback_through_two_stages_equal_one_session() {
     let p = std::env::var("SHADOW_MODEL").unwrap_or_else(|_| MODEL.into());
-    if !Path::new(&p).is_file() {
+    if !Path::new(&p).exists() {
         eprintln!("SKIPPED, not passed: no model at {p}");
         return;
     }
@@ -177,7 +183,7 @@ fn verify_and_rollback_through_two_stages_equal_one_session() {
             return;
         }
     };
-    let model = Model::load_lean(Gguf::open(Path::new(&p)).unwrap()).unwrap();
+    let model = open_model(&p);
     let ctx_b = peer_ctx();
     let cb = ctx_b.as_ref().unwrap_or(&ctx);
     let n_layer = model.cfg.n_layer;
@@ -245,7 +251,7 @@ fn script<'c, 'm>(s: &mut GpuSession<'c, 'm>) -> Vec<Vec<f32>> {
 #[test]
 fn a_pair_driven_through_the_first_stage_equals_one_session() {
     let p = std::env::var("SHADOW_MODEL").unwrap_or_else(|_| MODEL.into());
-    if !Path::new(&p).is_file() {
+    if !Path::new(&p).exists() {
         eprintln!("SKIPPED, not passed: no model at {p}");
         return;
     }
@@ -256,7 +262,7 @@ fn a_pair_driven_through_the_first_stage_equals_one_session() {
             return;
         }
     };
-    let model = Model::load_lean(Gguf::open(Path::new(&p)).unwrap()).unwrap();
+    let model = open_model(&p);
     let ctx_b = peer_ctx();
     let cb = ctx_b.as_ref().unwrap_or(&ctx);
     let n_layer = model.cfg.n_layer;
@@ -328,7 +334,7 @@ fn draft_script<'c, 'm>(s: &mut GpuSession<'c, 'm>) -> Vec<Vec<u32>> {
 #[test]
 fn the_drafter_across_two_stages_drafts_what_one_session_drafts() {
     let p = std::env::var("SHADOW_MODEL").unwrap_or_else(|_| MODEL.into());
-    if !Path::new(&p).is_file() {
+    if !Path::new(&p).exists() {
         eprintln!("SKIPPED, not passed: no model at {p}");
         return;
     }
@@ -343,7 +349,7 @@ fn the_drafter_across_two_stages_drafts_what_one_session_drafts() {
             return;
         }
     };
-    let model = Model::load_lean(Gguf::open(Path::new(&p)).unwrap()).unwrap();
+    let model = open_model(&p);
     let ctx_b = peer_ctx();
     let cb = ctx_b.as_ref().unwrap_or(&ctx);
     let n_layer = model.cfg.n_layer;
@@ -373,7 +379,7 @@ fn the_drafter_across_two_stages_drafts_what_one_session_drafts() {
 #[test]
 fn a_long_prompt_through_the_pair_equals_one_session() {
     let p = std::env::var("SHADOW_MODEL").unwrap_or_else(|_| MODEL.into());
-    if !Path::new(&p).is_file() {
+    if !Path::new(&p).exists() {
         eprintln!("SKIPPED, not passed: no model at {p}");
         return;
     }
@@ -384,7 +390,7 @@ fn a_long_prompt_through_the_pair_equals_one_session() {
             return;
         }
     };
-    let model = Model::load_lean(Gguf::open(Path::new(&p)).unwrap()).unwrap();
+    let model = open_model(&p);
     let ctx_b = peer_ctx();
     let cb = ctx_b.as_ref().unwrap_or(&ctx);
     let n_layer = model.cfg.n_layer;

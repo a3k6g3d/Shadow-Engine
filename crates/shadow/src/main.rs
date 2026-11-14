@@ -173,9 +173,9 @@ fn ppl(path: &std::path::Path, text: &str, rest: &[String]) -> ExitCode {
         }
         None => text.to_string(),
     };
-    let g = Gguf::open(path).expect("model");
-    let tok = Tokenizer::from_gguf(&g).expect("tokenizer");
-    let model = Model::load(g).expect("model");
+    // a GGUF file, or an EXL3 checkpoint directory
+    let model = if path.is_dir() { Model::load_exl3(path, false).expect("model") } else { Model::load(Gguf::open(path).expect("model")).expect("model") };
+    let tok = Tokenizer::from_gguf(&model.g).expect("tokenizer");
     check_layout(&model.g, &model.cfg).expect("layout");
     let ids = tok.encode(&text, true);
     let ctx = shadow_cuda::Context::new(0).expect("GPU");
@@ -472,22 +472,27 @@ fn generate(path: &std::path::Path, prompt: &str, rest: &[String]) -> ExitCode {
         .unwrap_or(8);
     let chat = rest.iter().any(|a| a == "--chat");
     let mode = mode(rest);
-    let g = match Gguf::open(path) {
-        Ok(g) => g,
-        Err(e) => {
-            eprintln!("shadow generate: {e}");
-            return ExitCode::FAILURE;
+    let t0 = std::time::Instant::now();
+    // a GGUF file, or an EXL3 checkpoint directory
+    let loaded = if path.is_dir() {
+        Model::load_exl3(path, false)
+    } else {
+        match Gguf::open(path) {
+            Ok(g) => Model::load(g),
+            Err(e) => {
+                eprintln!("shadow generate: {e}");
+                return ExitCode::FAILURE;
+            }
         }
     };
-    let tok = Tokenizer::from_gguf(&g).expect("tokenizer");
-    let t0 = std::time::Instant::now();
-    let model = match Model::load(g) {
+    let model = match loaded {
         Ok(m) => m,
         Err(e) => {
             eprintln!("shadow generate: {e}");
             return ExitCode::FAILURE;
         }
     };
+    let tok = Tokenizer::from_gguf(&model.g).expect("tokenizer");
     if let Err(e) = check_layout(&model.g, &model.cfg) {
         eprintln!("shadow generate: {e}");
         return ExitCode::FAILURE;

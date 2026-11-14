@@ -343,11 +343,16 @@ fn run(
             .map(|f| f.to_string_lossy().into_owned())
             .unwrap_or_default();
     }
-    let g = Gguf::open(&cfg.model).map_err(|e| e.to_string())?;
-    let tok = Tokenizer::from_gguf(&g).map_err(|e| e.0)?;
+    // a GGUF file, or an EXL3 checkpoint directory (config.json, tokenizer.json, model-*.safetensors: `exl3_model.rs` presents it as a GGUF)
+    let model = if cfg.model.is_dir() {
+        Model::load_exl3(&cfg.model, true)?
+    } else {
+        let g = Gguf::open(&cfg.model).map_err(|e| e.to_string())?;
+        Model::load_lean(g)? // the GPU session reads the big dense weights from the file as it uploads them: ~4.3 GiB less RAM than `load`
+    };
+    let tok = Tokenizer::from_gguf(&model.g).map_err(|e| e.0)?;
     // message text is defanged only where it holds a real special token's string (`neutralize_specials`)
     crate::set_special_tokens(tok.special_strings());
-    let model = Model::load_lean(g)?; // the GPU session reads the big dense weights from the file as it uploads them: ~4.3 GiB less RAM than `load`
     check_layout(&model.g, &model.cfg)?;
     let ctx = shadow_cuda::Context::new(cfg.gpu).map_err(|e| format!("GPU: {e}"))?;
     let ctx1 = match &cfg.pair {
