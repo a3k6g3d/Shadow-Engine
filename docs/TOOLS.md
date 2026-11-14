@@ -54,6 +54,7 @@ CUDA index, `safetensors`, `numpy`, `matplotlib`).
 | `tools/hf_range.py` | reads tensors from a Hugging Face safetensors checkpoint by HTTP range requests (no 360 GB download) |
 | `tools/fetch_exl3_subset.py` | `REPO REV OUT.safetensors REGEX...`: pulls the tensors of an EXL3 (or any safetensors) repo branch whose names match, by range requests, into one small valid safetensors file; what the EXL3 tests and fixtures are made from |
 | `tools/gguf_tensor_types.py` | `FILE.gguf [SUBSTRING...]`: every tensor of a GGUF (the ones whose name has a substring) with dims and quant type, then a count per type; reads the header only |
+| `tools/fetch_base_experts.py` | `OUT LAYERS EXPERTS`: slices of the fused expert tensors of the BF16 base checkpoint (`Qwen/Qwen3.8-Flash-Next`) for chosen layers and experts, by range requests, under per-expert names; what `tests/exl3_vs_base.rs` compares the EXL3 decode with |
 | `tools/_refenv.py` | import before transformers in the reference scripts (a stand-in for a broken global torchaudio) |
 
 ## The agent harness and memory
