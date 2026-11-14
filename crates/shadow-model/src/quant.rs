@@ -8,7 +8,7 @@
 
 use crate::gguf::GgmlType;
 use crate::half::{bf16_to_f32, f16_to_f32};
-use crate::quant_tables::{IQ2S_GRID, IQ3S_GRID, IQ3XXS_GRID, IQ4NL_VALUES, KSIGNS};
+use crate::quant_tables::{IQ2S_GRID, IQ2XS_GRID, IQ2XXS_GRID, IQ3S_GRID, IQ3XXS_GRID, IQ4NL_VALUES, KSIGNS};
 
 const QK_K: usize = 256;
 
@@ -86,6 +86,44 @@ fn iq2_s(b: &[u8], y: &mut [f32]) {
             let s = (scales[e / 32] >> (4 * ((e / 16) % 2))) & 0x0f;
             let db = d * (0.5 + s as f32) * 0.25;
             y[e] = db * v as f32 * sign(signs[e / 8] >> (e % 8));
+        }
+    }
+}
+
+/// IQ2_XXS (upstream ggml, `dequantize_row_iq2_xxs`): an f16 scale, then per 32 weights two u32: four grid indices (one byte
+/// each, 256 entries of 8 magnitudes) and, in the second, four 7-bit sign patterns (`KSIGNS`) with a 4-bit scale on top.
+fn iq2_xxs(b: &[u8], y: &mut [f32]) {
+    let d = f16_at(b, 0);
+    let qs = &b[2..66];
+    for g in 0..8 {
+        let aux = &qs[g * 8..g * 8 + 8];
+        let s32 = u32::from_le_bytes(aux[4..8].try_into().unwrap());
+        let db = d * (0.5 + (s32 >> 28) as f32) * 0.25;
+        for k in 0..4 {
+            let signs = KSIGNS[((s32 >> (7 * k)) & 0x7f) as usize];
+            for m in 0..8 {
+                let e = g * 32 + k * 8 + m;
+                y[e] = db * IQ2XXS_GRID[aux[k] as usize][m] as f32 * sign(signs >> m);
+            }
+        }
+    }
+}
+
+/// IQ2_XS (upstream ggml, `dequantize_row_iq2_xs`): an f16 scale, 32 u16 codes (9-bit grid index into 512 entries of 8
+/// magnitudes, 7-bit sign pattern), 8 scale bytes (two 4-bit scales, one per 16 weights, a byte a 32-weight group).
+fn iq2_xs(b: &[u8], y: &mut [f32]) {
+    let d = f16_at(b, 0);
+    let (qs, scales) = (&b[2..66], &b[66..74]);
+    for g in 0..8 {
+        for k in 0..4 {
+            let q = u16::from_le_bytes([qs[(g * 4 + k) * 2], qs[(g * 4 + k) * 2 + 1]]);
+            let s = (scales[g] >> (4 * (k / 2))) & 0x0f;
+            let db = d * (0.5 + s as f32) * 0.25;
+            let signs = KSIGNS[(q >> 9) as usize];
+            for m in 0..8 {
+                let e = g * 32 + k * 8 + m;
+                y[e] = db * IQ2XS_GRID[(q & 511) as usize][m] as f32 * sign(signs >> m);
+            }
         }
     }
 }
@@ -203,6 +241,8 @@ pub fn dequantize(ty: GgmlType, data: &[u8], out: &mut [f32]) -> Result<(), Stri
         "Q5_K" => q5_k,
         "Q6_K" => q6_k,
         "IQ2_S" => iq2_s,
+        "IQ2_XXS" => iq2_xxs,
+        "IQ2_XS" => iq2_xs,
         "IQ3_XXS" => iq3_xxs,
         "IQ3_S" => iq3_s,
         "IQ4_NL" => iq4_nl,

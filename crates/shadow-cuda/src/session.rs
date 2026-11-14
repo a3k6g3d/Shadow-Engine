@@ -6935,7 +6935,7 @@ impl<'c, 'm> GpuSession<'c, 'm> {
     /// Whether a layer's three expert matrices can run on the tensor cores (`--tensor-prompt`: types with an FP16 decode, columns a multiple of 64).
     fn mma_experts_ok(&self, infos: &[TensorInfo]) -> bool {
         self.tensor_prompt
-            && infos.iter().all(|t| matches!(t.ty.name().as_str(), "Q6_K" | "IQ4_XS" | "IQ4_NL" | "Q2_0" | "IQ2_S" | "IQ3_XXS" | "IQ3_S")
+            && infos.iter().all(|t| matches!(t.ty.name().as_str(), "Q6_K" | "IQ4_XS" | "IQ4_NL" | "Q2_0" | "IQ2_S" | "IQ2_XXS" | "IQ2_XS" | "IQ3_XXS" | "IQ3_S")
                                     && t.dims[0] % 64 == 0 && t.dims[1] % 8 == 0)
     }
 

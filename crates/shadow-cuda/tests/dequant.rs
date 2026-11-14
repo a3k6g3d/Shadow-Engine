@@ -47,7 +47,10 @@ fn gpu_dequant_matches_the_reference_bit_for_bit() {
         return eprintln!("SKIPPED, not passed: no NVRTC ({e})");
     }
     let prog = Program::load(&ctx, file("dequant.cu").unwrap()).unwrap();
-    let text = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../../eval/fixtures/dequant.txt")).unwrap();
+    // dequant.txt, plus dequant_iq2.txt: IQ2_XXS and IQ2_XS blocks (only the Swift file named IQ3_XXS has them; STATUS 128)
+    let mut text = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../../eval/fixtures/dequant.txt")).unwrap();
+    text.push_str("\n");
+    text.push_str(&std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../../eval/fixtures/dequant_iq2.txt")).unwrap());
     let lines: Vec<&str> = text.lines().filter(|l| !l.starts_with('#') && !l.is_empty()).collect();
     let mut checked = std::collections::BTreeMap::new();
     for rec in lines.chunks(3) {
@@ -64,7 +67,7 @@ fn gpu_dequant_matches_the_reference_bit_for_bit() {
         *checked.entry(ty).or_insert(0) += 1;
     }
     eprintln!("fixture blocks checked on the GPU: {checked:?}");
-    assert_eq!(checked.len(), 9, "every quant type of the model that has fixtures and a CUDA kernel, BF16 included");
+    assert_eq!(checked.len(), 11, "every quant type of the model that has fixtures and a CUDA kernel, BF16 included");
 
     // Q2_0: no fixture exists, so against the Rust implementation on real blocks - a whole expert of blk.1's down
     // projection - when the model is here.

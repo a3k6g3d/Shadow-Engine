@@ -112,6 +112,33 @@ struct IQ2S {
     }
 };
 
+// IQ2_XXS (66 bytes a 256 weights): f16 scale, 8 groups of 32 weights, each two u32: four grid-index bytes (256 entries of 8 magnitudes) and four 7-bit sign patterns with a 4-bit scale on top.
+struct IQ2XXS {
+    static const unsigned int QK = 256, BYTES = 66;
+    static __device__ __forceinline__ float at(const u8* b, unsigned int e) {
+        unsigned int g = e / 32, k = (e % 32) / 8;
+        const u8* a = b + 2 + g * 8;
+        unsigned int s32 = (unsigned int) a[4] | ((unsigned int) a[5] << 8) | ((unsigned int) a[6] << 16) | ((unsigned int) a[7] << 24);
+        float db = __fmul_rn(__fmul_rn(qf16(b), __fadd_rn(0.5f, (float) (s32 >> 28))), 0.25f);
+        u8 signs = kKSigns[(s32 >> (7 * k)) & 0x7f];
+        return qsign(__fmul_rn(db, (float) kIQ2XXSGrid[a[k]][e % 8]), signs >> (e % 8));
+    }
+};
+
+// IQ2_XS (74 bytes a 256 weights): f16 scale, 32 u16 codes (9-bit grid index into 512 entries of 8 magnitudes, 7-bit sign pattern), 8 scale bytes (a 4-bit scale a 16 weights).
+struct IQ2XS {
+    static const unsigned int QK = 256, BYTES = 74;
+    static __device__ __forceinline__ float at(const u8* b, unsigned int e) {
+        unsigned int g = e / 32, k = (e % 32) / 8;
+        const u8* qp = b + 2 + (g * 4 + k) * 2;
+        unsigned int q = (unsigned int) qp[0] | ((unsigned int) qp[1] << 8);
+        unsigned int sc = (b[66 + g] >> (4 * (k / 2))) & 0x0f;
+        float db = __fmul_rn(__fmul_rn(qf16(b), __fadd_rn(0.5f, (float) sc)), 0.25f);
+        u8 signs = kKSigns[q >> 9];
+        return qsign(__fmul_rn(db, (float) kIQ2XSGrid[q & 511][e % 8]), signs >> (e % 8));
+    }
+};
+
 struct IQ3XXS {
     static const unsigned int QK = 256, BYTES = 98;
     static __device__ __forceinline__ float at(const u8* b, unsigned int e) {

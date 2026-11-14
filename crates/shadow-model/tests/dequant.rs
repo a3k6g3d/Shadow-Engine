@@ -8,6 +8,7 @@ use shadow_model::quant::dequantize;
 const IDS: &[(&str, u32)] = &[
     ("F32", 0), ("F16", 1), ("Q4_K", 12), ("Q5_K", 13), ("Q6_K", 14), ("IQ3_XXS", 18),
     ("IQ4_NL", 20), ("IQ3_S", 21), ("IQ2_S", 22), ("IQ4_XS", 23), ("BF16", 30), ("NVFP4", 40),
+    ("IQ2_XXS", 16), ("IQ2_XS", 17),
 ];
 
 fn hex(s: &str) -> Vec<u8> {
@@ -16,11 +17,24 @@ fn hex(s: &str) -> Vec<u8> {
 
 #[test]
 fn every_fixture_block_matches_the_reference_bit_for_bit() {
-    let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../eval/fixtures/dequant.txt");
-    let text = std::fs::read_to_string(path).expect("eval/fixtures/dequant.txt (tools/gen_dequant_fixtures.py)");
+    let per_type = check_fixtures("dequant.txt");
+    assert_eq!(per_type.len(), IDS.len() - 2, "every type the models use (but Q2_0, IQ2_XXS, IQ2_XS) must have fixtures");
+}
+
+/// IQ2_XXS and IQ2_XS only occur in the Swift file named IQ3_XXS (its expert gate/up matrices; STATUS 128), so their blocks
+/// are in a file of their own.
+#[test]
+fn iq2_xxs_and_iq2_xs_blocks_match_the_reference_bit_for_bit() {
+    let per_type = check_fixtures("dequant_iq2.txt");
+    assert_eq!(per_type.keys().copied().collect::<Vec<_>>(), ["IQ2_XS", "IQ2_XXS"]);
+}
+
+fn check_fixtures(file: &str) -> std::collections::BTreeMap<&'static str, usize> {
+    let path = format!("{}/../../eval/fixtures/{file}", env!("CARGO_MANIFEST_DIR"));
+    let text = std::fs::read_to_string(&path).unwrap_or_else(|_| panic!("{path} (tools/gen_dequant_fixtures.py)"));
     let lines: Vec<&str> = text.lines().filter(|l| !l.starts_with('#') && !l.is_empty()).collect();
     assert_eq!(lines.len() % 3, 0);
-    let mut per_type = std::collections::BTreeMap::new();
+    let mut per_type = std::collections::BTreeMap::<&'static str, usize>::new();
     for rec in lines.chunks(3) {
         let head: Vec<&str> = rec[0].split_whitespace().collect();
         let (ty_name, tensor, block) = (head[0], head[1], head[2]);
@@ -34,10 +48,10 @@ fn every_fixture_block_matches_the_reference_bit_for_bit() {
             assert_eq!(g.to_bits(), *w, "{ty_name} {tensor} block {block} element {i}: got {g}, reference {}",
                        f32::from_bits(*w));
         }
-        *per_type.entry(ty_name).or_insert(0) += 1;
+        *per_type.entry(IDS.iter().find(|(n, _)| *n == ty_name).unwrap().0).or_insert(0) += 1;
     }
     eprintln!("blocks checked per type: {per_type:?}");
-    assert_eq!(per_type.len(), IDS.len(), "every type the models use (but Q2_0) must have fixtures");
+    per_type
 }
 
 #[test]

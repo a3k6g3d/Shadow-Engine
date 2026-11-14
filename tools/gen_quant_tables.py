@@ -44,6 +44,8 @@ def main() -> None:
         "",
     ]
     lines += table("IQ2S_GRID", grid(quants.IQ2_S)) + [""]
+    lines += table("IQ2XXS_GRID", grid(quants.IQ2_XXS)) + [""]
+    lines += table("IQ2XS_GRID", grid(quants.IQ2_XS)) + [""]
     lines += table("IQ3XXS_GRID", grid(quants.IQ3_XXS)) + [""]
     lines += table("IQ3S_GRID", grid(quants.IQ3_S)) + [""]
     ks = np.frombuffer(quants.IQ2_XXS.ksigns, dtype=np.uint8)
@@ -60,7 +62,8 @@ def main() -> None:
         "// as crates/shadow-model/src/quant_tables.rs.  Listed as a header of the kernel files that need it.",
         "",
     ]
-    for name, cls in (("kIQ2SGrid", quants.IQ2_S), ("kIQ3XXSGrid", quants.IQ3_XXS), ("kIQ3SGrid", quants.IQ3_S)):
+    for name, cls in (("kIQ2SGrid", quants.IQ2_S), ("kIQ2XXSGrid", quants.IQ2_XXS), ("kIQ2XSGrid", quants.IQ2_XS),
+                      ("kIQ3XXSGrid", quants.IQ3_XXS), ("kIQ3SGrid", quants.IQ3_S)):
         g = grid(cls)
         rows, width = g.shape
         cu.append(f"__device__ const u8 __align__(8) {name}[{rows}][{width}] = {{")

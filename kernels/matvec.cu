@@ -350,6 +350,59 @@ template <> struct Fast<IQ2S> {
     }
 };
 
+// IQ2_XXS / IQ2_XS: 8 weights i..i+8 (inside one 32-weight group, so one grid row and one sign byte), as `IQ2XXS::at` / `IQ2XS::at` compute them.
+#define IQ2_ROW_XXS(r, i, db, signs, row) \
+    const u8* b = (r) + ((i) / 256) * 66; \
+    unsigned int e0_ = (i) % 256, g_ = e0_ / 32, kk_ = (e0_ % 32) / 8; \
+    const u16* ap_ = (const u16*) (b + 2 + g_ * 8); \
+    unsigned int s32_ = (unsigned int) ap_[2] | ((unsigned int) ap_[3] << 16); \
+    float db = __fmul_rn(__fmul_rn(qf16(b), __fadd_rn(0.5f, (float) (s32_ >> 28))), 0.25f); \
+    u8 signs = kKSigns[(s32_ >> (7 * kk_)) & 0x7f]; \
+    u64 row = *(const u64*) kIQ2XXSGrid[b[2 + g_ * 8 + kk_]];
+#define IQ2_ROW_XS(r, i, db, signs, row) \
+    const u8* b = (r) + ((i) / 256) * 74; \
+    unsigned int e0_ = (i) % 256, g_ = e0_ / 32, kk_ = (e0_ % 32) / 8; \
+    unsigned int q_ = ((const u16*) (b + 2))[g_ * 4 + kk_]; \
+    float db = __fmul_rn(__fmul_rn(qf16(b), __fadd_rn(0.5f, (float) ((b[66 + g_] >> (4 * (kk_ / 2))) & 0x0f))), 0.25f); \
+    u8 signs = kKSigns[q_ >> 9]; \
+    u64 row = *(const u64*) kIQ2XSGrid[q_ & 511];
+
+template <> struct Fast<IQ2XXS> {
+    static __device__ __forceinline__ float dot8(const u8* r, unsigned int i, const float* x) {
+        IQ2_ROW_XXS(r, i, db, signs, row)
+        float s = 0.0f;
+#pragma unroll
+        for (unsigned int k = 0; k < 8; k++) s += qsign(__fmul_rn(db, (float) (u8) (row >> (8 * k))), signs >> k) * x[k];
+        return s;
+    }
+    template <unsigned int M>
+    static __device__ __forceinline__ void dotm(const u8* r, unsigned int i, const float* x, unsigned int xs, float* acc) {
+        IQ2_ROW_XXS(r, i, db, signs, row)
+        float s[M] = {};
+#pragma unroll
+        for (unsigned int k = 0; k < 8; k++) DOTM_ACC(qsign(__fmul_rn(db, (float) (u8) (row >> (8 * k))), signs >> k), k);
+        for (unsigned int j = 0; j < M; j++) acc[j] += s[j];
+    }
+};
+
+template <> struct Fast<IQ2XS> {
+    static __device__ __forceinline__ float dot8(const u8* r, unsigned int i, const float* x) {
+        IQ2_ROW_XS(r, i, db, signs, row)
+        float s = 0.0f;
+#pragma unroll
+        for (unsigned int k = 0; k < 8; k++) s += qsign(__fmul_rn(db, (float) (u8) (row >> (8 * k))), signs >> k) * x[k];
+        return s;
+    }
+    template <unsigned int M>
+    static __device__ __forceinline__ void dotm(const u8* r, unsigned int i, const float* x, unsigned int xs, float* acc) {
+        IQ2_ROW_XS(r, i, db, signs, row)
+        float s[M] = {};
+#pragma unroll
+        for (unsigned int k = 0; k < 8; k++) DOTM_ACC(qsign(__fmul_rn(db, (float) (u8) (row >> (8 * k))), signs >> k), k);
+        for (unsigned int j = 0; j < M; j++) acc[j] += s[j];
+    }
+};
+
 template <> struct Fast<IQ3XXS> {
     static __device__ __forceinline__ float dot8(const u8* r, unsigned int i, const float* x) {
         const u8* b = r + (i / 256) * 98;
@@ -777,6 +830,22 @@ template <> struct Dec8<IQ2S> {
         float db = __fmul_rn(__fmul_rn(qf16(b), __fadd_rn(0.5f, (float) sc)), 0.25f);
         u8 signs = b[34 + j];
         u64 row = *(const u64*) kIQ2SGrid[idx];
+#pragma unroll
+        for (unsigned int k = 0; k < 8; k++) o[k] = qsign(__fmul_rn(db, (float) (u8) (row >> (8 * k))), signs >> k);
+    }
+};
+
+template <> struct Dec8<IQ2XXS> {
+    static __device__ __forceinline__ void dec8(const u8* r, unsigned int i, float* o) {
+        IQ2_ROW_XXS(r, i, db, signs, row)
+#pragma unroll
+        for (unsigned int k = 0; k < 8; k++) o[k] = qsign(__fmul_rn(db, (float) (u8) (row >> (8 * k))), signs >> k);
+    }
+};
+
+template <> struct Dec8<IQ2XS> {
+    static __device__ __forceinline__ void dec8(const u8* r, unsigned int i, float* o) {
+        IQ2_ROW_XS(r, i, db, signs, row)
 #pragma unroll
         for (unsigned int k = 0; k < 8; k++) o[k] = qsign(__fmul_rn(db, (float) (u8) (row >> (8 * k))), signs >> k);
     }
@@ -1582,6 +1651,37 @@ extern "C" __global__ void GROUPED_LB matvec_grouped_q8_0(const u64* wtab, const
 extern "C" __global__ void GROUPED_LB matvec_grouped_iq2_s(const u64* wtab, const unsigned int* gtab, const float* x, unsigned int xs, float* y, unsigned int ys, unsigned int rows, unsigned int cols) { grouped_rows<IQ2S>(wtab, gtab, x, xs, y, ys, rows, cols); }
 extern "C" __global__ void GROUPED_LB matvec_grouped_iq3_xxs(const u64* wtab, const unsigned int* gtab, const float* x, unsigned int xs, float* y, unsigned int ys, unsigned int rows, unsigned int cols) { grouped_rows<IQ3XXS>(wtab, gtab, x, xs, y, ys, rows, cols); }
 extern "C" __global__ void GROUPED_LB matvec_grouped_iq3_s(const u64* wtab, const unsigned int* gtab, const float* x, unsigned int xs, float* y, unsigned int ys, unsigned int rows, unsigned int cols) { grouped_rows<IQ3S>(wtab, gtab, x, xs, y, ys, rows, cols); }
+
+// IQ2_XXS and IQ2_XS expert kernels (STATUS 128): the IQ2_S entry points with the type swapped; the dense fast/batch/pair/cols ones are not made (these types are only in the experts).
+extern "C" __global__ void matvec_iq2_xxs(const u8* w, const float* x, float* y, unsigned int rows, unsigned int cols) { matvec_rows<IQ2XXS>(w, x, y, rows, cols); }
+extern "C" __global__ void mma_grouped_gu_iq2_xxs(const u64* wtab, const unsigned int* gtab, const float* x, unsigned int xs, float* y, unsigned int ys, unsigned int rows, unsigned int cols) { mma_gu<IQ2XXS, 32>(wtab, gtab, x, xs, y, ys, rows, cols); }
+extern "C" __global__ void mma_grouped64_gu_iq2_xxs(const u64* wtab, const unsigned int* gtab, const float* x, unsigned int xs, float* y, unsigned int ys, unsigned int rows, unsigned int cols) { mma_gu<IQ2XXS, 64>(wtab, gtab, x, xs, y, ys, rows, cols); }
+extern "C" __global__ void mma_grouped48_iq2_xxs(const u64* wtab, const unsigned int* gtab, const float* x, unsigned int xs, float* y, unsigned int ys, unsigned int rows, unsigned int cols) { mma_grouped48<IQ2XXS>(wtab, gtab, x, xs, y, ys, rows, cols); }
+extern "C" __global__ void mma_grouped16_iq2_xxs(const u64* wtab, const unsigned int* gtab, const float* x, unsigned int xs, float* y, unsigned int ys, unsigned int rows, unsigned int cols) { mma_groupedw<IQ2XXS, 16>(wtab, gtab, x, xs, y, ys, rows, cols); }
+extern "C" __global__ void mma_grouped_iq2_xxs(const u64* wtab, const unsigned int* gtab, const float* x, unsigned int xs, float* y, unsigned int ys, unsigned int rows, unsigned int cols) { mma_grouped<IQ2XXS>(wtab, gtab, x, xs, y, ys, rows, cols); }
+extern "C" __global__ void mma_grouped64_iq2_xxs(const u64* wtab, const unsigned int* gtab, const float* x, unsigned int xs, float* y, unsigned int ys, unsigned int rows, unsigned int cols) { mma_grouped64<IQ2XXS>(wtab, gtab, x, xs, y, ys, rows, cols); }
+extern "C" __global__ void GROUPED_LB matvec_grouped_iq2_xxs(const u64* wtab, const unsigned int* gtab, const float* x, unsigned int xs, float* y, unsigned int ys, unsigned int rows, unsigned int cols) { grouped_rows<IQ2XXS>(wtab, gtab, x, xs, y, ys, rows, cols); }
+extern "C" __global__ void matvec_iq2_xs(const u8* w, const float* x, float* y, unsigned int rows, unsigned int cols) { matvec_rows<IQ2XS>(w, x, y, rows, cols); }
+extern "C" __global__ void mma_grouped_gu_iq2_xs(const u64* wtab, const unsigned int* gtab, const float* x, unsigned int xs, float* y, unsigned int ys, unsigned int rows, unsigned int cols) { mma_gu<IQ2XS, 32>(wtab, gtab, x, xs, y, ys, rows, cols); }
+extern "C" __global__ void mma_grouped64_gu_iq2_xs(const u64* wtab, const unsigned int* gtab, const float* x, unsigned int xs, float* y, unsigned int ys, unsigned int rows, unsigned int cols) { mma_gu<IQ2XS, 64>(wtab, gtab, x, xs, y, ys, rows, cols); }
+extern "C" __global__ void mma_grouped48_iq2_xs(const u64* wtab, const unsigned int* gtab, const float* x, unsigned int xs, float* y, unsigned int ys, unsigned int rows, unsigned int cols) { mma_grouped48<IQ2XS>(wtab, gtab, x, xs, y, ys, rows, cols); }
+extern "C" __global__ void mma_grouped16_iq2_xs(const u64* wtab, const unsigned int* gtab, const float* x, unsigned int xs, float* y, unsigned int ys, unsigned int rows, unsigned int cols) { mma_groupedw<IQ2XS, 16>(wtab, gtab, x, xs, y, ys, rows, cols); }
+extern "C" __global__ void mma_grouped_iq2_xs(const u64* wtab, const unsigned int* gtab, const float* x, unsigned int xs, float* y, unsigned int ys, unsigned int rows, unsigned int cols) { mma_grouped<IQ2XS>(wtab, gtab, x, xs, y, ys, rows, cols); }
+extern "C" __global__ void mma_grouped64_iq2_xs(const u64* wtab, const unsigned int* gtab, const float* x, unsigned int xs, float* y, unsigned int ys, unsigned int rows, unsigned int cols) { mma_grouped64<IQ2XS>(wtab, gtab, x, xs, y, ys, rows, cols); }
+extern "C" __global__ void GROUPED_LB matvec_grouped_iq2_xs(const u64* wtab, const unsigned int* gtab, const float* x, unsigned int xs, float* y, unsigned int ys, unsigned int rows, unsigned int cols) { grouped_rows<IQ2XS>(wtab, gtab, x, xs, y, ys, rows, cols); }
+// the dense-weight entry points of the same two types (fast, batch, pair, cols); a type has all of them in the table, whether or not a model has it in a dense matrix
+extern "C" __global__ void matvec_fast_iq2_xxs(const u8* w, const float* x, float* y, unsigned int rows, unsigned int cols) { matvec_fast_rows<IQ2XXS>(w, x, y, rows, cols); }
+extern "C" __global__ void matvec_batch_iq2_xxs(const u64* wtab, const float* x, unsigned int xs, float* y, unsigned int ys, unsigned int rows, unsigned int cols) { matvec_batch_rows<IQ2XXS>(wtab, x, xs, y, ys, rows, cols); }
+extern "C" __global__ void matvec_pair_iq2_xxs(const u8* w0, float* y0, unsigned int r0, const u8* w1, float* y1, unsigned int r1, const float* x, unsigned int cols) { matvec_pair_fast_rows<IQ2XXS>(w0, y0, r0, w1, y1, r1, x, cols); }
+extern "C" __global__ void matvec_cols_iq2_xxs(const u8* w, const float* x, unsigned int xs, float* y, unsigned int ys, unsigned int rows, unsigned int cols, unsigned int m) { matvec_cols_rows<IQ2XXS>(w, x, xs, y, ys, rows, cols, m); }
+extern "C" __global__ void mma_cols_iq2_xxs(const u8* w, const float* x, unsigned int xs, float* y, unsigned int ys, unsigned int rows, unsigned int cols, unsigned int m) { mma_cols<IQ2XXS>(w, x, xs, y, ys, rows, cols, m); }
+extern "C" __global__ void mma_cols64_iq2_xxs(const u8* w, const float* x, unsigned int xs, float* y, unsigned int ys, unsigned int rows, unsigned int cols, unsigned int m) { mma_cols64<IQ2XXS>(w, x, xs, y, ys, rows, cols, m); }
+extern "C" __global__ void matvec_fast_iq2_xs(const u8* w, const float* x, float* y, unsigned int rows, unsigned int cols) { matvec_fast_rows<IQ2XS>(w, x, y, rows, cols); }
+extern "C" __global__ void matvec_batch_iq2_xs(const u64* wtab, const float* x, unsigned int xs, float* y, unsigned int ys, unsigned int rows, unsigned int cols) { matvec_batch_rows<IQ2XS>(wtab, x, xs, y, ys, rows, cols); }
+extern "C" __global__ void matvec_pair_iq2_xs(const u8* w0, float* y0, unsigned int r0, const u8* w1, float* y1, unsigned int r1, const float* x, unsigned int cols) { matvec_pair_fast_rows<IQ2XS>(w0, y0, r0, w1, y1, r1, x, cols); }
+extern "C" __global__ void matvec_cols_iq2_xs(const u8* w, const float* x, unsigned int xs, float* y, unsigned int ys, unsigned int rows, unsigned int cols, unsigned int m) { matvec_cols_rows<IQ2XS>(w, x, xs, y, ys, rows, cols, m); }
+extern "C" __global__ void mma_cols_iq2_xs(const u8* w, const float* x, unsigned int xs, float* y, unsigned int ys, unsigned int rows, unsigned int cols, unsigned int m) { mma_cols<IQ2XS>(w, x, xs, y, ys, rows, cols, m); }
+extern "C" __global__ void mma_cols64_iq2_xs(const u8* w, const float* x, unsigned int xs, float* y, unsigned int ys, unsigned int rows, unsigned int cols, unsigned int m) { mma_cols64<IQ2XS>(w, x, xs, y, ys, rows, cols, m); }
 
 // ------------------------------------------------------------------------- BF16 hc projections in the dot8 order
 // hc_down_inject_bf16 with matvec_fast_rows' sums (dot8 over 8 consecutive weights a lane) instead of the reference
