@@ -196,8 +196,9 @@ static __device__ __forceinline__ void exl3_mv2(const u8* w, const float* x, flo
 // one block of all m inputs at a time (warp j of the slice rotates input j, in registers and shuffles), then its 8 warps accumulate
 // the 8 tile rows of that block for all m inputs; the slice's barrier is a named one (id 1 + slice).  Shared memory: a block of
 // every input a slice, M x 128 floats, plus the partial sums.
-template <int K, int M, int KS>
-static __device__ __forceinline__ void exl3_mvc2(const u8* w, const float* x, u32 xs, float* y, u32 ys, u32 rows, u32 cols, u32 m) {
+template <int K, int M, int KS, bool G>
+static __device__ __forceinline__ void exl3_mvc2(const u8* w, const float* x, u32 xs, float* y, u32 ys, u32 rows, u32 cols, u32 m, const u32* gi) {
+    if (G) m = gi[0]; // a routed expert's group: n <= 8 inputs at x + gi[1 + j] xs, outputs at y + gi[9 + j] ys
     __shared__ float sxs[KS][M][128];
     __shared__ float red[KS][M][128];
     const u32 ob = blockIdx.x;
@@ -214,7 +215,7 @@ static __device__ __forceinline__ void exl3_mvc2(const u8* w, const float* x, u3
         if ((u32) tc < m) {
             float v[4];
             #pragma unroll
-            for (int e = 0; e < 4; e++) v[e] = x[(u64) tc * xs + b * 128 + lane + 32 * e] * f16_to_f32(suh[b * 128 + lane + 32 * e]);
+            for (int e = 0; e < 4; e++) v[e] = x[(u64) (G ? gi[1 + tc] : (u32) tc) * xs + b * 128 + lane + 32 * e] * f16_to_f32(suh[b * 128 + lane + 32 * e]);
             #pragma unroll
             for (int q = 1; q < 32; q <<= 1) {
                 #pragma unroll
@@ -274,7 +275,136 @@ static __device__ __forceinline__ void exl3_mvc2(const u8* w, const float* x, u3
         { float a = v[0], c = v[1]; v[0] = a + c; v[1] = a - c; a = v[2]; c = v[3]; v[2] = a + c; v[3] = a - c; }
         { float a = v[0], c = v[2]; v[0] = a + c; v[2] = a - c; a = v[1]; c = v[3]; v[1] = a + c; v[3] = a - c; }
         #pragma unroll
-        for (int e = 0; e < 4; e++) y[(u64) warp * ys + ob * 128 + lane + 32 * e] = v[e] * 0.08838834764831845f * f16_to_f32(svh[ob * 128 + lane + 32 * e]);
+        for (int e = 0; e < 4; e++) y[(u64) (G ? gi[9 + warp] : (u32) warp) * ys + ob * 128 + lane + 32 * e] = v[e] * 0.08838834764831845f * f16_to_f32(svh[ob * 128 + lane + 32 * e]);
+    }
+}
+
+// The tensor-core prompt kernel: y_j = x_j W for 64 tokens a block (blockIdx.y), 128 outputs a block (blockIdx.x).  A warp is a tile column; the
+// trellis lane order is the mma B-fragment order (lane L decodes B[k = 2 (L mod 4) + (j mod 2) + 8 ((j >> 1) mod 2)][n = L >> 2] of n-half j >> 2), so a lane's
+// 8 decoded f16 values are two n8 fragments as they are.  The input is rotated (x suh, the 128-block Hadamard, 1 / sqrt(128)) a 128-block at a time into
+// shared memory as f16 (a warp 8 token rows, in registers and shuffles), the products go through `mma.m16n8k16` with f32 accumulators, and the 128 outputs
+// of a token are rotated at the end (x 1 / sqrt(128) x svh).
+static __device__ __forceinline__ u32 exl3_cb2_h(u32 state) {
+    u32 x = state * 0x83DCD12Du;
+    u32 sum;
+    asm("dp4a.u32.u32 %0, %1, %2, %3;" : "=r"(sum) : "r"(x), "r"(0x01010101u), "r"(0x6400u));
+    u32 r;
+    asm("{ .reg .b16 a, b, c, d; mov.b16 a, %1; mov.b16 b, 0x1eee; mov.b16 c, 0xc931; fma.rn.f16 d, a, b, c; cvt.u32.u16 %0, d; }" : "=r"(r) : "h"((u16) sum));
+    return r;
+}
+
+template <int K>
+static __device__ __forceinline__ void exl3_lane_h(const u32* tile, int lane, u32* hv) {
+    constexpr int NW = (31 + 7 * K + 16 + 31) / 32;
+    constexpr int RING = 256 * K;
+    const int sb = ((lane * 8 + 1) * K + RING - 16) % RING;
+    const int w0 = sb >> 5, off = sb & 31;
+    u32 w[NW + 1];
+    #pragma unroll
+    for (int i = 0; i < NW; i++) {
+        int wi = w0 + i;
+        w[i] = tile[wi >= 8 * K ? wi - 8 * K : wi];
+    }
+    w[NW] = 0;
+    #pragma unroll
+    for (int j = 0; j < 8; j++) {
+        int pos = off + j * K;
+        int wi = pos >> 5, sh = pos & 31;
+        u64 m = ((u64) w[wi] << 32) | w[wi + 1];
+        hv[j] = exl3_cb2_h((u32) (m >> (48 - sh)) & 0xffffu);
+    }
+}
+
+// the Hadamard rotation of 128 values, lane L holding i = L + 32 e (the stage order of the other kernels: h = 1 .. 64)
+static __device__ __forceinline__ void exl3_wht4(float* v, int lane) {
+    #pragma unroll
+    for (int m = 1; m < 32; m <<= 1) {
+        #pragma unroll
+        for (int e = 0; e < 4; e++) { float p = __shfl_xor_sync(0xffffffffu, v[e], m); v[e] = (lane & m) ? p - v[e] : v[e] + p; }
+    }
+    { float a = v[0], c = v[1]; v[0] = a + c; v[1] = a - c; a = v[2]; c = v[3]; v[2] = a + c; v[3] = a - c; }
+    { float a = v[0], c = v[2]; v[0] = a + c; v[2] = a - c; a = v[1]; c = v[3]; v[1] = a + c; v[3] = a - c; }
+}
+
+static __device__ __forceinline__ u32 exl3_f16_bits(float f) {
+    u32 r;
+    asm("{ .reg .b16 h; cvt.rn.f16.f32 h, %1; cvt.u32.u16 %0, h; }" : "=r"(r) : "f"(f));
+    return r;
+}
+
+// G: a routed expert's group of up to 64 tokens (record gi: n, 64 input rows, 64 output rows; the matrix w is the group's)
+template <int K, bool G>
+static __device__ __forceinline__ void exl3_mma(const u8* w, const float* x, u32 xs, float* y, u32 ys, u32 rows, u32 cols, u32 m, const u32* gi) {
+    if (G) m = gi[0];
+    __shared__ __align__(16) u8 smem[64 * 132 * 4];
+    u16* sa = (u16*) smem;      // [64][136] f16 (the input's rotated 128-block)
+    float* sy = (float*) smem;  // [64][132] f32 (the accumulated outputs; the same storage, after the last block)
+    const u32 ob = blockIdx.x, tok0 = G ? 0 : blockIdx.y * 64;
+    const u16* suh = (const u16*) w;
+    const u16* svh = (const u16*) (w + 2 * cols);
+    const u32* tr = (const u32*) (w + 2 * cols + 2 * rows + 4);
+    const u32 nt = rows / 16;
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int g = lane >> 2, t = lane & 3;
+    float acc[4][2][4];
+    #pragma unroll
+    for (int a = 0; a < 4; a++)
+        #pragma unroll
+        for (int h = 0; h < 2; h++)
+            #pragma unroll
+            for (int i = 0; i < 4; i++) acc[a][h][i] = 0.0f;
+    for (u32 b = 0; b < cols / 128; b++) {
+        for (int rr = 0; rr < 8; rr++) {
+            const int r = warp * 8 + rr;
+            const u32 tok = tok0 + r;
+            float v[4];
+            #pragma unroll
+            for (int e = 0; e < 4; e++) v[e] = tok < m ? x[(u64) (G ? gi[1 + r] : tok) * xs + b * 128 + lane + 32 * e] * f16_to_f32(suh[b * 128 + lane + 32 * e]) * 0.08838834764831845f : 0.0f;
+            exl3_wht4(v, lane);
+            #pragma unroll
+            for (int e = 0; e < 4; e++) sa[r * 136 + lane + 32 * e] = (u16) exl3_f16_bits(v[e]);
+        }
+        __syncthreads();
+        #pragma unroll 2
+        for (int kk = 0; kk < 8; kk++) {
+            const u32* tile = tr + ((u64) (b * 8 + kk) * nt + ob * 8 + warp) * (8 * K);
+            u32 hv[8];
+            exl3_lane_h<K>(tile, lane, hv);
+            const u32 b0l = hv[0] | (hv[1] << 16), b1l = hv[2] | (hv[3] << 16), b0h = hv[4] | (hv[5] << 16), b1h = hv[6] | (hv[7] << 16);
+            #pragma unroll
+            for (int tt = 0; tt < 4; tt++) {
+                const u16* ar = sa + (tt * 16 + g) * 136 + kk * 16 + 2 * t;
+                const u32 a0 = *(const u32*) ar, a1 = *(const u32*) (ar + 8 * 136), a2 = *(const u32*) (ar + 8), a3 = *(const u32*) (ar + 8 * 136 + 8);
+                asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
+                             : "+f"(acc[tt][0][0]), "+f"(acc[tt][0][1]), "+f"(acc[tt][0][2]), "+f"(acc[tt][0][3]) : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0l), "r"(b1l));
+                asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
+                             : "+f"(acc[tt][1][0]), "+f"(acc[tt][1][1]), "+f"(acc[tt][1][2]), "+f"(acc[tt][1][3]) : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0h), "r"(b1h));
+            }
+        }
+        __syncthreads();
+    }
+    #pragma unroll
+    for (int tt = 0; tt < 4; tt++) {
+        #pragma unroll
+        for (int h = 0; h < 2; h++) {
+            const int c = warp * 16 + h * 8 + 2 * t;
+            sy[(tt * 16 + g) * 132 + c] = acc[tt][h][0];
+            sy[(tt * 16 + g) * 132 + c + 1] = acc[tt][h][1];
+            sy[(tt * 16 + g + 8) * 132 + c] = acc[tt][h][2];
+            sy[(tt * 16 + g + 8) * 132 + c + 1] = acc[tt][h][3];
+        }
+    }
+    __syncthreads();
+    for (int rr = 0; rr < 8; rr++) {
+        const int r = warp * 8 + rr;
+        const u32 tok = tok0 + r;
+        if (tok >= m) break;
+        float v[4];
+        #pragma unroll
+        for (int e = 0; e < 4; e++) v[e] = sy[r * 132 + lane + 32 * e];
+        exl3_wht4(v, lane);
+        #pragma unroll
+        for (int e = 0; e < 4; e++) y[(u64) (G ? gi[65 + r] : tok) * ys + ob * 128 + lane + 32 * e] = v[e] * 0.08838834764831845f * f16_to_f32(svh[ob * 128 + lane + 32 * e]);
     }
 }
 
@@ -288,8 +418,11 @@ extern "C" __global__ void exl3_codebook(float* out, u32 n) {
 extern "C" __global__ void matvec_exl3_1(const u8* w, const float* x, float* y, u32 rows, u32 cols) { exl3_mv<1, 1>(w, x, 0, y, 0, rows, cols, 1); }
 extern "C" __global__ void matvec_cols_exl3_1(const u8* w, const float* x, u32 xs, float* y, u32 ys, u32 rows, u32 cols, u32 m) { exl3_mv<1, 8>(w, x, xs, y, ys, rows, cols, m); }
 extern "C" __global__ void matvec_batch_exl3_1(const u64* wtab, const float* x, u32 xs, float* y, u32 ys, u32 rows, u32 cols) { exl3_mv<1, 1>((const u8*) wtab[blockIdx.y], x + (u64) blockIdx.y * xs, 0, y + (u64) blockIdx.y * ys, 0, rows, cols, 1); }
-extern "C" __global__ void __launch_bounds__(512) matvec_cols_exl3_s2_1(const u8* w, const float* x, u32 xs, float* y, u32 ys, u32 rows, u32 cols, u32 m) { exl3_mvc2<1, 8, 2>(w, x, xs, y, ys, rows, cols, m); }
-extern "C" __global__ void __launch_bounds__(1024) matvec_cols_exl3_s4_1(const u8* w, const float* x, u32 xs, float* y, u32 ys, u32 rows, u32 cols, u32 m) { exl3_mvc2<1, 8, 4>(w, x, xs, y, ys, rows, cols, m); }
+extern "C" __global__ void __launch_bounds__(512) matvec_cols_exl3_s2_1(const u8* w, const float* x, u32 xs, float* y, u32 ys, u32 rows, u32 cols, u32 m) { exl3_mvc2<1, 8, 2, false>(w, x, xs, y, ys, rows, cols, m, nullptr); }
+extern "C" __global__ void __launch_bounds__(1024) matvec_cols_exl3_s4_1(const u8* w, const float* x, u32 xs, float* y, u32 ys, u32 rows, u32 cols, u32 m) { exl3_mvc2<1, 8, 4, false>(w, x, xs, y, ys, rows, cols, m, nullptr); }
+extern "C" __global__ void __launch_bounds__(1024) matvec_grouped_exl3_s4_1(const u64* wtab, const u32* gtab, const float* x, u32 xs, float* y, u32 ys, u32 rows, u32 cols) { exl3_mvc2<1, 8, 4, true>((const u8*) wtab[blockIdx.y], x, xs, y, ys, rows, cols, 0, gtab + (u64) blockIdx.y * 17); }
+extern "C" __global__ void __launch_bounds__(256) mma_cols_exl3_1(const u8* w, const float* x, u32 xs, float* y, u32 ys, u32 rows, u32 cols, u32 m) { exl3_mma<1, false>(w, x, xs, y, ys, rows, cols, m, nullptr); }
+extern "C" __global__ void __launch_bounds__(256) mma_grouped_exl3_1(const u64* wtab, const u32* gtab, const float* x, u32 xs, float* y, u32 ys, u32 rows, u32 cols) { exl3_mma<1, true>((const u8*) wtab[blockIdx.y], x, xs, y, ys, rows, cols, 0, gtab + (u64) blockIdx.y * 129); }
 extern "C" __global__ void __launch_bounds__(256) matvec_exl3_s1_1(const u8* w, const float* x, float* y, u32 rows, u32 cols) { exl3_mv2<1, 1>(w, x, y, rows, cols); }
 extern "C" __global__ void __launch_bounds__(256) matvec_batch_exl3_s1_1(const u64* wtab, const float* x, u32 xs, float* y, u32 ys, u32 rows, u32 cols) { exl3_mv2<1, 1>((const u8*) wtab[blockIdx.y], x + (u64) blockIdx.y * xs, y + (u64) blockIdx.y * ys, rows, cols); }
 extern "C" __global__ void __launch_bounds__(512) matvec_exl3_s2_1(const u8* w, const float* x, float* y, u32 rows, u32 cols) { exl3_mv2<1, 2>(w, x, y, rows, cols); }
@@ -299,8 +432,11 @@ extern "C" __global__ void __launch_bounds__(1024) matvec_batch_exl3_s4_1(const 
 extern "C" __global__ void matvec_exl3_2(const u8* w, const float* x, float* y, u32 rows, u32 cols) { exl3_mv<2, 1>(w, x, 0, y, 0, rows, cols, 1); }
 extern "C" __global__ void matvec_cols_exl3_2(const u8* w, const float* x, u32 xs, float* y, u32 ys, u32 rows, u32 cols, u32 m) { exl3_mv<2, 8>(w, x, xs, y, ys, rows, cols, m); }
 extern "C" __global__ void matvec_batch_exl3_2(const u64* wtab, const float* x, u32 xs, float* y, u32 ys, u32 rows, u32 cols) { exl3_mv<2, 1>((const u8*) wtab[blockIdx.y], x + (u64) blockIdx.y * xs, 0, y + (u64) blockIdx.y * ys, 0, rows, cols, 1); }
-extern "C" __global__ void __launch_bounds__(512) matvec_cols_exl3_s2_2(const u8* w, const float* x, u32 xs, float* y, u32 ys, u32 rows, u32 cols, u32 m) { exl3_mvc2<2, 8, 2>(w, x, xs, y, ys, rows, cols, m); }
-extern "C" __global__ void __launch_bounds__(1024) matvec_cols_exl3_s4_2(const u8* w, const float* x, u32 xs, float* y, u32 ys, u32 rows, u32 cols, u32 m) { exl3_mvc2<2, 8, 4>(w, x, xs, y, ys, rows, cols, m); }
+extern "C" __global__ void __launch_bounds__(512) matvec_cols_exl3_s2_2(const u8* w, const float* x, u32 xs, float* y, u32 ys, u32 rows, u32 cols, u32 m) { exl3_mvc2<2, 8, 2, false>(w, x, xs, y, ys, rows, cols, m, nullptr); }
+extern "C" __global__ void __launch_bounds__(1024) matvec_cols_exl3_s4_2(const u8* w, const float* x, u32 xs, float* y, u32 ys, u32 rows, u32 cols, u32 m) { exl3_mvc2<2, 8, 4, false>(w, x, xs, y, ys, rows, cols, m, nullptr); }
+extern "C" __global__ void __launch_bounds__(1024) matvec_grouped_exl3_s4_2(const u64* wtab, const u32* gtab, const float* x, u32 xs, float* y, u32 ys, u32 rows, u32 cols) { exl3_mvc2<2, 8, 4, true>((const u8*) wtab[blockIdx.y], x, xs, y, ys, rows, cols, 0, gtab + (u64) blockIdx.y * 17); }
+extern "C" __global__ void __launch_bounds__(256) mma_cols_exl3_2(const u8* w, const float* x, u32 xs, float* y, u32 ys, u32 rows, u32 cols, u32 m) { exl3_mma<2, false>(w, x, xs, y, ys, rows, cols, m, nullptr); }
+extern "C" __global__ void __launch_bounds__(256) mma_grouped_exl3_2(const u64* wtab, const u32* gtab, const float* x, u32 xs, float* y, u32 ys, u32 rows, u32 cols) { exl3_mma<2, true>((const u8*) wtab[blockIdx.y], x, xs, y, ys, rows, cols, 0, gtab + (u64) blockIdx.y * 129); }
 extern "C" __global__ void __launch_bounds__(256) matvec_exl3_s1_2(const u8* w, const float* x, float* y, u32 rows, u32 cols) { exl3_mv2<2, 1>(w, x, y, rows, cols); }
 extern "C" __global__ void __launch_bounds__(256) matvec_batch_exl3_s1_2(const u64* wtab, const float* x, u32 xs, float* y, u32 ys, u32 rows, u32 cols) { exl3_mv2<2, 1>((const u8*) wtab[blockIdx.y], x + (u64) blockIdx.y * xs, y + (u64) blockIdx.y * ys, rows, cols); }
 extern "C" __global__ void __launch_bounds__(512) matvec_exl3_s2_2(const u8* w, const float* x, float* y, u32 rows, u32 cols) { exl3_mv2<2, 2>(w, x, y, rows, cols); }
@@ -310,8 +446,11 @@ extern "C" __global__ void __launch_bounds__(1024) matvec_batch_exl3_s4_2(const 
 extern "C" __global__ void matvec_exl3_3(const u8* w, const float* x, float* y, u32 rows, u32 cols) { exl3_mv<3, 1>(w, x, 0, y, 0, rows, cols, 1); }
 extern "C" __global__ void matvec_cols_exl3_3(const u8* w, const float* x, u32 xs, float* y, u32 ys, u32 rows, u32 cols, u32 m) { exl3_mv<3, 8>(w, x, xs, y, ys, rows, cols, m); }
 extern "C" __global__ void matvec_batch_exl3_3(const u64* wtab, const float* x, u32 xs, float* y, u32 ys, u32 rows, u32 cols) { exl3_mv<3, 1>((const u8*) wtab[blockIdx.y], x + (u64) blockIdx.y * xs, 0, y + (u64) blockIdx.y * ys, 0, rows, cols, 1); }
-extern "C" __global__ void __launch_bounds__(512) matvec_cols_exl3_s2_3(const u8* w, const float* x, u32 xs, float* y, u32 ys, u32 rows, u32 cols, u32 m) { exl3_mvc2<3, 8, 2>(w, x, xs, y, ys, rows, cols, m); }
-extern "C" __global__ void __launch_bounds__(1024) matvec_cols_exl3_s4_3(const u8* w, const float* x, u32 xs, float* y, u32 ys, u32 rows, u32 cols, u32 m) { exl3_mvc2<3, 8, 4>(w, x, xs, y, ys, rows, cols, m); }
+extern "C" __global__ void __launch_bounds__(512) matvec_cols_exl3_s2_3(const u8* w, const float* x, u32 xs, float* y, u32 ys, u32 rows, u32 cols, u32 m) { exl3_mvc2<3, 8, 2, false>(w, x, xs, y, ys, rows, cols, m, nullptr); }
+extern "C" __global__ void __launch_bounds__(1024) matvec_cols_exl3_s4_3(const u8* w, const float* x, u32 xs, float* y, u32 ys, u32 rows, u32 cols, u32 m) { exl3_mvc2<3, 8, 4, false>(w, x, xs, y, ys, rows, cols, m, nullptr); }
+extern "C" __global__ void __launch_bounds__(1024) matvec_grouped_exl3_s4_3(const u64* wtab, const u32* gtab, const float* x, u32 xs, float* y, u32 ys, u32 rows, u32 cols) { exl3_mvc2<3, 8, 4, true>((const u8*) wtab[blockIdx.y], x, xs, y, ys, rows, cols, 0, gtab + (u64) blockIdx.y * 17); }
+extern "C" __global__ void __launch_bounds__(256) mma_cols_exl3_3(const u8* w, const float* x, u32 xs, float* y, u32 ys, u32 rows, u32 cols, u32 m) { exl3_mma<3, false>(w, x, xs, y, ys, rows, cols, m, nullptr); }
+extern "C" __global__ void __launch_bounds__(256) mma_grouped_exl3_3(const u64* wtab, const u32* gtab, const float* x, u32 xs, float* y, u32 ys, u32 rows, u32 cols) { exl3_mma<3, true>((const u8*) wtab[blockIdx.y], x, xs, y, ys, rows, cols, 0, gtab + (u64) blockIdx.y * 129); }
 extern "C" __global__ void __launch_bounds__(256) matvec_exl3_s1_3(const u8* w, const float* x, float* y, u32 rows, u32 cols) { exl3_mv2<3, 1>(w, x, y, rows, cols); }
 extern "C" __global__ void __launch_bounds__(256) matvec_batch_exl3_s1_3(const u64* wtab, const float* x, u32 xs, float* y, u32 ys, u32 rows, u32 cols) { exl3_mv2<3, 1>((const u8*) wtab[blockIdx.y], x + (u64) blockIdx.y * xs, y + (u64) blockIdx.y * ys, rows, cols); }
 extern "C" __global__ void __launch_bounds__(512) matvec_exl3_s2_3(const u8* w, const float* x, float* y, u32 rows, u32 cols) { exl3_mv2<3, 2>(w, x, y, rows, cols); }
@@ -321,8 +460,11 @@ extern "C" __global__ void __launch_bounds__(1024) matvec_batch_exl3_s4_3(const 
 extern "C" __global__ void matvec_exl3_4(const u8* w, const float* x, float* y, u32 rows, u32 cols) { exl3_mv<4, 1>(w, x, 0, y, 0, rows, cols, 1); }
 extern "C" __global__ void matvec_cols_exl3_4(const u8* w, const float* x, u32 xs, float* y, u32 ys, u32 rows, u32 cols, u32 m) { exl3_mv<4, 8>(w, x, xs, y, ys, rows, cols, m); }
 extern "C" __global__ void matvec_batch_exl3_4(const u64* wtab, const float* x, u32 xs, float* y, u32 ys, u32 rows, u32 cols) { exl3_mv<4, 1>((const u8*) wtab[blockIdx.y], x + (u64) blockIdx.y * xs, 0, y + (u64) blockIdx.y * ys, 0, rows, cols, 1); }
-extern "C" __global__ void __launch_bounds__(512) matvec_cols_exl3_s2_4(const u8* w, const float* x, u32 xs, float* y, u32 ys, u32 rows, u32 cols, u32 m) { exl3_mvc2<4, 8, 2>(w, x, xs, y, ys, rows, cols, m); }
-extern "C" __global__ void __launch_bounds__(1024) matvec_cols_exl3_s4_4(const u8* w, const float* x, u32 xs, float* y, u32 ys, u32 rows, u32 cols, u32 m) { exl3_mvc2<4, 8, 4>(w, x, xs, y, ys, rows, cols, m); }
+extern "C" __global__ void __launch_bounds__(512) matvec_cols_exl3_s2_4(const u8* w, const float* x, u32 xs, float* y, u32 ys, u32 rows, u32 cols, u32 m) { exl3_mvc2<4, 8, 2, false>(w, x, xs, y, ys, rows, cols, m, nullptr); }
+extern "C" __global__ void __launch_bounds__(1024) matvec_cols_exl3_s4_4(const u8* w, const float* x, u32 xs, float* y, u32 ys, u32 rows, u32 cols, u32 m) { exl3_mvc2<4, 8, 4, false>(w, x, xs, y, ys, rows, cols, m, nullptr); }
+extern "C" __global__ void __launch_bounds__(1024) matvec_grouped_exl3_s4_4(const u64* wtab, const u32* gtab, const float* x, u32 xs, float* y, u32 ys, u32 rows, u32 cols) { exl3_mvc2<4, 8, 4, true>((const u8*) wtab[blockIdx.y], x, xs, y, ys, rows, cols, 0, gtab + (u64) blockIdx.y * 17); }
+extern "C" __global__ void __launch_bounds__(256) mma_cols_exl3_4(const u8* w, const float* x, u32 xs, float* y, u32 ys, u32 rows, u32 cols, u32 m) { exl3_mma<4, false>(w, x, xs, y, ys, rows, cols, m, nullptr); }
+extern "C" __global__ void __launch_bounds__(256) mma_grouped_exl3_4(const u64* wtab, const u32* gtab, const float* x, u32 xs, float* y, u32 ys, u32 rows, u32 cols) { exl3_mma<4, true>((const u8*) wtab[blockIdx.y], x, xs, y, ys, rows, cols, 0, gtab + (u64) blockIdx.y * 129); }
 extern "C" __global__ void __launch_bounds__(256) matvec_exl3_s1_4(const u8* w, const float* x, float* y, u32 rows, u32 cols) { exl3_mv2<4, 1>(w, x, y, rows, cols); }
 extern "C" __global__ void __launch_bounds__(256) matvec_batch_exl3_s1_4(const u64* wtab, const float* x, u32 xs, float* y, u32 ys, u32 rows, u32 cols) { exl3_mv2<4, 1>((const u8*) wtab[blockIdx.y], x + (u64) blockIdx.y * xs, y + (u64) blockIdx.y * ys, rows, cols); }
 extern "C" __global__ void __launch_bounds__(512) matvec_exl3_s2_4(const u8* w, const float* x, float* y, u32 rows, u32 cols) { exl3_mv2<4, 2>(w, x, y, rows, cols); }
@@ -332,8 +474,11 @@ extern "C" __global__ void __launch_bounds__(1024) matvec_batch_exl3_s4_4(const 
 extern "C" __global__ void matvec_exl3_5(const u8* w, const float* x, float* y, u32 rows, u32 cols) { exl3_mv<5, 1>(w, x, 0, y, 0, rows, cols, 1); }
 extern "C" __global__ void matvec_cols_exl3_5(const u8* w, const float* x, u32 xs, float* y, u32 ys, u32 rows, u32 cols, u32 m) { exl3_mv<5, 8>(w, x, xs, y, ys, rows, cols, m); }
 extern "C" __global__ void matvec_batch_exl3_5(const u64* wtab, const float* x, u32 xs, float* y, u32 ys, u32 rows, u32 cols) { exl3_mv<5, 1>((const u8*) wtab[blockIdx.y], x + (u64) blockIdx.y * xs, 0, y + (u64) blockIdx.y * ys, 0, rows, cols, 1); }
-extern "C" __global__ void __launch_bounds__(512) matvec_cols_exl3_s2_5(const u8* w, const float* x, u32 xs, float* y, u32 ys, u32 rows, u32 cols, u32 m) { exl3_mvc2<5, 8, 2>(w, x, xs, y, ys, rows, cols, m); }
-extern "C" __global__ void __launch_bounds__(1024) matvec_cols_exl3_s4_5(const u8* w, const float* x, u32 xs, float* y, u32 ys, u32 rows, u32 cols, u32 m) { exl3_mvc2<5, 8, 4>(w, x, xs, y, ys, rows, cols, m); }
+extern "C" __global__ void __launch_bounds__(512) matvec_cols_exl3_s2_5(const u8* w, const float* x, u32 xs, float* y, u32 ys, u32 rows, u32 cols, u32 m) { exl3_mvc2<5, 8, 2, false>(w, x, xs, y, ys, rows, cols, m, nullptr); }
+extern "C" __global__ void __launch_bounds__(1024) matvec_cols_exl3_s4_5(const u8* w, const float* x, u32 xs, float* y, u32 ys, u32 rows, u32 cols, u32 m) { exl3_mvc2<5, 8, 4, false>(w, x, xs, y, ys, rows, cols, m, nullptr); }
+extern "C" __global__ void __launch_bounds__(1024) matvec_grouped_exl3_s4_5(const u64* wtab, const u32* gtab, const float* x, u32 xs, float* y, u32 ys, u32 rows, u32 cols) { exl3_mvc2<5, 8, 4, true>((const u8*) wtab[blockIdx.y], x, xs, y, ys, rows, cols, 0, gtab + (u64) blockIdx.y * 17); }
+extern "C" __global__ void __launch_bounds__(256) mma_cols_exl3_5(const u8* w, const float* x, u32 xs, float* y, u32 ys, u32 rows, u32 cols, u32 m) { exl3_mma<5, false>(w, x, xs, y, ys, rows, cols, m, nullptr); }
+extern "C" __global__ void __launch_bounds__(256) mma_grouped_exl3_5(const u64* wtab, const u32* gtab, const float* x, u32 xs, float* y, u32 ys, u32 rows, u32 cols) { exl3_mma<5, true>((const u8*) wtab[blockIdx.y], x, xs, y, ys, rows, cols, 0, gtab + (u64) blockIdx.y * 129); }
 extern "C" __global__ void __launch_bounds__(256) matvec_exl3_s1_5(const u8* w, const float* x, float* y, u32 rows, u32 cols) { exl3_mv2<5, 1>(w, x, y, rows, cols); }
 extern "C" __global__ void __launch_bounds__(256) matvec_batch_exl3_s1_5(const u64* wtab, const float* x, u32 xs, float* y, u32 ys, u32 rows, u32 cols) { exl3_mv2<5, 1>((const u8*) wtab[blockIdx.y], x + (u64) blockIdx.y * xs, y + (u64) blockIdx.y * ys, rows, cols); }
 extern "C" __global__ void __launch_bounds__(512) matvec_exl3_s2_5(const u8* w, const float* x, float* y, u32 rows, u32 cols) { exl3_mv2<5, 2>(w, x, y, rows, cols); }
@@ -343,8 +488,11 @@ extern "C" __global__ void __launch_bounds__(1024) matvec_batch_exl3_s4_5(const 
 extern "C" __global__ void matvec_exl3_6(const u8* w, const float* x, float* y, u32 rows, u32 cols) { exl3_mv<6, 1>(w, x, 0, y, 0, rows, cols, 1); }
 extern "C" __global__ void matvec_cols_exl3_6(const u8* w, const float* x, u32 xs, float* y, u32 ys, u32 rows, u32 cols, u32 m) { exl3_mv<6, 8>(w, x, xs, y, ys, rows, cols, m); }
 extern "C" __global__ void matvec_batch_exl3_6(const u64* wtab, const float* x, u32 xs, float* y, u32 ys, u32 rows, u32 cols) { exl3_mv<6, 1>((const u8*) wtab[blockIdx.y], x + (u64) blockIdx.y * xs, 0, y + (u64) blockIdx.y * ys, 0, rows, cols, 1); }
-extern "C" __global__ void __launch_bounds__(512) matvec_cols_exl3_s2_6(const u8* w, const float* x, u32 xs, float* y, u32 ys, u32 rows, u32 cols, u32 m) { exl3_mvc2<6, 8, 2>(w, x, xs, y, ys, rows, cols, m); }
-extern "C" __global__ void __launch_bounds__(1024) matvec_cols_exl3_s4_6(const u8* w, const float* x, u32 xs, float* y, u32 ys, u32 rows, u32 cols, u32 m) { exl3_mvc2<6, 8, 4>(w, x, xs, y, ys, rows, cols, m); }
+extern "C" __global__ void __launch_bounds__(512) matvec_cols_exl3_s2_6(const u8* w, const float* x, u32 xs, float* y, u32 ys, u32 rows, u32 cols, u32 m) { exl3_mvc2<6, 8, 2, false>(w, x, xs, y, ys, rows, cols, m, nullptr); }
+extern "C" __global__ void __launch_bounds__(1024) matvec_cols_exl3_s4_6(const u8* w, const float* x, u32 xs, float* y, u32 ys, u32 rows, u32 cols, u32 m) { exl3_mvc2<6, 8, 4, false>(w, x, xs, y, ys, rows, cols, m, nullptr); }
+extern "C" __global__ void __launch_bounds__(1024) matvec_grouped_exl3_s4_6(const u64* wtab, const u32* gtab, const float* x, u32 xs, float* y, u32 ys, u32 rows, u32 cols) { exl3_mvc2<6, 8, 4, true>((const u8*) wtab[blockIdx.y], x, xs, y, ys, rows, cols, 0, gtab + (u64) blockIdx.y * 17); }
+extern "C" __global__ void __launch_bounds__(256) mma_cols_exl3_6(const u8* w, const float* x, u32 xs, float* y, u32 ys, u32 rows, u32 cols, u32 m) { exl3_mma<6, false>(w, x, xs, y, ys, rows, cols, m, nullptr); }
+extern "C" __global__ void __launch_bounds__(256) mma_grouped_exl3_6(const u64* wtab, const u32* gtab, const float* x, u32 xs, float* y, u32 ys, u32 rows, u32 cols) { exl3_mma<6, true>((const u8*) wtab[blockIdx.y], x, xs, y, ys, rows, cols, 0, gtab + (u64) blockIdx.y * 129); }
 extern "C" __global__ void __launch_bounds__(256) matvec_exl3_s1_6(const u8* w, const float* x, float* y, u32 rows, u32 cols) { exl3_mv2<6, 1>(w, x, y, rows, cols); }
 extern "C" __global__ void __launch_bounds__(256) matvec_batch_exl3_s1_6(const u64* wtab, const float* x, u32 xs, float* y, u32 ys, u32 rows, u32 cols) { exl3_mv2<6, 1>((const u8*) wtab[blockIdx.y], x + (u64) blockIdx.y * xs, y + (u64) blockIdx.y * ys, rows, cols); }
 extern "C" __global__ void __launch_bounds__(512) matvec_exl3_s2_6(const u8* w, const float* x, float* y, u32 rows, u32 cols) { exl3_mv2<6, 2>(w, x, y, rows, cols); }
@@ -354,8 +502,11 @@ extern "C" __global__ void __launch_bounds__(1024) matvec_batch_exl3_s4_6(const 
 extern "C" __global__ void matvec_exl3_7(const u8* w, const float* x, float* y, u32 rows, u32 cols) { exl3_mv<7, 1>(w, x, 0, y, 0, rows, cols, 1); }
 extern "C" __global__ void matvec_cols_exl3_7(const u8* w, const float* x, u32 xs, float* y, u32 ys, u32 rows, u32 cols, u32 m) { exl3_mv<7, 8>(w, x, xs, y, ys, rows, cols, m); }
 extern "C" __global__ void matvec_batch_exl3_7(const u64* wtab, const float* x, u32 xs, float* y, u32 ys, u32 rows, u32 cols) { exl3_mv<7, 1>((const u8*) wtab[blockIdx.y], x + (u64) blockIdx.y * xs, 0, y + (u64) blockIdx.y * ys, 0, rows, cols, 1); }
-extern "C" __global__ void __launch_bounds__(512) matvec_cols_exl3_s2_7(const u8* w, const float* x, u32 xs, float* y, u32 ys, u32 rows, u32 cols, u32 m) { exl3_mvc2<7, 8, 2>(w, x, xs, y, ys, rows, cols, m); }
-extern "C" __global__ void __launch_bounds__(1024) matvec_cols_exl3_s4_7(const u8* w, const float* x, u32 xs, float* y, u32 ys, u32 rows, u32 cols, u32 m) { exl3_mvc2<7, 8, 4>(w, x, xs, y, ys, rows, cols, m); }
+extern "C" __global__ void __launch_bounds__(512) matvec_cols_exl3_s2_7(const u8* w, const float* x, u32 xs, float* y, u32 ys, u32 rows, u32 cols, u32 m) { exl3_mvc2<7, 8, 2, false>(w, x, xs, y, ys, rows, cols, m, nullptr); }
+extern "C" __global__ void __launch_bounds__(1024) matvec_cols_exl3_s4_7(const u8* w, const float* x, u32 xs, float* y, u32 ys, u32 rows, u32 cols, u32 m) { exl3_mvc2<7, 8, 4, false>(w, x, xs, y, ys, rows, cols, m, nullptr); }
+extern "C" __global__ void __launch_bounds__(1024) matvec_grouped_exl3_s4_7(const u64* wtab, const u32* gtab, const float* x, u32 xs, float* y, u32 ys, u32 rows, u32 cols) { exl3_mvc2<7, 8, 4, true>((const u8*) wtab[blockIdx.y], x, xs, y, ys, rows, cols, 0, gtab + (u64) blockIdx.y * 17); }
+extern "C" __global__ void __launch_bounds__(256) mma_cols_exl3_7(const u8* w, const float* x, u32 xs, float* y, u32 ys, u32 rows, u32 cols, u32 m) { exl3_mma<7, false>(w, x, xs, y, ys, rows, cols, m, nullptr); }
+extern "C" __global__ void __launch_bounds__(256) mma_grouped_exl3_7(const u64* wtab, const u32* gtab, const float* x, u32 xs, float* y, u32 ys, u32 rows, u32 cols) { exl3_mma<7, true>((const u8*) wtab[blockIdx.y], x, xs, y, ys, rows, cols, 0, gtab + (u64) blockIdx.y * 129); }
 extern "C" __global__ void __launch_bounds__(256) matvec_exl3_s1_7(const u8* w, const float* x, float* y, u32 rows, u32 cols) { exl3_mv2<7, 1>(w, x, y, rows, cols); }
 extern "C" __global__ void __launch_bounds__(256) matvec_batch_exl3_s1_7(const u64* wtab, const float* x, u32 xs, float* y, u32 ys, u32 rows, u32 cols) { exl3_mv2<7, 1>((const u8*) wtab[blockIdx.y], x + (u64) blockIdx.y * xs, y + (u64) blockIdx.y * ys, rows, cols); }
 extern "C" __global__ void __launch_bounds__(512) matvec_exl3_s2_7(const u8* w, const float* x, float* y, u32 rows, u32 cols) { exl3_mv2<7, 2>(w, x, y, rows, cols); }
@@ -365,8 +516,11 @@ extern "C" __global__ void __launch_bounds__(1024) matvec_batch_exl3_s4_7(const 
 extern "C" __global__ void matvec_exl3_8(const u8* w, const float* x, float* y, u32 rows, u32 cols) { exl3_mv<8, 1>(w, x, 0, y, 0, rows, cols, 1); }
 extern "C" __global__ void matvec_cols_exl3_8(const u8* w, const float* x, u32 xs, float* y, u32 ys, u32 rows, u32 cols, u32 m) { exl3_mv<8, 8>(w, x, xs, y, ys, rows, cols, m); }
 extern "C" __global__ void matvec_batch_exl3_8(const u64* wtab, const float* x, u32 xs, float* y, u32 ys, u32 rows, u32 cols) { exl3_mv<8, 1>((const u8*) wtab[blockIdx.y], x + (u64) blockIdx.y * xs, 0, y + (u64) blockIdx.y * ys, 0, rows, cols, 1); }
-extern "C" __global__ void __launch_bounds__(512) matvec_cols_exl3_s2_8(const u8* w, const float* x, u32 xs, float* y, u32 ys, u32 rows, u32 cols, u32 m) { exl3_mvc2<8, 8, 2>(w, x, xs, y, ys, rows, cols, m); }
-extern "C" __global__ void __launch_bounds__(1024) matvec_cols_exl3_s4_8(const u8* w, const float* x, u32 xs, float* y, u32 ys, u32 rows, u32 cols, u32 m) { exl3_mvc2<8, 8, 4>(w, x, xs, y, ys, rows, cols, m); }
+extern "C" __global__ void __launch_bounds__(512) matvec_cols_exl3_s2_8(const u8* w, const float* x, u32 xs, float* y, u32 ys, u32 rows, u32 cols, u32 m) { exl3_mvc2<8, 8, 2, false>(w, x, xs, y, ys, rows, cols, m, nullptr); }
+extern "C" __global__ void __launch_bounds__(1024) matvec_cols_exl3_s4_8(const u8* w, const float* x, u32 xs, float* y, u32 ys, u32 rows, u32 cols, u32 m) { exl3_mvc2<8, 8, 4, false>(w, x, xs, y, ys, rows, cols, m, nullptr); }
+extern "C" __global__ void __launch_bounds__(1024) matvec_grouped_exl3_s4_8(const u64* wtab, const u32* gtab, const float* x, u32 xs, float* y, u32 ys, u32 rows, u32 cols) { exl3_mvc2<8, 8, 4, true>((const u8*) wtab[blockIdx.y], x, xs, y, ys, rows, cols, 0, gtab + (u64) blockIdx.y * 17); }
+extern "C" __global__ void __launch_bounds__(256) mma_cols_exl3_8(const u8* w, const float* x, u32 xs, float* y, u32 ys, u32 rows, u32 cols, u32 m) { exl3_mma<8, false>(w, x, xs, y, ys, rows, cols, m, nullptr); }
+extern "C" __global__ void __launch_bounds__(256) mma_grouped_exl3_8(const u64* wtab, const u32* gtab, const float* x, u32 xs, float* y, u32 ys, u32 rows, u32 cols) { exl3_mma<8, true>((const u8*) wtab[blockIdx.y], x, xs, y, ys, rows, cols, 0, gtab + (u64) blockIdx.y * 129); }
 extern "C" __global__ void __launch_bounds__(256) matvec_exl3_s1_8(const u8* w, const float* x, float* y, u32 rows, u32 cols) { exl3_mv2<8, 1>(w, x, y, rows, cols); }
 extern "C" __global__ void __launch_bounds__(256) matvec_batch_exl3_s1_8(const u64* wtab, const float* x, u32 xs, float* y, u32 ys, u32 rows, u32 cols) { exl3_mv2<8, 1>((const u8*) wtab[blockIdx.y], x + (u64) blockIdx.y * xs, y + (u64) blockIdx.y * ys, rows, cols); }
 extern "C" __global__ void __launch_bounds__(512) matvec_exl3_s2_8(const u8* w, const float* x, float* y, u32 rows, u32 cols) { exl3_mv2<8, 2>(w, x, y, rows, cols); }

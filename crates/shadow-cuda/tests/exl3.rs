@@ -136,6 +136,101 @@ fn the_gpu_matvec_matches_the_cpu_on_random_blobs_at_every_bit_rate() {
                     check(&got[j * ys..j * ys + outf], &want[j], &format!("matvec_cols_exl3_s{ks}_{bits} {inf}x{outf} input {j}"));
                 }
             }
+            // the tensor-core prompt kernel: 5 and 70 tokens (a second, partial token block); f16 activations, so a looser bound than the f32 kernels
+            for mt in [5usize, 70] {
+                let xm: Vec<f32> = (0..mt * inf).map(|_| rng.unit()).collect();
+                let dxm = ctx.alloc(mt * inf * 4).unwrap();
+                dxm.upload(&xm.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>()).unwrap();
+                let dym = ctx.alloc(mt * outf * 4).unwrap();
+                dym.upload(&vec![0u8; mt * outf * 4]).unwrap();
+                // SAFETY: mt inputs of inf floats at dxm, mt outputs of outf at dym.
+                unsafe { prog.launch(&format!("mma_cols_exl3_{bits}"), (grid, mt.div_ceil(64) as u32, 1), (256, 1, 1), 0, None,
+                                     &[Arg::Ptr(w.ptr), Arg::Ptr(dxm.ptr), Arg::U32(inf as u32), Arg::Ptr(dym.ptr), Arg::U32(outf as u32), Arg::U32(outf as u32), Arg::U32(inf as u32), Arg::U32(mt as u32)]).unwrap() };
+                ctx.synchronize().unwrap();
+                let got = read(&dym, mt * outf);
+                for j in 0..mt {
+                    let wantm = matvec_blob(inf, outf, bits, 2, &blob, &xm[j * inf..(j + 1) * inf], 2);
+                    let scale = wantm.iter().map(|v| v.abs()).fold(0.0f32, f32::max).max(1e-6);
+                    let worst = got[j * outf..(j + 1) * outf].iter().zip(&wantm).map(|(g, w)| (g - w).abs()).fold(0.0f32, f32::max);
+                    assert!(worst <= 3e-3 * scale, "mma_cols_exl3_{bits} {inf}x{outf} m={mt} input {j}: worst difference {worst} against a largest output of {scale}");
+                }
+            }
+            // a routed expert's group: n inputs picked from rows of x (stride xs), outputs scattered to rows of y (stride ys), two groups on two matrices
+            {
+                let blob2 = random_blob(&mut rng, inf, outf, bits);
+                let w2 = ctx.alloc(blob2.len()).unwrap();
+                w2.upload(&blob2).unwrap();
+                let tab: Vec<u8> = [w.ptr, w2.ptr].iter().flat_map(|p| p.to_le_bytes()).collect();
+                let dt = ctx.alloc(tab.len()).unwrap();
+                dt.upload(&tab).unwrap();
+                // records: n, 8 input rows, 8 output rows (17 u32)
+                let groups: [(usize, [u32; 8], [u32; 8]); 2] = [(5, [4, 0, 3, 1, 2, 0, 0, 0], [7, 1, 0, 9, 3, 0, 0, 0]), (2, [1, 4, 0, 0, 0, 0, 0, 0], [2, 5, 0, 0, 0, 0, 0, 0])];
+                let rec: Vec<u8> = groups.iter().flat_map(|(n, xi, yi)| std::iter::once(*n as u32).chain(xi.iter().copied()).chain(yi.iter().copied())).flat_map(|v| v.to_le_bytes()).collect();
+                let dg = ctx.alloc(rec.len()).unwrap();
+                dg.upload(&rec).unwrap();
+                let (xs, ys) = (inf + 16, outf + 32);
+                let xpad: Vec<u8> = (0..m).flat_map(|j| x[j * inf..(j + 1) * inf].iter().copied().chain(std::iter::repeat(0.0).take(16))).flat_map(|v: f32| v.to_le_bytes()).collect();
+                let dxp = ctx.alloc(xpad.len()).unwrap();
+                dxp.upload(&xpad).unwrap();
+                let dyg = ctx.alloc(10 * ys * 4).unwrap();
+                dyg.upload(&vec![0u8; 10 * ys * 4]).unwrap();
+                // SAFETY: two table entries, two 17-u32 records, input rows < 5 of dxp, output rows < 10 of dyg.
+                unsafe { prog.launch(&format!("matvec_grouped_exl3_s4_{bits}"), (grid, 2, 1), (1024, 1, 1), 0, None,
+                                     &[Arg::Ptr(dt.ptr), Arg::Ptr(dg.ptr), Arg::Ptr(dxp.ptr), Arg::U32(xs as u32), Arg::Ptr(dyg.ptr), Arg::U32(ys as u32), Arg::U32(outf as u32), Arg::U32(inf as u32)]).unwrap() };
+                ctx.synchronize().unwrap();
+                let got = read(&dyg, 10 * ys);
+                for (gi, (n, xi, yi)) in groups.iter().enumerate() {
+                    let b = if gi == 0 { &blob } else { &blob2 };
+                    for u in 0..*n {
+                        let wantg = matvec_blob(inf, outf, bits, 2, b, &x[xi[u] as usize * inf..(xi[u] as usize + 1) * inf], 2);
+                        let r = yi[u] as usize;
+                        check(&got[r * ys..r * ys + outf], &wantg, &format!("matvec_grouped_exl3_s4_{bits} {inf}x{outf} group {gi} input {u}"));
+                    }
+                }
+            }
+            // the tensor-core group kernel: groups of up to 64 tokens (records of 129 u32: n, 64 input rows, 64 output rows)
+            {
+                let blob2 = random_blob(&mut rng, inf, outf, bits);
+                let w2 = ctx.alloc(blob2.len()).unwrap();
+                w2.upload(&blob2).unwrap();
+                let tab: Vec<u8> = [w.ptr, w2.ptr].iter().flat_map(|p| p.to_le_bytes()).collect();
+                let dt = ctx.alloc(tab.len()).unwrap();
+                dt.upload(&tab).unwrap();
+                let (n0, n1) = (37usize, 3usize);
+                let mut recs = vec![0u32; 2 * 129];
+                recs[0] = n0 as u32;
+                for u in 0..n0 {
+                    recs[1 + u] = (u * 7 % 20) as u32; // inputs: rows of a 20-row buffer, with repeats
+                    recs[65 + u] = (u * 3 + 1) as u32; // outputs: distinct rows of a 120-row buffer
+                }
+                recs[129] = n1 as u32;
+                for u in 0..n1 {
+                    recs[129 + 1 + u] = (19 - u) as u32;
+                    recs[129 + 65 + u] = (112 + u) as u32;
+                }
+                let dg = ctx.alloc(recs.len() * 4).unwrap();
+                dg.upload(&recs.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>()).unwrap();
+                let xm: Vec<f32> = (0..20 * inf).map(|_| rng.unit()).collect();
+                let dxm = ctx.alloc(xm.len() * 4).unwrap();
+                dxm.upload(&xm.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>()).unwrap();
+                let dyg = ctx.alloc(120 * outf * 4).unwrap();
+                dyg.upload(&vec![0u8; 120 * outf * 4]).unwrap();
+                // SAFETY: two table entries, two 129-u32 records, input rows < 20 of dxm, output rows < 120 of dyg.
+                unsafe { prog.launch(&format!("mma_grouped_exl3_{bits}"), (grid, 2, 1), (256, 1, 1), 0, None,
+                                     &[Arg::Ptr(dt.ptr), Arg::Ptr(dg.ptr), Arg::Ptr(dxm.ptr), Arg::U32(inf as u32), Arg::Ptr(dyg.ptr), Arg::U32(outf as u32), Arg::U32(outf as u32), Arg::U32(inf as u32)]).unwrap() };
+                ctx.synchronize().unwrap();
+                let got = read(&dyg, 120 * outf);
+                for gi in 0..2usize {
+                    let b = if gi == 0 { &blob } else { &blob2 };
+                    for u in 0..recs[gi * 129] as usize {
+                        let (xi, yi) = (recs[gi * 129 + 1 + u] as usize, recs[gi * 129 + 65 + u] as usize);
+                        let wantg = matvec_blob(inf, outf, bits, 2, b, &xm[xi * inf..(xi + 1) * inf], 2);
+                        let scale = wantg.iter().map(|v| v.abs()).fold(0.0f32, f32::max).max(1e-6);
+                        let worst = got[yi * outf..(yi + 1) * outf].iter().zip(&wantg).map(|(g, w)| (g - w).abs()).fold(0.0f32, f32::max);
+                        assert!(worst <= 3e-3 * scale, "mma_grouped_exl3_{bits} {inf}x{outf} group {gi} input {u}: worst difference {worst} against a largest output of {scale}");
+                    }
+                }
+            }
             // a table of two different matrices of this shape, one shared input and one input each
             let blob2 = random_blob(&mut rng, inf, outf, bits);
             let w2 = ctx.alloc(blob2.len()).unwrap();

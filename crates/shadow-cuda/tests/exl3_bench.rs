@@ -39,6 +39,10 @@ fn time_the_decode_shapes() {
         ("experts gate+up x20", 2560, 640, 3, 20), ("experts down x10", 640, 2560, 3, 10),
     ];
     let cols_m: u32 = std::env::var("EXL3_COLS").ok().and_then(|v| v.parse().ok()).unwrap_or(0); // >0: the multi-input kernels with that many inputs
+    let mma = std::env::var("EXL3_MMA").is_ok_and(|v| v == "1"); // with EXL3_COLS: the tensor-core kernel
+    let threads: u32 = std::env::var("EXL3_THREADS").ok().and_then(|v| v.parse().ok()).unwrap_or(256);
+    let threads: u32 = std::env::var("EXL3_THREADS").ok().and_then(|v| v.parse().ok()).unwrap_or(256);
+    let threads: u32 = std::env::var("EXL3_THREADS").ok().and_then(|v| v.parse().ok()).unwrap_or(256);
     let threads: u32 = std::env::var("EXL3_THREADS").ok().and_then(|v| v.parse().ok()).unwrap_or(256);
     let threads: u32 = std::env::var("EXL3_THREADS").ok().and_then(|v| v.parse().ok()).unwrap_or(256);
     let threads: u32 = std::env::var("EXL3_THREADS").ok().and_then(|v| v.parse().ok()).unwrap_or(256);
@@ -50,13 +54,16 @@ fn time_the_decode_shapes() {
         let tab: Vec<u8> = (0..n).flat_map(|i| bufs[i % bufs.len()].ptr.to_le_bytes()).collect();
         let dt = ctx.alloc(tab.len()).unwrap();
         dt.upload(&tab).unwrap();
-        let dx = ctx.alloc(inf * 4 * n.max(8)).unwrap();
-        dx.upload(&vec![0x3du8; inf * 4 * n.max(8)]).unwrap();
-        let dy = ctx.alloc(outf * 4 * n.max(8)).unwrap();
+        let dx = ctx.alloc(inf * 4 * n.max(cols_m as usize).max(8)).unwrap();
+        dx.upload(&vec![0x3du8; inf * 4 * n.max(cols_m as usize).max(8)]).unwrap();
+        let dy = ctx.alloc(outf * 4 * n.max(cols_m as usize).max(8)).unwrap();
         let launch = || {
             // SAFETY: random blobs of this shape; inf floats in, outf floats out (a table: a matrix a blockIdx.y).
             unsafe {
-                if count == 0 && cols_m > 0 {
+                if count == 0 && cols_m > 0 && mma {
+                    prog.launch(&format!("mma_cols_exl3_{bits}"), ((outf / 128) as u32, cols_m.div_ceil(64), 1), (256, 1, 1), 0, None,
+                                &[Arg::Ptr(bufs[0].ptr), Arg::Ptr(dx.ptr), Arg::U32(inf as u32), Arg::Ptr(dy.ptr), Arg::U32(outf as u32), Arg::U32(outf as u32), Arg::U32(inf as u32), Arg::U32(cols_m)]).unwrap()
+                } else if count == 0 && cols_m > 0 {
                     prog.launch(&format!("matvec_cols_exl3{suffix}_{bits}"), ((outf / 128) as u32, 1, 1), (threads, 1, 1), 0, None,
                                 &[Arg::Ptr(bufs[0].ptr), Arg::Ptr(dx.ptr), Arg::U32(inf as u32), Arg::Ptr(dy.ptr), Arg::U32(outf as u32), Arg::U32(outf as u32), Arg::U32(inf as u32), Arg::U32(cols_m)]).unwrap()
                 } else if count == 0 {

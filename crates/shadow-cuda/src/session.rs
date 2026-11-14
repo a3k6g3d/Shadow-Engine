@@ -4314,7 +4314,7 @@ impl<'c, 'm> GpuSession<'c, 'm> {
                 None => half + (e * self.cache.slot_bytes) as u64,
             };
             let copied = |e: usize| !self.cache.map.contains_key(&(l, e));
-            let chunk_n = if self.mma_experts_ok(infos) { mma_group() } else { 8 };
+            let chunk_n = if self.mma_experts_ok(infos) { mma_group() } else if self.exl3_mma_experts(infos) { 64 } else { 8 };
             let plan = grouped_plan(tops, 0, m, &set, k, self.rows * k, addr, copied, part, chunk_n);
             assert!(plan.bytes.len() <= self.bb.gtab.bytes, "grouped experts: {} bytes of tables", plan.bytes.len());
             self.upload_to(self.bb.gtab.ptr, &plan.bytes);
@@ -5661,6 +5661,16 @@ impl<'c, 'm> GpuSession<'c, 'm> {
         if let Some((p, bits)) = self.exl3_prog(t) {
             let (rows, cols) = (t.dims[1] as usize, t.dims[0] as u32);
             let wptr = self.w.get(name).unwrap_or_else(|| panic!("{name} is not resident")).ptr;
+            if self.tensor_prompt && m >= 24 && cols % 128 == 0 && rows % 128 == 0 && exl3_mma_on() {
+                // a long prompt's rows on the tensor cores: 64 tokens a block, f16 rotated activations, f32 sums (STATUS 140; inexact, so not under --exact)
+                // SAFETY: a blob of cols x rows weights at wptr; m inputs of `cols` floats xs apart, m outputs of `rows` floats ys apart.
+                unsafe {
+                    p.launch(&format!("mma_cols_exl3_{bits}"), ((rows / 128) as u32, m.div_ceil(64) as u32, 1), (256, 1, 1), 0, self.ls(),
+                             &[Arg::Ptr(wptr), Arg::Ptr(x), Arg::U32(xs as u32), Arg::Ptr(y), Arg::U32(ys as u32), Arg::U32(rows as u32), Arg::U32(cols), Arg::U32(m as u32)])
+                }
+                .unwrap_or_else(|err| panic!("{name}: {err}"));
+                return;
+            }
             for j0 in (0..m).step_by(COLS_MAX) {
                 let (x, y, n) = (x + (j0 * xs * 4) as u64, y + (j0 * ys * 4) as u64, (m - j0).min(COLS_MAX));
                 // SAFETY: a blob of cols x rows weights at wptr; n inputs of `cols` floats xs apart, n outputs of `rows` floats ys apart.
@@ -6788,7 +6798,7 @@ impl<'c, 'm> GpuSession<'c, 'm> {
         if cpu_pending {
             self.cpu_host.0 += t_plan.elapsed().as_secs_f64();
         }
-        if self.sp.is_some() && m > MAX_VERIFY && !cpu_pending && infos[0].ty.exl3().is_none() {
+        if self.sp.is_some() && m > MAX_VERIFY && !cpu_pending && (infos[0].ty.exl3().is_none() || exl3_groups_on()) {
             let t_pre = t_woke.elapsed();
             self.moe_staged(l, m, Some(&tops), &infos, &sizes, &names);
             if m >= 2048 && std::env::var("SHADOW_STAGE_TIME").is_ok_and(|v| v == "1") {
@@ -6880,8 +6890,8 @@ impl<'c, 'm> GpuSession<'c, 'm> {
             vt_lap(&mut vt, 6);
             // grouped and overlapped: each union expert once, on all of the group's tokens that route to it - the
             // resident ones while the misses copy, then (the GPU waiting for the copies) the copied ones
-            // (an EXL3 matrix has no grouped kernel yet: its tokens go through `routed_qwen`, one token at a time)
-            let overlap = self.overlap && self.prof.is_none() && infos[0].ty == infos[1].ty && infos[0].dims == infos[1].dims && infos[0].ty.exl3().is_none();
+            // (an EXL3 matrix: `matvec_grouped_exl3_*`; `SHADOW_EXL3_GROUPED=0`: its tokens go through `routed_qwen`, one token at a time)
+            let overlap = self.overlap && self.prof.is_none() && infos[0].ty == infos[1].ty && infos[0].dims == infos[1].dims && (infos[0].ty.exl3().is_none() || exl3_groups_on());
             let part = [0u64, sizes[0] as u64, (sizes[0] + sizes[1]) as u64];
             let mut plan = None;
             // the copies are the long pole of a layer with misses: their calls go out before the plan is built and the resident experts are launched (`SHADOW_FETCH_FIRST=0`: after, as
@@ -6912,7 +6922,7 @@ impl<'c, 'm> GpuSession<'c, 'm> {
                     None => extra.iter().find(|x| x.0 == e).expect("a routed expert neither cached nor fetched").1,
                 };
                 let copied = |e: usize| copying.iter().any(|c| c.0 == e);
-                let chunk_n = if end - start >= 64 && self.mma_experts_ok(&infos) { mma_group() } else { 8 };
+                let chunk_n = if end - start >= 64 && self.mma_experts_ok(&infos) { mma_group() } else if end - start >= 64 && self.exl3_mma_experts(&infos) { 64 } else { 8 };
                 let p = grouped_plan(&tops, start, end, &set, k, self.rows * k, addr, copied, part, chunk_n);
                 assert!(p.bytes.len() <= self.bb.gtab.bytes, "grouped experts: {} bytes of tables", p.bytes.len());
                 self.upload_to(self.bb.gtab.ptr, &p.bytes);
@@ -6994,6 +7004,12 @@ impl<'c, 'm> GpuSession<'c, 'm> {
         }
     }
 
+    /// Whether a layer's expert matrices are EXL3 ones the tensor-core group kernel (`mma_grouped_exl3_*`, 64 tokens a group) can take (`--tensor-prompt`, whole 128-blocks;
+    /// `SHADOW_EXL3_MMA=0` off; STATUS 140).
+    fn exl3_mma_experts(&self, infos: &[TensorInfo]) -> bool {
+        self.tensor_prompt && exl3_mma_on() && infos.iter().all(|t| t.ty.exl3().is_some() && t.dims[0] % 128 == 0 && t.dims[1] % 128 == 0)
+    }
+
     /// Whether a layer's three expert matrices can run on the tensor cores (`--tensor-prompt`: types with an FP16 decode, columns a multiple of 64).
     fn mma_experts_ok(&self, infos: &[TensorInfo]) -> bool {
         self.tensor_prompt
@@ -7015,6 +7031,19 @@ impl<'c, 'm> GpuSession<'c, 'm> {
         let grouped = |t: &TensorInfo, wt: u64, gt: u64, count: usize, x: u64, xs: usize, y: u64, ys: usize| {
             let ty = t.ty.name().to_lowercase();
             let (rows, cols) = (t.dims[1] as u32, t.dims[0] as u32);
+            if let Some((p3, bits)) = self.exl3_prog(t) {
+                // an EXL3 expert: groups of up to 8 tokens (STATUS 140), 1,024 threads a 128-output slice
+                assert!((p.chunk_n == 8 || p.chunk_n == 64) && cols % 128 == 0, "{}: EXL3 groups hold 8 or 64 tokens and whole 128-blocks", t.name);
+                let (kernel, block) = if p.chunk_n == 64 { (format!("mma_grouped_exl3_{bits}"), 256) } else { (format!("matvec_grouped_exl3_s4_{bits}"), 1024) };
+                // SAFETY: as the launches below, with `exl3.cu`'s grouped kernel (the same tables and 17-u32 records).
+                unsafe {
+                    p3.launch(&kernel, (rows.div_ceil(128), count as u32, 1), (block, 1, 1), 0, self.ls(),
+                              &[Arg::Ptr(bb.gtab.ptr + wt), Arg::Ptr(bb.gtab.ptr + gt), Arg::Ptr(x), Arg::U32(xs as u32),
+                                Arg::Ptr(y), Arg::U32(ys as u32), Arg::U32(rows), Arg::U32(cols)])
+                }
+                .unwrap_or_else(|err| panic!("{}: {err}", t.name));
+                return;
+            }
             // SAFETY: `count` table entries at gtab + wt (matrix addresses) and + gt (17 u32 each: count, input rows,
             // output rows; 65 for the 32-token records), each a rows x cols matrix in the cache or the scratch slots; the rows
             // they name are inside the batch's buffers at the strides given.
@@ -7610,4 +7639,16 @@ fn exl3_kernel(base: &str, bits: usize, cols: usize, batch: bool) -> (String, u3
     }
     let ks: u32 = if cols <= 1024 { 2 } else { 4 };
     (format!("{base}_s{ks}_{bits}"), 256 * ks, (cols * 4) as u32)
+}
+
+/// EXL3 experts through the grouped plan (`matvec_grouped_exl3_s4_*`, STATUS 140); `SHADOW_EXL3_GROUPED=0` makes a batch take the per-token expert route again.
+fn exl3_groups_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("SHADOW_EXL3_GROUPED").is_ok_and(|v| v != "0") || std::env::var("SHADOW_EXL3_GROUPED").is_err())
+}
+
+/// The tensor-core EXL3 prompt kernel for dense projections (`SHADOW_EXL3_MMA=0`: the m <= 8 chunked ones; STATUS 140).
+fn exl3_mma_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("SHADOW_EXL3_MMA").map_or(true, |v| v != "0"))
 }
