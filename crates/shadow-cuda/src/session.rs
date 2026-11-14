@@ -1731,6 +1731,12 @@ struct BucketLayout {
     total: usize,
 }
 
+/// Whether the CPU expert path (`--cpu-experts`) can compute a layer: its three matrices' quant types have a CPU decoder (`cpu_expert::layout`).
+/// The IQ2_XXS / IQ2_XS layers of the Swift IQ3_XXS file do not (STATUS 128): those layers go to the GPU as without the flag, instead of panicking in a CPU worker.
+fn cpu_expert_types_ok(infos: &[TensorInfo]) -> bool {
+    infos.iter().take(3).all(|t| shadow_model::cpu_expert::layout(&t.ty.name()).is_some())
+}
+
 fn bucket_layout(m: usize, k: usize, ne: usize) -> BucketLayout {
     // at most one remainder group an expert in each class, and the full groups of 64 are at most m * k / 64 in all
     let caps = [ne, ne, ne + (m * k) / 64];
@@ -4792,7 +4798,7 @@ impl<'c, 'm> GpuSession<'c, 'm> {
         // Hybrid MoE: up to `cpu_experts` of the lowest-weight misses that the RAM tier holds are computed on the CPU,
         // from the pinned bytes, while the GPU copies and runs the rest.  `top` becomes [GPU experts.., CPU experts..].
         let mut cpu_offs: Vec<usize> = vec![];
-        if let Some(&(_, max)) = self.cpu.as_ref().filter(|_| self.cache.slots > 0) {
+        if let Some(&(_, max)) = self.cpu.as_ref().filter(|_| self.cache.slots > 0 && cpu_expert_types_ok(&infos)) {
             let mut cpu_set: Vec<(usize, f64, usize)> = vec![];
             for &(e, w) in top.iter().rev() {
                 if cpu_set.len() == max {
@@ -6674,7 +6680,7 @@ impl<'c, 'm> GpuSession<'c, 'm> {
         let t_plan = std::time::Instant::now();
         let mut cpu_submit = std::time::Instant::now();
         if let (Some(ub), Some(max)) = (u_host.as_ref(), self.cpu.as_ref().map(|c| c.1)) {
-            if infos[0].ty == infos[1].ty && infos[0].dims == infos[1].dims && self.ram.region.is_some() {
+            if infos[0].ty == infos[1].ty && infos[0].dims == infos[1].dims && self.ram.region.is_some() && cpu_expert_types_ok(&infos) {
                 let mut users: HashMap<usize, Vec<(usize, usize, f64)>> = HashMap::new();
                 for (j, top) in tops.iter().enumerate() {
                     for (i, &(e, w)) in top.iter().enumerate() {
