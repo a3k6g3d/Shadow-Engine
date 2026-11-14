@@ -1,0 +1,36 @@
+shadow serve: 47.4 GiB of RAM available, floor 3.5: RAM tier 35 GiB (at most 45)
+shadow serve: fastest-mode defaults: --tail-skip 3 --tensor-prompt --verify-rank 2 --ram-tier-gib 35 --ram-floor-gib 3.5 --placement profiles/routing-varied300.shrc --dflash models/dflash2 --spec 3 --dflash-min-p 0.5 (--exact for the exact path)
+RAM floor: 3.5 GiB (default 4): a pinned tier cannot be paged out, and this PC has frozen hard at 0.4 GiB free
+placement: profiles/routing-varied300.shrc, 34990 tokens of routing
+shadow serve: starting 2 MCP server(s) from mcp.json
+shadow serve: listening on http://127.0.0.1:8095
+shadow serve: MCP server time: 3 tools
+shadow serve: MCP server browser: 10 tools
+mmq: loaded J:\Shadow\native\mmq\shadow_mmq.dll (int8 tensor-core projections for the prompt path, mul_mat_vec_q)
+fused: loaded J:\Shadow\native\fused\shadow_fused.dll (Strata's int8 fused experts for the prompt path)
+dflash: loaded the drafter from models/dflash2 (~1.2 GB VRAM)
+shadow serve: ready in 39.2 s; expert cache: 1705 slots x 1.96 MiB = 3.27 GiB; 0 hits, 0 misses (0.0% hits); 0 slice uploads; RAM tier: 18411 experts, 35.00 GiB pinned (filled in 30.9 s), misses served 0 from RAM, 0 from the file; tail skip (rank >= 3): 0 routed experts skipped; host waits per step: router 0.0 ms, copies 0.0 ms, file 0.0 ms; kernel launches per step 0, 0.0 ms of host time in them
+fused experts: taken: gate/up IQ3_XXS + down IQ4_NL, phase 0
+fused experts: taken: gate/up IQ3_XXS + down IQ4_NL, phase 1
+fused experts: taken: gate/up IQ2_S + down Q2_0, phase 0
+fused experts: taken: gate/up IQ2_S + down Q2_0, phase 1
+fused experts: taken: gate/up IQ2_S + down IQ4_NL, phase 1
+fused experts: taken: gate/up IQ3_XXS + down Q2_0, phase 1
+fused experts: taken: gate/up IQ3_S + down IQ4_NL, phase 1
+fused experts: taken: gate/up IQ3_S + down Q2_0, phase 1
+fused experts: taken: gate/up IQ4_XS + down IQ4_NL, phase 1
+shadow serve: conversation snapshot of 3007 tokens (0.27 GiB) in 0.10 s; 1 kept
+shadow serve: speculation: 6 passes (0 drafted by lookup), 9 of 14 drafted tokens accepted, 16 tokens in 0.5 s                    (drafting 0.06 s, checking 0.35 s, rolling back 0.01 s)
+shadow serve: draft position right/tried: 4/6 4/4 1/3 0/0 0/0 0/0 0/0 0/0
+shadow serve: conversation snapshot of 5659 tokens (0.41 GiB) in 0.17 s; 1 kept
+shadow serve: speculation: 9 passes (1 drafted by lookup), 7 of 20 drafted tokens accepted, 16 tokens in 0.5 s                    (drafting 0.08 s, checking 0.41 s, rolling back 0.02 s)
+shadow serve: draft position right/tried: 5/9 2/5 0/1 0/0 0/0 0/0 0/0 0/0
+shadow serve: conversation snapshot of 8088 tokens (0.54 GiB) in 0.23 s; 1 kept
+shadow serve: speculation: 7 passes (1 drafted by lookup), 8 of 15 drafted tokens accepted, 16 tokens in 0.4 s                    (drafting 0.05 s, checking 0.32 s, rolling back 0.01 s)
+shadow serve: draft position right/tried: 4/7 2/3 2/2 0/0 0/0 0/0 0/0 0/0
+shadow serve: conversation snapshot of 10833 tokens (0.68 GiB) in 0.25 s; 1 kept
+shadow serve: speculation: 4 passes (1 drafted by lookup), 2 of 9 drafted tokens accepted, 6 tokens in 0.2 s                    (drafting 0.03 s, checking 0.16 s, rolling back 0.01 s)
+shadow serve: draft position right/tried: 2/4 0/2 0/0 0/0 0/0 0/0 0/0 0/0
+shadow serve: conversation snapshot of 14172 tokens (0.86 GiB) in 0.31 s; 1 kept
+shadow serve: speculation: 2 passes (1 drafted by lookup), 1 of 4 drafted tokens accepted, 3 tokens in 0.1 s                    (drafting 0.01 s, checking 0.07 s, rolling back 0.00 s)
+shadow serve: draft position right/tried: 1/2 0/1 0/0 0/0 0/0 0/0 0/0 0/0
