@@ -1,0 +1,653 @@
+{
+ "before": {
+  "cpu": {
+   "info": {
+    "base_mhz": 3600,
+    "caches": [
+     {
+      "count": 8,
+      "kb": 32.0,
+      "kind": 1,
+      "level": 1
+     },
+     {
+      "count": 8,
+      "kb": 48.0,
+      "kind": 2,
+      "level": 1
+     },
+     {
+      "count": 8,
+      "kb": 512.0,
+      "kind": 0,
+      "level": 2
+     },
+     {
+      "count": 1,
+      "kb": 16384.0,
+      "kind": 0,
+      "level": 3
+     }
+    ],
+    "current_mhz": 4600.0,
+    "name": "11th Gen Intel(R) Core(TM) i7-11700K @ 3.60GHz",
+    "thermal_zones": [
+     {
+      "celsius": 27.9,
+      "name": "_TZ.TZ00"
+     }
+    ]
+   },
+   "logical_cores": 16,
+   "process_cores_used": 0.6,
+   "process_percent": 4.0,
+   "system_percent": 17.9
+  },
+  "gpu": {
+   "expert_cache_hit_rate": 0.0,
+   "expert_cache_hits": 0,
+   "expert_cache_misses": 0,
+   "expert_cache_slots": 2198,
+   "memory_controller_percent": 0.0,
+   "name": "NVIDIA GeForce RTX 5070",
+   "temperature_c": 38,
+   "utilization_percent": 17.0,
+   "vram_free_bytes": 100663296,
+   "vram_total_bytes": 12792365056,
+   "vram_used_bytes": 12691701760
+  },
+  "mcp": [
+   {
+    "error": null,
+    "name": "time",
+    "tools": 3
+   },
+   {
+    "error": null,
+    "name": "browser",
+    "tools": 10
+   }
+  ],
+  "process": {
+   "busy": false,
+   "cached_tokens": 0,
+   "completion_tokens": 0,
+   "dflash_active": true,
+   "model": "Swift-Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00001-of-00002",
+   "mtp_active": false,
+   "n_ctx": 25600,
+   "pid": 32188,
+   "prefill_done": 0,
+   "prefill_total": 0,
+   "prompt_tokens": 0,
+   "queued": 0,
+   "requests": 0,
+   "session_tokens": 0,
+   "state": "ready",
+   "tok_per_sec": 0.0,
+   "uptime_s": 37.3
+  },
+  "ram": {
+   "file_served_misses": 0,
+   "pinned_tier_bytes": 37580963840,
+   "pinned_tier_experts": 21640,
+   "process_commit_bytes": 51701932032,
+   "process_working_set_bytes": 39896481792,
+   "ram_served_hits": 0,
+   "system_available_bytes": 10415939584,
+   "system_load_percent": 84,
+   "system_total_bytes": 68497301504,
+   "system_used_bytes": 58081361920
+  },
+  "recent": [],
+  "spec": {
+   "acceptance_rate": 0.0,
+   "accepted": 0,
+   "drafted": 0,
+   "lookup_passes": 0,
+   "mean_accepted_per_pass": 0.0,
+   "passes": 0,
+   "positions": [
+    {
+     "right": 0,
+     "tried": 0
+    },
+    {
+     "right": 0,
+     "tried": 0
+    },
+    {
+     "right": 0,
+     "tried": 0
+    },
+    {
+     "right": 0,
+     "tried": 0
+    },
+    {
+     "right": 0,
+     "tried": 0
+    },
+    {
+     "right": 0,
+     "tried": 0
+    },
+    {
+     "right": 0,
+     "tried": 0
+    },
+    {
+     "right": 0,
+     "tried": 0
+    }
+   ]
+  }
+ },
+ "after": {
+  "cpu": {
+   "info": {
+    "base_mhz": 3600,
+    "caches": [
+     {
+      "count": 8,
+      "kb": 32.0,
+      "kind": 1,
+      "level": 1
+     },
+     {
+      "count": 8,
+      "kb": 48.0,
+      "kind": 2,
+      "level": 1
+     },
+     {
+      "count": 8,
+      "kb": 512.0,
+      "kind": 0,
+      "level": 2
+     },
+     {
+      "count": 1,
+      "kb": 16384.0,
+      "kind": 0,
+      "level": 3
+     }
+    ],
+    "current_mhz": 4600.0,
+    "name": "11th Gen Intel(R) Core(TM) i7-11700K @ 3.60GHz",
+    "thermal_zones": [
+     {
+      "celsius": 27.9,
+      "name": "_TZ.TZ00"
+     }
+    ]
+   },
+   "logical_cores": 16,
+   "process_cores_used": 1.2,
+   "process_percent": 7.5,
+   "system_percent": 19.0
+  },
+  "gpu": {
+   "expert_cache_hit_rate": 62.2,
+   "expert_cache_hits": 445641,
+   "expert_cache_misses": 270834,
+   "expert_cache_slots": 2198,
+   "memory_controller_percent": 12.0,
+   "name": "NVIDIA GeForce RTX 5070",
+   "temperature_c": 48,
+   "utilization_percent": 98.0,
+   "vram_free_bytes": 37748736,
+   "vram_total_bytes": 12792365056,
+   "vram_used_bytes": 12754616320
+  },
+  "mcp": [
+   {
+    "error": null,
+    "name": "time",
+    "tools": 3
+   },
+   {
+    "error": null,
+    "name": "browser",
+    "tools": 10
+   }
+  ],
+  "process": {
+   "busy": false,
+   "cached_tokens": 59100,
+   "completion_tokens": 1850,
+   "dflash_active": true,
+   "model": "Swift-Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00001-of-00002",
+   "mtp_active": false,
+   "n_ctx": 25600,
+   "pid": 32188,
+   "prefill_done": 23,
+   "prefill_total": 23,
+   "prompt_tokens": 61490,
+   "queued": 0,
+   "requests": 36,
+   "session_tokens": 3090,
+   "state": "ready",
+   "tok_per_sec": 55.89,
+   "uptime_s": 106.0
+  },
+  "ram": {
+   "file_served_misses": 8567,
+   "pinned_tier_bytes": 37580963840,
+   "pinned_tier_experts": 21640,
+   "process_commit_bytes": 52643184640,
+   "process_working_set_bytes": 40535732224,
+   "ram_served_hits": 310723,
+   "system_available_bytes": 7431426048,
+   "system_load_percent": 89,
+   "system_total_bytes": 68497301504,
+   "system_used_bytes": 61065875456
+  },
+  "recent": [
+   {
+    "at": 1794675684.0421915,
+    "cached_tokens": 0,
+    "completion_tokens": 96,
+    "finish": "length",
+    "pictures": 0,
+    "predicted_ms": 1066.0,
+    "prompt_ms": 518.0,
+    "prompt_tokens": 24
+   },
+   {
+    "at": 1794675686.3440106,
+    "cached_tokens": 0,
+    "completion_tokens": 9,
+    "finish": "stop",
+    "pictures": 0,
+    "predicted_ms": 141.0,
+    "prompt_ms": 2156.0,
+    "prompt_tokens": 184
+   },
+   {
+    "at": 1794675688.360206,
+    "cached_tokens": 193,
+    "completion_tokens": 96,
+    "finish": "length",
+    "pictures": 0,
+    "predicted_ms": 1563.0,
+    "prompt_ms": 448.0,
+    "prompt_tokens": 217
+   },
+   {
+    "at": 1794675691.213058,
+    "cached_tokens": 120,
+    "completion_tokens": 46,
+    "finish": "stop",
+    "pictures": 0,
+    "predicted_ms": 687.0,
+    "prompt_ms": 2159.0,
+    "prompt_tokens": 344
+   },
+   {
+    "at": 1794675693.3806632,
+    "cached_tokens": 390,
+    "completion_tokens": 81,
+    "finish": "stop",
+    "pictures": 0,
+    "predicted_ms": 1684.0,
+    "prompt_ms": 477.0,
+    "prompt_tokens": 418
+   },
+   {
+    "at": 1794675695.810454,
+    "cached_tokens": 499,
+    "completion_tokens": 96,
+    "finish": "length",
+    "pictures": 0,
+    "predicted_ms": 1619.0,
+    "prompt_ms": 805.0,
+    "prompt_tokens": 539
+   },
+   {
+    "at": 1794675697.985667,
+    "cached_tokens": 635,
+    "completion_tokens": 96,
+    "finish": "length",
+    "pictures": 0,
+    "predicted_ms": 1459.0,
+    "prompt_ms": 710.0,
+    "prompt_tokens": 670
+   },
+   {
+    "at": 1794675704.894127,
+    "cached_tokens": 217,
+    "completion_tokens": 16,
+    "finish": "stop",
+    "pictures": 0,
+    "predicted_ms": 281.0,
+    "prompt_ms": 6620.0,
+    "prompt_tokens": 796
+   },
+   {
+    "at": 1794675707.023324,
+    "cached_tokens": 812,
+    "completion_tokens": 96,
+    "finish": "length",
+    "pictures": 0,
+    "predicted_ms": 1514.0,
+    "prompt_ms": 609.0,
+    "prompt_tokens": 848
+   },
+   {
+    "at": 1794675709.1296144,
+    "cached_tokens": 944,
+    "completion_tokens": 96,
+    "finish": "length",
+    "pictures": 0,
+    "predicted_ms": 1724.0,
+    "prompt_ms": 374.0,
+    "prompt_tokens": 969
+   },
+   {
+    "at": 1794675711.9925866,
+    "cached_tokens": 1065,
+    "completion_tokens": 96,
+    "finish": "length",
+    "pictures": 0,
+    "predicted_ms": 2249.0,
+    "prompt_ms": 606.0,
+    "prompt_tokens": 1094
+   },
+   {
+    "at": 1794675715.513032,
+    "cached_tokens": 1094,
+    "completion_tokens": 77,
+    "finish": "stop",
+    "pictures": 0,
+    "predicted_ms": 1650.0,
+    "prompt_ms": 1862.0,
+    "prompt_tokens": 1216
+   },
+   {
+    "at": 1794675717.8506725,
+    "cached_tokens": 1293,
+    "completion_tokens": 96,
+    "finish": "length",
+    "pictures": 0,
+    "predicted_ms": 1375.0,
+    "prompt_ms": 952.0,
+    "prompt_tokens": 1354
+   },
+   {
+    "at": 1794675719.2299669,
+    "cached_tokens": 1450,
+    "completion_tokens": 32,
+    "finish": "stop",
+    "pictures": 0,
+    "predicted_ms": 676.0,
+    "prompt_ms": 691.0,
+    "prompt_tokens": 1481
+   },
+   {
+    "at": 1794675721.5866804,
+    "cached_tokens": 1513,
+    "completion_tokens": 96,
+    "finish": "length",
+    "pictures": 0,
+    "predicted_ms": 1780.0,
+    "prompt_ms": 565.0,
+    "prompt_tokens": 1540
+   },
+   {
+    "at": 1794675722.4291344,
+    "cached_tokens": 1636,
+    "completion_tokens": 17,
+    "finish": "stop",
+    "pictures": 0,
+    "predicted_ms": 259.0,
+    "prompt_ms": 571.0,
+    "prompt_tokens": 1667
+   },
+   {
+    "at": 1794675723.0301445,
+    "cached_tokens": 1684,
+    "completion_tokens": 3,
+    "finish": "stop",
+    "pictures": 0,
+    "predicted_ms": 104.0,
+    "prompt_ms": 482.0,
+    "prompt_tokens": 1705
+   },
+   {
+    "at": 1794675724.353468,
+    "cached_tokens": 1708,
+    "completion_tokens": 36,
+    "finish": "stop",
+    "pictures": 0,
+    "predicted_ms": 783.0,
+    "prompt_ms": 524.0,
+    "prompt_tokens": 1733
+   },
+   {
+    "at": 1794675726.5737822,
+    "cached_tokens": 1769,
+    "completion_tokens": 96,
+    "finish": "length",
+    "pictures": 0,
+    "predicted_ms": 1536.0,
+    "prompt_ms": 668.0,
+    "prompt_tokens": 1807
+   },
+   {
+    "at": 1794675729.6291752,
+    "cached_tokens": 1807,
+    "completion_tokens": 96,
+    "finish": "length",
+    "pictures": 0,
+    "predicted_ms": 1684.0,
+    "prompt_ms": 1355.0,
+    "prompt_tokens": 1948
+   },
+   {
+    "at": 1794675730.632372,
+    "cached_tokens": 2044,
+    "completion_tokens": 12,
+    "finish": "stop",
+    "pictures": 0,
+    "predicted_ms": 184.0,
+    "prompt_ms": 803.0,
+    "prompt_tokens": 2080
+   },
+   {
+    "at": 1794675733.1539373,
+    "cached_tokens": 2092,
+    "completion_tokens": 96,
+    "finish": "length",
+    "pictures": 0,
+    "predicted_ms": 1923.0,
+    "prompt_ms": 582.0,
+    "prompt_tokens": 2126
+   },
+   {
+    "at": 1794675734.5873928,
+    "cached_tokens": 2126,
+    "completion_tokens": 10,
+    "finish": "stop",
+    "pictures": 0,
+    "predicted_ms": 209.0,
+    "prompt_ms": 1205.0,
+    "prompt_tokens": 2259
+   },
+   {
+    "at": 1794675735.651543,
+    "cached_tokens": 2269,
+    "completion_tokens": 10,
+    "finish": "stop",
+    "pictures": 0,
+    "predicted_ms": 158.0,
+    "prompt_ms": 885.0,
+    "prompt_tokens": 2314
+   },
+   {
+    "at": 1794675736.694793,
+    "cached_tokens": 2324,
+    "completion_tokens": 10,
+    "finish": "stop",
+    "pictures": 0,
+    "predicted_ms": 166.0,
+    "prompt_ms": 856.0,
+    "prompt_tokens": 2369
+   },
+   {
+    "at": 1794675738.878491,
+    "cached_tokens": 2379,
+    "completion_tokens": 76,
+    "finish": "stop",
+    "pictures": 0,
+    "predicted_ms": 1557.0,
+    "prompt_ms": 605.0,
+    "prompt_tokens": 2410
+   },
+   {
+    "at": 1794675739.7468112,
+    "cached_tokens": 2486,
+    "completion_tokens": 7,
+    "finish": "stop",
+    "pictures": 0,
+    "predicted_ms": 127.0,
+    "prompt_ms": 718.0,
+    "prompt_tokens": 2520
+   },
+   {
+    "at": 1794675740.4315915,
+    "cached_tokens": 2527,
+    "completion_tokens": 8,
+    "finish": "stop",
+    "pictures": 0,
+    "predicted_ms": 137.0,
+    "prompt_ms": 524.0,
+    "prompt_tokens": 2556
+   },
+   {
+    "at": 1794675741.1496792,
+    "cached_tokens": 2564,
+    "completion_tokens": 9,
+    "finish": "stop",
+    "pictures": 0,
+    "predicted_ms": 153.0,
+    "prompt_ms": 538.0,
+    "prompt_tokens": 2586
+   },
+   {
+    "at": 1794675741.8806572,
+    "cached_tokens": 2595,
+    "completion_tokens": 5,
+    "finish": "stop",
+    "pictures": 0,
+    "predicted_ms": 169.0,
+    "prompt_ms": 534.0,
+    "prompt_tokens": 2619
+   },
+   {
+    "at": 1794675742.8906388,
+    "cached_tokens": 2624,
+    "completion_tokens": 24,
+    "finish": "stop",
+    "pictures": 0,
+    "predicted_ms": 287.0,
+    "prompt_ms": 697.0,
+    "prompt_tokens": 2659
+   },
+   {
+    "at": 1794675745.6199255,
+    "cached_tokens": 2683,
+    "completion_tokens": 96,
+    "finish": "length",
+    "pictures": 0,
+    "predicted_ms": 2208.0,
+    "prompt_ms": 496.0,
+    "prompt_tokens": 2709
+   },
+   {
+    "at": 1794675746.2666063,
+    "cached_tokens": 2805,
+    "completion_tokens": 3,
+    "finish": "stop",
+    "pictures": 0,
+    "predicted_ms": 93.0,
+    "prompt_ms": 526.0,
+    "prompt_tokens": 2828
+   },
+   {
+    "at": 1794675747.0578356,
+    "cached_tokens": 2831,
+    "completion_tokens": 4,
+    "finish": "stop",
+    "pictures": 0,
+    "predicted_ms": 108.0,
+    "prompt_ms": 654.0,
+    "prompt_tokens": 2862
+   },
+   {
+    "at": 1794675750.3461418,
+    "cached_tokens": 2866,
+    "completion_tokens": 96,
+    "finish": "length",
+    "pictures": 0,
+    "predicted_ms": 1629.0,
+    "prompt_ms": 1626.0,
+    "prompt_tokens": 2960
+   },
+   {
+    "at": 1794675751.159998,
+    "cached_tokens": 3056,
+    "completion_tokens": 11,
+    "finish": "stop",
+    "pictures": 0,
+    "predicted_ms": 160.0,
+    "prompt_ms": 619.0,
+    "prompt_tokens": 3079
+   }
+  ],
+  "spec": {
+   "acceptance_rate": 62.4,
+   "accepted": 1153,
+   "drafted": 1849,
+   "lookup_passes": 62,
+   "mean_accepted_per_pass": 2.68,
+   "passes": 688,
+   "positions": [
+    {
+     "right": 527,
+     "tried": 688
+    },
+    {
+     "right": 378,
+     "tried": 505
+    },
+    {
+     "right": 248,
+     "tried": 354
+    },
+    {
+     "right": 0,
+     "tried": 0
+    },
+    {
+     "right": 0,
+     "tried": 0
+    },
+    {
+     "right": 0,
+     "tried": 0
+    },
+    {
+     "right": 0,
+     "tried": 0
+    },
+    {
+     "right": 0,
+     "tried": 0
+    }
+   ]
+  }
+ },
+ "tokens": 1850,
+ "seconds": 68.70749521255493
+}
