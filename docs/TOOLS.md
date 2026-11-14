@@ -52,6 +52,8 @@ CUDA index, `safetensors`, `numpy`, `matplotlib`).
 | `tools/make_reference_fixture.py`, `make_reference_fixture_flint.py` | run the published reference implementation (transformers / the Flint model code) in float32 on the first N layers, write every layer's streams as a fixture; the GPU and CPU forward passes are held to it (`shadow compare`, `crates/shadow/tests/reference.rs`) |
 | `tools/gen_dequant_fixtures.py`, `gen_quant_tables.py`, `gen_nfc_table.py`, `gen_unicode_table.py`, `make_tokenizer_fixture.py` | tables and fixtures the Rust tests are checked against |
 | `tools/hf_range.py` | reads tensors from a Hugging Face safetensors checkpoint by HTTP range requests (no 360 GB download) |
+| `tools/fetch_exl3_subset.py` | `REPO REV OUT.safetensors REGEX...`: pulls the tensors of an EXL3 (or any safetensors) repo branch whose names match, by range requests, into one small valid safetensors file; what the EXL3 tests and fixtures are made from |
+| `tools/gguf_tensor_types.py` | `FILE.gguf [SUBSTRING...]`: every tensor of a GGUF (the ones whose name has a substring) with dims and quant type, then a count per type; reads the header only |
 | `tools/_refenv.py` | import before transformers in the reference scripts (a stand-in for a broken global torchaudio) |
 
 ## The agent harness and memory
