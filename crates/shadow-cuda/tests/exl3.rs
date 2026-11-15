@@ -203,6 +203,61 @@ fn the_gpu_matvec_matches_the_cpu_on_random_blobs_at_every_bit_rate() {
                     }
                 }
             }
+            // split-K: the input split over `ns` blocks (partial sums in a scratch), then the combine
+            for ns in [2u32, 3] {
+                if ns as usize > (inf / 128).max(1) {
+                    continue;
+                }
+                let dpart = ctx.alloc(ns as usize * 8 * outf * 4).unwrap();
+                let dys = ctx.alloc(m * outf * 4).unwrap();
+                dys.upload(&vec![0u8; m * outf * 4]).unwrap();
+                // SAFETY: m inputs of inf floats at dx, partial sums for ns slices of 8 inputs of outf floats at dpart, m outputs of outf at dys.
+                unsafe {
+                    prog.launch(&format!("matvec_cols_exl3_sk4_{bits}"), (grid, ns, 1), (1024, 1, 1), 0, None,
+                                &[Arg::Ptr(w.ptr), Arg::Ptr(dx.ptr), Arg::U32(inf as u32), Arg::Ptr(dpart.ptr), Arg::U32(outf as u32), Arg::U32(inf as u32), Arg::U32(m as u32)]).unwrap();
+                    prog.launch("exl3_splitk_combine", (grid, 1, 1), (256, 1, 1), 0, None,
+                                &[Arg::Ptr(w.ptr), Arg::Ptr(dpart.ptr), Arg::Ptr(dys.ptr), Arg::U32(outf as u32), Arg::U32(outf as u32), Arg::U32(inf as u32), Arg::U32(m as u32), Arg::U32(ns)]).unwrap();
+                }
+                ctx.synchronize().unwrap();
+                let got = read(&dys, m * outf);
+                for j in 0..m {
+                    check(&got[j * outf..(j + 1) * outf], &want[j], &format!("split-K x{ns} {bits} {inf}x{outf} input {j}"));
+                }
+            }
+            // the group kernels made for groups of at most 2 and 4 tokens (`m2s4`, `m4s4`), on groups of that size
+            for (kname, sizes) in [("m2s4", [2usize, 1]), ("m4s4", [4, 3])] {
+                let blob2 = random_blob(&mut rng, inf, outf, bits);
+                let w2 = ctx.alloc(blob2.len()).unwrap();
+                w2.upload(&blob2).unwrap();
+                let tab: Vec<u8> = [w.ptr, w2.ptr].iter().flat_map(|p| p.to_le_bytes()).collect();
+                let dt = ctx.alloc(tab.len()).unwrap();
+                dt.upload(&tab).unwrap();
+                let mut rec = vec![0u32; 2 * 17];
+                for (g, &n) in sizes.iter().enumerate() {
+                    rec[g * 17] = n as u32;
+                    for u in 0..n {
+                        rec[g * 17 + 1 + u] = ((g * 3 + u) % 5) as u32; // input rows of the 5 of x
+                        rec[g * 17 + 9 + u] = (g * 4 + u) as u32; // distinct output rows
+                    }
+                }
+                let dg = ctx.alloc(rec.len() * 4).unwrap();
+                dg.upload(&rec.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>()).unwrap();
+                let dyg = ctx.alloc(8 * outf * 4).unwrap();
+                dyg.upload(&vec![0u8; 8 * outf * 4]).unwrap();
+                // SAFETY: two table entries and 17-u32 records, input rows < 5 of dx (inf floats a row), output rows < 8 of dyg.
+                unsafe { prog.launch(&format!("matvec_grouped_exl3_{kname}_{bits}"), (grid, 2, 1), (1024, 1, 1), 0, None,
+                                     &[Arg::Ptr(dt.ptr), Arg::Ptr(dg.ptr), Arg::Ptr(dx.ptr), Arg::U32(inf as u32), Arg::Ptr(dyg.ptr), Arg::U32(outf as u32), Arg::U32(outf as u32), Arg::U32(inf as u32)]).unwrap() };
+                ctx.synchronize().unwrap();
+                let got = read(&dyg, 8 * outf);
+                for (g, &n) in sizes.iter().enumerate() {
+                    let b = if g == 0 { &blob } else { &blob2 };
+                    for u in 0..n {
+                        let (xi, yi) = (rec[g * 17 + 1 + u] as usize, rec[g * 17 + 9 + u] as usize);
+                        let wantg = matvec_blob(inf, outf, bits, 2, b, &x[xi * inf..(xi + 1) * inf], 2);
+                        check(&got[yi * outf..(yi + 1) * outf], &wantg, &format!("matvec_grouped_exl3_{kname}_{bits} {inf}x{outf} group {g} input {u}"));
+                    }
+                }
+            }
             // the tensor-core group kernel: groups of up to 64 tokens (records of 129 u32: n, 64 input rows, 64 output rows)
             {
                 let blob2 = random_blob(&mut rng, inf, outf, bits);

@@ -1790,6 +1790,8 @@ struct GroupedPlan {
     counts: u64,
     /// tokens a group holds (8: `matvec_grouped_*`; 32: `mma_grouped_*`)
     chunk_n: usize,
+    /// the most tokens any group of this plan holds (a verify pass's groups are mostly 1-2: the EXL3 8-token kernel is made for 2, 4 and 8)
+    max_group: usize,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1923,7 +1925,8 @@ fn grouped_plan(tops: &[Vec<(usize, f64)>], start: usize, end: usize, set: &[usi
         bytes.extend_from_slice(&(top.len() as u32).to_le_bytes());
     }
     let phase = spans.map(|(n, a, r)| (n, a as u64, (rec_at + 4 * r) as u64));
-    GroupedPlan { bytes, phase, weights, counts, chunk_n }
+    let max_group = groups.iter().flatten().map(|g| g.1.len()).max().unwrap_or(0);
+    GroupedPlan { bytes, phase, weights, counts, chunk_n, max_group }
 }
 
 /// Row j of a [rows][stride] f32 buffer.
@@ -4330,7 +4333,7 @@ impl<'c, 'm> GpuSession<'c, 'm> {
         } else if buckets {
             // routed and planned on the device, in width classes (`plan_fill_w`, skipped when the fused int8 path covers the layer)
             let (lay, any_res) = self.dev_plan_buckets(l, m, sizes, infos);
-            let plan = GroupedPlan { bytes: vec![], phase: [(0, 0, 0); 2], weights: lay.weights as u64, counts: lay.counts as u64, chunk_n: 32 };
+            let plan = GroupedPlan { bytes: vec![], phase: [(0, 0, 0); 2], weights: lay.weights as u64, counts: lay.counts as u64, chunk_n: 32, max_group: 32 };
             blay = Some((lay, any_res));
             (plan, 0)
         } else {
@@ -5698,8 +5701,30 @@ impl<'c, 'm> GpuSession<'c, 'm> {
                 .unwrap_or_else(|err| panic!("{name}: {err}"));
                 return;
             }
+            // a projection with few 128-output blocks (a 20-block output projection, the 4-block k / v) split along its input over several blocks (`matvec_cols_exl3_sk4_*`: partial sums in the
+            // scratch, then `exl3_splitk_combine` adds them in order and rotates the outputs; STATUS 144; `SHADOW_EXL3_SK=0` off)
+            let blocks = (rows / 128).max(1);
+            let nsplit = if rows % 128 == 0 && cols % 128 == 0 && blocks <= 24 && cols >= 2048 && exl3_sk_on() && !self.pipe_active && self.exl3_rot.is_some() {
+                (64 / blocks).min(8).min((cols as usize / 128).div_ceil(4)).max(1)
+            } else {
+                1
+            };
             for j0 in (0..m).step_by(COLS_MAX) {
                 let (x, y, n) = (x + (j0 * xs * 4) as u64, y + (j0 * ys * 4) as u64, (m - j0).min(COLS_MAX));
+                if nsplit > 1 {
+                    let part = self.exl3_rot.as_ref().map_or(0, |r| r.0.ptr);
+                    // SAFETY: a blob of cols x rows weights at wptr; n inputs of `cols` floats xs apart; the scratch holds nsplit x 8 x rows floats (rows <= 24 x 128, nsplit <= 8);
+                    // n outputs of `rows` floats ys apart.  Both launches are on this stream, so the next matrix's partials wait for this combine.
+                    unsafe {
+                        p.launch(&format!("matvec_cols_exl3_sk4_{bits}"), ((rows / 128) as u32, nsplit as u32, 1), (1024, 1, 1), 0, self.ls(),
+                                 &[Arg::Ptr(wptr), Arg::Ptr(x), Arg::U32(xs as u32), Arg::Ptr(part), Arg::U32(rows as u32), Arg::U32(cols), Arg::U32(n as u32)])
+                            .and_then(|_| p.launch("exl3_splitk_combine", ((rows / 128) as u32, 1, 1), (256, 1, 1), 0, self.ls(),
+                                                   &[Arg::Ptr(wptr), Arg::Ptr(part), Arg::Ptr(y), Arg::U32(ys as u32), Arg::U32(rows as u32), Arg::U32(cols), Arg::U32(n as u32),
+                                                     Arg::U32(nsplit as u32)]))
+                    }
+                    .unwrap_or_else(|err| panic!("{name}: {err}"));
+                    continue;
+                }
                 // SAFETY: a blob of cols x rows weights at wptr; n inputs of `cols` floats xs apart, n outputs of `rows` floats ys apart.
                 unsafe {
                     let (kname, threads, shared) = exl3_kernel("matvec_cols_exl3", bits, cols as usize, false);
@@ -6405,7 +6430,7 @@ impl<'c, 'm> GpuSession<'c, 'm> {
         // the combine's per-token expert counts: all k
         let nc = m;
         self.k1("fill_words", nc, &[Arg::Ptr(gt + counts as u64), Arg::U32(nc as u32), Arg::U32(k as u32)]);
-        GroupedPlan { bytes: vec![], phase: [(g, a0 as u64, r0 as u64), (g, a1 as u64, r1 as u64)], weights: w as u64, counts: counts as u64, chunk_n }
+        GroupedPlan { bytes: vec![], phase: [(g, a0 as u64, r0 as u64), (g, a1 as u64, r1 as u64)], weights: w as u64, counts: counts as u64, chunk_n, max_group: chunk_n }
     }
 
     /// Whether `fused_experts` covers this layer's formats, shapes and scratch buffers for `m` rows.
@@ -7081,7 +7106,7 @@ impl<'c, 'm> GpuSession<'c, 'm> {
                     }
                     return;
                 }
-                let (kernel, block) = if p.chunk_n == 64 { (format!("mma_grouped_exl3_{bits}"), 256) } else { (format!("matvec_grouped_exl3_s4_{bits}"), 1024) };
+                let (kernel, block) = if p.chunk_n == 64 { (format!("mma_grouped_exl3_{bits}"), 256) } else { (format!("matvec_grouped_exl3_{}s4_{bits}", match (exl3_gm_on(), p.max_group) { (true, 0..=2) => "m2", (true, 3..=4) => "m4", _ => "" }), 1024) };
                 // SAFETY: as the launches below, with `exl3.cu`'s grouped kernel (the same tables and 17-u32 records).
                 unsafe {
                     p3.launch(&kernel, (rows.div_ceil(128), count as u32, 1), (block, 1, 1), 0, self.ls(),
@@ -7707,4 +7732,16 @@ const EXL3_ROT_ROWS: usize = 2048;
 fn exl3_pre_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var("SHADOW_EXL3_PRE").map_or(true, |v| v != "0"))
+}
+
+/// The EXL3 8-token group kernel specialised on the plan's largest group (2, 4 or 8 tokens; `SHADOW_EXL3_GM=0`: always 8; STATUS 144).
+fn exl3_gm_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("SHADOW_EXL3_GM").map_or(true, |v| v != "0"))
+}
+
+/// Split-K for the dense EXL3 projections with few output blocks in the m <= 8 launches (`SHADOW_EXL3_SK=0`: one launch each; STATUS 144).
+fn exl3_sk_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("SHADOW_EXL3_SK").map_or(true, |v| v != "0"))
 }
