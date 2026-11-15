@@ -46,6 +46,8 @@ fn time_the_decode_shapes() {
     let threads: u32 = std::env::var("EXL3_THREADS").ok().and_then(|v| v.parse().ok()).unwrap_or(256);
     let threads: u32 = std::env::var("EXL3_THREADS").ok().and_then(|v| v.parse().ok()).unwrap_or(256);
     let threads: u32 = std::env::var("EXL3_THREADS").ok().and_then(|v| v.parse().ok()).unwrap_or(256);
+    let threads: u32 = std::env::var("EXL3_THREADS").ok().and_then(|v| v.parse().ok()).unwrap_or(256);
+    let threads: u32 = std::env::var("EXL3_THREADS").ok().and_then(|v| v.parse().ok()).unwrap_or(256);
     eprintln!("{:22} {:>9} {:>10} {:>9}", "shape", "us/launch", "G weights/s", "GB/s");
     for &(name, inf, outf, bits, count) in shapes {
         let n = count.max(1);
@@ -61,7 +63,7 @@ fn time_the_decode_shapes() {
             // SAFETY: random blobs of this shape; inf floats in, outf floats out (a table: a matrix a blockIdx.y).
             unsafe {
                 if count == 0 && cols_m > 0 && mma {
-                    prog.launch(&format!("mma_cols_exl3_{bits}"), ((outf / 128) as u32, cols_m.div_ceil(64), 1), (256, 1, 1), 0, None,
+                    prog.launch(&format!("mma_cols_exl3{suffix}_{bits}"), ((outf / 128) as u32, cols_m.div_ceil(64), 1), (256, 1, 1), 0, None,
                                 &[Arg::Ptr(bufs[0].ptr), Arg::Ptr(dx.ptr), Arg::U32(inf as u32), Arg::Ptr(dy.ptr), Arg::U32(outf as u32), Arg::U32(outf as u32), Arg::U32(inf as u32), Arg::U32(cols_m)]).unwrap()
                 } else if count == 0 && cols_m > 0 {
                     prog.launch(&format!("matvec_cols_exl3{suffix}_{bits}"), ((outf / 128) as u32, 1, 1), (threads, 1, 1), 0, None,
