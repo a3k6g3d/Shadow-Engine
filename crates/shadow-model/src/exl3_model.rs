@@ -94,17 +94,18 @@ fn contiguous(st: &SafeTensors, prefix: &str) -> Option<(usize, u64, u64)> {
     (same && suh.end == svh.start && svh.end == mk.start && mk.end == tr.start).then_some((suh.file, suh.start, tr.end - suh.start))
 }
 
-fn linear_shape(st: &SafeTensors, prefix: &str) -> Result<(usize, usize, usize, u8), String> {
+/// (in, out, K, half, codebook) of a projection.
+fn linear_shape(st: &SafeTensors, prefix: &str) -> Result<(usize, usize, usize, bool, u8), String> {
     let t = st.get(&format!("{prefix}.trellis")).ok_or_else(|| format!("no tensor {prefix}.trellis"))?;
     if t.shape.len() != 3 {
         return Err(format!("{prefix}.trellis: shape {:?}", t.shape));
     }
     let (bits, half) = bits_from_last_dim(t.shape[2]).ok_or_else(|| format!("{prefix}: {} words a tile is not a bit rate", t.shape[2]))?;
-    if half {
-        return Err(format!("{prefix}: half-integer bit rates are not supported yet"));
-    }
     let cb = if st.get(&format!("{prefix}.mcg")).is_some() { 1 } else if st.get(&format!("{prefix}.mul1")).is_some() { 2 } else { 0 };
-    Ok((t.shape[0] * 16, t.shape[1] * 16, bits, cb))
+    if half && cb != 2 {
+        return Err(format!("{prefix}: a half-integer bit rate needs the mul1 codebook"));
+    }
+    Ok((t.shape[0] * 16, t.shape[1] * 16, bits, half, cb))
 }
 
 fn i64s(st: &SafeTensors, name: &str) -> Result<Vec<i64>, String> {
@@ -220,12 +221,12 @@ pub fn open(dir: &Path) -> Result<Exl3Model, String> {
         let src = source_of(name, &map).ok_or_else(|| format!("{name}: no source in the EXL3 map"))?;
         match &src {
             Source::Linear { prefix, perm_out, perm_in, out_blocks } => {
-                let (inf, mut outf, bits, cb) = linear_shape(&st, prefix)?;
+                let (inf, mut outf, bits, half, cb) = linear_shape(&st, prefix)?;
                 if let Some((a, b)) = out_blocks {
                     outf = (b - a) * 128;
                 }
-                let ty = GgmlType::from_exl3(bits, cb);
-                let len = blob_len(inf, outf, bits) as u64;
+                let ty = GgmlType::from_exl3_rate(bits, half, cb);
+                let len = blob_len(inf, outf, (bits, half)) as u64;
                 let direct = perm_out.is_none() && perm_in.is_none() && out_blocks.is_none();
                 match contiguous(&st, prefix).filter(|_| direct) {
                     Some((file, off, l)) if l == len => tensors.push(new_info(name, vec![inf as u64, outf as u64], ty, file, off, len)),
@@ -257,14 +258,14 @@ pub fn open(dir: &Path) -> Result<Exl3Model, String> {
             }
             Source::Expert { prefix } => {
                 let p0 = prefix.replace("{e}", "0");
-                let (inf, outf, bits, cb) = linear_shape(&st, &p0)?;
-                let len = blob_len(inf, outf, bits);
+                let (inf, outf, bits, half, cb) = linear_shape(&st, &p0)?;
+                let len = blob_len(inf, outf, (bits, half));
                 let mut table = Vec::with_capacity(n_expert);
                 for e in 0..n_expert {
                     let pe = prefix.replace("{e}", &e.to_string());
-                    let (i2, o2, b2, c2) = linear_shape(&st, &pe)?;
-                    if (i2, o2, b2, c2) != (inf, outf, bits, cb) {
-                        return Err(format!("{pe}: {i2} x {o2} K={b2} codebook {c2}, but expert 0 of the layer is {inf} x {outf} K={bits} codebook {cb}"));
+                    let (i2, o2, b2, h2, c2) = linear_shape(&st, &pe)?;
+                    if (i2, o2, b2, h2, c2) != (inf, outf, bits, half, cb) {
+                        return Err(format!("{pe}: {i2} x {o2} K={b2} (half {h2}) codebook {c2}, but expert 0 of the layer is {inf} x {outf} K={bits} (half {half}) codebook {cb}"));
                     }
                     let (file, off, l) = contiguous(&st, &pe).ok_or_else(|| format!("{pe}: its tensors are not one range of a file"))?;
                     if l as usize != len {
@@ -272,7 +273,7 @@ pub fn open(dir: &Path) -> Result<Exl3Model, String> {
                     }
                     table.push((file, off));
                 }
-                tensors.push(new_info(name, vec![inf as u64, outf as u64, n_expert as u64], GgmlType::from_exl3(bits, cb), 0, 0, (len * n_expert) as u64));
+                tensors.push(new_info(name, vec![inf as u64, outf as u64, n_expert as u64], GgmlType::from_exl3_rate(bits, half, cb), 0, 0, (len * n_expert) as u64));
                 experts.insert(name.clone(), table);
             }
         }

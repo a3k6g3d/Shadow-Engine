@@ -129,10 +129,51 @@ fn stream_bit(tile: &[u16], s: usize) -> u32 {
     (word >> (31 - s % 32)) & 1
 }
 
-/// The 16-bit state of weight `t` of a tile with integer bit rate `bits`.
-pub fn state_int(tile: &[u16], bits: usize, t: usize) -> u32 {
-    let n = 256 * bits;
-    let end = (t + 1) * bits;
+/// A bit rate: K bits a weight, or K + 0.5 when `half` (the `mul1` codebook only).  `usize` is an integer rate.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Rate {
+    pub bits: usize,
+    pub half: bool,
+}
+
+impl From<usize> for Rate {
+    fn from(bits: usize) -> Rate {
+        Rate { bits, half: false }
+    }
+}
+
+impl From<(usize, bool)> for Rate {
+    fn from((bits, half): (usize, bool)) -> Rate {
+        Rate { bits, half }
+    }
+}
+
+impl Rate {
+    /// u32 words of a tile's ring: 8 K, or 4 (2 K + 1) for K + 0.5.
+    pub fn ring_words(self) -> usize {
+        if self.half { 4 * (2 * self.bits + 1) } else { 8 * self.bits }
+    }
+
+    /// u16 words of a tile (16 K, or 16 K + 8).
+    pub fn tile_words(self) -> usize {
+        2 * self.ring_words()
+    }
+
+    /// End bit (counting from the stream's start) of the window of weight `t`.  An integer rate: `(t + 1) K`.  K + 0.5 (exllamav3's `dq8_half`): positions alternate K and
+    /// K + 1 bits, so a pair of positions takes `2 K + 1`; weight `2 q + 1` ends at `(q + 1) (2 K + 1)` and weight `2 q` at `q (2 K + 1) + K`.
+    pub fn end_bit(self, t: usize) -> usize {
+        if !self.half {
+            return (t + 1) * self.bits;
+        }
+        let b2 = 2 * self.bits + 1;
+        if t & 1 == 1 { (t / 2 + 1) * b2 } else { (t / 2) * b2 + self.bits }
+    }
+}
+
+/// The 16-bit state of weight `t` of a tile of bit rate `rate`.
+pub fn state_r(tile: &[u16], rate: Rate, t: usize) -> u32 {
+    let n = rate.ring_words() * 32;
+    let end = rate.end_bit(t);
     let mut w = 0u32;
     for b in 0..16 {
         w = (w << 1) | stream_bit(tile, (end + n - 16 + b) % n);
@@ -140,11 +181,17 @@ pub fn state_int(tile: &[u16], bits: usize, t: usize) -> u32 {
     w
 }
 
+/// The 16-bit state of weight `t` of a tile with integer bit rate `bits`.
+pub fn state_int(tile: &[u16], bits: usize, t: usize) -> u32 {
+    state_r(tile, bits.into(), t)
+}
+
 /// The 256 weights of one tile, in trellis order, as the exact f16 values the codebook gives.
-pub fn decode_tile(tile: &[u16], bits: usize, cb: u8) -> [f32; 256] {
+pub fn decode_tile(tile: &[u16], rate: impl Into<Rate>, cb: u8) -> [f32; 256] {
+    let rate = rate.into();
     let mut out = [0f32; 256];
     for (t, o) in out.iter_mut().enumerate() {
-        *o = codebook::decode(cb, state_int(tile, bits, t));
+        *o = codebook::decode(cb, state_r(tile, rate, t));
     }
     out
 }
@@ -167,7 +214,7 @@ pub struct Exl3Linear {
 impl Exl3Linear {
     /// Words of one tile.
     pub fn tile_words(&self) -> usize {
-        16 * self.bits + if self.half { 8 } else { 0 }
+        Rate { bits: self.bits, half: self.half }.tile_words()
     }
 
     /// Reads the tensors `{prefix}.trellis`, `.suh`, `.svh` and `.mul1` / `.mcg`.
@@ -193,13 +240,12 @@ impl Exl3Linear {
 
     /// `W_hat[in][out]` (row-major, f32 holding f16 values): the weight in the rotated basis, straight from the trellis.
     pub fn reconstruct_inner(&self) -> Vec<f32> {
-        assert!(!self.half, "half-integer bit rates are not decoded yet");
         let (kt, nt, tw) = (self.in_features / 16, self.out_features / 16, self.tile_words());
         let mut w = vec![0f32; self.in_features * self.out_features];
         for k in 0..kt {
             for n in 0..nt {
                 let tile = &self.trellis[(k * nt + n) * tw..(k * nt + n + 1) * tw];
-                let vals = decode_tile(tile, self.bits, self.cb);
+                let vals = decode_tile(tile, (self.bits, self.half), self.cb);
                 for (p, v) in vals.iter().enumerate() {
                     let (r, c) = tile_pos(p);
                     w[(k * 16 + r) * self.out_features + n * 16 + c] = *v;
@@ -326,12 +372,13 @@ fn tile_pos_table() -> &'static [(u8, u8); 256] {
 }
 
 /// `decode_tile` with a table for the codebook and 64-bit windows instead of bit loops: the same values.
-pub fn decode_tile_fast(tile: &[u16], bits: usize, lut: &[f32], out: &mut [f32; 256]) {
-    let nw = 8 * bits; // u32 words in the tile's ring
-    let n = 256 * bits;
+pub fn decode_tile_fast(tile: &[u16], rate: impl Into<Rate>, lut: &[f32], out: &mut [f32; 256]) {
+    let rate = rate.into();
+    let nw = rate.ring_words(); // u32 words in the tile's ring
+    let n = nw * 32;
     let word = |i: usize| tile[2 * i] as u32 | ((tile[2 * i + 1] as u32) << 16);
     for (t, o) in out.iter_mut().enumerate() {
-        let s = ((t + 1) * bits + n - 16) % n; // first bit of the window (stream bit 0 = msb of word 0)
+        let s = (rate.end_bit(t) + n - 16) % n; // first bit of the window (stream bit 0 = msb of word 0)
         let (wi, sh) = (s / 32, s % 32);
         let merged = ((word(wi) as u64) << 32) | word((wi + 1) % nw) as u64;
         *o = lut[((merged >> (48 - sh)) & 0xffff) as usize];
@@ -340,8 +387,9 @@ pub fn decode_tile_fast(tile: &[u16], bits: usize, lut: &[f32], out: &mut [f32; 
 
 /// Bytes of a projection stored as one blob: `suh` (f16 `[in]`), `svh` (f16 `[out]`), `mul1` / `mcg` (4 bytes, a marker),
 /// then the trellis, which is the order the tensors have in a repo's safetensors files (so a blob is one range of the file).
-pub fn blob_len(in_features: usize, out_features: usize, bits: usize) -> usize {
-    2 * in_features + 2 * out_features + 4 + in_features * out_features * bits / 8
+pub fn blob_len(in_features: usize, out_features: usize, rate: impl Into<Rate>) -> usize {
+    let rate = rate.into();
+    2 * in_features + 2 * out_features + 4 + in_features * out_features * (2 * rate.bits + rate.half as usize) / 16
 }
 
 /// Byte offsets inside a blob: (svh, marker, trellis).
@@ -351,12 +399,13 @@ pub fn blob_offsets(in_features: usize, out_features: usize) -> (usize, usize, u
 
 impl Exl3Linear {
     /// Reads a projection from its blob (see `blob_len`); `cb` is the codebook the model uses.
-    pub fn from_blob(in_features: usize, out_features: usize, bits: usize, cb: u8, blob: &[u8]) -> Exl3Linear {
-        assert_eq!(blob.len(), blob_len(in_features, out_features, bits), "EXL3 blob of {} bytes for {in_features} x {out_features} at K = {bits}", blob.len());
+    pub fn from_blob(in_features: usize, out_features: usize, rate: impl Into<Rate>, cb: u8, blob: &[u8]) -> Exl3Linear {
+        let Rate { bits, half } = rate.into();
+        assert_eq!(blob.len(), blob_len(in_features, out_features, (bits, half)), "EXL3 blob of {} bytes for {in_features} x {out_features} at K = {bits} (+ half: {half})", blob.len());
         let (osv, _, otr) = blob_offsets(in_features, out_features);
         let h = |b: &[u8]| -> Vec<f32> { b.chunks_exact(2).map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]]))).collect() };
         Exl3Linear {
-            in_features, out_features, bits, half: false, cb,
+            in_features, out_features, bits, half, cb,
             trellis: blob[otr..].chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect(),
             suh: h(&blob[..osv]), svh: h(&blob[osv..osv + 2 * out_features]),
         }
@@ -375,7 +424,6 @@ impl Exl3Linear {
     /// Output block `ob` (128 outputs) of `y = x W`, given the rotated input: accumulate the block's 8 tile columns tile by
     /// tile in the rotated basis, then `H` and `diag(svh)`.
     pub fn matvec_block(&self, xr: &[f32], ob: usize, y: &mut [f32; 128]) {
-        assert!(!self.half, "half-integer bit rates are not decoded yet");
         let (kt, nt, tw) = (self.in_features / 16, self.out_features / 16, self.tile_words());
         let (lut, pos) = (codebook_table(self.cb), tile_pos_table());
         let mut acc = [0f64; 128];
@@ -383,7 +431,7 @@ impl Exl3Linear {
         for c in 0..8 {
             let n = ob * 8 + c;
             for k in 0..kt {
-                decode_tile_fast(&self.trellis[(k * nt + n) * tw..(k * nt + n + 1) * tw], self.bits, lut, &mut vals);
+                decode_tile_fast(&self.trellis[(k * nt + n) * tw..(k * nt + n + 1) * tw], (self.bits, self.half), lut, &mut vals);
                 let xk = &xr[k * 16..k * 16 + 16];
                 for (p, v) in vals.iter().enumerate() {
                     let (r, col) = pos[p];
@@ -451,8 +499,7 @@ pub fn ngram_row(words: &[u16], bits: usize, bias: &[f32], out: &mut [f32]) {
 impl Exl3Linear {
     /// The blob (`blob_len` bytes, layout of `blob_len`'s doc) of this projection; the marker is 1 (the repos' own is a scalar tensor).
     pub fn to_blob(&self) -> Vec<u8> {
-        assert!(!self.half, "half-integer bit rates are not decoded yet");
-        let mut b = Vec::with_capacity(blob_len(self.in_features, self.out_features, self.bits));
+        let mut b = Vec::with_capacity(blob_len(self.in_features, self.out_features, (self.bits, self.half)));
         for v in self.suh.iter().chain(&self.svh) {
             b.extend_from_slice(&crate::half::f32_to_f16(*v).to_le_bytes());
         }
@@ -478,8 +525,9 @@ fn blob_words(blob: &[u8], from: usize) -> std::borrow::Cow<'_, [u16]> {
 
 /// `y = x W` for a projection given as a blob, without building an `Exl3Linear` (the trellis is read in place): the
 /// reference matvec the GPU kernels are checked against.
-pub fn matvec_blob(in_features: usize, out_features: usize, bits: usize, cb: u8, blob: &[u8], x: &[f32], threads: usize) -> Vec<f32> {
-    assert_eq!(blob.len(), blob_len(in_features, out_features, bits), "EXL3 blob of {} bytes for {in_features} x {out_features} at K = {bits}", blob.len());
+pub fn matvec_blob(in_features: usize, out_features: usize, rate: impl Into<Rate>, cb: u8, blob: &[u8], x: &[f32], threads: usize) -> Vec<f32> {
+    let rate = rate.into();
+    assert_eq!(blob.len(), blob_len(in_features, out_features, rate), "EXL3 blob of {} bytes for {in_features} x {out_features} at {rate:?}", blob.len());
     assert_eq!(x.len(), in_features);
     let (osv, _, otr) = blob_offsets(in_features, out_features);
     let h = |b: &[u8]| -> Vec<f32> { b.chunks_exact(2).map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]]))).collect() };
@@ -490,7 +538,7 @@ pub fn matvec_blob(in_features: usize, out_features: usize, bits: usize, cb: u8,
     for b in xr.chunks_exact_mut(128) {
         wht128(b.try_into().unwrap());
     }
-    let (kt, nt, tw) = (in_features / 16, out_features / 16, 16 * bits);
+    let (kt, nt, tw) = (in_features / 16, out_features / 16, rate.tile_words());
     let (lut, pos) = (codebook_table(cb), tile_pos_table());
     let block = |ob: usize, y: &mut [f32]| {
         let mut acc = [0f64; 128];
@@ -498,7 +546,7 @@ pub fn matvec_blob(in_features: usize, out_features: usize, bits: usize, cb: u8,
         for c in 0..8 {
             let n = ob * 8 + c;
             for k in 0..kt {
-                decode_tile_fast(&trellis[(k * nt + n) * tw..(k * nt + n + 1) * tw], bits, lut, &mut vals);
+                decode_tile_fast(&trellis[(k * nt + n) * tw..(k * nt + n + 1) * tw], rate, lut, &mut vals);
                 let xk = &xr[k * 16..k * 16 + 16];
                 for (p, v) in vals.iter().enumerate() {
                     let (r, col) = pos[p];

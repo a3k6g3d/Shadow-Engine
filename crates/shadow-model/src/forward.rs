@@ -242,7 +242,7 @@ impl Backend for CpuBackend {
     fn matvec(&self, t: &TensorInfo, bytes: &[u8], _key: Option<&str>, x: &[f32]) -> Vec<f32> {
         if let Some((bits, cb)) = t.ty.exl3() {
             // an EXL3 projection (a blob): the matvec in the rotated basis; dims are ggml's [in, out]
-            return crate::exl3::matvec_blob(t.dims[0] as usize, t.dims[1] as usize, bits, cb, bytes, x, threads());
+            return crate::exl3::matvec_blob(t.dims[0] as usize, t.dims[1] as usize, (bits, t.ty.exl3_half()), cb, bytes, x, threads());
         }
         matvec(&Mat { t, bytes }, x)
     }

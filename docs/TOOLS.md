@@ -54,6 +54,8 @@ CUDA index, `safetensors`, `numpy`, `matplotlib`).
 | `tools/hf_range.py` | reads tensors from a Hugging Face safetensors checkpoint by HTTP range requests (no 360 GB download) |
 | `tools/fetch_exl3_subset.py` | `REPO REV OUT.safetensors REGEX...`: pulls the tensors of an EXL3 (or any safetensors) repo branch whose names match, by range requests, into one small valid safetensors file; what the EXL3 tests and fixtures are made from |
 | `tools/gguf_tensor_types.py` | `FILE.gguf [SUBSTRING...]`: every tensor of a GGUF (the ones whose name has a substring) with dims and quant type, then a count per type; reads the header only |
+| `tools/find_exl3.py` | lists every EXL3 repo of Qwen3.8-Flash-Next on the Hub (several searches), marks the abliterated / uncensored / heretic ones and the gated ones |
+| `tools/analyze_exl3.py` | `REPO [REVISION]`: reads the safetensors headers of an EXL3 repo by range requests: total size, n-gram table size, the bit rate K (halves included) of every routed expert per layer and of the dense, MTP and vision tensors; what decides whether Shadow can load a repo |
 | `tools/fetch_base_experts.py` | `OUT LAYERS EXPERTS`: slices of the fused expert tensors of the BF16 base checkpoint (`Qwen/Qwen3.8-Flash-Next`) for chosen layers and experts, by range requests, under per-expert names; what `tests/exl3_vs_base.rs` compares the EXL3 decode with |
 | `tools/_refenv.py` | import before transformers in the reference scripts (a stand-in for a broken global torchaudio) |
 

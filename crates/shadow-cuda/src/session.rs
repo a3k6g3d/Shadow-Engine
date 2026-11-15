@@ -2859,17 +2859,19 @@ impl<'c, 'm> GpuSession<'c, 'm> {
     }
 
     /// The EXL3 program and bit rate of an EXL3 matrix (None for any other type).  Only the `mul1` codebook has kernels.
-    fn exl3_prog(&self, t: &TensorInfo) -> Option<(&Program<'c>, usize)> {
+    fn exl3_prog(&self, t: &TensorInfo) -> Option<(&Program<'c>, String)> {
         let (bits, cb) = t.ty.exl3()?;
         assert_eq!(cb, 2, "{}: only the mul1 codebook has GPU kernels", t.name);
-        Some((self.ex3.as_ref().expect("an EXL3 matrix needs the exl3.cu program"), bits))
+        // the kernels' name suffix: K, or `Kh` for K + 0.5 bits a weight (`matvec_exl3_s4_2h`)
+        let rate = if t.ty.exl3_half() { format!("{bits}h") } else { bits.to_string() };
+        Some((self.ex3.as_ref().expect("an EXL3 matrix needs the exl3.cu program"), rate))
     }
 
     fn matvec(&self, t: &TensorInfo, wptr: u64, rows: usize, x: u64, y: u64) {
         if let Some((p, bits)) = self.exl3_prog(t) {
             // SAFETY: a blob of dims[0] x rows weights at wptr (an EXL3 matrix's dims are [in, out]); x holds dims[0] floats, y `rows`.
             unsafe {
-                let (name, threads, shared) = exl3_kernel("matvec_exl3", bits, t.dims[0] as usize, false);
+                let (name, threads, shared) = exl3_kernel("matvec_exl3", &bits, t.dims[0] as usize, false);
                 p.launch(&name, ((rows as u32).div_ceil(128), 1, 1), (threads, 1, 1), shared, self.ls(),
                          &[Arg::Ptr(wptr), Arg::Ptr(x), Arg::Ptr(y), Arg::U32(rows as u32), Arg::U32(t.dims[0] as u32)])
             }
@@ -5727,7 +5729,7 @@ impl<'c, 'm> GpuSession<'c, 'm> {
                 }
                 // SAFETY: a blob of cols x rows weights at wptr; n inputs of `cols` floats xs apart, n outputs of `rows` floats ys apart.
                 unsafe {
-                    let (kname, threads, shared) = exl3_kernel("matvec_cols_exl3", bits, cols as usize, false);
+                    let (kname, threads, shared) = exl3_kernel("matvec_cols_exl3", &bits, cols as usize, false);
                     p.launch(&kname, ((rows as u32).div_ceil(128), 1, 1), (threads, 1, 1), shared, self.ls(),
                              &[Arg::Ptr(wptr), Arg::Ptr(x), Arg::U32(xs as u32), Arg::Ptr(y), Arg::U32(ys as u32), Arg::U32(rows as u32), Arg::U32(cols), Arg::U32(n as u32)])
                 }
@@ -5933,7 +5935,7 @@ impl<'c, 'm> GpuSession<'c, 'm> {
             // SAFETY: `count` blobs of cols x rows weights from the table at `tab`; `count` inputs of `cols` floats (stride xs, or 0 when shared)
             // and `count` outputs of `rows` floats (stride ys) inside this session's buffers.
             unsafe {
-                let (name, threads, shared) = exl3_kernel("matvec_batch_exl3", bits, t.dims[0] as usize, true);
+                let (name, threads, shared) = exl3_kernel("matvec_batch_exl3", &bits, t.dims[0] as usize, true);
                 p.launch(&name, (rows.div_ceil(128), count as u32, 1), (threads, 1, 1), shared, self.ls(),
                          &[Arg::Ptr(tab), Arg::Ptr(x), Arg::U32(xs as u32), Arg::Ptr(y), Arg::U32(ys as u32), Arg::U32(rows), Arg::U32(cols)])
             }
@@ -7699,7 +7701,7 @@ mod snapshot_disk_tests {
 /// (`_s4`: 4 slices of 8 warps = 1024 threads, `_s2` for the short inputs of the expert down projection and the like) rotate the whole input
 /// into shared memory first and split the tile rows over the slices; the plain ones (`SHADOW_EXL3_V1=1`, or an input too long for the 48 KiB
 /// of static shared memory, or not whole 128-blocks) run one slice a block (STATUS 139).
-fn exl3_kernel(base: &str, bits: usize, cols: usize, batch: bool) -> (String, u32, u32) {
+fn exl3_kernel(base: &str, bits: &str, cols: usize, batch: bool) -> (String, u32, u32) {
     static V1: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     let _ = batch;
     if *V1.get_or_init(|| std::env::var("SHADOW_EXL3_V1").is_ok_and(|v| v == "1")) || !cols.is_multiple_of(128) || (base != "matvec_cols_exl3" && cols * 4 > 48 * 1024) {

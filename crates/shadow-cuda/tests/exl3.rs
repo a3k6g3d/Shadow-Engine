@@ -5,7 +5,7 @@
 
 use shadow_cuda::kernels::{file, Arg, Program};
 use shadow_cuda::{nvrtc, Context};
-use shadow_model::exl3::{blob_len, codebook, matvec_blob, Exl3Linear};
+use shadow_model::exl3::{blob_len, codebook, matvec_blob, Exl3Linear, Rate};
 use shadow_model::half::{f16_to_f32, f32_to_f16};
 use shadow_model::safetensors::SafeTensors;
 
@@ -23,18 +23,19 @@ impl Rng {
     }
 }
 
-fn random_blob(rng: &mut Rng, inf: usize, outf: usize, bits: usize) -> Vec<u8> {
-    let mut b = Vec::with_capacity(blob_len(inf, outf, bits));
+fn random_blob(rng: &mut Rng, inf: usize, outf: usize, rate: impl Into<Rate>) -> Vec<u8> {
+    let rate: Rate = rate.into();
+    let mut b = Vec::with_capacity(blob_len(inf, outf, rate));
     for i in 0..inf + outf {
         // sign vectors are +-1 (suh); the output scales (svh) are small positive numbers
         let v = if i < inf { if rng.next() & 1 == 0 { 1.0 } else { -1.0 } } else { 0.3 + (rng.next() % 100) as f32 / 100.0 };
         b.extend_from_slice(&f32_to_f16(v).to_le_bytes());
     }
     b.extend_from_slice(&1i32.to_le_bytes());
-    for _ in 0..inf * outf * bits / 8 / 2 {
+    for _ in 0..inf * outf * (2 * rate.bits + rate.half as usize) / 32 {
         b.extend_from_slice(&(rng.next() as u16).to_le_bytes());
     }
-    assert_eq!(b.len(), blob_len(inf, outf, bits));
+    assert_eq!(b.len(), blob_len(inf, outf, rate));
     b
 }
 
@@ -80,9 +81,12 @@ fn the_gpu_matvec_matches_the_cpu_on_random_blobs_at_every_bit_rate() {
     let Some(ctx) = gpu_ctx() else { return };
     let prog = Program::load(&ctx, file("exl3.cu").unwrap()).unwrap();
     let mut rng = Rng(0x2545_f491_4f6c_dd1d);
-    for bits in 1..=8usize {
+    // every integer rate and the half-integer rates K + 0.5 (tag "2h" = 2.5 bits)
+    for (bits, half) in (1..=8usize).map(|b| (b, false)).chain((1..=3usize).map(|b| (b, true))) {
+        let tag = if half { format!("{bits}h") } else { bits.to_string() };
+        let rate = (bits, half);
         for (inf, outf) in [(256usize, 128usize), (640, 256), (384, 384)] {
-            let blob = random_blob(&mut rng, inf, outf, bits);
+            let blob = random_blob(&mut rng, inf, outf, rate);
             let w = ctx.alloc(blob.len()).unwrap();
             w.upload(&blob).unwrap();
             let m = 5usize;
@@ -91,7 +95,7 @@ fn the_gpu_matvec_matches_the_cpu_on_random_blobs_at_every_bit_rate() {
             let dx = ctx.alloc(xb.len()).unwrap();
             dx.upload(&xb).unwrap();
             let dy = ctx.alloc(m * outf * 4).unwrap();
-            let want: Vec<Vec<f32>> = (0..m).map(|j| matvec_blob(inf, outf, bits, 2, &blob, &x[j * inf..(j + 1) * inf], 2)).collect();
+            let want: Vec<Vec<f32>> = (0..m).map(|j| matvec_blob(inf, outf, rate, 2, &blob, &x[j * inf..(j + 1) * inf], 2)).collect();
             let grid = (outf / 128) as u32;
             let read = |dy: &shadow_cuda::DeviceBuffer, n: usize| -> Vec<f32> {
                 let mut o = vec![0u8; n * 4];
@@ -100,16 +104,16 @@ fn the_gpu_matvec_matches_the_cpu_on_random_blobs_at_every_bit_rate() {
             };
             // one input
             // SAFETY: a blob of this projection at w, `inf` floats at dx, `outf` at dy.
-            unsafe { prog.launch(&format!("matvec_exl3_{bits}"), (grid, 1, 1), (256, 1, 1), 0, None, &[Arg::Ptr(w.ptr), Arg::Ptr(dx.ptr), Arg::Ptr(dy.ptr), Arg::U32(outf as u32), Arg::U32(inf as u32)]).unwrap() };
+            unsafe { prog.launch(&format!("matvec_exl3_{tag}"), (grid, 1, 1), (256, 1, 1), 0, None, &[Arg::Ptr(w.ptr), Arg::Ptr(dx.ptr), Arg::Ptr(dy.ptr), Arg::U32(outf as u32), Arg::U32(inf as u32)]).unwrap() };
             ctx.synchronize().unwrap();
-            check(&read(&dy, outf), &want[0], &format!("matvec_exl3_{bits} {inf}x{outf}"));
+            check(&read(&dy, outf), &want[0], &format!("matvec_exl3_{tag} {inf}x{outf}"));
             // the k-sliced kernels (1, 2 and 4 slices of 8 warps; dynamic shared memory for the rotated input)
             for ks in [1u32, 2, 4] {
                 dy.upload(&vec![0u8; outf * 4]).unwrap();
                 // SAFETY: as above; 256 ks threads, 4 inf bytes of shared memory.
-                unsafe { prog.launch(&format!("matvec_exl3_s{ks}_{bits}"), (grid, 1, 1), (256 * ks, 1, 1), (inf * 4) as u32, None, &[Arg::Ptr(w.ptr), Arg::Ptr(dx.ptr), Arg::Ptr(dy.ptr), Arg::U32(outf as u32), Arg::U32(inf as u32)]).unwrap() };
+                unsafe { prog.launch(&format!("matvec_exl3_s{ks}_{tag}"), (grid, 1, 1), (256 * ks, 1, 1), (inf * 4) as u32, None, &[Arg::Ptr(w.ptr), Arg::Ptr(dx.ptr), Arg::Ptr(dy.ptr), Arg::U32(outf as u32), Arg::U32(inf as u32)]).unwrap() };
                 ctx.synchronize().unwrap();
-                check(&read(&dy, outf), &want[0], &format!("matvec_exl3_s{ks}_{bits} {inf}x{outf}"));
+                check(&read(&dy, outf), &want[0], &format!("matvec_exl3_s{ks}_{tag} {inf}x{outf}"));
             }
             // m inputs at once, strides wider than the rows
             let (xs, ys) = (inf + 16, outf + 32);
@@ -118,22 +122,22 @@ fn the_gpu_matvec_matches_the_cpu_on_random_blobs_at_every_bit_rate() {
             dxp.upload(&xpad).unwrap();
             let dyp = ctx.alloc(m * ys * 4).unwrap();
             // SAFETY: m rows of inf floats xs apart at dxp, m rows of outf floats ys apart at dyp.
-            unsafe { prog.launch(&format!("matvec_cols_exl3_{bits}"), (grid, 1, 1), (256, 1, 1), 0, None,
+            unsafe { prog.launch(&format!("matvec_cols_exl3_{tag}"), (grid, 1, 1), (256, 1, 1), 0, None,
                                  &[Arg::Ptr(w.ptr), Arg::Ptr(dxp.ptr), Arg::U32(xs as u32), Arg::Ptr(dyp.ptr), Arg::U32(ys as u32), Arg::U32(outf as u32), Arg::U32(inf as u32), Arg::U32(m as u32)]).unwrap() };
             ctx.synchronize().unwrap();
             let got = read(&dyp, m * ys);
             for j in 0..m {
-                check(&got[j * ys..j * ys + outf], &want[j], &format!("matvec_cols_exl3_{bits} {inf}x{outf} input {j}"));
+                check(&got[j * ys..j * ys + outf], &want[j], &format!("matvec_cols_exl3_{tag} {inf}x{outf} input {j}"));
             }
             for ks in [2u32, 4] {
                 dyp.upload(&vec![0u8; m * ys * 4]).unwrap();
                 // SAFETY: as the cols launch above, with the k-sliced kernel.
-                unsafe { prog.launch(&format!("matvec_cols_exl3_s{ks}_{bits}"), (grid, 1, 1), (256 * ks, 1, 1), 0, None,
+                unsafe { prog.launch(&format!("matvec_cols_exl3_s{ks}_{tag}"), (grid, 1, 1), (256 * ks, 1, 1), 0, None,
                                      &[Arg::Ptr(w.ptr), Arg::Ptr(dxp.ptr), Arg::U32(xs as u32), Arg::Ptr(dyp.ptr), Arg::U32(ys as u32), Arg::U32(outf as u32), Arg::U32(inf as u32), Arg::U32(m as u32)]).unwrap() };
                 ctx.synchronize().unwrap();
                 let got = read(&dyp, m * ys);
                 for j in 0..m {
-                    check(&got[j * ys..j * ys + outf], &want[j], &format!("matvec_cols_exl3_s{ks}_{bits} {inf}x{outf} input {j}"));
+                    check(&got[j * ys..j * ys + outf], &want[j], &format!("matvec_cols_exl3_s{ks}_{tag} {inf}x{outf} input {j}"));
                 }
             }
             // the tensor-core prompt kernel: 5 and 70 tokens (a second, partial token block); f16 activations, so a looser bound than the f32 kernels
@@ -144,7 +148,7 @@ fn the_gpu_matvec_matches_the_cpu_on_random_blobs_at_every_bit_rate() {
                 let dym = ctx.alloc(mt * outf * 4).unwrap();
                 dym.upload(&vec![0u8; mt * outf * 4]).unwrap();
                 // SAFETY: mt inputs of inf floats at dxm, mt outputs of outf at dym.
-                unsafe { prog.launch(&format!("mma_cols_exl3_{bits}"), (grid, mt.div_ceil(64) as u32, 1), (256, 1, 1), 0, None,
+                unsafe { prog.launch(&format!("mma_cols_exl3_{tag}"), (grid, mt.div_ceil(64) as u32, 1), (256, 1, 1), 0, None,
                                      &[Arg::Ptr(w.ptr), Arg::Ptr(dxm.ptr), Arg::U32(inf as u32), Arg::Ptr(dym.ptr), Arg::U32(outf as u32), Arg::U32(outf as u32), Arg::U32(inf as u32), Arg::U32(mt as u32)]).unwrap() };
                 ctx.synchronize().unwrap();
                 let got = read(&dym, mt * outf);
@@ -157,22 +161,22 @@ fn the_gpu_matvec_matches_the_cpu_on_random_blobs_at_every_bit_rate() {
                     unsafe {
                         prog.launch("exl3_rotate_rows", (((mt * (inf / 128)) as u32).div_ceil(8), 1, 1), (256, 1, 1), 0, None,
                                     &[Arg::Ptr(w.ptr), Arg::Ptr(dxm.ptr), Arg::U32(inf as u32), Arg::Ptr(dxr.ptr), Arg::U32(inf as u32), Arg::U32(mt as u32)]).unwrap();
-                        prog.launch(&format!("mma_cols_exl3_pre_{bits}"), (grid, mt.div_ceil(64) as u32, 1), (256, 1, 1), 0, None,
+                        prog.launch(&format!("mma_cols_exl3_pre_{tag}"), (grid, mt.div_ceil(64) as u32, 1), (256, 1, 1), 0, None,
                                     &[Arg::Ptr(w.ptr), Arg::Ptr(dxr.ptr), Arg::U32(0), Arg::Ptr(dyp.ptr), Arg::U32(outf as u32), Arg::U32(outf as u32), Arg::U32(inf as u32), Arg::U32(mt as u32)]).unwrap();
                     }
                     ctx.synchronize().unwrap();
-                    assert_eq!(read(&dyp, mt * outf), got, "mma_cols_exl3_pre_{bits} {inf}x{outf} m={mt}: not what the fused kernel gives");
+                    assert_eq!(read(&dyp, mt * outf), got, "mma_cols_exl3_pre_{tag} {inf}x{outf} m={mt}: not what the fused kernel gives");
                 }
                 for j in 0..mt {
-                    let wantm = matvec_blob(inf, outf, bits, 2, &blob, &xm[j * inf..(j + 1) * inf], 2);
+                    let wantm = matvec_blob(inf, outf, rate, 2, &blob, &xm[j * inf..(j + 1) * inf], 2);
                     let scale = wantm.iter().map(|v| v.abs()).fold(0.0f32, f32::max).max(1e-6);
                     let worst = got[j * outf..(j + 1) * outf].iter().zip(&wantm).map(|(g, w)| (g - w).abs()).fold(0.0f32, f32::max);
-                    assert!(worst <= 3e-3 * scale, "mma_cols_exl3_{bits} {inf}x{outf} m={mt} input {j}: worst difference {worst} against a largest output of {scale}");
+                    assert!(worst <= 3e-3 * scale, "mma_cols_exl3_{tag} {inf}x{outf} m={mt} input {j}: worst difference {worst} against a largest output of {scale}");
                 }
             }
             // a routed expert's group: n inputs picked from rows of x (stride xs), outputs scattered to rows of y (stride ys), two groups on two matrices
             {
-                let blob2 = random_blob(&mut rng, inf, outf, bits);
+                let blob2 = random_blob(&mut rng, inf, outf, rate);
                 let w2 = ctx.alloc(blob2.len()).unwrap();
                 w2.upload(&blob2).unwrap();
                 let tab: Vec<u8> = [w.ptr, w2.ptr].iter().flat_map(|p| p.to_le_bytes()).collect();
@@ -190,16 +194,16 @@ fn the_gpu_matvec_matches_the_cpu_on_random_blobs_at_every_bit_rate() {
                 let dyg = ctx.alloc(10 * ys * 4).unwrap();
                 dyg.upload(&vec![0u8; 10 * ys * 4]).unwrap();
                 // SAFETY: two table entries, two 17-u32 records, input rows < 5 of dxp, output rows < 10 of dyg.
-                unsafe { prog.launch(&format!("matvec_grouped_exl3_s4_{bits}"), (grid, 2, 1), (1024, 1, 1), 0, None,
+                unsafe { prog.launch(&format!("matvec_grouped_exl3_s4_{tag}"), (grid, 2, 1), (1024, 1, 1), 0, None,
                                      &[Arg::Ptr(dt.ptr), Arg::Ptr(dg.ptr), Arg::Ptr(dxp.ptr), Arg::U32(xs as u32), Arg::Ptr(dyg.ptr), Arg::U32(ys as u32), Arg::U32(outf as u32), Arg::U32(inf as u32)]).unwrap() };
                 ctx.synchronize().unwrap();
                 let got = read(&dyg, 10 * ys);
                 for (gi, (n, xi, yi)) in groups.iter().enumerate() {
                     let b = if gi == 0 { &blob } else { &blob2 };
                     for u in 0..*n {
-                        let wantg = matvec_blob(inf, outf, bits, 2, b, &x[xi[u] as usize * inf..(xi[u] as usize + 1) * inf], 2);
+                        let wantg = matvec_blob(inf, outf, rate, 2, b, &x[xi[u] as usize * inf..(xi[u] as usize + 1) * inf], 2);
                         let r = yi[u] as usize;
-                        check(&got[r * ys..r * ys + outf], &wantg, &format!("matvec_grouped_exl3_s4_{bits} {inf}x{outf} group {gi} input {u}"));
+                        check(&got[r * ys..r * ys + outf], &wantg, &format!("matvec_grouped_exl3_s4_{tag} {inf}x{outf} group {gi} input {u}"));
                     }
                 }
             }
@@ -213,7 +217,7 @@ fn the_gpu_matvec_matches_the_cpu_on_random_blobs_at_every_bit_rate() {
                 dys.upload(&vec![0u8; m * outf * 4]).unwrap();
                 // SAFETY: m inputs of inf floats at dx, partial sums for ns slices of 8 inputs of outf floats at dpart, m outputs of outf at dys.
                 unsafe {
-                    prog.launch(&format!("matvec_cols_exl3_sk4_{bits}"), (grid, ns, 1), (1024, 1, 1), 0, None,
+                    prog.launch(&format!("matvec_cols_exl3_sk4_{tag}"), (grid, ns, 1), (1024, 1, 1), 0, None,
                                 &[Arg::Ptr(w.ptr), Arg::Ptr(dx.ptr), Arg::U32(inf as u32), Arg::Ptr(dpart.ptr), Arg::U32(outf as u32), Arg::U32(inf as u32), Arg::U32(m as u32)]).unwrap();
                     prog.launch("exl3_splitk_combine", (grid, 1, 1), (256, 1, 1), 0, None,
                                 &[Arg::Ptr(w.ptr), Arg::Ptr(dpart.ptr), Arg::Ptr(dys.ptr), Arg::U32(outf as u32), Arg::U32(outf as u32), Arg::U32(inf as u32), Arg::U32(m as u32), Arg::U32(ns)]).unwrap();
@@ -221,12 +225,12 @@ fn the_gpu_matvec_matches_the_cpu_on_random_blobs_at_every_bit_rate() {
                 ctx.synchronize().unwrap();
                 let got = read(&dys, m * outf);
                 for j in 0..m {
-                    check(&got[j * outf..(j + 1) * outf], &want[j], &format!("split-K x{ns} {bits} {inf}x{outf} input {j}"));
+                    check(&got[j * outf..(j + 1) * outf], &want[j], &format!("split-K x{ns} {tag} {inf}x{outf} input {j}"));
                 }
             }
             // the group kernels made for groups of at most 2 and 4 tokens (`m2s4`, `m4s4`), on groups of that size
             for (kname, sizes) in [("m2s4", [2usize, 1]), ("m4s4", [4, 3])] {
-                let blob2 = random_blob(&mut rng, inf, outf, bits);
+                let blob2 = random_blob(&mut rng, inf, outf, rate);
                 let w2 = ctx.alloc(blob2.len()).unwrap();
                 w2.upload(&blob2).unwrap();
                 let tab: Vec<u8> = [w.ptr, w2.ptr].iter().flat_map(|p| p.to_le_bytes()).collect();
@@ -245,7 +249,7 @@ fn the_gpu_matvec_matches_the_cpu_on_random_blobs_at_every_bit_rate() {
                 let dyg = ctx.alloc(8 * outf * 4).unwrap();
                 dyg.upload(&vec![0u8; 8 * outf * 4]).unwrap();
                 // SAFETY: two table entries and 17-u32 records, input rows < 5 of dx (inf floats a row), output rows < 8 of dyg.
-                unsafe { prog.launch(&format!("matvec_grouped_exl3_{kname}_{bits}"), (grid, 2, 1), (1024, 1, 1), 0, None,
+                unsafe { prog.launch(&format!("matvec_grouped_exl3_{kname}_{tag}"), (grid, 2, 1), (1024, 1, 1), 0, None,
                                      &[Arg::Ptr(dt.ptr), Arg::Ptr(dg.ptr), Arg::Ptr(dx.ptr), Arg::U32(inf as u32), Arg::Ptr(dyg.ptr), Arg::U32(outf as u32), Arg::U32(outf as u32), Arg::U32(inf as u32)]).unwrap() };
                 ctx.synchronize().unwrap();
                 let got = read(&dyg, 8 * outf);
@@ -253,14 +257,14 @@ fn the_gpu_matvec_matches_the_cpu_on_random_blobs_at_every_bit_rate() {
                     let b = if g == 0 { &blob } else { &blob2 };
                     for u in 0..n {
                         let (xi, yi) = (rec[g * 17 + 1 + u] as usize, rec[g * 17 + 9 + u] as usize);
-                        let wantg = matvec_blob(inf, outf, bits, 2, b, &x[xi * inf..(xi + 1) * inf], 2);
-                        check(&got[yi * outf..(yi + 1) * outf], &wantg, &format!("matvec_grouped_exl3_{kname}_{bits} {inf}x{outf} group {g} input {u}"));
+                        let wantg = matvec_blob(inf, outf, rate, 2, b, &x[xi * inf..(xi + 1) * inf], 2);
+                        check(&got[yi * outf..(yi + 1) * outf], &wantg, &format!("matvec_grouped_exl3_{kname}_{tag} {inf}x{outf} group {g} input {u}"));
                     }
                 }
             }
             // the tensor-core group kernel: groups of up to 64 tokens (records of 129 u32: n, 64 input rows, 64 output rows)
             {
-                let blob2 = random_blob(&mut rng, inf, outf, bits);
+                let blob2 = random_blob(&mut rng, inf, outf, rate);
                 let w2 = ctx.alloc(blob2.len()).unwrap();
                 w2.upload(&blob2).unwrap();
                 let tab: Vec<u8> = [w.ptr, w2.ptr].iter().flat_map(|p| p.to_le_bytes()).collect();
@@ -286,7 +290,7 @@ fn the_gpu_matvec_matches_the_cpu_on_random_blobs_at_every_bit_rate() {
                 let dyg = ctx.alloc(120 * outf * 4).unwrap();
                 dyg.upload(&vec![0u8; 120 * outf * 4]).unwrap();
                 // SAFETY: two table entries, two 129-u32 records, input rows < 20 of dxm, output rows < 120 of dyg.
-                unsafe { prog.launch(&format!("mma_grouped_exl3_{bits}"), (grid, 2, 1), (256, 1, 1), 0, None,
+                unsafe { prog.launch(&format!("mma_grouped_exl3_{tag}"), (grid, 2, 1), (256, 1, 1), 0, None,
                                      &[Arg::Ptr(dt.ptr), Arg::Ptr(dg.ptr), Arg::Ptr(dxm.ptr), Arg::U32(inf as u32), Arg::Ptr(dyg.ptr), Arg::U32(outf as u32), Arg::U32(outf as u32), Arg::U32(inf as u32)]).unwrap() };
                 ctx.synchronize().unwrap();
                 let got = read(&dyg, 120 * outf);
@@ -299,54 +303,54 @@ fn the_gpu_matvec_matches_the_cpu_on_random_blobs_at_every_bit_rate() {
                     unsafe {
                         prog.launch("exl3_rotate_groups", ((64 * (inf as u32 / 128)).div_ceil(8), 2, 1), (256, 1, 1), 0, None,
                                     &[Arg::Ptr(dt.ptr), Arg::Ptr(dg.ptr), Arg::Ptr(dxm.ptr), Arg::U32(inf as u32), Arg::Ptr(dxr.ptr), Arg::U32(inf as u32)]).unwrap();
-                        prog.launch(&format!("mma_grouped_exl3_pre_{bits}"), (grid, 2, 1), (256, 1, 1), 0, None,
+                        prog.launch(&format!("mma_grouped_exl3_pre_{tag}"), (grid, 2, 1), (256, 1, 1), 0, None,
                                     &[Arg::Ptr(dt.ptr), Arg::Ptr(dg.ptr), Arg::Ptr(dxr.ptr), Arg::U32(0), Arg::Ptr(dyq.ptr), Arg::U32(outf as u32), Arg::U32(outf as u32), Arg::U32(inf as u32)]).unwrap();
                     }
                     ctx.synchronize().unwrap();
-                    assert_eq!(read(&dyq, 120 * outf), got, "mma_grouped_exl3_pre_{bits} {inf}x{outf}: not what the fused group kernel gives");
+                    assert_eq!(read(&dyq, 120 * outf), got, "mma_grouped_exl3_pre_{tag} {inf}x{outf}: not what the fused group kernel gives");
                 }
                 for gi in 0..2usize {
                     let b = if gi == 0 { &blob } else { &blob2 };
                     for u in 0..recs[gi * 129] as usize {
                         let (xi, yi) = (recs[gi * 129 + 1 + u] as usize, recs[gi * 129 + 65 + u] as usize);
-                        let wantg = matvec_blob(inf, outf, bits, 2, b, &xm[xi * inf..(xi + 1) * inf], 2);
+                        let wantg = matvec_blob(inf, outf, rate, 2, b, &xm[xi * inf..(xi + 1) * inf], 2);
                         let scale = wantg.iter().map(|v| v.abs()).fold(0.0f32, f32::max).max(1e-6);
                         let worst = got[yi * outf..(yi + 1) * outf].iter().zip(&wantg).map(|(g, w)| (g - w).abs()).fold(0.0f32, f32::max);
-                        assert!(worst <= 3e-3 * scale, "mma_grouped_exl3_{bits} {inf}x{outf} group {gi} input {u}: worst difference {worst} against a largest output of {scale}");
+                        assert!(worst <= 3e-3 * scale, "mma_grouped_exl3_{tag} {inf}x{outf} group {gi} input {u}: worst difference {worst} against a largest output of {scale}");
                     }
                 }
             }
             // a table of two different matrices of this shape, one shared input and one input each
-            let blob2 = random_blob(&mut rng, inf, outf, bits);
+            let blob2 = random_blob(&mut rng, inf, outf, rate);
             let w2 = ctx.alloc(blob2.len()).unwrap();
             w2.upload(&blob2).unwrap();
             let tab: Vec<u8> = [w.ptr, w2.ptr].iter().flat_map(|p| p.to_le_bytes()).collect();
             let dt = ctx.alloc(tab.len()).unwrap();
             dt.upload(&tab).unwrap();
             let dyb = ctx.alloc(2 * outf * 4).unwrap();
-            let want2: Vec<Vec<f32>> = [&blob, &blob2].iter().map(|b| matvec_blob(inf, outf, bits, 2, b, &x[..inf], 2)).collect();
+            let want2: Vec<Vec<f32>> = [&blob, &blob2].iter().map(|b| matvec_blob(inf, outf, rate, 2, b, &x[..inf], 2)).collect();
             for ks in [1u32, 2, 4] {
                 for (xstride, name) in [(0usize, "shared input"), (inf, "an input each")] {
                     // SAFETY: as below, with the k-sliced kernel.
-                    unsafe { prog.launch(&format!("matvec_batch_exl3_s{ks}_{bits}"), (grid, 2, 1), (256 * ks, 1, 1), (inf * 4) as u32, None,
+                    unsafe { prog.launch(&format!("matvec_batch_exl3_s{ks}_{tag}"), (grid, 2, 1), (256 * ks, 1, 1), (inf * 4) as u32, None,
                                          &[Arg::Ptr(dt.ptr), Arg::Ptr(dx.ptr), Arg::U32(xstride as u32), Arg::Ptr(dyb.ptr), Arg::U32(outf as u32), Arg::U32(outf as u32), Arg::U32(inf as u32)]).unwrap() };
                     ctx.synchronize().unwrap();
                     let got = read(&dyb, 2 * outf);
                     for b in 0..2 {
-                        let wantb = if xstride == 0 { want2[b].clone() } else { matvec_blob(inf, outf, bits, 2, if b == 0 { &blob } else { &blob2 }, &x[b * inf..(b + 1) * inf], 2) };
-                        check(&got[b * outf..(b + 1) * outf], &wantb, &format!("matvec_batch_exl3_s{ks}_{bits} {inf}x{outf} {name} matrix {b}"));
+                        let wantb = if xstride == 0 { want2[b].clone() } else { matvec_blob(inf, outf, rate, 2, if b == 0 { &blob } else { &blob2 }, &x[b * inf..(b + 1) * inf], 2) };
+                        check(&got[b * outf..(b + 1) * outf], &wantb, &format!("matvec_batch_exl3_s{ks}_{tag} {inf}x{outf} {name} matrix {b}"));
                     }
                 }
             }
             for (xstride, name) in [(0usize, "shared input"), (inf, "an input each")] {
                 // SAFETY: a table of two blobs, the inputs at dx (stride xstride), the outputs outf apart at dyb.
-                unsafe { prog.launch(&format!("matvec_batch_exl3_{bits}"), (grid, 2, 1), (256, 1, 1), 0, None,
+                unsafe { prog.launch(&format!("matvec_batch_exl3_{tag}"), (grid, 2, 1), (256, 1, 1), 0, None,
                                      &[Arg::Ptr(dt.ptr), Arg::Ptr(dx.ptr), Arg::U32(xstride as u32), Arg::Ptr(dyb.ptr), Arg::U32(outf as u32), Arg::U32(outf as u32), Arg::U32(inf as u32)]).unwrap() };
                 ctx.synchronize().unwrap();
                 let got = read(&dyb, 2 * outf);
                 for b in 0..2 {
-                    let wantb = if xstride == 0 { want2[b].clone() } else { matvec_blob(inf, outf, bits, 2, if b == 0 { &blob } else { &blob2 }, &x[b * inf..(b + 1) * inf], 2) };
-                    check(&got[b * outf..(b + 1) * outf], &wantb, &format!("matvec_batch_exl3_{bits} {inf}x{outf} {name} matrix {b}"));
+                    let wantb = if xstride == 0 { want2[b].clone() } else { matvec_blob(inf, outf, rate, 2, if b == 0 { &blob } else { &blob2 }, &x[b * inf..(b + 1) * inf], 2) };
+                    check(&got[b * outf..(b + 1) * outf], &wantb, &format!("matvec_batch_exl3_{tag} {inf}x{outf} {name} matrix {b}"));
                 }
             }
         }

@@ -145,6 +145,8 @@ const TYPES: &[(u32, &str, u64, u64)] = &[
     (1015, "EXL3C1_5", 0, 0), (1016, "EXL3C1_6", 0, 0), (1017, "EXL3C1_7", 0, 0), (1018, "EXL3C1_8", 0, 0),
     (1021, "EXL3_1", 0, 0), (1022, "EXL3_2", 0, 0), (1023, "EXL3_3", 0, 0), (1024, "EXL3_4", 0, 0),
     (1025, "EXL3_5", 0, 0), (1026, "EXL3_6", 0, 0), (1027, "EXL3_7", 0, 0), (1028, "EXL3_8", 0, 0),
+    // the half-integer rates of the "mul1" codebook: K + 0.5 bits a weight for K = 1, 2, 3 (1.5, 2.5, 3.5); a tile is 16 K + 8 words
+    (1031, "EXL3_1h", 0, 0), (1032, "EXL3_2h", 0, 0), (1033, "EXL3_3h", 0, 0),
 ];
 
 impl GgmlType {
@@ -180,14 +182,34 @@ impl GgmlType {
             id @ 1001..=1008 => Some(((id - 1000) as usize, 0)),
             id @ 1011..=1018 => Some(((id - 1010) as usize, 1)),
             id @ 1021..=1028 => Some(((id - 1020) as usize, 2)),
+            id @ 1031..=1033 => Some(((id - 1030) as usize, 2)),
             _ => None,
         }
+    }
+
+    /// Whether an EXL3 type is a half-integer rate (K + 0.5 bits a weight, `exl3()` giving K).
+    pub fn exl3_half(self) -> bool {
+        matches!(self.id(), 1031..=1033)
+    }
+
+    /// `(K, half)` of an EXL3 type.
+    pub fn exl3_rate(self) -> Option<(usize, bool)> {
+        self.exl3().map(|(bits, _)| (bits, self.exl3_half()))
     }
 
     /// The type of an EXL3 tensor of `bits` bits a weight with codebook `cb`.
     pub fn from_exl3(bits: usize, cb: u8) -> GgmlType {
         assert!((1..=8).contains(&bits) && cb <= 2, "EXL3 type with K = {bits}, codebook {cb}");
         GgmlType::Known(1000 + 10 * cb as u32 + bits as u32)
+    }
+
+    /// As `from_exl3`, for K or K + 0.5 (`half`: K = 1..3, codebook "mul1" only).
+    pub fn from_exl3_rate(bits: usize, half: bool, cb: u8) -> GgmlType {
+        if !half {
+            return GgmlType::from_exl3(bits, cb);
+        }
+        assert!((1..=3).contains(&bits) && cb == 2, "EXL3 half-integer type with K = {bits} + 0.5, codebook {cb}");
+        GgmlType::Known(1030 + bits as u32)
     }
 }
 
