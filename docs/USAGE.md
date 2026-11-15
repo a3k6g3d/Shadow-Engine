@@ -113,6 +113,7 @@ Defaults are right for normal use; these are for measurement and diagnosis.
 | `SHADOW_REPORT=1` | print the session report after each answer (tier hits, verify pass times, launches) |
 | `SHADOW_EXL3_GROUPED=0` | EXL3 checkpoints: a prompt batch takes the per-token expert route again (no grouped plan, no staged pass; STATUS 140) |
 | `SHADOW_EXL3_MMA=0` | EXL3 checkpoints: no tensor-core kernels for the prompt (dense `mma_cols_exl3`, experts `mma_grouped_exl3`); the chunked f32 ones instead (STATUS 140) |
+| `SHADOW_EXL3_PRE=0` | EXL3 checkpoints: rotate the prompt kernels' inputs inside each tensor-core block again (no pre-pass into the scratch; STATUS 143) |
 | `SHADOW_EXL3_V1=1` | EXL3 checkpoints: the first (one slice a block) trellis kernels instead of the k-sliced ones (STATUS 139) |
 | `SHADOW_LTIME=1`, `SHADOW_KTIME=1`, `SHADOW_PROFILE=1` | time a batched pass by segment / each kernel / the single-token step (these synchronize: they slow the run) |
 | `SHADOW_DF_TIME=1` | time the phases of the DFlash draft round |

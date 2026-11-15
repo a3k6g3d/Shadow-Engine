@@ -430,6 +430,8 @@ pub struct GpuSession<'c, 'm> {
     mvp: Program<'c>,
     /// The EXL3 trellis kernels (`kernels/exl3.cu`), loaded when the model has EXL3 matrices.
     ex3: Option<Program<'c>>,
+    /// The rotated f16 rows of an EXL3 projection's prompt input (`exl3_rotate_rows`, then `mma_cols_exl3_pre_*`): `EXL3_ROT_ROWS` rows of the widest EXL3 dense input, and that width.
+    exl3_rot: Option<(DeviceBuffer<'c>, usize)>,
     fw: Program<'c>,
     w: HashMap<String, DeviceBuffer<'c>>,
     v: HashMap<String, DeviceBuffer<'c>>,
@@ -1978,6 +1980,12 @@ impl<'c, 'm> GpuSession<'c, 'm> {
         vm("start");
         let mvp = Program::load(ctx, file("matvec.cu").ok_or("matvec.cu")?)?;
         let ex3 = if m.g.tensors.iter().any(|t| t.ty.exl3().is_some()) { Some(Program::load(ctx, file("exl3.cu").ok_or("exl3.cu")?)?) } else { None };
+        let exl3_rot = if ex3.is_some() {
+            let maxc = m.g.tensors.iter().filter(|t| t.ty.exl3().is_some() && !t.name.contains("_exps")).map(|t| t.dims[0] as usize).max().unwrap_or(0);
+            Some((ctx.alloc(EXL3_ROT_ROWS * maxc * 2).map_err(|e| format!("EXL3 rotation scratch: {e}"))?, maxc))
+        } else {
+            None
+        };
         let fw = Program::load(ctx, file("forward.cu").ok_or("forward.cu")?)?;
         let mut w = HashMap::new();
         let mut v = HashMap::new();
@@ -2365,7 +2373,7 @@ impl<'c, 'm> GpuSession<'c, 'm> {
             None
         };
         let mut s = GpuSession {
-            ctx, m, mvp, ex3, fw, w, v, b, bb, replay, dscr, mmq, mmq_y, mmq_y_tag: std::cell::Cell::new((0, 0, 0, 0, 0)), fused,
+            ctx, m, mvp, ex3, exl3_rot, fw, w, v, b, bb, replay, dscr, mmq, mmq_y, mmq_y_tag: std::cell::Cell::new((0, 0, 0, 0, 0)), fused,
             rparts: Vec::new(), bb_sig: 0, logits_last: false, sub_last: true, sub_first: true,
             devplan: tiers.tensor_prompt && !std::env::var("SHADOW_PREFILL_DEVPLAN").is_ok_and(|v| v == "0"), dp_tidx, dp_cnt, dp_gstart, dp_copied, dp_eaddr, dp_lay, kv_regions, kv_extra: None, kv_extra_reg, vmm_pool: Vec::new(), prompt_hint: 0, kv_rows: 0, kv_halves: false, router_bias: std::env::var("SHADOW_ROUTER_BIAS").ok().and_then(|v| v.parse().ok()).unwrap_or(0.0), batch_scratch, delta, attn, ple_state, tokens: vec![], layers, layers_in: None, layers_out: None, peer: None, reset_tokens: vec![], pictures: vec![], rope_tab: None, rope_on: false, cap, trace: None, stop_after: None,
             resident_bytes, expert_uploads: 0, cache, ram, copy_stream, copy_stream2, copy_ev2, copy_event, staging,
@@ -5663,6 +5671,25 @@ impl<'c, 'm> GpuSession<'c, 'm> {
             let wptr = self.w.get(name).unwrap_or_else(|| panic!("{name} is not resident")).ptr;
             if self.tensor_prompt && m >= 24 && cols % 128 == 0 && rows % 128 == 0 && exl3_mma_on() {
                 // a long prompt's rows on the tensor cores: 64 tokens a block, f16 rotated activations, f32 sums (STATUS 140; inexact, so not under --exact)
+                if let Some((rot, maxc)) = self.exl3_rot.as_ref().filter(|(_, maxc)| cols as usize <= *maxc && !self.pipe_active && exl3_pre_on()) {
+                    // the input rotation once a matrix (`exl3_rotate_rows`) instead of in each of its 128-output blocks, then `mma_cols_exl3_pre_*` (STATUS 143); the scratch holds
+                    // EXL3_ROT_ROWS rows, so a bigger m goes in slices; both launches are on this stream, so the next matrix's pre-pass waits for this one's products
+                    let _ = maxc;
+                    for j0 in (0..m).step_by(EXL3_ROT_ROWS) {
+                        let n = (m - j0).min(EXL3_ROT_ROWS);
+                        // SAFETY: a blob of cols x rows weights at wptr; n inputs of `cols` floats xs apart from row j0, the scratch holds n rotated rows of `cols` f16 (n <= EXL3_ROT_ROWS,
+                        // cols <= maxc), n outputs of `rows` floats ys apart.
+                        unsafe {
+                            p.launch("exl3_rotate_rows", (((n * (cols as usize / 128)) as u32).div_ceil(8), 1, 1), (256, 1, 1), 0, self.ls(),
+                                     &[Arg::Ptr(wptr), Arg::Ptr(x + (j0 * xs * 4) as u64), Arg::U32(xs as u32), Arg::Ptr(rot.ptr), Arg::U32(cols), Arg::U32(n as u32)])
+                                .and_then(|_| p.launch(&format!("mma_cols_exl3_pre_{bits}"), ((rows / 128) as u32, n.div_ceil(64) as u32, 1), (256, 1, 1), 0, self.ls(),
+                                                       &[Arg::Ptr(wptr), Arg::Ptr(rot.ptr), Arg::U32(0), Arg::Ptr(y + (j0 * ys * 4) as u64), Arg::U32(ys as u32), Arg::U32(rows as u32),
+                                                         Arg::U32(cols), Arg::U32(n as u32)]))
+                        }
+                        .unwrap_or_else(|err| panic!("{name}: {err}"));
+                    }
+                    return;
+                }
                 // SAFETY: a blob of cols x rows weights at wptr; m inputs of `cols` floats xs apart, m outputs of `rows` floats ys apart.
                 unsafe {
                     p.launch(&format!("mma_cols_exl3_{bits}"), ((rows / 128) as u32, m.div_ceil(64) as u32, 1), (256, 1, 1), 0, self.ls(),
@@ -7034,6 +7061,26 @@ impl<'c, 'm> GpuSession<'c, 'm> {
             if let Some((p3, bits)) = self.exl3_prog(t) {
                 // an EXL3 expert: groups of up to 8 tokens (STATUS 140), 1,024 threads a 128-output slice
                 assert!((p.chunk_n == 8 || p.chunk_n == 64) && cols % 128 == 0, "{}: EXL3 groups hold 8 or 64 tokens and whole 128-blocks", t.name);
+                if let Some((rot, _)) = self.exl3_rot.as_ref().filter(|_| p.chunk_n == 64 && !self.pipe_active && exl3_pre_on()) {
+                    // each expert has its own suh: the group's rows are rotated once (`exl3_rotate_groups`) into the scratch, a slice of groups at a time, then
+                    // `mma_grouped_exl3_pre_*` (STATUS 143); the rotation done in each of a matrix's 128-output blocks was ~40% of the kernel
+                    let per_group = 64 * cols as usize * 2;
+                    let slice = (rot.bytes / per_group).clamp(1, 256);
+                    for g0 in (0..count).step_by(slice) {
+                        let ng = (count - g0).min(slice);
+                        let (wtab, gtab) = (bb.gtab.ptr + wt + (g0 * 8) as u64, bb.gtab.ptr + gt + (g0 * 4 * (1 + 2 * 64)) as u64);
+                        // SAFETY: `ng` table entries from g0 (matrix addresses at wtab, 129-u32 records at gtab) as the launches below; the scratch holds `slice` groups of 64 rotated rows of
+                        // `cols` f16; the rows the records name are inside the batch's buffers at the strides given.
+                        unsafe {
+                            p3.launch("exl3_rotate_groups", ((64 * (cols / 128)).div_ceil(8), ng as u32, 1), (256, 1, 1), 0, self.ls(),
+                                      &[Arg::Ptr(wtab), Arg::Ptr(gtab), Arg::Ptr(x), Arg::U32(xs as u32), Arg::Ptr(rot.ptr), Arg::U32(cols)])
+                                .and_then(|_| p3.launch(&format!("mma_grouped_exl3_pre_{bits}"), (rows.div_ceil(128), ng as u32, 1), (256, 1, 1), 0, self.ls(),
+                                                        &[Arg::Ptr(wtab), Arg::Ptr(gtab), Arg::Ptr(rot.ptr), Arg::U32(0), Arg::Ptr(y), Arg::U32(ys as u32), Arg::U32(rows), Arg::U32(cols)]))
+                        }
+                        .unwrap_or_else(|err| panic!("{}: {err}", t.name));
+                    }
+                    return;
+                }
                 let (kernel, block) = if p.chunk_n == 64 { (format!("mma_grouped_exl3_{bits}"), 256) } else { (format!("matvec_grouped_exl3_s4_{bits}"), 1024) };
                 // SAFETY: as the launches below, with `exl3.cu`'s grouped kernel (the same tables and 17-u32 records).
                 unsafe {
@@ -7651,4 +7698,13 @@ fn exl3_groups_on() -> bool {
 fn exl3_mma_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var("SHADOW_EXL3_MMA").map_or(true, |v| v != "0"))
+}
+
+/// Rows of the EXL3 prompt kernels' rotated-input scratch (`GpuSession::exl3_rot`): 2,048 rows of the widest dense input (6,144) is 25 MiB.
+const EXL3_ROT_ROWS: usize = 2048;
+
+/// The input rotation of a prompt's dense EXL3 projections done once a matrix in a pre-pass (`SHADOW_EXL3_PRE=0`: inside each tensor-core block; STATUS 143).
+fn exl3_pre_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("SHADOW_EXL3_PRE").map_or(true, |v| v != "0"))
 }
