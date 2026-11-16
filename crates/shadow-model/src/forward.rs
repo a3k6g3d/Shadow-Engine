@@ -495,6 +495,44 @@ impl Model {
         self.pool.wait_async().unwrap();
     }
 
+    /// `ple_prefetch` on a background thread (STATUS 162): the n-gram rows of a verify pass are random reads of a 27 GB table, ~1 ms before the PLE layer, so they are asked for when the
+    /// pass starts and `ple_prefetch_wait` (at the PLE layer) joins.  One worker for the process; every start must be followed by a wait before the model is dropped.
+    pub fn ple_prefetch_start(&self, rows: Vec<i64>) {
+        let w = PLE_WORKER.get_or_init(|| {
+            let (tx, rx) = std::sync::mpsc::channel::<(usize, Vec<i64>)>();
+            let (dtx, drx) = std::sync::mpsc::channel::<()>();
+            std::thread::Builder::new()
+                .name("shadow-ple".into())
+                .spawn(move || {
+                    while let Ok((model, rows)) = rx.recv() {
+                        // SAFETY: `model` is the address of a live `Model` (the caller waits for this job inside the pass that started it), and `ple_prefetch` takes `&self`
+                        // (its state is behind locks and the read pool).
+                        let m = unsafe { &*(model as *const Model) };
+                        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| m.ple_prefetch(&rows)));
+                        let _ = dtx.send(());
+                    }
+                })
+                .expect("ple worker");
+            PleWorker { tx: std::sync::Mutex::new(tx), done: std::sync::Mutex::new(drx) }
+        });
+        if w.tx.lock().unwrap().send((self as *const Model as usize, rows)).is_ok() {
+            PLE_PENDING.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    /// Waits for the `ple_prefetch_start` jobs that are still running.
+    pub fn ple_prefetch_wait(&self) {
+        use std::sync::atomic::Ordering::SeqCst;
+        let Some(w) = PLE_WORKER.get() else { return };
+        while PLE_PENDING.load(SeqCst) > 0 {
+            if w.done.lock().unwrap().recv().is_ok() {
+                PLE_PENDING.fetch_sub(1, SeqCst);
+            } else {
+                PLE_PENDING.store(0, SeqCst);
+            }
+        }
+    }
+
     /// One row of the n-gram table (ple_head_dim weights), cached in RAM.
     /// Reads and caches the n-gram rows that are not cached yet, in parallel (a pass's rows are random places in a
     /// 27 GB table, most of them not in the file cache: one read after another costs ~0.1 ms each).
@@ -1143,3 +1181,11 @@ mod route_tests {
         }
     }
 }
+
+/// The background thread of `Model::ple_prefetch_start` and the number of its jobs not yet waited for.
+struct PleWorker {
+    tx: std::sync::Mutex<std::sync::mpsc::Sender<(usize, Vec<i64>)>>,
+    done: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
+}
+static PLE_WORKER: std::sync::OnceLock<PleWorker> = std::sync::OnceLock::new();
+static PLE_PENDING: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);

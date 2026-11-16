@@ -5441,6 +5441,11 @@ impl<'c, 'm> GpuSession<'c, 'm> {
         let (h, cs) = (c.hidden, c.streams);
         let ch = h * cs;
         let (lo, hi) = self.layers;
+        // a verify pass asks for its n-gram rows now, on the model's background thread, and joins at the PLE layer (STATUS 162; `SHADOW_PLE_ASYNC=0`: at the layer, as before)
+        let ple_async = m <= MAX_VERIFY && (lo..hi).contains(&c.ple_layer) && !std::env::var("SHADOW_PLE_ASYNC").is_ok_and(|v| v == "0");
+        if ple_async {
+            self.m.ple_prefetch_start((0..m).flat_map(|j| ple_rows(c, &self.tokens[..p0 + j + 1])).collect());
+        }
         // a pass bigger than the temporaries' rows runs layer by layer in sub-chunks (the first takes the remainder, so the last is a full one), the residual streams
         // of every row in `rbig`; `bb.r` is a view of the sub-chunk being run
         let sub_mode = m > self.rows && !self.rparts.is_empty() && !self.pipeline_ok(m);
@@ -5567,8 +5572,12 @@ impl<'c, 'm> GpuSession<'c, 'm> {
                         self.ctx.synchronize().unwrap();
                     }
                     let t_ple_block = std::time::Instant::now();
-                    let all: Vec<i64> = (0..m).flat_map(|j| ple_rows(c, &self.tokens[..p0 + j + 1])).collect();
-                    self.m.ple_prefetch(&all);
+                    if ple_async {
+                        self.m.ple_prefetch_wait();
+                    } else {
+                        let all: Vec<i64> = (0..m).flat_map(|j| ple_rows(c, &self.tokens[..p0 + j + 1])).collect();
+                        self.m.ple_prefetch(&all);
+                    }
                     let t_pref = t_ple_block.elapsed().as_secs_f64();
                     // the whole batch at once with `--tensor-prompt` (`SHADOW_PLE_BATCH=0`: token by token)
                     let batched = self.tensor_prompt && !self.replay.on.get() && m >= 16 && !std::env::var("SHADOW_PLE_BATCH").is_ok_and(|v| v == "0") && self.ple_batch(l, p0, m);
