@@ -23,7 +23,7 @@ fn open_model(p: &str) -> Model {
 }
 
 const MODEL: &str =
-    "J:/Strata-work/models/swift15/IQ3_S/Swift-Qwen3.8-Flash-Next-GSQ-RCO-abliterated-IQ3_S-00001-of-00002.gguf";
+    "J:/Models/Huihui-Qwen3.8-Flash-Next-abliterated-v2-GGUF/swift-IQ3_XXS/Swift-Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00001-of-00002.gguf";
 const TOKENS: [u32; 6] = [1000, 2345, 56, 78901, 4, 12345];
 const CAP: usize = 64;
 

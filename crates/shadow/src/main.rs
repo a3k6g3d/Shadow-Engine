@@ -5,6 +5,8 @@
 //! `inspect` reads only the headers and prints what the plan's stage 0 gate asks for: every tensor accounted for,
 //! the bytes by type, by layer kind and by role, and the always-resident share that decides the VRAM budget.
 
+mod power;
+
 use shadow_model::gguf::{block_index, Gguf, TensorInfo, Value};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -305,7 +307,14 @@ fn fastest_defaults(rest: &[String]) -> Vec<String> {
         use shadow_cuda::pinned::{available_ram, tier_for_available, TIER_MAX};
         let g = (1u64 << 30) as f64;
         let avail = available_ram();
-        let tier = tier_for_available(avail, TIER_MAX, (floor_gib * g) as u64);
+        let mut tier = tier_for_available(avail, TIER_MAX, (floor_gib * g) as u64);
+        // two cards (`--gpus A,B`): the driver refuses pinned memory past ~20 GiB in a process that holds both (STATUS 150: a 16 GiB tier starts, 22 GiB fails with an out-of-memory error
+        // at `cuEventCreate`, the default 37 GiB one at `cuMemHostGetDevicePointer`), so the default tier is capped at 16 GiB there; `--ram-tier-gib` still overrides
+        let pair = rest.iter().position(|a| a == "--gpus").and_then(|i| rest.get(i + 1)).is_some_and(|v| v.split(',').filter(|x| !x.trim().is_empty()).count() >= 2);
+        if pair && tier > (16u64 << 30) {
+            eprintln!("shadow serve: two cards: the RAM tier is capped at 16 GiB (more pinned memory fails with both cards in one process)");
+            tier = 16u64 << 30;
+        }
         eprintln!("shadow serve: {:.1} GiB of RAM available, floor {floor_gib:.1}: RAM tier {:.0} GiB (at most {:.0})", avail as f64 / g, tier as f64 / g, TIER_MAX as f64 / g);
         set.extend(["--ram-tier-gib".into(), (tier >> 30).to_string()]);
     }
@@ -368,7 +377,17 @@ fn serve(path: &std::path::Path, rest: &[String]) -> ExitCode {
     if std::env::var_os("RUST_BACKTRACE").is_none() {
         std::env::set_var("RUST_BACKTRACE", "1");
     }
-    let rest = &fastest_defaults(rest);
+    // `--power-limit "5070=200,5060 Ti=150"` (or SHADOW_POWER_LIMITS): GPU power limits for this run, set before anything loads (power.rs); the flag is not the server's
+    let mut rest: Vec<String> = rest.to_vec();
+    let mut power_spec = std::env::var("SHADOW_POWER_LIMITS").ok();
+    if let Some(i) = rest.iter().position(|a| a == "--power-limit") {
+        power_spec = rest.get(i + 1).cloned();
+        rest.drain(i..(i + 2).min(rest.len()));
+    }
+    if let Some(spec) = power_spec.filter(|s| !s.trim().is_empty()) {
+        power::apply(&spec);
+    }
+    let rest = &fastest_defaults(&rest);
     if rest.iter().any(|a| a == "--direct-io") {
         std::env::set_var("SHADOW_DIRECT_IO", "1");
     } else if rest.iter().any(|a| a == "--no-direct-io") {

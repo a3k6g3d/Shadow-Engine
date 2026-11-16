@@ -266,7 +266,7 @@ impl<'c> PinnedRegion<'c> {
                 let mut dptr = 0u64;
                 let dcode = unsafe { (ctx.api.cuMemHostGetDevicePointer)(&mut dptr, at, 0) };
                 if dcode != 0 {
-                    return Err(format!("cuMemHostGetDevicePointer failed ({dcode})"));
+                    return Err(format!("cuMemHostGetDevicePointer failed ({dcode}) for {n} bytes at offset {off} of {len} on {}", ctx.name));
                 }
                 if off == 0 {
                     r.dev_ptr = dptr;

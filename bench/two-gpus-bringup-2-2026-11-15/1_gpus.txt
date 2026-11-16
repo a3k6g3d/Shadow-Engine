@@ -1,0 +1,43 @@
+﻿driver API 13.5; CUDA_DEVICE_ORDER=(unset: fastest first); CUDA_VISIBLE_DEVICES=(unset)
+
+2 device(s):
+  [0] NVIDIA GeForce RTX 5070  cc 12.0  48 SMs  11.9 GiB  PCI 0000:01:00  192-bit bus, memory clock 14001 MHz (~672 GB/s at 2 transfers a clock)  GPU-c78d59cb-b832-bc00-3a4b-e9b5efc4f52f
+  [1] NVIDIA GeForce RTX 5060 Ti  cc 12.0  36 SMs  15.9 GiB  PCI 0000:03:00  128-bit bus, memory clock 14001 MHz (~448 GB/s at 2 transfers a clock)  GPU-dc3bd5c3-9fab-ef0c-1e37-94dad2214c6f
+
+host <-> device bandwidth, 256 MiB copies from pinned memory, median of 8 (GB/s):
+  [0] host -> device  18.67   device -> host  11.12
+  [1] host -> device   2.48   device -> host   2.28
+
+the same with every card copying at once:
+  [0] host -> device  20.89   device -> host  15.46
+  [1] host -> device   2.13   device -> host   3.22
+
+peer access (a card reading another's memory directly):
+  [0] -> -  no
+  [1] -> no  -
+
+hop: device -> pinned host -> device, microseconds (median / 99th percentile / max):
+  [0] -> [0]
+      4 KiB                                           43.2 /     148.9 /     185.8
+      40 KiB (one token's residual streams)           58.5 /     161.4 /     416.5
+      160 KiB (a 4-token verify pass)                106.7 /     201.2 /    7499.4
+      2 MiB                                          224.6 /    2377.5 /    2377.5
+      80 MiB (a 2,048-row prompt sub-chunk)         7830.4 /   25865.3 /   25865.3
+  [0] -> [1]
+      4 KiB                                           59.5 /     151.1 /     180.6
+      40 KiB (one token's residual streams)           50.5 /     194.7 /     212.2
+      160 KiB (a 4-token verify pass)                175.9 /    1118.3 /    1161.8
+      2 MiB                                         1252.5 /    2005.4 /    2005.4
+      80 MiB (a 2,048-row prompt sub-chunk)        55523.0 /   60790.2 /   60790.2
+  [1] -> [0]
+      4 KiB                                           35.9 /     111.5 /     126.5
+      40 KiB (one token's residual streams)           50.5 /     112.6 /     134.6
+      160 KiB (a 4-token verify pass)                132.7 /     206.0 /   51378.6
+      2 MiB                                         1032.1 /    2891.0 /    2891.0
+      80 MiB (a 2,048-row prompt sub-chunk)        45494.6 /   50217.5 /   50217.5
+  [1] -> [1]
+      4 KiB                                           21.8 /     135.4 /     183.0
+      40 KiB (one token's residual streams)           44.1 /    1333.4 /    1351.5
+      160 KiB (a 4-token verify pass)                118.9 /    1366.1 /    2213.0
+      2 MiB                                         1335.8 /    5497.8 /    5497.8
+      80 MiB (a 2,048-row prompt sub-chunk)        77420.2 /   91342.3 /   91342.3

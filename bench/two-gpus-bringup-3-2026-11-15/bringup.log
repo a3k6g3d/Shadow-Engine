@@ -1,0 +1,9 @@
+﻿19:05:15 == two-card bring-up, NVIDIA GeForce RTX 5070, 12227 MiB, 250.00 W | NVIDIA GeForce RTX 5060 Ti, 16311 MiB, 180.00 W
+19:05:15 power: if the two cards plus the CPU trip the 650 W supply, cap them first, e.g.  nvidia-smi -i 0 -pl 200   and   nvidia-smi -i 1 -pl 140   (run by you, as administrator; not done here)
+19:05:15 building the dev binaries (target-dev)
+19:05:17       Compiling shadow-bench v0.1.36 (J:\Shadow\crates\shadow-bench)
+19:05:17        Finished `release` profile [optimized] target(s) in 2.05s
+19:05:20 -- 5 fast mode on the pair
+19:05:55 card 0: peak power 41.5 W, peak temperature 46.16 C
+19:05:55 card 1: peak power 19.19 W, peak temperature 40.86 C
+19:05:55 done - everything is in bench/two-gpus-bringup-3-2026-11-15 (bringup.log first)

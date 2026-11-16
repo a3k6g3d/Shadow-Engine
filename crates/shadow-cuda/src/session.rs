@@ -2103,14 +2103,16 @@ impl<'c, 'm> GpuSession<'c, 'm> {
             } else {
                 let mut s = a(c.ssm_v_heads * c.ssm_head_dim * c.ssm_head_dim)?;
                 let mut conv = a((c.conv_k.max(1) - 1) * (2 * kd + vd))?;
-                s.zero().map_err(e)?;
-                conv.zero().map_err(e)?;
+                let (sb, cb) = (s.bytes, conv.bytes);
+                s.zero().map_err(|x| format!("zeroing a DeltaNet state of {sb} bytes at layer {l} on {}: {x}", ctx.name))?;
+                conv.zero().map_err(|x| format!("zeroing a conv state of {cb} bytes at layer {l} on {}: {x}", ctx.name))?;
                 delta.push(Some((s, conv)));
                 attn.push(None);
             }
         }
         let mut ple_state = a((c.ple_conv_k.max(1) - 1) * c.ple_ngram * ch)?;
-        ple_state.zero().map_err(e)?;
+        let pb = ple_state.bytes;
+        ple_state.zero().map_err(|x| format!("zeroing the PLE state of {pb} bytes on {}: {x}", ctx.name))?;
 
         let mtp = match tiers.mtp_dir.as_ref() {
             Some(p) => match crate::mtp::MtpModel::load(ctx, p, cap, c.vocab) {

@@ -1,0 +1,55 @@
+
+running 6 tests
+test a_long_prompt_through_the_pair_equals_one_session ... FAILED
+test a_pair_driven_through_the_first_stage_equals_one_session ... FAILED
+test batches_through_two_stages_equal_one_session ... FAILED
+test the_drafter_across_two_stages_drafts_what_one_session_drafts ... FAILED
+test two_stages_on_one_card_equal_one_session ... FAILED
+test verify_and_rollback_through_two_stages_equal_one_session ... FAILED
+
+failures:
+
+---- a_long_prompt_through_the_pair_equals_one_session stdout ----
+one session: lent true, batch_rows 256
+
+thread 'a_long_prompt_through_the_pair_equals_one_session' (4900) panicked at crates\shadow\tests\two_stage.rs:428:84:
+called `Result::unwrap()` on an `Err` value: "cuMemsetD8 failed (1)"
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+---- a_pair_driven_through_the_first_stage_equals_one_session stdout ----
+
+thread 'a_pair_driven_through_the_first_stage_equals_one_session' (12020) panicked at crates\shadow\tests\two_stage.rs:275:95:
+called `Result::unwrap()` on an `Err` value: "cuMemsetD8 failed (1)"
+
+---- batches_through_two_stages_equal_one_session stdout ----
+
+thread 'batches_through_two_stages_equal_one_session' (7760) panicked at crates\shadow\tests\two_stage.rs:111:99:
+called `Result::unwrap()` on an `Err` value: "cuMemsetD8 failed (1)"
+
+---- the_drafter_across_two_stages_drafts_what_one_session_drafts stdout ----
+dflash: loaded the drafter from J:\Shadow\crates\shadow\../../models/dflash2 (~1.2 GB VRAM)
+
+thread 'the_drafter_across_two_stages_drafts_what_one_session_drafts' (13512) panicked at crates\shadow\tests\two_stage.rs:366:109:
+called `Result::unwrap()` on an `Err` value: "cuMemsetD8 failed (1)"
+
+---- two_stages_on_one_card_equal_one_session stdout ----
+
+thread 'two_stages_on_one_card_equal_one_session' (6804) panicked at crates\shadow\tests\two_stage.rs:68:92:
+called `Result::unwrap()` on an `Err` value: "cuMemsetD8 failed (1)"
+
+---- verify_and_rollback_through_two_stages_equal_one_session stdout ----
+
+thread 'verify_and_rollback_through_two_stages_equal_one_session' (7472) panicked at crates\shadow\tests\two_stage.rs:208:99:
+called `Result::unwrap()` on an `Err` value: "cuMemsetD8 failed (1)"
+
+
+failures:
+    a_long_prompt_through_the_pair_equals_one_session
+    a_pair_driven_through_the_first_stage_equals_one_session
+    batches_through_two_stages_equal_one_session
+    the_drafter_across_two_stages_drafts_what_one_session_drafts
+    two_stages_on_one_card_equal_one_session
+    verify_and_rollback_through_two_stages_equal_one_session
+
+test result: FAILED. 0 passed; 6 failed; 0 ignored; 0 measured; 0 filtered out; finished in 78.10s
+

@@ -1,0 +1,104 @@
+﻿18:10:35 == two-card bring-up, NVIDIA GeForce RTX 5070, 12227 MiB, 250.00 W | NVIDIA GeForce RTX 5060 Ti, 16311 MiB, 180.00 W
+18:10:36 power: if the two cards plus the CPU trip the 650 W supply, cap them first, e.g.  nvidia-smi -i 0 -pl 200   and   nvidia-smi -i 1 -pl 140   (run by you, as administrator; not done here)
+18:10:36 building the dev binaries (target-dev)
+18:10:38       Compiling shadow-bench v0.1.36 (J:\Shadow\crates\shadow-bench)
+18:10:38        Finished `release` profile [optimized] target(s) in 2.10s
+18:10:39 -- 1 gpus
+18:10:48    driver API 13.5; CUDA_DEVICE_ORDER=(unset: fastest first); CUDA_VISIBLE_DEVICES=(unset)
+18:10:48    2 device(s):
+18:10:48      [0] NVIDIA GeForce RTX 5070  cc 12.0  48 SMs  11.9 GiB  PCI 0000:01:00  192-bit bus, memory clock 14001 MHz (~672 GB/s at 2 transfers a clock)  GPU-c78d59cb-b832-bc00-3a4b-e9b5efc4f52f
+18:10:48      [1] NVIDIA GeForce RTX 5060 Ti  cc 12.0  36 SMs  15.9 GiB  PCI 0000:03:00  128-bit bus, memory clock 14001 MHz (~448 GB/s at 2 transfers a clock)  GPU-dc3bd5c3-9fab-ef0c-1e37-94dad2214c6f
+18:10:48    host <-> device bandwidth, 256 MiB copies from pinned memory, median of 8 (GB/s):
+18:10:48      [0] host -> device  27.35   device -> host  19.64
+18:10:48      [1] host -> device   3.40   device -> host   3.48
+18:10:48    the same with every card copying at once:
+18:10:48      [0] host -> device  23.85   device -> host  16.83
+18:10:48      [1] host -> device   3.39   device -> host   3.47
+18:10:48    peer access (a card reading another's memory directly):
+18:10:48      [0] -> -  no
+18:10:48      [1] -> no  -
+18:10:48    hop: device -> pinned host -> device, microseconds (median / 99th percentile / max):
+18:10:48      [0] -> [0]
+18:10:48          4 KiB                                           12.5 /      65.6 /      66.9
+18:10:48          40 KiB (one token's residual streams)           15.6 /      81.6 /      85.8
+18:10:48          160 KiB (a 4-token verify pass)                 26.6 /      75.8 /     109.6
+18:10:48          2 MiB                                          187.1 /     414.2 /     414.2
+18:10:48          80 MiB (a 2,048-row prompt sub-chunk)         7211.0 /    7659.2 /    7659.2
+18:10:48      [0] -> [1]
+18:10:48          4 KiB                                           36.6 /      97.1 /     122.7
+18:10:48          40 KiB (one token's residual streams)           49.5 /      97.4 /     107.0
+18:10:48          160 KiB (a 4-token verify pass)                100.9 /     160.7 /     178.5
+18:10:48          2 MiB                                          756.0 /    1011.5 /    1011.5
+18:10:48          80 MiB (a 2,048-row prompt sub-chunk)        29095.8 /   29923.7 /   29923.7
+18:10:48      [1] -> [0]
+18:10:48          4 KiB                                           36.9 /      92.2 /     125.9
+18:10:48          40 KiB (one token's residual streams)           50.3 /      81.6 /      89.4
+18:10:48          160 KiB (a 4-token verify pass)                 98.2 /     134.0 /     139.8
+18:10:48          2 MiB                                          743.9 /     924.0 /     924.0
+18:10:48          80 MiB (a 2,048-row prompt sub-chunk)        27323.0 /   28153.4 /   28153.4
+18:10:48      [1] -> [1]
+18:10:48          4 KiB                                           20.5 /     104.5 /     122.2
+18:10:48          40 KiB (one token's residual streams)           42.6 /     109.0 /     140.3
+18:10:48          160 KiB (a 4-token verify pass)                112.1 /     154.7 /     190.5
+18:10:48          2 MiB                                         1264.8 /    1701.7 /    1701.7
+18:10:48          80 MiB (a 2,048-row prompt sub-chunk)        48938.6 /   49128.6 /   49128.6
+18:10:48 -- 2 pair tests, second stage on card 1
+18:11:30 == two-card bring-up, NVIDIA GeForce RTX 5070, 12227 MiB, 250.00 W | NVIDIA GeForce RTX 5060 Ti, 16311 MiB, 180.00 W
+18:11:30 power: if the two cards plus the CPU trip the 650 W supply, cap them first, e.g.  nvidia-smi -i 0 -pl 200   and   nvidia-smi -i 1 -pl 140   (run by you, as administrator; not done here)
+18:11:31 building the dev binaries (target-dev)
+18:11:31        Finished `release` profile [optimized] target(s) in 0.39s
+18:11:32 -- 1 gpus
+18:11:46    driver API 13.5; CUDA_DEVICE_ORDER=(unset: fastest first); CUDA_VISIBLE_DEVICES=(unset)
+18:11:46    2 device(s):
+18:11:46      [0] NVIDIA GeForce RTX 5070  cc 12.0  48 SMs  11.9 GiB  PCI 0000:01:00  192-bit bus, memory clock 14001 MHz (~672 GB/s at 2 transfers a clock)  GPU-c78d59cb-b832-bc00-3a4b-e9b5efc4f52f
+18:11:46      [1] NVIDIA GeForce RTX 5060 Ti  cc 12.0  36 SMs  15.9 GiB  PCI 0000:03:00  128-bit bus, memory clock 14001 MHz (~448 GB/s at 2 transfers a clock)  GPU-dc3bd5c3-9fab-ef0c-1e37-94dad2214c6f
+18:11:46    host <-> device bandwidth, 256 MiB copies from pinned memory, median of 8 (GB/s):
+18:11:46      [0] host -> device  18.67   device -> host  11.12
+18:11:46      [1] host -> device   2.48   device -> host   2.28
+18:11:46    the same with every card copying at once:
+18:11:46      [0] host -> device  20.89   device -> host  15.46
+18:11:46      [1] host -> device   2.13   device -> host   3.22
+18:11:46    peer access (a card reading another's memory directly):
+18:11:46      [0] -> -  no
+18:11:46      [1] -> no  -
+18:11:46    hop: device -> pinned host -> device, microseconds (median / 99th percentile / max):
+18:11:46      [0] -> [0]
+18:11:46          4 KiB                                           43.2 /     148.9 /     185.8
+18:11:46          40 KiB (one token's residual streams)           58.5 /     161.4 /     416.5
+18:11:46          160 KiB (a 4-token verify pass)                106.7 /     201.2 /    7499.4
+18:11:46          2 MiB                                          224.6 /    2377.5 /    2377.5
+18:11:46          80 MiB (a 2,048-row prompt sub-chunk)         7830.4 /   25865.3 /   25865.3
+18:11:46      [0] -> [1]
+18:11:46          4 KiB                                           59.5 /     151.1 /     180.6
+18:11:46          40 KiB (one token's residual streams)           50.5 /     194.7 /     212.2
+18:11:46          160 KiB (a 4-token verify pass)                175.9 /    1118.3 /    1161.8
+18:11:46          2 MiB                                         1252.5 /    2005.4 /    2005.4
+18:11:46          80 MiB (a 2,048-row prompt sub-chunk)        55523.0 /   60790.2 /   60790.2
+18:11:46      [1] -> [0]
+18:11:46          4 KiB                                           35.9 /     111.5 /     126.5
+18:11:46          40 KiB (one token's residual streams)           50.5 /     112.6 /     134.6
+18:11:46          160 KiB (a 4-token verify pass)                132.7 /     206.0 /   51378.6
+18:11:46          2 MiB                                         1032.1 /    2891.0 /    2891.0
+18:11:46          80 MiB (a 2,048-row prompt sub-chunk)        45494.6 /   50217.5 /   50217.5
+18:11:46      [1] -> [1]
+18:11:46          4 KiB                                           21.8 /     135.4 /     183.0
+18:11:46          40 KiB (one token's residual streams)           44.1 /    1333.4 /    1351.5
+18:11:46          160 KiB (a 4-token verify pass)                118.9 /    1366.1 /    2213.0
+18:11:46          2 MiB                                         1335.8 /    5497.8 /    5497.8
+18:11:46          80 MiB (a 2,048-row prompt sub-chunk)        77420.2 /   91342.3 /   91342.3
+18:11:46 -- 2 pair tests, second stage on card 1
+18:22:08 == two-card bring-up, NVIDIA GeForce RTX 5070, 12227 MiB, 250.00 W | NVIDIA GeForce RTX 5060 Ti, 16311 MiB, 180.00 W
+18:22:08 power: if the two cards plus the CPU trip the 650 W supply, cap them first, e.g.  nvidia-smi -i 0 -pl 200   and   nvidia-smi -i 1 -pl 140   (run by you, as administrator; not done here)
+18:22:08 building the dev binaries (target-dev)
+18:22:08        Finished `release` profile [optimized] target(s) in 0.20s
+18:22:09 -- 4 exact: single card against the pair
+18:26:04    exact replies identical, single card vs the pair: 10 of 10
+18:26:04 -- 5 fast mode on the pair
+18:33:38    fast_pair: server never came up (see bench/two-gpus-bringup-2-2026-11-15\serve_fast_pair.log.err)
+18:33:42    conversation finished; speculation lines: 
+18:33:42    dflash on the pair: 
+18:33:43 card 0: peak power 99.21 W, peak temperature 65.75 C
+18:33:43 card 1: peak power 107.21 W, peak temperature 60.05 C
+18:33:43 card 43.03: peak power 180 W, peak temperature 0 C
+18:33:43 card 50 %: peak power 168 W, peak temperature 3 C
+18:33:43 done - everything is in bench/two-gpus-bringup-2-2026-11-15 (bringup.log first)

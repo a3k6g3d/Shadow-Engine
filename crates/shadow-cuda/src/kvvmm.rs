@@ -15,18 +15,21 @@ pub struct VmmRegion<'c> {
     pub per_pos: usize,
 }
 
-fn prop() -> [u8; 32] {
-    // CUmemAllocationProp: type PINNED (1), no handle types, location {DEVICE (1), id 0}, no win32 metadata, flags 0
+fn prop(dev: i32) -> [u8; 32] {
+    // CUmemAllocationProp: type PINNED (1), no handle types, location {DEVICE (1), id `dev`}, no win32 metadata, flags 0 (the id was always 0: on a second card the
+    // memory landed on card 0 and `cuMemsetD8` on it failed, `cuMemsetD8 failed (1)`: STATUS 150)
     let mut p = [0u8; 32];
     p[0..4].copy_from_slice(&1u32.to_le_bytes());
     p[8..12].copy_from_slice(&1u32.to_le_bytes());
+    p[12..16].copy_from_slice(&dev.to_le_bytes());
     p
 }
 
-fn access() -> [u8; 12] {
-    // CUmemAccessDesc: location {DEVICE, 0}, flags READWRITE (3)
+fn access(dev: i32) -> [u8; 12] {
+    // CUmemAccessDesc: location {DEVICE, `dev`}, flags READWRITE (3)
     let mut a = [0u8; 12];
     a[0..4].copy_from_slice(&1u32.to_le_bytes());
+    a[4..8].copy_from_slice(&dev.to_le_bytes());
     a[8..12].copy_from_slice(&3u32.to_le_bytes());
     a
 }
@@ -36,7 +39,7 @@ impl<'c> VmmRegion<'c> {
     pub fn new(ctx: &'c Context, per_pos: usize, cap: usize) -> Result<VmmRegion<'c>, String> {
         let api = ctx.api;
         ctx.bind().map_err(|e| e.to_string())?;
-        let p = prop();
+        let p = prop(ctx.device);
         let mut gran = 0usize;
         // SAFETY: out-pointer and a 32-byte property block as the driver wants.
         let r = unsafe { (api.cuMemGetAllocationGranularity)(&mut gran, p.as_ptr() as *const _, 1) };
@@ -72,7 +75,7 @@ impl<'c> VmmRegion<'c> {
     pub fn new_empty(ctx: &'c Context, bytes: usize) -> Result<VmmRegion<'c>, String> {
         let api = ctx.api;
         ctx.bind().map_err(|e| e.to_string())?;
-        let p = prop();
+        let p = prop(ctx.device);
         let mut gran = 0usize;
         // SAFETY: as `new`.
         let r = unsafe { (api.cuMemGetAllocationGranularity)(&mut gran, p.as_ptr() as *const _, 1) };
@@ -111,7 +114,7 @@ impl<'c> VmmRegion<'c> {
     fn map_to_from(&mut self, n: usize, pool: &mut Vec<u64>, zero: bool) -> Result<(), String> {
         let api = self.ctx.api;
         self.ctx.bind().map_err(|e| e.to_string())?;
-        let (p, acc) = (prop(), access());
+        let (p, acc) = (prop(self.ctx.device), access(self.ctx.device));
         let from = self.mapped;
         while self.mapped < n {
             let h = match pool.pop() {

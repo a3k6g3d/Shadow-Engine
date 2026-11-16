@@ -15,8 +15,8 @@ param([string]$Out = 'bench\two-gpus-bringup', [string]$Skip = '', [int]$Peer = 
 $root = Split-Path -Parent $PSScriptRoot
 Set-Location $root
 New-Item -ItemType Directory -Force -Path $Out | Out-Null
-$skip = $Skip.Split(',') | ForEach-Object { $_.Trim().ToLower() }
-$model = 'J:/Strata-work/models/swift15/IQ3_S/Swift-Qwen3.8-Flash-Next-GSQ-RCO-abliterated-IQ3_S-00001-of-00002.gguf'
+$skipSet = $Skip.Split(',') | ForEach-Object { $_.Trim().ToLower() }
+$model = 'J:/Models/Huihui-Qwen3.8-Flash-Next-abliterated-v2-GGUF/swift-IQ3_XXS/Swift-Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00001-of-00002.gguf'
 $dev = 'target-dev\release'
 function Say($t) { $l = "$([DateTime]::Now.ToString('HH:mm:ss')) $t"; $l; $l | Out-File -Append -Encoding utf8 "$Out\bringup.log" }
 function Stop-Mine { Get-NetTCPConnection -LocalPort 8095 -State Listen -ErrorAction SilentlyContinue | ForEach-Object { Stop-Process -Id $_.OwningProcess -Force -ErrorAction SilentlyContinue }; Start-Sleep 3 }
@@ -52,22 +52,23 @@ $twoStage = (cargo test --release -p shadow --test two_stage --no-run 2>&1 | Sel
 $int8 = (cargo test --release -p shadow-cuda --test int8_cols --no-run 2>&1 | Select-String 'Executable.*\((.*int8_cols-[0-9a-f]+\.exe)\)' | ForEach-Object { $_.Matches[0].Groups[1].Value } | Select-Object -First 1)
 Remove-Item Env:CARGO_TARGET_DIR -ErrorAction SilentlyContinue
 
-if ('gpus' -notin $skip) {
+if ('gpus' -notin $skipSet) {
   Say '-- 1 gpus'
   $g = & "$dev\shadow.exe" gpus 2>&1 | ForEach-Object { "$_" }
   $g | Out-File -Encoding utf8 "$Out\1_gpus.txt"
   $g | Where-Object { $_.Trim() } | ForEach-Object { Say "   $_" }
 }
 
-if ('tests' -notin $skip -and $twoStage) {
+if ('tests' -notin $skipSet -and $twoStage) {
   Say "-- 2 pair tests, second stage on card $Peer"
+  $env:SHADOW_MODEL = $model
   $env:SHADOW_PEER_GPU = "$Peer"
   Run-Capped "$Out\2_two_stage.txt" (Join-Path $root $twoStage) '--test-threads 1'
   Remove-Item Env:SHADOW_PEER_GPU -ErrorAction SilentlyContinue
   Say "   result: $((Select-String -Path "$Out\2_two_stage.txt" -Pattern 'test result' | Select-Object -First 1).Line)"
 }
 
-if ('int8' -notin $skip -and $int8) {
+if ('int8' -notin $skipSet -and $int8) {
   Say "-- 3 native int8 kernels on card $Peer"
   $env:INT8_GPU = "$Peer"; $env:SHADOW_MMQ_DLL = Join-Path $root 'native\mmq\shadow_mmq.dll'; $env:INT8_ROWS = '20000'
   Run-Capped "$Out\3_int8_cols.txt" (Join-Path $root $int8) '--nocapture'
@@ -84,7 +85,7 @@ function Conversation($tag, $flags, $envs) {
   return (Test-Path "$Out\conv_$tag.json")
 }
 
-if ('exact' -notin $skip) {
+if ('exact' -notin $skipSet) {
   Say '-- 4 exact: single card against the pair'
   $a = Conversation 'exact_single' '--exact --expert-cache-gib 1.0' @{}
   $b = Conversation 'exact_pair' "--exact --gpus 0,$Peer$pairExtra" @{}
@@ -94,7 +95,7 @@ if ('exact' -notin $skip) {
   } else { Say '   (a conversation did not finish)' }
 }
 
-if ('fast' -notin $skip) {
+if ('fast' -notin $skipSet) {
   Say '-- 5 fast mode on the pair'
   if (Conversation 'fast_pair' "--gpus 0,$Peer$pairExtra" @{}) {
     $spec = Select-String -Path "$Out\serve_fast_pair.log.err" -Pattern 'speculation:' | Select-Object -Last 3 | ForEach-Object { $_.Line.Substring(0, [Math]::Min(150, $_.Line.Length)) }
@@ -103,7 +104,7 @@ if ('fast' -notin $skip) {
   }
 }
 
-if ('bench' -notin $skip) {
+if ('bench' -notin $skipSet) {
   Say '-- 6 decode bench (36 prompts x 2 runs, interleaved): single card / pair / pair --dflash off'
   Stop-Mine
   $a = @('run', '--model', $model, '--out', "$Out\bench", '--runs', '2', '--turns', '36', '--prompts-file', 'bench/dfdata/varied36.json',
