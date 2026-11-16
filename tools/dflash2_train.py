@@ -50,40 +50,55 @@ np.random.seed(0)
 
 
 # ------------------------------------------------------------------------------------------------------- data
-def load_sequences(d):
+def load_sequences(d, max_seqs=0, maxlen=1100):
+    """Streams the `feats*.bin` records (no memory map: a 37 GB file would sit in the working set) and keeps, for each conversation, its first `maxlen` positions as fp16 rows;
+    stops after `max_seqs` conversations (0: all).  Memory: ~25.6 KB a position kept."""
     seqs = []
+    done = False
     for path in [p for one in d.split(",") for p in sorted(glob.glob(f"{one}/feats*.bin"))]:
-        raw = np.memmap(path, dtype=np.uint8, mode="r")
-        at, n = 0, len(raw)
-        toks, feats = None, None
+        if done:
+            break
         cur = None
-        while at + 8 <= n:
-            p0, m = struct.unpack_from("<II", raw, at)
-            at += 8
-            if at + 4 * m + 4 * m * NFEAT > n:
-                break  # a record still being written
-            t = np.frombuffer(raw, dtype="<u4", count=m, offset=at)
-            at += 4 * m
-            f = np.frombuffer(raw, dtype="<f4", count=m * NFEAT, offset=at).reshape(m, NFEAT)
-            at += 4 * m * NFEAT
-            if p0 == 0:
-                if cur is not None:
-                    seqs.append(cur)
-                cur = {"tok": [], "feat": []}
-            if cur is None or p0 > len(cur["tok"]):
-                cur = None  # a gap: features for the start are missing
-                continue
-            del cur["tok"][p0:]
-            del cur["feat"][p0:]
-            cur["tok"].extend(t.tolist())
-            cur["feat"].extend(f.astype(np.float16))  # one row each
-        if cur is not None:
+        with open(path, "rb", buffering=1 << 20) as fh:
+            while True:
+                head = fh.read(8)
+                if len(head) < 8:
+                    break
+                p0, m = struct.unpack("<II", head)
+                tb = fh.read(4 * m)
+                fb = fh.read(4 * m * NFEAT)
+                if len(tb) < 4 * m or len(fb) < 4 * m * NFEAT:
+                    break  # a record still being written
+                if p0 >= maxlen and (cur is None or p0 > len(cur["tok"])):
+                    continue
+                t = np.frombuffer(tb, dtype="<u4")
+                if p0 == 0:
+                    if cur is not None:
+                        seqs.append(cur)
+                    if max_seqs and len(seqs) >= max_seqs:
+                        done = True
+                        cur = None
+                        break
+                    cur = {"tok": [], "feat": []}
+                if cur is None or p0 > len(cur["tok"]):
+                    cur = None  # a gap: features for the start are missing
+                    continue
+                keep = max(0, min(m, maxlen - p0))
+                if keep == 0:
+                    continue
+                f = np.frombuffer(fb, dtype="<f4", count=m * NFEAT).reshape(m, NFEAT)[:keep].astype(np.float16)
+                del cur["tok"][p0:]
+                del cur["feat"][p0:]
+                cur["tok"].extend(t[:keep].tolist())
+                cur["feat"].extend(f)  # one row each, views of `f`
+        if cur is not None and not done:
             seqs.append(cur)
     out = []
     for s in seqs:
         if len(s["tok"]) >= 48:
             tok = np.array(s["tok"], dtype=np.int64)
             out.append((tok, np.stack(s["feat"]), generated_mask(tok)))
+        s["feat"] = None
     return out
 
 
@@ -340,9 +355,7 @@ def merge(model, path_in, path_out):
 
 def main():
     t0 = time.time()
-    data = load_sequences(args.data)
-    if args.max_seqs:
-        data = data[:args.max_seqs]
+    data = load_sequences(args.data, args.max_seqs, args.maxlen)
     tot = sum(len(t) for t, _, _ in data)
     print(f"{len(data)} conversations, {tot} tokens ({time.time() - t0:.0f} s)", flush=True)
     nval = max(4, len(data) // 10)

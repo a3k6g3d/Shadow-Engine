@@ -61,8 +61,95 @@ fn what_breaks_with_two_contexts_and_a_big_pinned_region() {
                 eprintln!("PROBE pin {g} GiB on ctx{on}: ok in {:.1} s", t0.elapsed().as_secs_f64());
                 eprintln!("PROBE   {}", poke(&c0, "ctx0"));
                 eprintln!("PROBE   {}", poke(&c1, "ctx1"));
+                // `SHADOW_PROBE_HOLD_S=n`: stay n seconds with the region registered (to read the Windows GPU memory counters meanwhile)
+                if let Some(n) = std::env::var("SHADOW_PROBE_HOLD_S").ok().and_then(|v| v.parse::<u64>().ok()) {
+                    eprintln!("PROBE   holding {n} s");
+                    std::thread::sleep(std::time::Duration::from_secs(n));
+                }
                 drop(region);
             }
         }
+    }
+}
+
+/// STATUS 166: does the limit come from the second card's context existing while memory is registered?  Pins `SHADOW_PROBE_GIB` (one size) on context 0 BEFORE the second context
+/// exists, then creates context 1, exercises both, and registers more memory (as the server does later: staging, stage-pipe buffers) on each.
+#[test]
+#[ignore]
+fn pin_first_then_create_the_second_context() {
+    let g: usize = std::env::var("SHADOW_PROBE_GIB").ok().and_then(|v| v.parse().ok()).unwrap_or(30);
+    let Ok(c0) = Context::new(0) else {
+        eprintln!("SKIPPED: needs a CUDA device");
+        return;
+    };
+    let t0 = std::time::Instant::now();
+    let region = match PinnedRegion::new_chunked(&c0, g * GIB, GIB) {
+        Ok(r) => r,
+        Err(e) => return eprintln!("PROBE pin {g} GiB on ctx0 alone: FAILED: {e}"),
+    };
+    eprintln!("PROBE pin {g} GiB on ctx0 alone: ok in {:.1} s", t0.elapsed().as_secs_f64());
+    let c1 = match Context::new(1) {
+        Ok(c) => c,
+        Err(e) => return eprintln!("PROBE then creating ctx1: FAILED: {e}"),
+    };
+    eprintln!("PROBE then creating ctx1: ok");
+    eprintln!("PROBE   {}", poke(&c0, "ctx0"));
+    eprintln!("PROBE   {}", poke(&c1, "ctx1"));
+    for (label, ctx) in [("ctx0", &c0), ("ctx1", &c1)] {
+        for i in 0..6 {
+            match PinnedRegion::new(ctx, 512 << 20) {
+                Ok(r) => {
+                    eprintln!("PROBE   extra 512 MiB #{i} on {label}: ok");
+                    std::mem::forget(r);
+                }
+                Err(e) => {
+                    eprintln!("PROBE   extra 512 MiB #{i} on {label}: FAILED: {e}");
+                    break;
+                }
+            }
+        }
+    }
+    drop(region);
+}
+
+/// STATUS 166: the limit for memory the driver allocates itself (`cuMemHostAlloc`, flags `SHADOW_PROBE_FLAGS`: 0 none, 1 portable, 2 devicemap, 3 both) with two contexts: how many GiB in 1 GiB
+/// pieces before it fails, and whether the contexts still work then.
+#[test]
+#[ignore]
+fn how_much_cumemhostalloc_gives_with_two_contexts() {
+    let (Ok(c0), Ok(c1)) = (Context::new(0), Context::new(1)) else {
+        eprintln!("SKIPPED: needs two CUDA devices");
+        return;
+    };
+    let flags: u32 = std::env::var("SHADOW_PROBE_FLAGS").ok().and_then(|v| v.parse().ok()).unwrap_or(1);
+    let cap: usize = std::env::var("SHADOW_PROBE_GIB").ok().and_then(|v| v.parse().ok()).unwrap_or(40);
+    c0.bind().unwrap();
+    let mut held: Vec<*mut std::ffi::c_void> = vec![];
+    let mut failed = None;
+    // `SHADOW_PROBE_PIECE=n`: pieces of n GiB (default 1): one 34 GiB block is what a contiguous RAM tier needs
+    let piece: usize = std::env::var("SHADOW_PROBE_PIECE").ok().and_then(|v| v.parse().ok()).unwrap_or(1);
+    for i in 0..cap.div_ceil(piece) {
+        let mut p: *mut std::ffi::c_void = std::ptr::null_mut();
+        // SAFETY: an out-pointer for a host allocation of `piece` GiB.
+        let r = unsafe { (c0.api.cuMemHostAlloc)(&mut p, piece * GIB, flags) };
+        if r != 0 {
+            failed = Some((i, r));
+            break;
+        }
+        held.push(p);
+    }
+    match failed {
+        Some((i, r)) => eprintln!("PROBE cuMemHostAlloc flags {flags}, pieces of {piece} GiB: {} GiB, then code {r}", i * piece),
+        None => eprintln!("PROBE cuMemHostAlloc flags {flags}, pieces of {piece} GiB: all {cap} GiB"),
+    }
+    eprintln!("PROBE   {}", poke(&c0, "ctx0"));
+    eprintln!("PROBE   {}", poke(&c1, "ctx1"));
+    if let Some(n) = std::env::var("SHADOW_PROBE_HOLD_S").ok().and_then(|v| v.parse::<u64>().ok()) {
+        eprintln!("PROBE   holding {n} s");
+        std::thread::sleep(std::time::Duration::from_secs(n));
+    }
+    for p in held {
+        // SAFETY: allocated above with cuMemHostAlloc, freed once.
+        unsafe { (c0.api.cuMemFreeHost)(p) };
     }
 }
