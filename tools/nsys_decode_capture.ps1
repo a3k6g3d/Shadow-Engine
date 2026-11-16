@@ -1,10 +1,10 @@
-param([string]$Tag, [string]$Flags = '', [int]$CapGiB = 56, [double]$FloorGiB = 3.5)
+param([string]$Tag, [string]$Flags = '', [string]$Model = 'J:/Models/Lygodactylus-Qwen3.8-Flash-Next-Uncensored-exl3-2bpw', [int]$CapGiB = 56, [double]$FloorGiB = 3.5)
 # Decode under Nsight Systems: nsys starts shadow.exe; this script caps the shadow.exe child's working set and kills it below the free-RAM floor
 # (the rule of tools/run_capped.ps1, applied to the child because run_capped would cap nsys itself).
 Set-Location J:\Shadow
-$sp = 'C:\Users\a3k6g\AppData\Local\Temp\claude\c2eb5aa3e3d3334d\54ce6761-0ca8-4bdf-aa1e-6c6cfcee9b3d\scratchpad'
+$sp = $env:TEMP
 $nsys = 'C:\Program Files\NVIDIA Corporation\Nsight Systems 2026.5.2\target-windows-x64\nsys.exe'
-$model = 'J:/Models/Lygodactylus-Qwen3.8-Flash-Next-Uncensored-exl3-2bpw'
+$model = $Model
 $rep = "J:\Shadow\bench\nsys-$Tag"
 Remove-Item "$rep.nsys-rep", "$rep.sqlite" -ErrorAction SilentlyContinue
 Add-Type @'
