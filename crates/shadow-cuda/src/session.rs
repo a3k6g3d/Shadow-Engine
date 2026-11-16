@@ -3454,6 +3454,10 @@ impl<'c, 'm> GpuSession<'c, 'm> {
         self.hc_read("output_hc", false, rn_ready);
         self.rec("final_u".into(), self.b.u.ptr, h);
         self.mv("output.weight", self.b.u.ptr, self.b.logits.ptr);
+        if self.top_want && self.topk_rows_at(self.b.logits.ptr, 1, c.vocab) {
+            self.mark("head + top 64 down");
+            return vec![];
+        }
         let mut out = vec![0u8; c.vocab * 4];
         self.download(self.b.logits.ptr, &mut out);
         self.mark("head + logits down");
@@ -5079,10 +5083,15 @@ impl<'c, 'm> GpuSession<'c, 'm> {
     /// The 64 largest logits of `n` rows of `bb.logits` (`topk_slices` then `topk_merge`), downloaded into `top_out`: 2 KiB a row instead of the 1 MiB vocabulary.  False when this
     /// stage cannot (no buffer): the caller then downloads the logits.
     fn topk_rows(&mut self, n: usize, vocab: usize) -> bool {
+        self.topk_rows_at(self.bb.logits.ptr, n, vocab)
+    }
+
+    /// `topk_rows` over `n` rows of `vocab` logits at `logits` (the batch buffers' or the single-token step's).
+    fn topk_rows_at(&mut self, logits: u64, n: usize, vocab: usize) -> bool {
         let nb = vocab.div_ceil(4096);
         let Some(buf) = self.top_buf.as_ref() else { return false };
         let (slices_v, slices_i, fin) = (buf.ptr, buf.ptr + (COLS_MAX * nb * 64 * 4) as u64, buf.ptr + (COLS_MAX * nb * 64 * 8) as u64);
-        self.k("topk_slices", (n * nb) as u32, 256, &[Arg::Ptr(self.bb.logits.ptr), Arg::U32(vocab as u32), Arg::U32(vocab as u32), Arg::U32(nb as u32), Arg::Ptr(slices_v), Arg::Ptr(slices_i)]);
+        self.k("topk_slices", (n * nb) as u32, 256, &[Arg::Ptr(logits), Arg::U32(vocab as u32), Arg::U32(vocab as u32), Arg::U32(nb as u32), Arg::Ptr(slices_v), Arg::Ptr(slices_i)]);
         self.k("topk_merge", n as u32, 256, &[Arg::Ptr(slices_v), Arg::Ptr(slices_i), Arg::U32(nb as u32), Arg::Ptr(fin)]);
         let mut bytes = vec![0u8; n * 128 * 4];
         self.download(fin, &mut bytes);
@@ -5091,6 +5100,22 @@ impl<'c, 'm> GpuSession<'c, 'm> {
             self.top_out.push((0..64).map(|t| (f32::from_bits(words[r * 128 + t]), words[r * 128 + 64 + t])).collect());
         }
         true
+    }
+
+    /// `step` for a caller that needs only the 64 largest logits of the position (largest first, ties to the lower token), picked on the device: 2 KiB come back, not the 1 MiB vocabulary
+    /// (`SHADOW_TOPK_LOGITS=0`: not used).  None, with nothing run, when this session cannot (the MTP probe, no buffer): use `step`.
+    pub fn step_top(&mut self, token: u32) -> Option<Vec<(f32, u32)>> {
+        if std::env::var("SHADOW_TOPK_LOGITS").is_ok_and(|v| v == "0") || std::env::var("SHADOW_TOPK_STEP").is_ok_and(|v| v == "0") || self.mtp_probe.is_some() || !self.top_ready() {
+            return None;
+        }
+        self.ram_pressure_poll();
+        self.top_out.clear();
+        self.set_top(true);
+        let _ = self.step_opt(token, true);
+        self.set_top(false);
+        let mut out = self.take_top();
+        assert_eq!(out.len(), 1, "the top-64 of a step came back for {} rows", out.len());
+        out.pop()
     }
 
     /// `step_batch_verify` for a caller that needs each row's 64 largest logits (a draw with top_k <= 64, or an argmax): the rows come back as (logit, token) pairs, largest first, ties to the

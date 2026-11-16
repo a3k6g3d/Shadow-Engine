@@ -1563,8 +1563,16 @@ fn answer<'c>(
             };
             spec_t[0] += t_d.elapsed().as_secs_f64();
             if draft.is_empty() {
-                *last_logits = sess.step(next);
-                last_top = None;
+                match if top_mode { sess.step_top(next) } else { None } {
+                    Some(t) => {
+                        last_top = Some(t);
+                        last_logits.clear();
+                    }
+                    None => {
+                        *last_logits = sess.step(next);
+                        last_top = None;
+                    }
+                }
                 continue;
             }
             // check the drafts in one pass: outs[i] is what follows batch[..=i], bit for bit what step would give
