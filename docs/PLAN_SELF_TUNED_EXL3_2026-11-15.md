@@ -54,3 +54,7 @@ So the target is **about 2.5-2.6 bpw for the experts** (35-37 GiB resident): gho
 * A model is never loaded outside `tools/run_capped.ps1`; the conversion is Python, so it gets the same RAM floor by running under the same wrapper's rule (kill below 3.5 GiB free).
 * Disk: the work directory of a conversion can hold tens of GB of Hessians and partial layers: put it on F:.
 * The exllamav3 build must be finished and smoke-tested (import the extension, load a small EXL3 model on one card) before Phase 2 is planned further.
+
+## Update (STATUS 158, same day): the headroom is small
+
+Perplexity on the STATUS 145 text: Lygodactylus 2.05 bpw 8.2838, Lygodactylus 3.05 bpw 7.9437 (-4.1%), ghost-actual 2.50 bpw 8.3708 (a different fine-tune). The whole 2.05 to 3.05 bpw quantization loss is 0.042 nats, so a better allocation at 2.5-2.6 bpw can recover about half of it at most. Phase 2 (360 GB download, a conversion of unknown length) is not recommended on this evidence; Phase 1 stays an option. The text above is kept as written.
