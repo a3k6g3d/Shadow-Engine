@@ -1,0 +1,4 @@
+3 arms x 2 runs x 36 turns, 96 tokens per turn; results in J:\Shadow\bench\lyg2-pair-order-varied36-2026-11-15\bench\results.jsonl
+run 0 rev_split4: load 14 s, decode_warm median 40.43 tok/s over 35 turns, min available RAM 32.8 GiB, peak GPU 11287 MiB
+run 0 rev_split8: load 16 s, decode_warm median 18.85 tok/s over 35 turns, min available RAM 30.6 GiB, peak GPU 11291 MiB
+run 0 rev_split12: load 18 s, decode_warm median 17.68 tok/s over 35 turns, min available RAM 28.1 GiB, peak GPU 11285 MiB

@@ -255,8 +255,9 @@ impl<'c> PinnedRegion<'c> {
                 if unsafe { win::VirtualAlloc(at, n, win::MEM_COMMIT, win::PAGE_READWRITE) }.is_null() {
                     return Err(format!("VirtualAlloc: committing {n} bytes at offset {off} of {len} failed")); // r frees it
                 }
-                // SAFETY: the committed range just made; CU_MEMHOSTREGISTER_DEVICEMAP = 0x02.
-                let code = unsafe { (ctx.api.cuMemHostRegister)(at, n, 0x02) };
+                // SAFETY: the committed range just made; CU_MEMHOSTREGISTER_DEVICEMAP = 0x02 (`SHADOW_PIN_PORTABLE=1` adds PORTABLE = 0x01: an experiment, STATUS 155).
+                let flags: u32 = std::env::var("SHADOW_PIN_FLAGS").ok().and_then(|v| v.parse().ok()).unwrap_or(if std::env::var("SHADOW_PIN_PORTABLE").is_ok_and(|v| v == "1") { 0x03 } else { 0x02 });
+                let code = unsafe { (ctx.api.cuMemHostRegister)(at, n, flags) };
                 if code != 0 {
                     // SAFETY: committed above, not registered: Drop would only release the reservation, which holds this commit too.
                     return Err(format!("cuMemHostRegister of {n} bytes at offset {off} of {len} failed ({code})"));
@@ -264,7 +265,7 @@ impl<'c> PinnedRegion<'c> {
                 r.chunks.push((off, n));
                 PINNED.fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
                 let mut dptr = 0u64;
-                let dcode = unsafe { (ctx.api.cuMemHostGetDevicePointer)(&mut dptr, at, 0) };
+                let dcode = if flags & 2 == 0 { 0 } else { unsafe { (ctx.api.cuMemHostGetDevicePointer)(&mut dptr, at, 0) } }; // no device mapping: an experiment only (STATUS 155)
                 if dcode != 0 {
                     return Err(format!("cuMemHostGetDevicePointer failed ({dcode}) for {n} bytes at offset {off} of {len} on {}", ctx.name));
                 }

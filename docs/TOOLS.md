@@ -28,6 +28,8 @@ CUDA index, `safetensors`, `numpy`, `matplotlib`).
 | `tools/bringup_two_gpus.ps1` | the one-command bring-up of a second card: `shadow gpus`, the pair tests and the int8 kernels on card 1, exact and fast conversations on the pair, a decode bench (single / pair / pair without the drafter), power and temperature logged; `-Peer 0` is a dry run on one card (STATUS 113) |
 | `tools/ncu_decode.ps1` | Nsight Compute on one verify pass's biggest decode kernels (SpeedOfLight, stall, occupancy, memory sections), elevated PowerShell; uses `SHADOW_NCU_RANGE` + `--profile-from-start off` because `--launch-skip` hangs (STATUS 108) |
 | `tools/nsys_decode_rounds.py X.sqlite` | decode only from an Nsight Systems export (`--cuda-graph-trace=node`): per DFlash round the kernel, copy and idle time, the kernels by name, the gaps by size and by the CUDA call running in them |
+| `tools/nsys_decode_capture.ps1 -Tag NAME [-Flags "..."]` + `tools/nsys_decode_client.py` | nsys capture of a served conversation (`--cuda-graph-trace=node`, the first six `varied36` prompts) of any flag set, the shadow.exe child capped like `run_capped`; export with `nsys export --type sqlite` (STATUS 155) |
+| `tools/nsys_pair_rounds.py X.sqlite` | per DFlash round on one or two cards: busy time per device, both busy at once, idle, copies by kind and device, kernels by name per device, and the segment timeline of a typical round (STATUS 155) |
 | `tools/spec_probe.py` | what speculation could buy from routing logs: expert-union size per verify pass, accepted tokens per pass |
 | `tools/serve_check.py [URL]` | live checks of a running `shadow serve`: every route, streamed vs whole answers identical, prefix reuse, refusals, concurrent requests |
 
