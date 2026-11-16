@@ -368,6 +368,7 @@ static __device__ __forceinline__ u32 exl3_f16_bits(float f) {
 template <int KB, bool G, bool PRE = false>
 static __device__ __forceinline__ void exl3_mma(const u8* w, const float* x, u32 xs, float* y, u32 ys, u32 rows, u32 cols, u32 m, const u32* gi) {
     if (G) m = gi[0];
+    if (G && m == 0) return;  // an empty group of the device planner (its tables are sized for the most groups there could be, STATUS 163): its weight address is 0
     __shared__ __align__(16) u8 smem[64 * 132 * 4];
     u16* sa = (u16*) smem;      // [64][136] f16 (the input's rotated 128-block)
     float* sy = (float*) smem;  // [64][132] f32 (the accumulated outputs; the same storage, after the last block)

@@ -1,0 +1,17 @@
+﻿== arm1_1 (SHADOW_EXL3_DEVPLAN=1)
+prompt 9551 tok at 1125.4 tok/s; answer md5 7a0c68df08 'This text details the iterative optimization of the "Shadow"'
+prompt 9027 tok at 1209.0 tok/s; answer md5 9b2832b580 'This text details the development and performance optimizati'
+prompt 9270 tok at 1181.7 tok/s; answer md5 5b82e59261 'This text documents the development and optimization of a GP'
+== arm2_0 (SHADOW_EXL3_DEVPLAN=0)
+prompt 9551 tok at 1013.5 tok/s; answer md5 7a0c68df08 'This text details the iterative optimization of the "Shadow"'
+prompt 9027 tok at 1093.4 tok/s; answer md5 9b2832b580 'This text details the development and performance optimizati'
+prompt 9270 tok at 1076.5 tok/s; answer md5 d6c4cfc3a8 'This text documents the development and benchmarking of a cu'
+== arm3_0 (SHADOW_EXL3_DEVPLAN=0)
+prompt 9551 tok at 1019.5 tok/s; answer md5 7a0c68df08 'This text details the iterative optimization of the "Shadow"'
+prompt 9027 tok at 1087.0 tok/s; answer md5 9b2832b580 'This text details the development and performance optimizati'
+prompt 9270 tok at 1069.3 tok/s; answer md5 d6c4cfc3a8 'This text documents the development and benchmarking of a cu'
+== arm4_1 (SHADOW_EXL3_DEVPLAN=1)
+prompt 9551 tok at 1128.7 tok/s; answer md5 7a0c68df08 'This text details the iterative optimization of the "Shadow"'
+prompt 9027 tok at 1211.9 tok/s; answer md5 9b2832b580 'This text details the development and performance optimizati'
+prompt 9270 tok at 1194.1 tok/s; answer md5 5b82e59261 'This text documents the development and optimization of a GP'
+DONE

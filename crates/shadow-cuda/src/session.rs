@@ -4350,7 +4350,9 @@ impl<'c, 'm> GpuSession<'c, 'm> {
             }
         }
         // never past the buffer: a pass whose tables do not fit takes the fixed-width device planner instead of failing
-        let buckets = tops.is_none() && self.buckets_on(infos) && bucket_layout(m, k, ne).total <= self.bb.gtab.bytes;
+        // an EXL3 layer planned on the device (STATUS 163) uses the fixed-width planner with groups of 64 (what `mma_grouped_exl3_pre_*` reads), not the width classes
+        let exl3_dp = tops.is_none() && self.exl3_mma_experts(infos);
+        let buckets = tops.is_none() && !exl3_dp && self.buckets_on(infos) && bucket_layout(m, k, ne).total <= self.bb.gtab.bytes;
         let mut blay: Option<(BucketLayout, bool)> = None;
         let (plan, n_set) = if let Some(tops) = tops {
             let mut seen = vec![false; ne];
@@ -4391,7 +4393,7 @@ impl<'c, 'm> GpuSession<'c, 'm> {
             (plan, 0)
         } else {
             // routed and planned on the device: nothing the host decided depends on the tokens' routing
-            (self.dev_plan(l, m, sizes), 0)
+            (self.dev_plan(l, m, sizes, if exl3_dp { 64 } else { mma_group() }), 0)
         };
         let t_plan = t_start.elapsed();
         match &blay {
@@ -6479,16 +6481,15 @@ impl<'c, 'm> GpuSession<'c, 'm> {
                       self.pipe_active, self.accept_moe, self.verify_resident, self.replay.on.get(), self.route_log.is_some(), self.mma_experts_ok(infos));
         }
         self.devplan && self.sp.is_some() && m > MAX_VERIFY && m <= BIG_BATCH_MAX && self.router_bias == 0.0 && self.cpu.is_none() && !self.pipe_active
-            && !self.replay.on.get() && self.route_log.is_none() && self.mma_experts_ok(infos)
+            && !self.replay.on.get() && self.route_log.is_none() && (self.mma_experts_ok(infos) || (self.exl3_mma_experts(infos) && exl3_devplan_on()))
             && self.m.cfg.n_expert <= 512 && self.m.cfg.n_expert_used <= 16
     }
 
     /// Routes (`route_topk_rows`) and plans (`plan_scan`, `plan_fill`) layer l's m tokens on the device, into `bb.gtab` in the layout `routed_grouped` reads, with room
     /// for the most groups a phase can have; the host sends only the per-expert tables (where each expert is, and whether it is resident), which do not depend on the routing.
-    fn dev_plan(&mut self, l: usize, m: usize, sizes: &[usize]) -> GroupedPlan {
+    fn dev_plan(&mut self, l: usize, m: usize, sizes: &[usize], chunk_n: usize) -> GroupedPlan {
         let c = &self.m.cfg;
         let (k, ne) = (c.n_expert_used, c.n_expert);
-        let chunk_n = mma_group();
         let g = ne + (m * k).div_ceil(chunk_n);
         let rec = 4 * (1 + 2 * chunk_n);
         let (a0, a1) = (0usize, 3 * g * 8);
@@ -7868,6 +7869,12 @@ fn exl3_groups_on() -> bool {
 }
 
 /// The tensor-core EXL3 prompt kernel for dense projections (`SHADOW_EXL3_MMA=0`: the m <= 8 chunked ones; STATUS 140).
+/// `SHADOW_EXL3_DEVPLAN=0`: an EXL3 prompt's routing and grouping are done on the host again (a 4.7 ms stall a layer and sub-chunk, STATUS 163).
+fn exl3_devplan_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("SHADOW_EXL3_DEVPLAN").map_or(true, |v| v != "0"))
+}
+
 fn exl3_mma_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var("SHADOW_EXL3_MMA").map_or(true, |v| v != "0"))

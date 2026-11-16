@@ -122,6 +122,7 @@ ode_modules\.bin\opencode.cmd`, else the PATH); `SHADOW_OPENCODE_DIR` is the fol
 | `SHADOW_TOPK_LOGITS=0` | a speculative verify pass and a single-token step download each row's whole logits (1 MiB a row) instead of the 64 largest picked on the device; the draw or argmax is the same (identical replies on 20 requests), +3.8% decode on one card (STATUS 159); `SHADOW_TOPK_STEP=0` turns off only the single-token step's (a tie, STATUS 160) |
 | `SHADOW_SNAP_KERNEL=0` | a speculative round's rollback snapshot is taken with a `cuMemcpyDtoD` per state (~116 calls) instead of one `copy_many` launch (+0.56%, STATUS 161) |
 | `SHADOW_PLE_ASYNC=0` | a verify pass reads its n-gram (PLE) rows at the PLE layer instead of on a background thread from the start of the pass (+0.76%, STATUS 162) |
+| `SHADOW_EXL3_DEVPLAN=0` | an EXL3 long prompt's expert routing and grouping are done on the host again instead of the device planner (a ~4.7 ms stall a layer and chunk; the planner is +10.8% prompt speed, STATUS 163); `SHADOW_DEVPLAN_CHECK=1` compares the device's routing with the host's, a layer at a time |
 | `SHADOW_EXL3_V1=1` | EXL3 checkpoints: the first (one slice a block) trellis kernels instead of the k-sliced ones (STATUS 139) |
 | `SHADOW_LTIME=1`, `SHADOW_KTIME=1`, `SHADOW_PROFILE=1` | time a batched pass by segment / each kernel / the single-token step (these synchronize: they slow the run) |
 | `SHADOW_DF_TIME=1` | time the phases of the DFlash draft round |
