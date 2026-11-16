@@ -319,6 +319,14 @@ canvas.spark { width: 100%; height: 64px; display: block; }
     #side-open { display: none; }
     body.side-closed.view-chat #side-open { display: inline-block; }
 
+    /* the OpenCode tab: a thin bar over a frame holding OpenCode's own page */
+    #oc-panel { padding: 0; }
+    #oc-bar { display: flex; align-items: center; gap: 0.75rem; padding: 0.4rem 1rem; border-bottom: 1px solid var(--border, #2a2a35); font-size: 0.85rem; color: var(--text-dim); }
+    #oc-bar .oc-note { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    #oc-frame { flex: 1; width: 100%; border: 0; min-height: 0; background: #fff; }
+    #oc-msg { padding: 1.5rem; max-width: 46rem; line-height: 1.5; color: var(--text-dim); }
+    #oc-msg code { user-select: all; }
+
     /* Views - Strict Tab Display */
     .view-panel {
       flex: 1;
@@ -1032,6 +1040,9 @@ canvas.spark { width: 100%; height: 64px; display: block; }
         <button class="nav-tab" id="tab-dash" onclick="switchView('dash')">
           <span>🏠</span> Dashboard
         </button>
+        <button class="nav-tab" id="tab-opencode" onclick="switchView('opencode')" title="OpenCode: a coding agent that uses this Shadow server">
+          <span>⌨</span> OpenCode
+        </button>
         <button class="nav-tab" id="tab-settings" onclick="switchView('settings')">
           <span>⚙</span> Settings
         </button>
@@ -1153,6 +1164,17 @@ canvas.spark { width: 100%; height: 64px; display: block; }
           <div id="d-recent" class="dash-empty">Nothing answered yet.</div>
         </div>
       </div>
+    </div>
+
+    <!-- VIEW: OPENCODE -->
+    <div class="view-panel" id="oc-panel">
+      <div id="oc-bar">
+        <span class="oc-note" id="oc-note">OpenCode</span>
+        <button class="pill action" id="oc-toggle" onclick="ocToggle()">Start</button>
+        <button class="pill action" onclick="window.open(document.getElementById('oc-frame').src || '', '_blank')" title="Open OpenCode in its own browser tab">Pop out</button>
+      </div>
+      <div id="oc-msg" style="display:none"></div>
+      <iframe id="oc-frame" title="OpenCode"></iframe>
     </div>
 
     <!-- VIEW: SETTINGS -->
@@ -1847,8 +1869,8 @@ canvas.spark { width: 100%; height: 64px; display: block; }
     // View switching: Chat, Dashboard and Settings are separate tabs
     function switchView(view) {
       currentView = view;
-      const panels = { chat: chatPanel, dash: document.getElementById('dash-panel'), settings: document.getElementById('settings-panel') };
-      const tabs = { chat: tabChat, dash: document.getElementById('tab-dash'), settings: document.getElementById('tab-settings') };
+      const panels = { chat: chatPanel, dash: document.getElementById('dash-panel'), opencode: document.getElementById('oc-panel'), settings: document.getElementById('settings-panel') };
+      const tabs = { chat: tabChat, dash: document.getElementById('tab-dash'), opencode: document.getElementById('tab-opencode'), settings: document.getElementById('tab-settings') };
       for (const k of Object.keys(panels)) {
         panels[k].classList.toggle('active', k === view);
         tabs[k].classList.toggle('active', k === view);
@@ -1857,6 +1879,61 @@ canvas.spark { width: 100%; height: 64px; display: block; }
       window.location.hash = view === 'chat' ? '' : '#' + view;
       if (view === 'dash') dashRefresh();
       if (view === 'settings') settingsOpen();
+      if (view === 'opencode') ocOpen();
+    }
+
+    // OpenCode tab: /v1/opencode says whether it is installed and running, /v1/opencode/start and /stop run it; the frame shows its page (served on 127.0.0.1, any port)
+    let ocPort = null;
+    function ocShow(msg) {
+      const m = document.getElementById('oc-msg');
+      m.style.display = msg ? 'block' : 'none';
+      m.innerHTML = msg || '';
+      document.getElementById('oc-frame').style.display = msg ? 'none' : 'block';
+    }
+    function ocRender(st, busy) {
+      const note = document.getElementById('oc-note'), btn = document.getElementById('oc-toggle'), fr = document.getElementById('oc-frame');
+      btn.disabled = !!busy;
+      if (!st.installed) {
+        note.textContent = 'OpenCode is not installed';
+        btn.style.display = 'none';
+        const hint = String(st.install_hint || '').replace(/[<>&]/g, c => ({ '<': '&lt;', '>': '&gt;', '&': '&amp;' }[c]));
+        ocShow('OpenCode is a coding agent with its own web page; here it uses this Shadow server as its model. Shadow does not ship it. To install it: <p><code>' + hint + '</code></p>');
+        return;
+      }
+      btn.style.display = '';
+      if (st.running) {
+        note.textContent = 'OpenCode runs on port ' + st.port + ', model: this Shadow server, folder: ' + st.workdir;
+        btn.textContent = 'Stop';
+        if (ocPort !== st.port) { ocPort = st.port; fr.src = 'http://' + location.hostname + ':' + st.port + '/'; }
+        ocShow('');
+      } else {
+        note.textContent = busy ? 'Starting OpenCode…' : 'OpenCode is stopped';
+        btn.textContent = 'Start';
+        ocPort = null; fr.removeAttribute('src');
+        ocShow(busy ? 'Starting OpenCode (a few seconds)…' : 'OpenCode is stopped. <b>Start</b> runs it on this PC, listening on 127.0.0.1 only.');
+      }
+    }
+    async function ocCall(path, method) {
+      const r = await fetch(path, { method: method || 'GET' });
+      const j = await r.json();
+      if (!r.ok) throw new Error((j.error && j.error.message) || r.statusText);
+      return j;
+    }
+    async function ocOpen() {
+      try {
+        const st = await ocCall('/v1/opencode');
+        ocRender(st);
+        if (st.installed && !st.running) ocStart();   // a click on the tab is the wish to use it
+      } catch (e) { ocShow('Could not ask Shadow about OpenCode: ' + e.message); }
+    }
+    async function ocStart() {
+      ocRender({ installed: true, running: false }, true);
+      try { ocRender(await ocCall('/v1/opencode/start', 'POST')); }
+      catch (e) { ocRender({ installed: true, running: false }); ocShow('OpenCode did not start: ' + String(e.message).replace(/</g, '&lt;')); }
+    }
+    async function ocToggle() {
+      const st = await ocCall('/v1/opencode').catch(() => ({}));
+      if (st.running) { ocRender(await ocCall('/v1/opencode/stop', 'POST')); } else { ocStart(); }
     }
 
     document.getElementById('brand-logo').addEventListener('click', () => switchView('chat'));
@@ -3735,7 +3812,7 @@ html('d-ramfree', gib(ram.system_available_bytes || 0) + '<small>GiB free</small
 
     document.body.classList.toggle('view-chat', currentView === 'chat');
     // (the old #monitor link: the Process Monitor became part of the Dashboard)
-    if (['#dash', '#settings', '#monitor'].includes(window.location.hash)) switchView(window.location.hash === '#settings' ? 'settings' : 'dash');
+    if (['#dash', '#settings', '#monitor', '#opencode'].includes(window.location.hash)) switchView(window.location.hash === '#settings' ? 'settings' : window.location.hash === '#opencode' ? 'opencode' : 'dash');
 
 pollTelemetry();
     setInterval(pollTelemetry, 1000);

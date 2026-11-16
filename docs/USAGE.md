@@ -117,6 +117,8 @@ Defaults are right for normal use; these are for measurement and diagnosis.
 | `SHADOW_EXL3_GM=0` | EXL3 checkpoints: the 8-token expert group kernel always with 8 accumulators, not the 2- / 4-token ones (STATUS 144) |
 | `SHADOW_EXL3_SK=0` | EXL3 checkpoints: no split-K launches for the dense projections with few output blocks (STATUS 144) |
 | `--power-limit "5070=200,5060=150"` (or `SHADOW_POWER_LIMITS`) | GPU power limits set when `shadow serve` starts: cards matched by name (a part of it, no spaces if the launcher's `extraFlags` carries it; `all=W` for every card), clamped to the driver's range, an elevated `nvidia-smi` is started silently when UAC is set to elevate without prompting; lasts until reboot, set again at the next start (STATUS 150) |
+| `SHADOW_OPENCODE`, `SHADOW_OPENCODE_DIR` | The OpenCode tab (STATUS 153): `SHADOW_OPENCODE` names the `opencode` launcher (else `%LOCALAPPDATA%\Shadow\opencode
+ode_modules\.bin\opencode.cmd`, else the PATH); `SHADOW_OPENCODE_DIR` is the folder it starts in (else the folder Shadow runs in). Routes: `GET /v1/opencode`, `POST /v1/opencode/start`, `POST /v1/opencode/stop` |
 | `SHADOW_EXL3_V1=1` | EXL3 checkpoints: the first (one slice a block) trellis kernels instead of the k-sliced ones (STATUS 139) |
 | `SHADOW_LTIME=1`, `SHADOW_KTIME=1`, `SHADOW_PROFILE=1` | time a batched pass by segment / each kernel / the single-token step (these synchronize: they slow the run) |
 | `SHADOW_DF_TIME=1` | time the phases of the DFlash draft round |

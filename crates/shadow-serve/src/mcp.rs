@@ -108,7 +108,7 @@ pub fn parse_config(text: &str) -> Result<Vec<(String, Value)>, String> {
 /// A server's processes (npx starts node starts a browser) must not outlive Shadow: they go into a Windows job object that kills them when
 /// Shadow's last handle to it closes, which is when Shadow ends, however it ends.
 #[cfg(windows)]
-fn tie_to_shadow(child: &Child) {
+pub(crate) fn tie_to_shadow(child: &Child) {
     use std::os::windows::io::AsRawHandle;
     #[repr(C)]
     struct Limits {
@@ -146,7 +146,7 @@ fn tie_to_shadow(child: &Child) {
 }
 
 #[cfg(not(windows))]
-fn tie_to_shadow(_child: &Child) {}
+pub(crate) fn tie_to_shadow(_child: &Child) {}
 
 fn spawn(cfg: &Value) -> Result<Child, String> {
     let command = cfg
