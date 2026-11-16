@@ -1,0 +1,111 @@
+shadow serve: 49.3 GiB of RAM available, floor 3.5: RAM tier 37 GiB (at most 45)
+shadow serve: fastest-mode defaults: --tail-skip 3 --tensor-prompt --verify-rank 2 --ram-tier-gib 37 --ram-floor-gib 3.5 --placement profiles/routing-varied300.shrc --spec 3 --dflash-min-p 0.5 (--exact for the exact path)
+RAM floor: 3.5 GiB (default 4): a pinned tier cannot be paged out, and this PC has frozen hard at 0.4 GiB free
+placement: profiles/routing-varied300.shrc, 34990 tokens of routing
+shadow serve: starting 2 MCP server(s) from mcp.json
+shadow serve: listening on http://127.0.0.1:8095
+shadow serve: MCP server browser: 10 tools
+shadow serve: MCP server time: 3 tools
+mmq: loaded J:\Shadow\native\mmq\shadow_mmq.dll (int8 tensor-core projections for the prompt path, mul_mat_vec_q)
+fused: loaded J:\Shadow\native\fused\shadow_fused.dll (Strata's int8 fused experts for the prompt path)
+dflash: loaded the drafter from J:/Shadow/models/dflash2-mix (~1.2 GB VRAM)
+shadow serve: ready in 40.8 s; expert cache: 2882 slots x 1.42 MiB = 3.99 GiB; 0 hits, 0 misses (0.0% hits); 0 slice uploads; RAM tier: 24576 experts, 34.16 GiB pinned (filled in 28.6 s), misses served 0 from RAM, 0 from the file; tail skip (rank >= 3): 0 routed experts skipped; host waits per step: router 0.0 ms, copies 0.0 ms, file 0.0 ms; kernel launches per step 0, 0.0 ms of host time in them
+shadow serve: speculation: 29 passes (2 drafted by lookup), 67 of 84 drafted tokens accepted, 96 tokens in 1.1 s                    (drafting 0.12 s, checking 0.96 s, rolling back 0.02 s)
+shadow serve: draft position right/tried: 26/29 22/25 19/21 0/0 0/0 0/0 0/0 0/0
+shadow serve: speculation: 10 passes (1 drafted by lookup), 15 of 25 drafted tokens accepted, 25 tokens in 0.4 s                    (drafting 0.05 s, checking 0.35 s, rolling back 0.01 s)
+shadow serve: draft position right/tried: 8/10 4/7 3/4 0/0 0/0 0/0 0/0 0/0
+shadow serve: speculation: 35 passes (2 drafted by lookup), 61 of 94 drafted tokens accepted, 96 tokens in 1.4 s                    (drafting 0.19 s, checking 1.16 s, rolling back 0.05 s)
+shadow serve: draft position right/tried: 28/35 21/27 12/20 0/0 0/0 0/0 0/0 0/0
+shadow serve: speculation: 26 passes (6 drafted by lookup), 65 of 78 drafted tokens accepted, 91 tokens in 1.0 s                    (drafting 0.10 s, checking 0.90 s, rolling back 0.02 s)
+shadow serve: draft position right/tried: 24/26 22/24 19/22 0/0 0/0 0/0 0/0 0/0
+shadow serve: speculation: 37 passes (1 drafted by lookup), 59 of 98 drafted tokens accepted, 96 tokens in 1.5 s                    (drafting 0.23 s, checking 1.23 s, rolling back 0.05 s)
+shadow serve: draft position right/tried: 31/37 18/30 10/16 0/0 0/0 0/0 0/0 0/0
+shadow serve: speculation: 34 passes (3 drafted by lookup), 55 of 84 drafted tokens accepted, 89 tokens in 1.4 s                    (drafting 0.21 s, checking 1.13 s, rolling back 0.05 s)
+shadow serve: draft position right/tried: 29/34 18/27 8/16 0/0 0/0 0/0 0/0 0/0
+shadow serve: speculation: 34 passes (1 drafted by lookup), 62 of 95 drafted tokens accepted, 96 tokens in 1.5 s                    (drafting 0.22 s, checking 1.19 s, rolling back 0.04 s)
+shadow serve: draft position right/tried: 27/34 21/27 14/20 0/0 0/0 0/0 0/0 0/0
+shadow serve: speculation: 4 passes (1 drafted by lookup), 6 of 12 drafted tokens accepted, 10 tokens in 0.2 s                    (drafting 0.02 s, checking 0.15 s, rolling back 0.01 s)
+shadow serve: draft position right/tried: 3/4 2/3 1/2 0/0 0/0 0/0 0/0 0/0
+shadow serve: speculation: 28 passes (3 drafted by lookup), 67 of 83 drafted tokens accepted, 96 tokens in 1.2 s                    (drafting 0.16 s, checking 1.00 s, rolling back 0.02 s)
+shadow serve: draft position right/tried: 26/28 23/26 18/23 0/0 0/0 0/0 0/0 0/0
+shadow serve: conversation snapshot of 1036 tokens (0.16 GiB) in 0.06 s; 1 kept
+shadow serve: speculation: 33 passes (3 drafted by lookup), 62 of 94 drafted tokens accepted, 96 tokens in 1.4 s                    (drafting 0.20 s, checking 1.14 s, rolling back 0.03 s)
+shadow serve: draft position right/tried: 27/33 19/25 16/19 0/0 0/0 0/0 0/0 0/0
+shadow serve: conversation snapshot of 1161 tokens (0.17 GiB) in 0.06 s; 1 kept
+shadow serve: speculation: 33 passes (0 drafted by lookup), 35 of 83 drafted tokens accepted, 68 tokens in 1.4 s                    (drafting 0.26 s, checking 1.11 s, rolling back 0.05 s)
+shadow serve: draft position right/tried: 20/33 10/20 5/10 0/0 0/0 0/0 0/0 0/0
+shadow serve: conversation snapshot of 1256 tokens (0.18 GiB) in 0.06 s; 1 kept
+shadow serve: speculation: 22 passes (4 drafted by lookup), 35 of 62 drafted tokens accepted, 57 tokens in 0.9 s                    (drafting 0.14 s, checking 0.78 s, rolling back 0.03 s)
+shadow serve: draft position right/tried: 17/22 10/17 8/10 0/0 0/0 0/0 0/0 0/0
+shadow serve: conversation snapshot of 1374 tokens (0.18 GiB) in 0.06 s; 1 kept
+shadow serve: speculation: 28 passes (2 drafted by lookup), 68 of 83 drafted tokens accepted, 96 tokens in 1.2 s                    (drafting 0.18 s, checking 1.00 s, rolling back 0.02 s)
+shadow serve: draft position right/tried: 25/28 23/25 20/23 0/0 0/0 0/0 0/0 0/0
+shadow serve: conversation snapshot of 1501 tokens (0.19 GiB) in 0.06 s; 1 kept
+shadow serve: speculation: 15 passes (1 drafted by lookup), 13 of 30 drafted tokens accepted, 28 tokens in 0.7 s                    (drafting 0.11 s, checking 0.52 s, rolling back 0.02 s)
+shadow serve: draft position right/tried: 10/15 2/8 1/1 0/0 0/0 0/0 0/0 0/0
+shadow serve: conversation snapshot of 1556 tokens (0.19 GiB) in 0.06 s; 1 kept
+shadow serve: speculation: 26 passes (2 drafted by lookup), 46 of 68 drafted tokens accepted, 72 tokens in 1.2 s                    (drafting 0.19 s, checking 0.93 s, rolling back 0.03 s)
+shadow serve: draft position right/tried: 23/26 16/22 7/13 0/0 0/0 0/0 0/0 0/0
+shadow serve: conversation snapshot of 1659 tokens (0.20 GiB) in 0.06 s; 1 kept
+shadow serve: speculation: 5 passes (1 drafted by lookup), 12 of 15 drafted tokens accepted, 17 tokens in 0.2 s                    (drafting 0.03 s, checking 0.19 s, rolling back 0.00 s)
+shadow serve: draft position right/tried: 4/5 4/4 4/4 0/0 0/0 0/0 0/0 0/0
+shadow serve: conversation snapshot of 1697 tokens (0.20 GiB) in 0.07 s; 1 kept
+shadow serve: speculation: 1 passes (0 drafted by lookup), 2 of 3 drafted tokens accepted, 3 tokens in 0.1 s                    (drafting 0.01 s, checking 0.04 s, rolling back 0.00 s)
+shadow serve: draft position right/tried: 1/1 1/1 0/1 0/0 0/0 0/0 0/0 0/0
+shadow serve: conversation snapshot of 1725 tokens (0.20 GiB) in 0.06 s; 1 kept
+shadow serve: speculation: 12 passes (1 drafted by lookup), 22 of 30 drafted tokens accepted, 34 tokens in 0.5 s                    (drafting 0.08 s, checking 0.43 s, rolling back 0.01 s)
+shadow serve: draft position right/tried: 11/12 8/10 3/4 0/0 0/0 0/0 0/0 0/0
+shadow serve: conversation snapshot of 1797 tokens (0.21 GiB) in 0.06 s; 1 kept
+shadow serve: speculation: 23 passes (6 drafted by lookup), 44 of 69 drafted tokens accepted, 67 tokens in 1.0 s                    (drafting 0.14 s, checking 0.84 s, rolling back 0.02 s)
+shadow serve: draft position right/tried: 18/23 14/18 12/14 0/0 0/0 0/0 0/0 0/0
+shadow serve: conversation snapshot of 1910 tokens (0.21 GiB) in 0.07 s; 1 kept
+shadow serve: speculation: 23 passes (4 drafted by lookup), 49 of 67 drafted tokens accepted, 72 tokens in 1.0 s                    (drafting 0.15 s, checking 0.84 s, rolling back 0.01 s)
+shadow serve: draft position right/tried: 18/23 16/18 15/16 0/0 0/0 0/0 0/0 0/0
+shadow serve: conversation snapshot of 2018 tokens (0.22 GiB) in 0.07 s; 1 kept
+shadow serve: speculation: 3 passes (1 drafted by lookup), 5 of 9 drafted tokens accepted, 8 tokens in 0.1 s                    (drafting 0.02 s, checking 0.12 s, rolling back 0.00 s)
+shadow serve: draft position right/tried: 2/3 2/2 1/2 0/0 0/0 0/0 0/0 0/0
+shadow serve: conversation snapshot of 2060 tokens (0.22 GiB) in 0.07 s; 1 kept
+shadow serve: speculation: 12 passes (4 drafted by lookup), 16 of 35 drafted tokens accepted, 28 tokens in 0.5 s                    (drafting 0.08 s, checking 0.43 s, rolling back 0.02 s)
+shadow serve: draft position right/tried: 7/12 6/7 3/6 0/0 0/0 0/0 0/0 0/0
+shadow serve: conversation snapshot of 2126 tokens (0.22 GiB) in 0.07 s; 1 kept
+shadow serve: speculation: 17 passes (4 drafted by lookup), 35 of 50 drafted tokens accepted, 52 tokens in 0.7 s                    (drafting 0.12 s, checking 0.59 s, rolling back 0.02 s)
+shadow serve: draft position right/tried: 14/17 13/14 8/13 0/0 0/0 0/0 0/0 0/0
+shadow serve: conversation snapshot of 2223 tokens (0.23 GiB) in 0.08 s; 1 kept
+shadow serve: speculation: 3 passes (1 drafted by lookup), 7 of 9 drafted tokens accepted, 10 tokens in 0.1 s                    (drafting 0.01 s, checking 0.11 s, rolling back 0.00 s)
+shadow serve: draft position right/tried: 3/3 2/3 2/2 0/0 0/0 0/0 0/0 0/0
+shadow serve: conversation snapshot of 2278 tokens (0.23 GiB) in 0.07 s; 1 kept
+shadow serve: speculation: 13 passes (4 drafted by lookup), 32 of 39 drafted tokens accepted, 45 tokens in 0.6 s                    (drafting 0.07 s, checking 0.47 s, rolling back 0.01 s)
+shadow serve: draft position right/tried: 11/13 11/11 10/11 0/0 0/0 0/0 0/0 0/0
+shadow serve: conversation snapshot of 2354 tokens (0.23 GiB) in 0.08 s; 1 kept
+shadow serve: speculation: 10 passes (0 drafted by lookup), 21 of 27 drafted tokens accepted, 31 tokens in 0.5 s                    (drafting 0.09 s, checking 0.36 s, rolling back 0.01 s)
+shadow serve: draft position right/tried: 10/10 7/10 4/6 0/0 0/0 0/0 0/0 0/0
+shadow serve: conversation snapshot of 2419 tokens (0.24 GiB) in 0.08 s; 1 kept
+shadow serve: speculation: 3 passes (2 drafted by lookup), 4 of 9 drafted tokens accepted, 7 tokens in 0.1 s                    (drafting 0.01 s, checking 0.11 s, rolling back 0.00 s)
+shadow serve: draft position right/tried: 2/3 1/2 1/1 0/0 0/0 0/0 0/0 0/0
+shadow serve: conversation snapshot of 2455 tokens (0.24 GiB) in 0.08 s; 1 kept
+shadow serve: speculation: 14 passes (4 drafted by lookup), 34 of 41 drafted tokens accepted, 48 tokens in 0.6 s                    (drafting 0.08 s, checking 0.50 s, rolling back 0.01 s)
+shadow serve: draft position right/tried: 13/14 11/13 10/11 0/0 0/0 0/0 0/0 0/0
+shadow serve: conversation snapshot of 2525 tokens (0.24 GiB) in 0.08 s; 1 kept
+shadow serve: speculation: 3 passes (0 drafted by lookup), 6 of 8 drafted tokens accepted, 9 tokens in 0.1 s                    (drafting 0.03 s, checking 0.11 s, rolling back 0.01 s)
+shadow serve: draft position right/tried: 3/3 2/3 1/2 0/0 0/0 0/0 0/0 0/0
+shadow serve: conversation snapshot of 2558 tokens (0.25 GiB) in 0.08 s; 1 kept
+shadow serve: speculation: 4 passes (1 drafted by lookup), 3 of 11 drafted tokens accepted, 7 tokens in 0.2 s                    (drafting 0.03 s, checking 0.15 s, rolling back 0.01 s)
+shadow serve: draft position right/tried: 3/4 0/3 0/0 0/0 0/0 0/0 0/0 0/0
+shadow serve: conversation snapshot of 2600 tokens (0.25 GiB) in 0.09 s; 1 kept
+shadow serve: speculation: 2 passes (1 drafted by lookup), 5 of 6 drafted tokens accepted, 7 tokens in 0.1 s                    (drafting 0.01 s, checking 0.08 s, rolling back 0.00 s)
+shadow serve: draft position right/tried: 2/2 2/2 1/2 0/0 0/0 0/0 0/0 0/0
+shadow serve: conversation snapshot of 2633 tokens (0.25 GiB) in 0.08 s; 1 kept
+shadow serve: speculation: 11 passes (0 drafted by lookup), 14 of 29 drafted tokens accepted, 25 tokens in 0.5 s                    (drafting 0.10 s, checking 0.39 s, rolling back 0.02 s)
+shadow serve: draft position right/tried: 8/11 4/7 2/4 0/0 0/0 0/0 0/0 0/0
+shadow serve: conversation snapshot of 2681 tokens (0.25 GiB) in 0.08 s; 1 kept
+shadow serve: speculation: 2 passes (1 drafted by lookup), 2 of 5 drafted tokens accepted, 4 tokens in 0.1 s                    (drafting 0.01 s, checking 0.07 s, rolling back 0.00 s)
+shadow serve: draft position right/tried: 2/2 0/2 0/0 0/0 0/0 0/0 0/0 0/0
+shadow serve: conversation snapshot of 2716 tokens (0.25 GiB) in 0.10 s; 1 kept
+shadow serve: speculation: 11 passes (6 drafted by lookup), 19 of 31 drafted tokens accepted, 30 tokens in 0.5 s                    (drafting 0.05 s, checking 0.40 s, rolling back 0.01 s)
+shadow serve: draft position right/tried: 8/11 7/8 4/6 0/0 0/0 0/0 0/0 0/0
+shadow serve: conversation snapshot of 2840 tokens (0.26 GiB) in 0.08 s; 1 kept
+shadow serve: speculation: 31 passes (2 drafted by lookup), 64 of 88 drafted tokens accepted, 96 tokens in 1.4 s                    (drafting 0.25 s, checking 1.10 s, rolling back 0.03 s)
+shadow serve: draft position right/tried: 27/31 21/25 16/20 0/0 0/0 0/0 0/0 0/0
+shadow serve: conversation snapshot of 2959 tokens (0.27 GiB) in 0.09 s; 1 kept
+shadow serve: speculation: 5 passes (0 drafted by lookup), 10 of 14 drafted tokens accepted, 15 tokens in 0.2 s                    (drafting 0.04 s, checking 0.18 s, rolling back 0.00 s)
+shadow serve: draft position right/tried: 4/5 3/4 3/3 0/0 0/0 0/0 0/0 0/0

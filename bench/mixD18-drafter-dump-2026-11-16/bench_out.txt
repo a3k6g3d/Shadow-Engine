@@ -1,0 +1,21 @@
+1 arms x 2 runs x 36 turns, 96 tokens per turn; results in J:\Shadow\bench\mixD18-drafter-dump-2026-11-16\bench\results.jsonl
+run 0 dump: load 43 s, decode_warm median 62.65 tok/s over 35 turns, min available RAM 11.9 GiB, peak GPU 11302 MiB
+run 1 dump: load 43 s, decode_warm median 63.52 tok/s over 35 turns, min available RAM 11.9 GiB, peak GPU 11302 MiB
+# shadow-bench: J:\Shadow\bench\mixD18-drafter-dump-2026-11-16\bench
+
+2 records, 1 arms, decode_warm (turn 0 dropped), tok/s
+
+| arm | runs | median | p90 (slow end) | worst | best | floor median | floor p90 | floor worst | lowest RAM GiB |
+|---|---|---|---|---|---|---|---|---|---|
+| dump | 2 | 63.09 | 62.65 | 62.65 | 63.52 | 0.7% | 2.2% | 5.4% | 11.9 |
+
+Answers that differ from the first one seen at the same turn: 0 (greedy: expected 0).
+# shadow-bench: J:\Shadow\bench\mixD18-drafter-dump-2026-11-16\bench
+
+2 records, 1 arms, decode_warm (turn 0 dropped), tok/s
+
+| arm | runs | median | p90 (slow end) | worst | best | floor median | floor p90 | floor worst | lowest RAM GiB |
+|---|---|---|---|---|---|---|---|---|---|
+| dump | 2 | 63.09 | 62.65 | 62.65 | 63.52 | 0.7% | 2.2% | 5.4% | 11.9 |
+
+Answers that differ from the first one seen at the same turn: 0 (greedy: expected 0).
