@@ -2594,9 +2594,11 @@ impl<'c, 'm> GpuSession<'c, 'm> {
     }
 
     pub fn reset(&mut self) {
+        let card = self.ctx.name.clone();
         for (s, conv) in self.delta.iter_mut().flatten() {
-            s.zero().unwrap();
-            conv.zero().unwrap();
+            let (sb, cb) = (s.bytes, conv.bytes);
+            s.zero().unwrap_or_else(|e| panic!("reset: zeroing a DeltaNet state of {sb} bytes on {card}: {e}"));
+            conv.zero().unwrap_or_else(|e| panic!("reset: zeroing a conv state of {cb} bytes on {card}: {e}"));
         }
         for a in self.attn.iter_mut().flatten() {
             a.k.zero().unwrap();

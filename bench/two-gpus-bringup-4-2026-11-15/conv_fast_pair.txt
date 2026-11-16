@@ -1,0 +1,10 @@
+﻿0 A 418 0 40 'The harbor town of Velmar, situated at the mouth of a slow b'
+1 A 26 458 40 '```python\nclass Point:\n    def __init__(self, x=0, y=0):\n   '
+2 A 66 524 22 "Extract the product category, color, and size from the user'"
+3 A 24 612 40 'Here are some efficient tips for better communication:\n\n*   '
+4 A 247 460 6 '```python\nclass Rectangle:'
+5 B 370 0 36 'At the mountain monastery of Karth, monks track the year by '
+6 B 29 406 40 'Physical education in schools is not merely a supplementary '
+7 A 105 636 40 'They are **similar**.\n\nWhile they are distinct species, hors'
+8 B 502 0 37 'Here are the animals sorted by their primary habitats:\n\n*   '
+9 A 185 636 40 '**Pros:**\n\n1.  **Enhanced Connectivity**: Allows for constan'
