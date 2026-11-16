@@ -37,7 +37,7 @@ $watch = Start-Job -ArgumentList $cp.Id, $FloorGiB -ScriptBlock {
 }
 $up = $false
 for ($i = 0; $i -lt 150; $i++) { Start-Sleep 3; try { if ((Invoke-WebRequest http://127.0.0.1:8095/health -UseBasicParsing -TimeoutSec 2).StatusCode -eq 200) { $up = $true; break } } catch {} }
-if ($up) { python "$sp\nsys_decode_client.py" 8095 2>&1 | Out-File "$sp\nsys_$Tag.client.txt" } else { 'server never came up' | Out-File "$sp\nsys_$Tag.client.txt" }
+if ($up) { python "J:\Shadow\tools\nsys_decode_client.py" 8095 2>&1 | Out-File "$sp\nsys_$Tag.client.txt" } else { 'server never came up' | Out-File "$sp\nsys_$Tag.client.txt" }
 try { Invoke-WebRequest http://127.0.0.1:8095/shutdown -Method Post -UseBasicParsing -TimeoutSec 5 | Out-Null } catch {}
 $p.WaitForExit(600000) | Out-Null
 Receive-Job $watch
