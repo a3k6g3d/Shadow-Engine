@@ -3395,3 +3395,10 @@ extern "C" __global__ void copy_many(const unsigned long long* tab, unsigned int
         for (unsigned long long i = n16 * 16 + threadIdx.x; i < bytes; i += 256) ((char*) dst)[i] = ((const char*) src)[i];
     }
 }
+
+// logits[j * ne + e] += mask[e] for j < m rows (STATUS 168: an expert pruned at run time has its router logit at -1e30, so it is never among the top k and the softmax over the kept ones is
+// exactly the pruned model's routing).  1-D launch over m * ne.
+extern "C" __global__ void add_mask_rows(float* logits, const float* mask, unsigned int ne, unsigned int n) {
+    unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) logits[i] += mask[i % ne];
+}

@@ -1,0 +1,13 @@
+selection,keep,text,ppl,nll
+freq,512,prose,8.0758,2.08887
+freq,512,code,3.5021,1.25337
+freq,384,prose,8.4202,2.13064
+freq,384,code,3.9393,1.37100
+freq,256,prose,10.6201,2.36275
+freq,256,code,5.5821,1.71956
+freq,192,prose,14.4959,2.67387
+freq,192,code,8.8195,2.17696
+freq,160,prose,17.4782,2.86095
+freq,160,code,11.6593,2.45611
+freq,128,prose,21.7632,3.08022
+freq,128,code,14.6183,2.68227

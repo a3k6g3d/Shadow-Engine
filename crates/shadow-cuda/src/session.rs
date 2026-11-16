@@ -615,6 +615,10 @@ pub struct GpuSession<'c, 'm> {
     stale_logits: HashMap<(usize, usize), Vec<Vec<f32>>>,
     /// `step_batch_verify_top`: the logits of this pass are reduced on the device to their 64 largest a row (STATUS 159); the last stage sets `top_out`
     top_want: bool,
+    /// `SHADOW_EXPERT_MASK=FILE` (STATUS 168): a file of n_layer x n_expert bytes, 1 = the expert stays, 0 = it is pruned at run time (its router logit becomes -1e30: the routing of a pruned model);
+    /// the additive mask on the host (`n_layer * n_expert` floats) and on the device (one layer's row at a time is added to the router logits)
+    expert_mask: Option<Vec<f32>>,
+    expert_mask_dev: Option<DeviceBuffer<'c>>,
     /// `snapshot_again`'s copies as one launch (STATUS 161): the (dst, src, bytes) entries of the table on the device, and the table
     snap_copy: std::cell::RefCell<Option<(Vec<[u64; 3]>, DeviceBuffer<'c>)>>,
     top_buf: Option<DeviceBuffer<'c>>,
@@ -2446,6 +2450,8 @@ impl<'c, 'm> GpuSession<'c, 'm> {
             timing_no_sync: std::env::var("SHADOW_TIMING_NO_SYNC").is_ok_and(|v| v == "1"),
             stale_logits: HashMap::new(),
             top_want: false,
+            expert_mask: None,
+            expert_mask_dev: None,
             snap_copy: std::cell::RefCell::new(None),
             top_buf: None,
             top_out: Vec::new(),
@@ -2473,7 +2479,31 @@ impl<'c, 'm> GpuSession<'c, 'm> {
             batch_max: std::env::var("SHADOW_BATCH").ok().and_then(|v| v.parse().ok()).unwrap_or(MAX_BATCH).clamp(1, MAX_BATCH),
         };
         s.stage_ptr = s.stage.as_mut_slice().as_mut_ptr();
+        if let Ok(path) = std::env::var("SHADOW_EXPERT_MASK") {
+            let (nl, ne) = (s.m.cfg.n_layer, s.m.cfg.n_expert);
+            let bytes = std::fs::read(&path).map_err(|e| format!("SHADOW_EXPERT_MASK {path}: {e}"))?;
+            if bytes.len() != nl * ne {
+                return Err(format!("SHADOW_EXPERT_MASK {path}: {} bytes, expected {} ({nl} layers x {ne} experts)", bytes.len(), nl * ne));
+            }
+            let mask: Vec<f32> = bytes.iter().map(|&b| if b != 0 { 0.0 } else { -1.0e30 }).collect();
+            let dev = ctx.alloc(mask.len() * 4).map_err(|e| e.to_string())?;
+            dev.upload(&mask.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>()).map_err(|e| e.to_string())?;
+            let kept: usize = bytes.iter().map(|&b| (b != 0) as usize).sum();
+            eprintln!("SHADOW_EXPERT_MASK: {kept} of {} experts kept ({:.1} a layer)", nl * ne, kept as f64 / nl as f64);
+            s.expert_mask = Some(mask);
+            s.expert_mask_dev = Some(dev);
+        }
         Ok(s)
+    }
+
+    /// Adds layer `l`'s mask to a router logit row (`SHADOW_EXPERT_MASK`).
+    fn mask_logits(&self, l: usize, row: &mut [f32]) {
+        if let Some(mask) = self.expert_mask.as_ref() {
+            let ne = self.m.cfg.n_expert;
+            for (x, m) in row.iter_mut().zip(&mask[l * ne..(l + 1) * ne]) {
+                *x += m;
+            }
+        }
     }
 
     /// Charges the time since the last mark to `phase` (profiling only; synchronizes the device first).
@@ -4819,7 +4849,8 @@ impl<'c, 'm> GpuSession<'c, 'm> {
         let t_wait = std::time::Instant::now();
         let mut got = self.download_mapped(&srcs).into_iter();
         self.waits[0] += t_wait.elapsed().as_secs_f64();
-        let logits = got.next().unwrap();
+        let mut logits = got.next().unwrap();
+        self.mask_logits(l, &mut logits);
         let next_logits = if pf_next { got.next() } else { None };
         let u_host = if cpu_on { got.next() } else { None };
         // Launch Qwen's shared expert on stream 0 immediately so the GPU SMs compute it while the CPU runs `route`
@@ -6521,6 +6552,9 @@ impl<'c, 'm> GpuSession<'c, 'm> {
         let nrec = 2 * 3 * g * (1 + 2 * chunk_n);
         self.k1("zero_words", ne, &[Arg::Ptr(self.dp_cnt.ptr), Arg::U32(ne as u32)]);
         self.k1("zero_words", nrec, &[Arg::Ptr(gt + r0 as u64), Arg::U32(nrec as u32)]);
+        if let Some(mask) = self.expert_mask_dev.as_ref() {
+            self.k1("add_mask_rows", m * ne, &[Arg::Ptr(rl), Arg::Ptr(mask.ptr + (l * ne * 4) as u64), Arg::U32(ne as u32), Arg::U32((m * ne) as u32)]);
+        }
         assert!(ne <= 512 && k <= 16, "route_topk_rows: {ne} experts, top {k}");
         let route_args = [Arg::Ptr(rl), Arg::Ptr(self.dp_tidx.ptr), Arg::Ptr(gt + w as u64), Arg::Ptr(self.dp_cnt.ptr), Arg::U32(ne as u32), Arg::U32(k as u32), Arg::U32(m as u32)];
         if std::env::var("SHADOW_ROUTE_UNIFORM").is_ok_and(|v| v == "1") {
@@ -6822,7 +6856,7 @@ impl<'c, 'm> GpuSession<'c, 'm> {
             // the copies below reuse slots the previous group's experts may still be reading: the copy stream waits for them
             self.ctx.stream_wait_event(Some(&self.copy_stream), &self.group_event).unwrap();
         }
-        let logits: Vec<Vec<f32>> = if let Some(slot) = ticket {
+        let mut logits: Vec<Vec<f32>> = if let Some(slot) = ticket {
             let (lg, u) = self.wait_router_read(slot, m, want_u);
             u_host = u;
             lg
@@ -6851,6 +6885,11 @@ impl<'c, 'm> GpuSession<'c, 'm> {
             }
             lg
         };
+        if self.expert_mask.is_some() {
+            for row in logits.iter_mut() {
+                self.mask_logits(l, row);
+            }
+        }
         self.waits[0] += t_wait.elapsed().as_secs_f64();
         let t_woke = std::time::Instant::now();
         vt_lap(&mut vt, 1);
