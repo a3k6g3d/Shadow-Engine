@@ -32,6 +32,7 @@ CUDA index, `safetensors`, `numpy`, `matplotlib`).
 | `tools/nsys_pair_rounds.py X.sqlite` | per DFlash round on one or two cards: busy time per device, both busy at once, idle, copies by kind and device, kernels by name per device, and the segment timeline of a typical round (STATUS 155) |
 | `tools/nsys_prompt_bound.py X.sqlite` + `tools/nsys_prompt_client.py` | long prompts under nsys (`nsys_decode_capture.ps1 -Client tools/nsys_prompt_client.py`): per prompt burst the wall time, kernel-busy, H2D-copy-busy, both, neither, GiB copied and the kernel time by name (STATUS 157) |
 | `tools/mix_exl3.py BASE OTHER OUT 0,1,..[,dense]` | an EXL3 checkpoint from two quants of the same weights (streams tensor bytes: ~0.7 GiB of RAM, 4 minutes for 40 GiB): BASE with the routed experts of the listed layers (and with `dense` the non-expert tensors and the head) from OTHER; the n-gram table is hard-linked (STATUS 165) |
+| `tools/exl3_export_tables.py MODEL OUT [cuda_device]` | an EXL3 checkpoint's token embedding and dequantized output head as float32 files (`token_embd.f32`, `output.f32`) for `tools/dflash2_train.py`, which `shadow dump` cannot make for a directory; run in the exllamav3 venv (STATUS 166) |
 | `tools/spec_probe.py` | what speculation could buy from routing logs: expert-union size per verify pass, accepted tokens per pass |
 | `tools/serve_check.py [URL]` | live checks of a running `shadow serve`: every route, streamed vs whole answers identical, prefix reuse, refusals, concurrent requests |
 
