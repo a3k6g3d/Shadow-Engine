@@ -409,6 +409,138 @@ fn tojson_serde(v: &Value) -> String {
 }
 
 /// Converts a parsed `<parameter=K>V</parameter>` string into a JSON value using the tool's schema when available.
+/// The OpenAI `tool_calls` array of parsed calls: arguments as a JSON object string with the parameters in the model's order and typed by the tool's schema.
+fn tool_calls_json(calls: &[ToolCall], tools: Option<&Vec<Value>>) -> Vec<Value> {
+    calls
+        .iter()
+        .enumerate()
+        .map(|(i, tc)| {
+            let pairs: Vec<String> = tc
+                .arguments
+                .iter()
+                .map(|(k, v)| format!("{}:{}", serde_json::to_string(k).unwrap(), arg_to_json(tools, &tc.name, k, v)))
+                .collect();
+            json!({
+                "id": format!("call_{i}"),
+                "type": "function",
+                "function": {
+                    "name": tc.name,
+                    "arguments": format!("{{{}}}", pairs.join(",")),
+                }
+            })
+        })
+        .collect()
+}
+
+/// A streamed chat answer for a request that carries `tools` (OpenAI streaming: the AI SDK behind OpenCode always streams): text before a `<tool_call>` block goes out as
+/// `content` deltas (a tail that could be the start of the marker is held back until it is decided); from the marker on, the text is kept, and at the end the parsed calls
+/// go out as one `tool_calls` delta with finish_reason `tool_calls` (a block that does not parse goes out as text).  STATUS 152.
+fn stream_with_tools(rx: tokio::sync::mpsc::UnboundedReceiver<Event>, id: String, model: String, created: u64, tools: Vec<Value>) -> Response<Body> {
+    const MARK: &str = "<tool_call>";
+    struct St {
+        rx: tokio::sync::mpsc::UnboundedReceiver<Event>,
+        first: bool,
+        held: String,
+        acc: String,
+        in_call: bool,
+        done: bool,
+    }
+    let chunk = move |delta: Value, finish: Value| -> String {
+        let c = json!({"id": id, "object": "chat.completion.chunk", "created": created, "model": model,
+                       "choices": [{"index": 0, "delta": delta, "finish_reason": finish}]});
+        format!("data: {c}\n\n")
+    };
+    let st0 = St { rx, first: true, held: String::new(), acc: String::new(), in_call: false, done: false };
+    let s = futures_util::stream::unfold(st0, move |mut st: St| {
+        let chunk = chunk.clone();
+        let tools = tools.clone();
+        async move {
+            if st.done {
+                return None;
+            }
+            if st.first {
+                st.first = false;
+                let b = Bytes::from(chunk(json!({"role": "assistant", "content": ""}), Value::Null));
+                return Some((Ok::<_, Infallible>(Frame::data(b)), st));
+            }
+            loop {
+                match st.rx.recv().await {
+                    Some(Event::Content(t)) => {
+                        if st.in_call {
+                            st.acc.push_str(&t);
+                            continue;
+                        }
+                        st.held.push_str(&t);
+                        if let Some(i) = st.held.find(MARK) {
+                            let before = st.held[..i].to_string();
+                            st.acc = st.held[i..].to_string();
+                            st.held.clear();
+                            st.in_call = true;
+                            if !before.is_empty() {
+                                return Some((Ok(Frame::data(Bytes::from(chunk(json!({"content": before}), Value::Null)))), st));
+                            }
+                            continue;
+                        }
+                        // the longest tail of the held text that is a prefix of the marker stays held (the marker is ASCII: the cut is on a character boundary)
+                        let keep = (1..MARK.len()).rev().find(|&k| st.held.ends_with(&MARK[..k])).unwrap_or(0);
+                        let cut = st.held.len() - keep;
+                        if cut > 0 {
+                            let out: String = st.held.drain(..cut).collect();
+                            return Some((Ok(Frame::data(Bytes::from(chunk(json!({"content": out}), Value::Null)))), st));
+                        }
+                    }
+                    Some(Event::Reasoning(t)) => {
+                        return Some((Ok(Frame::data(Bytes::from(chunk(json!({"reasoning_content": t}), Value::Null)))), st));
+                    }
+                    Some(Event::Done(stat)) => {
+                        let mut out = String::new();
+                        let mut finish = json!(stat.finish_reason);
+                        if st.in_call {
+                            let (_, calls) = parse_tool_calls(&st.acc);
+                            if calls.is_empty() {
+                                out += &chunk(json!({"content": st.acc.clone()}), Value::Null);
+                            } else {
+                                let tcs: Vec<Value> = tool_calls_json(&calls, Some(&tools))
+                                    .into_iter()
+                                    .enumerate()
+                                    .map(|(i, mut c)| {
+                                        c["index"] = json!(i);
+                                        c
+                                    })
+                                    .collect();
+                                out += &chunk(json!({"tool_calls": tcs}), Value::Null);
+                                finish = json!("tool_calls");
+                            }
+                        } else if !st.held.is_empty() {
+                            out += &chunk(json!({"content": st.held.clone()}), Value::Null);
+                        }
+                        let (u, t) = usage(&stat);
+                        let last = chunk(json!({}), finish);
+                        let mut v: Value = serde_json::from_str(&last[6..last.len() - 2]).unwrap();
+                        v["usage"] = u;
+                        v["timings"] = t;
+                        out += &format!("data: {v}\n\ndata: [DONE]\n\n");
+                        st.done = true;
+                        return Some((Ok(Frame::data(Bytes::from(out))), st));
+                    }
+                    Some(Event::Error(e)) => {
+                        let v = json!({"error": {"message": e}});
+                        st.done = true;
+                        return Some((Ok(Frame::data(Bytes::from(format!("data: {v}\n\ndata: [DONE]\n\n")))), st));
+                    }
+                    None => return None,
+                }
+            }
+        }
+    });
+    Response::builder()
+        .status(StatusCode::OK)
+        .header("content-type", "text/event-stream")
+        .header("cache-control", "no-cache")
+        .body(StreamBody::new(s).boxed())
+        .unwrap()
+}
+
 fn arg_to_json(tools: Option<&Vec<Value>>, fn_name: &str, key: &str, val: &str) -> Value {
     let prop_type = tools.and_then(|ts| {
         ts.iter().find_map(|t| {
@@ -779,32 +911,7 @@ async fn chat(req: Request<Incoming>, app: Arc<App>) -> Response<Body> {
                     let mut finish_reason = st.finish_reason;
                     if !calls.is_empty() {
                         let tools_arr = body.get("tools").and_then(Value::as_array);
-                        let tc_json: Vec<Value> = calls
-                            .iter()
-                            .enumerate()
-                            .map(|(i, tc)| {
-                                let pairs: Vec<String> = tc
-                                    .arguments
-                                    .iter()
-                                    .map(|(k, v)| {
-                                        format!(
-                                            "{}:{}",
-                                            serde_json::to_string(k).unwrap(),
-                                            arg_to_json(tools_arr, &tc.name, k, v)
-                                        )
-                                    })
-                                    .collect();
-                                json!({
-                                    "id": format!("call_{i}"),
-                                    "type": "function",
-                                    "function": {
-                                        "name": tc.name,
-                                        "arguments": format!("{{{}}}", pairs.join(",")),
-                                    }
-                                })
-                            })
-                            .collect();
-                        msg["tool_calls"] = Value::Array(tc_json);
+                        msg["tool_calls"] = Value::Array(tool_calls_json(&calls, tools_arr));
                         finish_reason = "tool_calls";
                     }
                     break json_resp(
@@ -827,6 +934,10 @@ async fn chat(req: Request<Incoming>, app: Arc<App>) -> Response<Body> {
         return resp;
     }
 
+    // a request with tools: the text streams until a `<tool_call>` block starts, the block is held back and goes out as `tool_calls` deltas at the end
+    if let Some(tools) = body.get("tools").and_then(Value::as_array).filter(|t| !t.is_empty()) {
+        return stream_with_tools(rx, id, model, created, tools.clone());
+    }
     // streamed: one server-sent event per piece, a final chunk with finish_reason, usage and timings, then [DONE]
     let chunk = move |delta: Value, finish: Value| -> Bytes {
         let c = json!({"id": id, "object": "chat.completion.chunk", "created": created, "model": model,
@@ -880,6 +991,88 @@ async fn chat(req: Request<Incoming>, app: Arc<App>) -> Response<Body> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The `data:` payloads of a streamed answer, in order (the `[DONE]` line left out).
+    async fn streamed(events: Vec<Event>) -> Vec<Value> {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        for e in events {
+            tx.send(e).unwrap();
+        }
+        drop(tx);
+        let tools = vec![json!({"type": "function", "function": {"name": "add", "parameters": {"type": "object",
+            "properties": {"a": {"type": "integer"}, "b": {"type": "integer"}}}}})];
+        let resp = stream_with_tools(rx, "id".into(), "m".into(), 1, tools);
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        String::from_utf8(bytes.to_vec())
+            .unwrap()
+            .lines()
+            .filter_map(|l| l.strip_prefix("data: "))
+            .filter(|l| *l != "[DONE]")
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect()
+    }
+
+    fn done(reason: &'static str) -> Event {
+        Event::Done(engine::Stats { finish_reason: reason, ..Default::default() })
+    }
+
+    fn text_of(chunks: &[Value]) -> String {
+        chunks.iter().filter_map(|c| c["choices"][0]["delta"]["content"].as_str()).collect()
+    }
+
+    #[tokio::test]
+    async fn a_streamed_answer_with_tools_but_no_call_is_plain_text() {
+        let c = streamed(vec![Event::Content("Hello ".into()), Event::Content("wor".into()), Event::Content("ld <".into()), done("stop")]).await;
+        assert_eq!(text_of(&c), "Hello world <");
+        assert_eq!(c.last().unwrap()["choices"][0]["finish_reason"], "stop");
+        assert!(c.iter().all(|x| x["choices"][0]["delta"].get("tool_calls").is_none()));
+    }
+
+    #[tokio::test]
+    async fn a_tool_call_split_across_pieces_goes_out_as_tool_calls_deltas() {
+        let c = streamed(vec![
+            Event::Content("Sure. <tool".into()),
+            Event::Content("_call>
+<function=add>
+<parameter=a>
+2
+</parameter>
+<parameter=b>
+3
+</parameter>
+</function>
+</tool_call>".into()),
+            Event::Content("<tool_call>
+<function=add>
+<parameter=a>
+10
+</parameter>
+<parameter=b>
+20
+</parameter>
+</function>
+</tool_call>".into()),
+            done("stop"),
+        ])
+        .await;
+        assert_eq!(text_of(&c), "Sure. ");
+        let calls: Vec<&Value> = c.iter().filter_map(|x| x["choices"][0]["delta"].get("tool_calls")).collect();
+        assert_eq!(calls.len(), 1, "one delta holds the calls");
+        let tc = calls[0].as_array().unwrap();
+        assert_eq!(tc.len(), 2);
+        assert_eq!((tc[0]["index"].as_i64(), tc[1]["index"].as_i64()), (Some(0), Some(1)));
+        assert_eq!(tc[0]["function"]["name"], "add");
+        assert_eq!(serde_json::from_str::<Value>(tc[0]["function"]["arguments"].as_str().unwrap()).unwrap(), json!({"a": 2, "b": 3}));
+        assert_eq!(serde_json::from_str::<Value>(tc[1]["function"]["arguments"].as_str().unwrap()).unwrap(), json!({"a": 10, "b": 20}));
+        assert_eq!(c.last().unwrap()["choices"][0]["finish_reason"], "tool_calls");
+    }
+
+    #[tokio::test]
+    async fn a_tool_call_block_that_does_not_parse_is_text() {
+        let c = streamed(vec![Event::Content("<tool_call>garbage".into()), done("stop")]).await;
+        assert_eq!(text_of(&c), "<tool_call>garbage");
+        assert_eq!(c.last().unwrap()["choices"][0]["finish_reason"], "stop");
+    }
 
     #[test]
     fn parses_a_chat_request() {
