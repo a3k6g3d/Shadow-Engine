@@ -1,0 +1,7 @@
+text,variant,ppl,nll
+prose,dense_only,8.0758,2.08887
+code,dense_only,3.5021,1.25337
+prose,dense_plus_best18,8.0006,2.07952
+code,dense_plus_best18,3.4957,1.25153
+prose,dense_plus_best24,8.0155,2.08138
+code,dense_plus_best24,3.5171,1.25764

@@ -1,0 +1,218 @@
+fn moe_batch(&mut self, l: usize, m: usize, logs: &mut [Vec<u16>], router_done: bool, ticket: Option<usize>) {
+        let c = &self.m.cfg;
+        let p = format!("blk.{l}");
+        let (h, sff, k, ne) = (c.hidden, c.shared_ff, c.n_expert_used, c.n_expert);
+        if !router_done {
+            self.moe_router_batch(l, m);
+        }
+        if self.devplan && self.sp.is_some() && m > MAX_VERIFY {
+            let names = [format!("{p}.ffn_gate_exps.weight"), format!("{p}.ffn_up_exps.weight"), format!("{p}.ffn_down_exps.weight")];
+            let infos: Vec<TensorInfo> = names.iter().map(|n| self.expert_info(n)).collect();
+            if self.dev_plan_ok(m, &infos) {
+                let sizes: Vec<usize> = names.iter().map(|n| self.m.expert_bytes(n)).collect();
+                {
+                    // the shared expert
+                    let bb = &self.bb;
+                    self.multi_cols(l, 2, false, m);
+                    self.k1("swiglu", m * sff, &[Arg::Ptr(bb.sg.ptr), Arg::Ptr(bb.su.ptr), Arg::Ptr(bb.sa.ptr), Arg::U32((m * sff) as u32)]);
+                    self.mv_cols(&format!("{p}.ffn_down_shexp.weight"), bb.sa.ptr, sff, bb.so.ptr, h, m);
+                }
+                self.moe_staged(l, m, None, &infos, &sizes, &names);
+                let _ = (logs, ticket, k, ne);
+                return;
+            }
+        }
+        let t_wait = std::time::Instant::now();
+        let mut vt = (vtime_on() && self.replay.on.get() && m <= MAX_VERIFY).then(std::time::Instant::now);
+        // SHADOW_TIMING_NO_SYNC=1 (timing only, wrong output): last time's router logits, no wait for the GPU
+        let stale = self.timing_no_sync && self.stale_logits.get(&(l, m)).is_some();
+        // the hybrid's CPU experts in a verify pass need the MoE input on the host
+        let want_u = self.want_u_rows(m) && !stale;
+        let mut u_host: Option<Vec<f32>> = None;
+        let mut shared_done = false;
+        if self.pipe_active {
+            // the copies below reuse slots the previous group's experts may still be reading: the copy stream waits for them
+            self.ctx.stream_wait_event(Some(&self.copy_stream), &self.group_event).unwrap();
+        }
+        let logits: Vec<Vec<f32>> = if let Some(slot) = ticket {
+            let (lg, u) = self.wait_router_read(slot, m, want_u);
+            u_host = u;
+            lg
+        } else if stale {
+            self.stale_logits[&(l, m)].clone()
+        } else {
+            let mut srcs = vec![(self.bb.rl.ptr, m * ne)];
+            if want_u {
+                srcs.push((self.bb.u.ptr, m * h));
+            }
+            // the shared expert does not depend on the routing: queued behind the copy, it runs on the GPU while the host waits and routes (`SHADOW_SHARED_EARLY=0`: after the wait)
+            let early = shared_early();
+            let mut got = if early {
+                shared_done = true;
+                self.download_mapped_with(&srcs, &|| self.shared_expert_batch(l, m))
+            } else {
+                self.download_mapped(&srcs)
+            };
+            if want_u {
+                u_host = Some(got.remove(1));
+            }
+            let all = got.remove(0);
+            let lg: Vec<Vec<f32>> = all.chunks(ne).map(|c| c.to_vec()).collect();
+            if self.timing_no_sync {
+                self.stale_logits.insert((l, m), lg.clone());
+            }
+            lg
+        };
+        self.waits[0] += t_wait.elapsed().as_secs_f64();
+        let t_woke = std::time::Instant::now();
+        vt_lap(&mut vt, 1);
+        self.mark("batch: router + logits down");
+        if !shared_done {
+            // the shared expert, on the GPU while the host routes and the copies run
+            self.shared_expert_batch(l, m);
+        }
+        vt_lap(&mut vt, 11);
+        let t_routed0 = t_woke.elapsed();
+        let mut tops: Vec<Vec<(usize, f64)>> = route_all(&logits, k, if self.router_bias != 0.0 { Some((&self.cache.map, l, self.router_bias)) } else { None });
+        vt_lap(&mut vt, 2);
+        for (j, top) in tops.iter().enumerate() {
+            for &(e, _) in top {
+                self.routing.add(l, e);
+            }
+            if self.route_log.is_some() {
+                logs[j].push(l as u16);
+                logs[j].extend(top.iter().map(|&(e, _)| e as u16));
+            }
+        }
+        if self.accept_moe && self.replay.on.get() && m >= 2 {
+            self.accept_route(l, &logits, &mut tops);
+        }
+        if self.verify_resident && !self.accept_moe && self.replay.on.get() {
+            // a verify pass: the drafted positions keep only their resident experts
+            for top in tops.iter_mut().skip(1) {
+                let before = top.len();
+                let mut rank = 0;
+                top.retain(|&(e, _)| {
+                    rank += 1;
+                    rank <= self.verify_rank || self.cache.map.contains_key(&(l, e))
+                });
+                self.tail_skipped += (before - top.len()) as u64;
+            }
+        }
+        if self.tail_skip > 0 && m <= MAX_VERIFY {
+            // --tail-skip over the whole pass: an expert not in VRAM that every token routes only at rank >= R
+            let mut low: HashMap<usize, bool> = HashMap::new();
+            for top in &tops {
+                for (i, &(e, _)) in top.iter().enumerate() {
+                    let tail = low.entry(e).or_insert(true);
+                    *tail &= i >= self.tail_skip;
+                }
+            }
+            for top in tops.iter_mut() {
+                let before = top.len();
+                top.retain(|&(e, _)| !low[&e] || self.cache.map.contains_key(&(l, e)));
+                self.tail_skipped += (before - top.len()) as u64;
+            }
+        }
+        vt_lap(&mut vt, 3);
+        let names = [format!("{p}.ffn_gate_exps.weight"), format!("{p}.ffn_up_exps.weight"), format!("{p}.ffn_down_exps.weight")];
+        let infos: Vec<TensorInfo> = names.iter().map(|n| self.expert_info(n)).collect();
+        let sizes: Vec<usize> = names.iter().map(|n| self.m.expert_bytes(n)).collect();
+        if self.replay.on.get() {
+            if let Some(sb) = self.spec_bytes.as_mut() {
+                let bytes = sizes.iter().sum::<usize>() as u64;
+                // every expert this pass copies: its lowest row, and whether every row routing to it is at depth >= d + 1 with it at rank 2 or lower
+                let mut seen: HashMap<usize, (usize, [bool; 3])> = HashMap::new();
+                for (j, top) in tops.iter().enumerate() {
+                    for (i, &(e, _)) in top.iter().enumerate() {
+                        if self.cache.map.contains_key(&(l, e)) {
+                            continue;
+                        }
+                        let ent = seen.entry(e).or_insert((j, [true; 3]));
+                        ent.0 = ent.0.min(j);
+                        for (d, f) in ent.1.iter_mut().enumerate() {
+                            *f &= j > d && i >= 1;
+                        }
+                    }
+                }
+                for (e, (j, cf)) in seen {
+                    let jj = j.min(7);
+                    sb.pass[jj][!self.ram.at.contains_key(&(l, e)) as usize] += bytes;
+                    for d in 0..3 {
+                        if cf[d] {
+                            sb.cf_pass[d][jj] += bytes;
+                        }
+                    }
+                }
+            }
+        }
+        vt_lap(&mut vt, 4);
+        // Hybrid MoE in a verify pass: up to `cpu_experts` of the layer's cache misses that the RAM tier holds and that
+        // ONE token routes to (the CPU computes an expert per token; a copy serves every token that uses it) are computed
+        // on the CPU from the pinned bytes while the GPU runs the resident experts and the copies run.  Their rank rows of
+        // eo are filled from the host before the combine; tops keeps them, so the combine weights them as usual.
+        let mut cpu_skip: Vec<usize> = vec![];
+        let mut cpu_pairs: Vec<(usize, usize)> = vec![];
+        let mut cpu_offs: Vec<usize> = vec![];
+        let mut cpu_pending = false;
+        let t_plan = std::time::Instant::now();
+        let mut cpu_submit = std::time::Instant::now();
+        if let (Some(ub), Some(max)) = (u_host.as_ref(), self.cpu.as_ref().map(|c| c.1)) {
+            if infos[0].ty == infos[1].ty && infos[0].dims == infos[1].dims && self.ram.region.is_some() && cpu_expert_types_ok(&infos) {
+                let mut users: HashMap<usize, Vec<(usize, usize, f64)>> = HashMap::new();
+                for (j, top) in tops.iter().enumerate() {
+                    for (i, &(e, w)) in top.iter().enumerate() {
+                        users.entry(e).or_default().push((j, i, w));
+                    }
+                }
+                // (weight, expert, token, rank, offset in the RAM tier), lowest weight first
+                let mut cand: Vec<(f64, usize, usize, usize, usize)> = vec![];
+                for (&e, us) in &users {
+                    if us.len() == 1 && !self.cache.map.contains_key(&(l, e)) {
+                        if let Some(&off) = self.ram.at.get(&(l, e)) {
+                            cand.push((us[0].2, e, us[0].0, us[0].1, off));
+                        }
+                    }
+                }
+                cand.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap().then(a.1.cmp(&b.1)));
+                cand.truncate(max);
+                if !cand.is_empty() {
+                    let mut toks: Vec<usize> = cand.iter().map(|c| c.2).collect();
+                    toks.sort_unstable();
+                    toks.dedup();
+                    let xs: Vec<f32> = toks.iter().flat_map(|&j| ub[j * h..(j + 1) * h].iter().copied()).collect();
+                    let xidx: Vec<usize> = cand.iter().map(|c| toks.iter().position(|&j| j == c.2).unwrap()).collect();
+                    let base = self.ram.region.as_ref().unwrap().as_slice().as_ptr();
+                    let refs: Vec<shadow_model::cpu_expert::ExpertRef> = cand.iter().map(|c| {
+                        // SAFETY: the RAM tier holds this expert's [gate | up | down] at its offset, inside the region.
+                        unsafe {
+                            shadow_model::cpu_expert::ExpertRef { gate: base.add(c.4), up: base.add(c.4 + sizes[0]),
+                                                                  down: base.add(c.4 + sizes[0] + sizes[1]) }
+                        }
+                    }).collect();
+                    for c in &cand {
+                        cpu_skip.push(c.1);
+                        cpu_pairs.push((c.2, c.3));
+                        cpu_offs.push(c.4);
+                    }
+                    let shape = shadow_model::cpu_expert::ExpertShape {
+                        hidden: h, ff: self.m.cfg.expert_ff, gate_ty: infos[0].ty.name(), up_ty: infos[1].ty.name(),
+                        down_ty: infos[2].ty.name(),
+                    };
+                    // SAFETY: the region lives as long as the session, and nothing rewrites these experts' bytes before
+                    // the `wait` below: the group loop re-claims their ring slots after every `claimed.clear()`.
+                    unsafe { self.cpu.as_mut().unwrap().0.submit_multi(&shape, refs, xidx, &xs) };
+                    self.cpu_served += cpu_pairs.len() as u64;
+                    cpu_pending = true;
+                    cpu_submit = std::time::Instant::now();
+                }
+            }
+        }
+        if cpu_pending {
+            self.cpu_host.0 += t_plan.elapsed().as_secs_f64();
+        }
+        if self.sp.is_some() && m > MAX_VERIFY && !cpu_pending && (infos[0].ty.exl3().is_none() || exl3_groups_on()) {
+            let t_pre = t_woke.elapsed();
+            self.moe_staged(l, m, Some(&tops), &infos, &sizes, &names);
+            if m >= 2048 && std::env::var("SHADOW_STAGE_TIME").is_ok_and(|v| v == "1") {
+                eprintln!("HOST L{l} m={m}: after the logits arrived: conversion {:.1} ms, route+bookkeeping+plan prep {:.1} ms, moe_staged {:.1} ms (G

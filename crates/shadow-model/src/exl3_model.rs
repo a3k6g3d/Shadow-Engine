@@ -135,8 +135,35 @@ pub fn open(dir: &Path) -> Result<Exl3Model, String> {
     }
     let ngram_path = dir.join("ngram_embedding.safetensors");
     files.push(ngram_path.clone());
-    let st = SafeTensors::open(&files).map_err(|e| e.to_string())?;
+    let mut st = SafeTensors::open(&files).map_err(|e| e.to_string())?;
     let ngram_file = st.files.len() - 1;
+    // `SHADOW_EXL3_UPGRADE=DIR@0,1,5-9`: the routed experts of those layers are read from the checkpoint in DIR (another quant of the same weights) instead of this one: a mix of two
+    // rates tried without writing it (STATUS 165); the layers' tensors must exist in both.  `DIR@dense,0-5`: also every tensor of the layers that is not a routed expert (attention, DeltaNet,
+    // shared expert, router) and the output head, from DIR; `DIR@dense` alone: only those
+    if let Ok(spec) = std::env::var("SHADOW_EXL3_UPGRADE") {
+        let (other, list) = spec.rsplit_once('@').ok_or("SHADOW_EXL3_UPGRADE: expected DIR@LAYERS")?;
+        let mut layers = std::collections::HashSet::new();
+        let mut dense = false;
+        for part in list.split(',').filter(|p| !p.trim().is_empty()) {
+            if part.trim() == "dense" {
+                dense = true;
+                continue;
+            }
+            let (a, b) = part.split_once('-').unwrap_or((part, part));
+            let (a, b): (usize, usize) = (a.trim().parse().map_err(|_| format!("SHADOW_EXL3_UPGRADE: layer {a:?}"))?, b.trim().parse().map_err(|_| format!("SHADOW_EXL3_UPGRADE: layer {b:?}"))?);
+            layers.extend(a..=b);
+        }
+        let n = st.override_from(Path::new(other), |name| {
+            if name.starts_with("lm_head.") {
+                return dense;
+            }
+            name.strip_prefix("model.language_model.layers.").and_then(|r| r.split_once('.')).is_some_and(|(l, rest)| {
+                let expert = rest.starts_with("mlp.experts.");
+                if expert { l.parse::<usize>().is_ok_and(|l| layers.contains(&l)) } else { dense && !rest.starts_with("ple.") }
+            })
+        }).map_err(|e| e.to_string())?;
+        eprintln!("SHADOW_EXL3_UPGRADE: {n} tensors of layers {list} read from {other}");
+    }
 
     let n_layer = num("num_hidden_layers")? as usize;
     let hidden = num("hidden_size")? as usize;

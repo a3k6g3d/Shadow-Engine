@@ -1,0 +1,45 @@
+2 arms x 4 runs x 36 turns, 96 tokens per turn; results in J:\Shadow\bench\lyg2-mixD18-varied36-2026-11-16\bench\results.jsonl
+run 0 lyg205: load 41 s, decode_warm median 55.24 tok/s over 35 turns, min available RAM 14.8 GiB, peak GPU 11240 MiB
+run 0 mixD18: load 45 s, decode_warm median 63.63 tok/s over 35 turns, min available RAM 9.1 GiB, peak GPU 11240 MiB
+run 1 mixD18: load 43 s, decode_warm median 64.61 tok/s over 35 turns, min available RAM 9.2 GiB, peak GPU 11240 MiB
+run 1 lyg205: load 39 s, decode_warm median 55.09 tok/s over 35 turns, min available RAM 14.8 GiB, peak GPU 11240 MiB
+run 2 lyg205: load 39 s, decode_warm median 55.55 tok/s over 35 turns, min available RAM 14.9 GiB, peak GPU 11240 MiB
+run 2 mixD18: load 43 s, decode_warm median 64.93 tok/s over 35 turns, min available RAM 9.2 GiB, peak GPU 11240 MiB
+run 3 mixD18: load 43 s, decode_warm median 64.20 tok/s over 35 turns, min available RAM 9.3 GiB, peak GPU 11240 MiB
+run 3 lyg205: load 39 s, decode_warm median 56.20 tok/s over 35 turns, min available RAM 14.9 GiB, peak GPU 11240 MiB
+# shadow-bench: J:\Shadow\bench\lyg2-mixD18-varied36-2026-11-16\bench
+
+8 records, 2 arms, decode_warm (turn 0 dropped), tok/s
+
+| arm | runs | median | p90 (slow end) | worst | best | floor median | floor p90 | floor worst | lowest RAM GiB |
+|---|---|---|---|---|---|---|---|---|---|
+| lyg205 | 4 | 55.40 | 55.09 | 55.09 | 56.20 | 0.8% | 2.6% | 6.8% | 14.8 |
+| mixD18 | 4 | 64.41 | 63.63 | 63.63 | 64.93 | 0.5% | 2.4% | 6.9% | 9.1 |
+
+Paired against the first arm, same run and turn (positive = faster than it):
+
+| arm | pairs | median | p10 | p90 | worst |
+|---|---|---|---|---|---|
+| mixD18 | 140 | +16.9% | -20.2% | +107.5% | -30.2% |
+
+A paired difference inside the first arm's floor is a tie.
+
+Answers that differ from the first one seen at the same turn: 33 (greedy: expected 0).
+# shadow-bench: J:\Shadow\bench\lyg2-mixD18-varied36-2026-11-16\bench
+
+8 records, 2 arms, decode_warm (turn 0 dropped), tok/s
+
+| arm | runs | median | p90 (slow end) | worst | best | floor median | floor p90 | floor worst | lowest RAM GiB |
+|---|---|---|---|---|---|---|---|---|---|
+| lyg205 | 4 | 55.40 | 55.09 | 55.09 | 56.20 | 0.8% | 2.6% | 6.8% | 14.8 |
+| mixD18 | 4 | 64.41 | 63.63 | 63.63 | 64.93 | 0.5% | 2.4% | 6.9% | 9.1 |
+
+Paired against the first arm, same run and turn (positive = faster than it):
+
+| arm | pairs | median | p10 | p90 | worst |
+|---|---|---|---|---|---|
+| mixD18 | 140 | +16.9% | -20.2% | +107.5% | -30.2% |
+
+A paired difference inside the first arm's floor is a tie.
+
+Answers that differ from the first one seen at the same turn: 33 (greedy: expected 0).

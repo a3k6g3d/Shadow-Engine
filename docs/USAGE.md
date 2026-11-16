@@ -123,6 +123,7 @@ ode_modules\.bin\opencode.cmd`, else the PATH); `SHADOW_OPENCODE_DIR` is the fol
 | `SHADOW_SNAP_KERNEL=0` | a speculative round's rollback snapshot is taken with a `cuMemcpyDtoD` per state (~116 calls) instead of one `copy_many` launch (+0.56%, STATUS 161) |
 | `SHADOW_PLE_ASYNC=0` | a verify pass reads its n-gram (PLE) rows at the PLE layer instead of on a background thread from the start of the pass (+0.76%, STATUS 162) |
 | `SHADOW_EXL3_DEVPLAN=0` | an EXL3 long prompt's expert routing and grouping are done on the host again instead of the device planner (a ~4.7 ms stall a layer and chunk; the planner is +10.8% prompt speed, STATUS 163); `SHADOW_DEVPLAN_CHECK=1` compares the device's routing with the host's, a layer at a time |
+| `SHADOW_EXL3_UPGRADE=DIR@0-5,18-23,dense` | an EXL3 checkpoint opened with the routed experts of those layers (and with `dense`, every non-expert tensor of the layers except the PLE module, and the head) read from the checkpoint in DIR, another quant of the same weights: a mix of two rates tried without writing it; `tools/mix_exl3.py` writes one (STATUS 165) |
 | `SHADOW_EXL3_V1=1` | EXL3 checkpoints: the first (one slice a block) trellis kernels instead of the k-sliced ones (STATUS 139) |
 | `SHADOW_LTIME=1`, `SHADOW_KTIME=1`, `SHADOW_PROFILE=1` | time a batched pass by segment / each kernel / the single-token step (these synchronize: they slow the run) |
 | `SHADOW_DF_TIME=1` | time the phases of the DFlash draft round |

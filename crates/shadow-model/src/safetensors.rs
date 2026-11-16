@@ -95,6 +95,28 @@ impl SafeTensors {
         self.tensors.get(name)
     }
 
+    /// Takes the tensors of `other`'s `model-*.safetensors` files whose names `keep` accepts in place of the ones of the same name here (a mix of two quants of the same weights,
+    /// STATUS 165); returns how many.  The other files are appended to `files`, so every index already handed out stays valid.
+    pub fn override_from(&mut self, other: &Path, keep: impl Fn(&str) -> bool) -> Result<usize, Error> {
+        let mut paths: Vec<PathBuf> = std::fs::read_dir(other)
+            .map_err(|e| Error(format!("{}: {e}", other.display())))?
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| p.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.starts_with("model-") && n.ends_with(".safetensors")))
+            .collect();
+        paths.sort();
+        let o = SafeTensors::open(&paths)?;
+        let base = self.files.len();
+        self.files.extend(o.files.iter().cloned());
+        let mut n = 0;
+        for (name, t) in o.tensors {
+            if keep(&name) && self.tensors.contains_key(&name) {
+                self.tensors.insert(name, StTensor { file: t.file + base, ..t });
+                n += 1;
+            }
+        }
+        Ok(n)
+    }
+
     /// The raw bytes of a tensor.
     pub fn read(&self, name: &str) -> Result<Vec<u8>, Error> {
         let t = self.get(name).ok_or_else(|| Error(format!("no tensor {name}")))?;
