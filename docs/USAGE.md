@@ -120,6 +120,7 @@ Defaults are right for normal use; these are for measurement and diagnosis.
 | `SHADOW_OPENCODE`, `SHADOW_OPENCODE_DIR` | The OpenCode tab (STATUS 153): `SHADOW_OPENCODE` names the `opencode` launcher (else `%LOCALAPPDATA%\Shadow\opencode
 ode_modules\.bin\opencode.cmd`, else the PATH); `SHADOW_OPENCODE_DIR` is the folder it starts in (else the folder Shadow runs in). Routes: `GET /v1/opencode`, `POST /v1/opencode/start`, `POST /v1/opencode/stop` |
 | `SHADOW_TOPK_LOGITS=0` | a speculative verify pass and a single-token step download each row's whole logits (1 MiB a row) instead of the 64 largest picked on the device; the draw or argmax is the same (identical replies on 20 requests), +3.8% decode on one card (STATUS 159); `SHADOW_TOPK_STEP=0` turns off only the single-token step's (a tie, STATUS 160) |
+| `SHADOW_SNAP_KERNEL=0` | a speculative round's rollback snapshot is taken with a `cuMemcpyDtoD` per state (~116 calls) instead of one `copy_many` launch (+0.56%, STATUS 161) |
 | `SHADOW_EXL3_V1=1` | EXL3 checkpoints: the first (one slice a block) trellis kernels instead of the k-sliced ones (STATUS 139) |
 | `SHADOW_LTIME=1`, `SHADOW_KTIME=1`, `SHADOW_PROFILE=1` | time a batched pass by segment / each kernel / the single-token step (these synchronize: they slow the run) |
 | `SHADOW_DF_TIME=1` | time the phases of the DFlash draft round |

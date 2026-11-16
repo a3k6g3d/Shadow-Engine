@@ -296,6 +296,7 @@ pub const FILES: &[File] = &[
             e("df_top16", &[C, U, U, C, W, W]),
             e("topk_slices", &[C, U, U, U, W, W]),
             e("topk_merge", &[C, C, U, W]),
+            e("copy_many", &[C, U]),
             e("df_walk", &[C, C, C, C, C, U, U, U, W]),
             e("gated_rmsnorm_heads", &[W, C, C, U, F]),
             e("head_norm_rope", &[C, U, W, U, C, U, F, U, U, F]),

@@ -615,6 +615,8 @@ pub struct GpuSession<'c, 'm> {
     stale_logits: HashMap<(usize, usize), Vec<Vec<f32>>>,
     /// `step_batch_verify_top`: the logits of this pass are reduced on the device to their 64 largest a row (STATUS 159); the last stage sets `top_out`
     top_want: bool,
+    /// `snapshot_again`'s copies as one launch (STATUS 161): the (dst, src, bytes) entries of the table on the device, and the table
+    snap_copy: std::cell::RefCell<Option<(Vec<[u64; 3]>, DeviceBuffer<'c>)>>,
     top_buf: Option<DeviceBuffer<'c>>,
     top_out: Vec<Vec<(f32, u32)>>,
     /// `SHADOW_ZERO_COPY=1`: the single-token path's RAM-tier misses are read in place over PCIe, not copied.
@@ -2444,6 +2446,7 @@ impl<'c, 'm> GpuSession<'c, 'm> {
             timing_no_sync: std::env::var("SHADOW_TIMING_NO_SYNC").is_ok_and(|v| v == "1"),
             stale_logits: HashMap::new(),
             top_want: false,
+            snap_copy: std::cell::RefCell::new(None),
             top_buf: None,
             top_out: Vec::new(),
             zero_copy: std::env::var("SHADOW_ZERO_COPY").is_ok_and(|v| v == "1"),
@@ -2679,6 +2682,26 @@ impl<'c, 'm> GpuSession<'c, 'm> {
                       nblocks: self.attn.iter().map(|a| a.as_ref().map_or(0, |a| a.nblocks)).collect(), mtp, peer })
     }
 
+    /// The copies of `ents` ((dst, src, bytes) device ranges) as one `copy_many` launch on the default stream (ordered with the kernels after it); the table is kept while the entries are the same.
+    /// False (nothing copied) when switched off or the table cannot be made.
+    fn copy_many(&self, ents: &[[u64; 3]]) -> bool {
+        if ents.is_empty() || std::env::var("SHADOW_SNAP_KERNEL").is_ok_and(|v| v == "0") {
+            return false;
+        }
+        let mut cache = self.snap_copy.borrow_mut();
+        if cache.as_ref().is_none_or(|(k, _)| k.as_slice() != ents) {
+            let Ok(tab) = self.ctx.alloc(ents.len() * 24) else { return false };
+            let bytes: Vec<u8> = ents.iter().flatten().flat_map(|v| v.to_le_bytes()).collect();
+            if tab.upload(&bytes).is_err() {
+                return false;
+            }
+            *cache = Some((ents.to_vec(), tab));
+        }
+        let ptr = cache.as_ref().unwrap().1.ptr;
+        self.k("copy_many", (ents.len() * 8) as u32, 256, &[Arg::Ptr(ptr), Arg::U32(8)]);
+        true
+    }
+
     /// Takes `snap` again at the current position, into its own buffers: a speculative pass's rollback point, once per
     /// pass without allocating (a device snapshot without the KV, from this session; otherwise a new one).
     pub fn snapshot_again(&self, snap: &mut Snapshot<'c>) -> Result<(), String> {
@@ -2701,14 +2724,27 @@ impl<'c, 'm> GpuSession<'c, 'm> {
             return Ok(());
         }
         let e = |x: crate::driver::CudaError| x.to_string();
+        // the recurrent states and the PLE state in one launch (`SHADOW_SNAP_KERNEL=0`: a synchronous copy each, ~116 calls and 0.9 ms of idle GPU a round)
+        let mut ents: Vec<[u64; 3]> = Vec::with_capacity(2 * self.delta.len() + 1);
         for (s, d) in snap.delta.iter().zip(&self.delta) {
             if let (Some((Saved::Dev(a, an), Saved::Dev(b, bn))), Some((st, conv))) = (s, d) {
-                a.copy_prefix_from(st, *an).map_err(e)?;
-                b.copy_prefix_from(conv, *bn).map_err(e)?;
+                ents.push([a.ptr, st.ptr, *an as u64]);
+                ents.push([b.ptr, conv.ptr, *bn as u64]);
             }
         }
         if let Saved::Dev(p, n) = &snap.ple {
-            p.copy_prefix_from(&self.ple_state, *n).map_err(e)?;
+            ents.push([p.ptr, self.ple_state.ptr, *n as u64]);
+        }
+        if !self.copy_many(&ents) {
+            for (s, d) in snap.delta.iter().zip(&self.delta) {
+                if let (Some((Saved::Dev(a, an), Saved::Dev(b, bn))), Some((st, conv))) = (s, d) {
+                    a.copy_prefix_from(st, *an).map_err(e)?;
+                    b.copy_prefix_from(conv, *bn).map_err(e)?;
+                }
+            }
+            if let Saved::Dev(p, n) = &snap.ple {
+                p.copy_prefix_from(&self.ple_state, *n).map_err(e)?;
+            }
         }
         snap.tokens.clone_from(&self.tokens);
         snap.nblocks = self.attn.iter().map(|a| a.as_ref().map_or(0, |a| a.nblocks)).collect();

@@ -3379,3 +3379,19 @@ extern "C" __global__ void topk_merge(const float* iv, const unsigned int* ii, u
         out[(u64) row * 128 + 64 + t] = si[t];
     }
 }
+
+// Many device-to-device copies in one launch (STATUS 161): tab = n x (dst, src, bytes) as u64; entry e is copied by blocks e * parts .. e * parts + parts - 1, 16 bytes a thread
+// (every address 16-byte aligned: cuMemAlloc's), the last block of an entry also the tail bytes.  grid = n * parts, block 256.
+extern "C" __global__ void copy_many(const unsigned long long* tab, unsigned int parts) {
+    unsigned int e = blockIdx.x / parts, p = blockIdx.x % parts;
+    unsigned long long dst = tab[3 * (u64) e], src = tab[3 * (u64) e + 1], bytes = tab[3 * (u64) e + 2];
+    unsigned long long n16 = bytes / 16;
+    unsigned long long per = (n16 + parts - 1) / parts;
+    unsigned long long lo = (u64) p * per, hi = lo + per < n16 ? lo + per : n16;
+    const uint4* s = (const uint4*) src;
+    uint4* d = (uint4*) dst;
+    for (unsigned long long i = lo + threadIdx.x; i < hi; i += 256) d[i] = s[i];
+    if (p == parts - 1) {
+        for (unsigned long long i = n16 * 16 + threadIdx.x; i < bytes; i += 256) ((char*) dst)[i] = ((const char*) src)[i];
+    }
+}
