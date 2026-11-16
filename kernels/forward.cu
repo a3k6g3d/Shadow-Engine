@@ -3318,3 +3318,64 @@ extern "C" __global__ void plan_fill(const unsigned int* tidx, const unsigned in
         __syncthreads();
     }
 }
+// The 64 largest logits of each row, exactly (STATUS 159): largest first, ties to the lower id, the order the host sampler sorts in (`sampler.rs`), so a draw from the 64
+// is the draw from the whole vocabulary whenever top_k <= 64.  Two launches: `topk_slices` sorts 4,096 logits a block (bitonic, in shared memory) and keeps each slice's
+// 64 best (grid = rows x nb, 1-D, block 256); `topk_merge` sorts the nb x 64 winners of a row and writes its 64 best (grid = rows, block 256, nb <= 64).
+// A NaN counts as -inf; the slots past the vocabulary hold (-inf, 0xffffffff), after any real id.
+#define TK_K 64u
+#define TK_N 4096u
+__device__ __forceinline__ bool tk_before(float va, unsigned int ia, float vb, unsigned int ib) {
+    return va > vb || (va == vb && ia < ib);
+}
+__device__ void tk_sort(float* sv, unsigned int* si) {
+    for (unsigned int k = 2; k <= TK_N; k <<= 1) {
+        for (unsigned int j = k >> 1; j > 0; j >>= 1) {
+            for (unsigned int t = threadIdx.x; t < TK_N; t += 256) {
+                unsigned int l = t ^ j;
+                if (l > t) {
+                    bool up = (t & k) == 0;
+                    bool sw = up ? tk_before(sv[l], si[l], sv[t], si[t]) : tk_before(sv[t], si[t], sv[l], si[l]);
+                    if (sw) {
+                        float tv = sv[t]; sv[t] = sv[l]; sv[l] = tv;
+                        unsigned int ti = si[t]; si[t] = si[l]; si[l] = ti;
+                    }
+                }
+            }
+            __syncthreads();
+        }
+    }
+}
+extern "C" __global__ void topk_slices(const float* logits, unsigned int vocab, unsigned int ls, unsigned int nb, float* ov, unsigned int* oi) {
+    __shared__ float sv[TK_N];
+    __shared__ unsigned int si[TK_N];
+    unsigned int row = blockIdx.x / nb, blk = blockIdx.x % nb;
+    const float* r = logits + (u64) row * ls;
+    for (unsigned int t = threadIdx.x; t < TK_N; t += 256) {
+        unsigned int i = blk * TK_N + t;
+        float v = i < vocab ? r[i] : __int_as_float(0xff800000);
+        if (v != v) v = __int_as_float(0xff800000);
+        sv[t] = v;
+        si[t] = i < vocab ? i : 0xffffffffu;
+    }
+    __syncthreads();
+    tk_sort(sv, si);
+    u64 o = ((u64) row * nb + blk) * TK_K;
+    for (unsigned int t = threadIdx.x; t < TK_K; t += 256) { ov[o + t] = sv[t]; oi[o + t] = si[t]; }
+}
+// out: row r's values (float bits) at out[r * 128 .. +64) and its ids at out[r * 128 + 64 .. +64)
+extern "C" __global__ void topk_merge(const float* iv, const unsigned int* ii, unsigned int nb, unsigned int* out) {
+    __shared__ float sv[TK_N];
+    __shared__ unsigned int si[TK_N];
+    unsigned int row = blockIdx.x;
+    u64 base = (u64) row * nb * TK_K;
+    for (unsigned int t = threadIdx.x; t < TK_N; t += 256) {
+        if (t < nb * TK_K) { sv[t] = iv[base + t]; si[t] = ii[base + t]; }
+        else { sv[t] = __int_as_float(0xff800000); si[t] = 0xffffffffu; }
+    }
+    __syncthreads();
+    tk_sort(sv, si);
+    for (unsigned int t = threadIdx.x; t < TK_K; t += 256) {
+        out[(u64) row * 128 + t] = __float_as_uint(sv[t]);
+        out[(u64) row * 128 + 64 + t] = si[t];
+    }
+}

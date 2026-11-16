@@ -613,6 +613,10 @@ pub struct GpuSession<'c, 'm> {
     ple_host: std::cell::Cell<f64>,
     ple_calls: std::cell::Cell<u64>,
     stale_logits: HashMap<(usize, usize), Vec<Vec<f32>>>,
+    /// `step_batch_verify_top`: the logits of this pass are reduced on the device to their 64 largest a row (STATUS 159); the last stage sets `top_out`
+    top_want: bool,
+    top_buf: Option<DeviceBuffer<'c>>,
+    top_out: Vec<Vec<(f32, u32)>>,
     /// `SHADOW_ZERO_COPY=1`: the single-token path's RAM-tier misses are read in place over PCIe, not copied.
     zero_copy: bool,
     /// BF16 / F32 matrices in the 8-at-a-time sum order the quantized ones use (vector loads; one token and a batch
@@ -2439,6 +2443,9 @@ impl<'c, 'm> GpuSession<'c, 'm> {
             ple_calls: std::cell::Cell::new(0),
             timing_no_sync: std::env::var("SHADOW_TIMING_NO_SYNC").is_ok_and(|v| v == "1"),
             stale_logits: HashMap::new(),
+            top_want: false,
+            top_buf: None,
+            top_out: Vec::new(),
             zero_copy: std::env::var("SHADOW_ZERO_COPY").is_ok_and(|v| v == "1"),
             batch_graphs: HashMap::new(),
             fv_on: std::env::var("SHADOW_FILE_VIEWS").is_ok_and(|v| v == "1"),
@@ -5040,6 +5047,67 @@ impl<'c, 'm> GpuSession<'c, 'm> {
           || self.prefetch.is_some() || self.pregate.is_some() || self.mtp_probe.is_some())
     }
 
+    /// Whether the stage that ends the stack can reduce logits on the device: a buffer for the slice winners and the rows (kept), and a vocabulary of at most 64 slices of 4,096.
+    fn top_ready(&mut self) -> bool {
+        if let Some(p) = self.peer.as_mut() {
+            return p.top_ready();
+        }
+        let nb = self.m.cfg.vocab.div_ceil(4096);
+        if nb > 64 {
+            return false;
+        }
+        if self.top_buf.is_none() {
+            self.top_buf = self.ctx.alloc(COLS_MAX * (nb * 64 * 8 + 128 * 4)).ok();
+        }
+        self.top_buf.is_some()
+    }
+
+    fn set_top(&mut self, on: bool) {
+        self.top_want = on;
+        if let Some(p) = self.peer.as_mut() {
+            p.set_top(on);
+        }
+    }
+
+    fn take_top(&mut self) -> Vec<Vec<(f32, u32)>> {
+        match self.peer.as_mut() {
+            Some(p) => p.take_top(),
+            None => std::mem::take(&mut self.top_out),
+        }
+    }
+
+    /// The 64 largest logits of `n` rows of `bb.logits` (`topk_slices` then `topk_merge`), downloaded into `top_out`: 2 KiB a row instead of the 1 MiB vocabulary.  False when this
+    /// stage cannot (no buffer): the caller then downloads the logits.
+    fn topk_rows(&mut self, n: usize, vocab: usize) -> bool {
+        let nb = vocab.div_ceil(4096);
+        let Some(buf) = self.top_buf.as_ref() else { return false };
+        let (slices_v, slices_i, fin) = (buf.ptr, buf.ptr + (COLS_MAX * nb * 64 * 4) as u64, buf.ptr + (COLS_MAX * nb * 64 * 8) as u64);
+        self.k("topk_slices", (n * nb) as u32, 256, &[Arg::Ptr(self.bb.logits.ptr), Arg::U32(vocab as u32), Arg::U32(vocab as u32), Arg::U32(nb as u32), Arg::Ptr(slices_v), Arg::Ptr(slices_i)]);
+        self.k("topk_merge", n as u32, 256, &[Arg::Ptr(slices_v), Arg::Ptr(slices_i), Arg::U32(nb as u32), Arg::Ptr(fin)]);
+        let mut bytes = vec![0u8; n * 128 * 4];
+        self.download(fin, &mut bytes);
+        let words: Vec<u32> = bytes.chunks_exact(4).map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]])).collect();
+        for r in 0..n {
+            self.top_out.push((0..64).map(|t| (f32::from_bits(words[r * 128 + t]), words[r * 128 + 64 + t])).collect());
+        }
+        true
+    }
+
+    /// `step_batch_verify` for a caller that needs each row's 64 largest logits (a draw with top_k <= 64, or an argmax): the rows come back as (logit, token) pairs, largest first, ties to the
+    /// lower token, from the device (`SHADOW_TOPK_LOGITS=0`: not used).  None, with nothing run, when this pass cannot (not a batched verify pass, or no buffer): use `step_batch_verify`.
+    pub fn step_batch_verify_top(&mut self, tokens: &[u32]) -> Option<Vec<Vec<(f32, u32)>>> {
+        if std::env::var("SHADOW_TOPK_LOGITS").is_ok_and(|v| v == "0") || !self.batches() || !(2..=MAX_VERIFY.min(self.batch_max)).contains(&tokens.len()) || self.logits_last || !self.top_ready() {
+            return None;
+        }
+        self.top_out.clear();
+        self.set_top(true);
+        let _ = self.step_batch_verify(tokens);
+        self.set_top(false);
+        let out = self.take_top();
+        assert_eq!(out.len(), tokens.len(), "the top-64 of a verify pass came back for {} of {} rows", out.len(), tokens.len());
+        Some(out)
+    }
+
     /// `step_batch` for a speculative verify pass (2..=MAX_VERIFY tokens): it also keeps what `rollback` needs to
     /// keep a prefix of them without reading it again.
     pub fn step_batch_verify(&mut self, tokens: &[u32]) -> Vec<Vec<f32>> {
@@ -5623,6 +5691,10 @@ impl<'c, 'm> GpuSession<'c, 'm> {
         for j0 in (first..m_obs).step_by(COLS_MAX) {
             let n = (m_obs - j0).min(COLS_MAX);
             self.mv_cols("output.weight", row(&self.bb.u, h, j0), h, self.bb.logits.ptr, c.vocab, n);
+            if self.top_want && self.topk_rows(n, c.vocab) {
+                logits.extend(std::iter::repeat_n(vec![], n));
+                continue;
+            }
             let mut out = vec![0u8; n * c.vocab * 4];
             self.download(self.bb.logits.ptr, &mut out);
             logits.extend(out.chunks(c.vocab * 4).map(floats));

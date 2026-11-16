@@ -93,6 +93,9 @@ fn uniform(seed: u64, pos: usize) -> f64 {
     (bits >> 11) as f64 / (1u64 << 53) as f64
 }
 
+/// How many of a row's largest logits the device hands over (`GpuSession::step_batch_verify_top`).
+pub const TOP_CANDIDATES: usize = 64;
+
 pub fn argmax(v: &[f32]) -> u32 {
     let mut best = 0usize;
     for (i, &x) in v.iter().enumerate() {
@@ -150,6 +153,29 @@ impl Sampler {
         }
         cand.sort_unstable_by(|a, b| b.0.partial_cmp(&a.0).unwrap().then(a.1.cmp(&b.1)));
         cand.truncate(self.top_k.max(1));
+        self.draw(cand, max, pos)
+    }
+
+    /// Whether a draw can be made from a row's 64 largest logits (`sample_top`) and give what `sample` gives from the whole row: no penalties (they move logits of tokens anywhere in the
+    /// vocabulary), and a top-k of at most 64 (STATUS 159).
+    pub fn top_ok(&self) -> bool {
+        self.repeat_penalty == 1.0 && self.presence_penalty == 0.0 && self.frequency_penalty == 0.0 && self.top_k <= TOP_CANDIDATES
+    }
+
+    /// `sample` from the `TOP_CANDIDATES` largest logits of the row (largest first, ties to the lower id: the device's `topk_rows`); the same draw as `sample` on the whole row while `top_ok`.
+    pub fn sample_top(&mut self, top: &[(f32, u32)], pos: usize) -> u32 {
+        let max = top[0].0;
+        if !max.is_finite() {
+            return top[0].1;
+        }
+        let cut = max - 18.0 * self.temperature;
+        let mut cand: Vec<(f32, u32)> = top.iter().copied().take_while(|&(x, _)| x >= cut).collect();
+        cand.truncate(self.top_k.max(1));
+        self.draw(cand, max, pos)
+    }
+
+    /// The draw from the candidates (largest first): the softmax at the temperature, min-p, top-p, then the uniform number of (seed, position).
+    fn draw(&self, cand: Vec<(f32, u32)>, max: f32, pos: usize) -> u32 {
         // softmax at the temperature (max subtracted)
         let inv_t = 1.0 / self.temperature;
         let mut probs: Vec<f64> = cand.iter().map(|&(x, _)| (((x - max) * inv_t) as f64).exp()).collect();
@@ -195,6 +221,37 @@ mod tests {
 
     fn sampler(s: Sampling) -> Sampler {
         s.resolve(false, 7).expect("not greedy")
+    }
+
+    /// The device hands over each row's 64 largest logits (largest first, ties to the lower id); a draw from them is the draw from the whole row (STATUS 159).
+    #[test]
+    fn a_draw_from_the_top_64_is_the_draw_from_the_whole_row() {
+        let top_of = |l: &[f32]| -> Vec<(f32, u32)> {
+            let mut v: Vec<(f32, u32)> = l.iter().enumerate().map(|(i, &x)| (x, i as u32)).collect();
+            v.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap().then(a.1.cmp(&b.1)));
+            v.truncate(TOP_CANDIDATES);
+            v
+        };
+        let configs = [
+            Sampling { temperature: Some(0.7), top_k: Some(20), top_p: Some(0.95), seed: Some(3), ..Default::default() },
+            Sampling { temperature: Some(1.0), top_k: Some(64), top_p: Some(1.0), seed: Some(4), ..Default::default() },
+            Sampling { temperature: Some(1.5), top_k: Some(1), seed: Some(5), ..Default::default() },
+            Sampling { temperature: Some(0.3), top_k: Some(40), min_p: Some(0.05), seed: Some(6), ..Default::default() },
+            Sampling { temperature: Some(2.0), top_k: Some(30), top_p: Some(0.9), seed: Some(7), ..Default::default() },
+        ];
+        for (c, cfg) in configs.into_iter().enumerate() {
+            let mut a = sampler(cfg.clone());
+            let mut b = sampler(cfg);
+            assert!(a.top_ok(), "config {c}");
+            for pos in 0..300 {
+                // a row with ties (values on a 0.25 grid) as well as a smooth one
+                let l: Vec<f32> = (0..5000).map(|i| { let u = (splitmix64((pos * 5000 + i) as u64 ^ 0x77) >> 40) as f32 / 16777216.0; if pos % 2 == 0 { (u * 24.0).floor() * 0.25 } else { u * 8.0 } }).collect();
+                assert_eq!(a.sample(&l, pos, &[]), b.sample_top(&top_of(&l), pos), "config {c} position {pos}");
+            }
+        }
+        // top_k 0 (everything), a penalty: not for the top 64
+        assert!(!sampler(Sampling { temperature: Some(1.0), top_k: Some(0), ..Default::default() }).top_ok());
+        assert!(!sampler(Sampling { temperature: Some(1.0), top_k: Some(20), repeat_penalty: Some(1.1), ..Default::default() }).top_ok());
     }
 
     #[test]

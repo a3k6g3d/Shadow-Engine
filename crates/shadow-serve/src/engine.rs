@@ -1442,6 +1442,10 @@ fn answer<'c>(
     // `--dflash-min-p`: the DFlash chain stops after a draft the selector gives less than this
     let df_min_p: f32 = sess.drafter().map_or(0.0, |d| d.min_p);
     let mut spec_t = [0f64; 3]; // seconds drafting, checking, rolling back
+    // a verify pass hands over each row's 64 largest logits (the device sorts them) instead of the 1 MiB vocabulary a row: the draw or the argmax is the same (STATUS 159);
+    // `SHADOW_TOPK_LOGITS=0` off; not with a penalty or a top-k above 64 (`Sampler::top_ok`)
+    let top_mode = spec > 0 && !std::env::var("SHADOW_TOPK_LOGITS").is_ok_and(|v| v == "0") && sampler.as_ref().is_none_or(|s| s.top_ok());
+    let mut last_top: Option<Vec<(f32, u32)>> = None;
     let mut snap: Option<shadow_cuda::session::Snapshot> = None;
     // A thinking budget by effort (the menu says Low ~1k, Medium ~4k): a reasoning model left alone can think until the context is full (an
     // extra-high question ran 17,303 tokens and never answered).  Past the budget the think block is closed for it and it answers; the budget
@@ -1507,11 +1511,14 @@ fn answer<'c>(
                 hist.extend_from_slice(&closer);
             }
             *last_logits = sess.step_batch(&closer).pop().unwrap();
+            last_top = None;
             continue;
         }
-        let next = match sampler.as_mut() {
-            Some(sm) => sm.sample(last_logits, n, &gen),
-            None => argmax(last_logits),
+        let next = match (last_top.take(), sampler.as_mut()) {
+            (Some(top), Some(sm)) => sm.sample_top(&top, n),
+            (Some(top), None) => top[0].1,
+            (None, Some(sm)) => sm.sample(last_logits, n, &gen),
+            (None, None) => argmax(last_logits),
         };
         if tok.is_eog(next) || stops.contains(&next) {
             finish = "stop";
@@ -1557,6 +1564,7 @@ fn answer<'c>(
             spec_t[0] += t_d.elapsed().as_secs_f64();
             if draft.is_empty() {
                 *last_logits = sess.step(next);
+                last_top = None;
                 continue;
             }
             // check the drafts in one pass: outs[i] is what follows batch[..=i], bit for bit what step would give
@@ -1566,16 +1574,22 @@ fn answer<'c>(
             }
             let batch: Vec<u32> = std::iter::once(next).chain(draft.iter().copied()).collect();
             let t_v = Instant::now();
-            let mut outs = sess.step_batch_verify(&batch);
+            let top = if top_mode { sess.step_batch_verify_top(&batch) } else { None };
+            let (mut outs, mut outs_top) = match top {
+                Some(t) => (Vec::new(), t),
+                None => (sess.step_batch_verify(&batch), Vec::new()),
+            };
             spec_t[1] += t_v.elapsed().as_secs_f64();
             let mut keep = 1; // the tokens of `batch` the session keeps
             let mut cancelled = false;
             for (i, &d) in draft.iter().enumerate() {
                 spec_pos[i.min(7)].0 += 1;
                 // a stop token is left for the top of the loop to see, as without speculation
-                let want = match sampler.as_mut() {
-                    Some(sm) => sm.sample(&outs[i], n, &gen),
-                    None => argmax(&outs[i]),
+                let want = match (outs_top.get(i), sampler.as_mut()) {
+                    (Some(top), Some(sm)) => sm.sample_top(top, n),
+                    (Some(top), None) => top[0].1,
+                    (None, Some(sm)) => sm.sample(&outs[i], n, &gen),
+                    (None, None) => argmax(&outs[i]),
                 };
                 if want != d || tok.is_eog(d) || stops.contains(&d) {
                     break;
@@ -1604,7 +1618,13 @@ fn answer<'c>(
                 sess.rollback(snap.as_ref().unwrap(), &batch[..keep])?;
                 spec_t[2] += t_r.elapsed().as_secs_f64();
             }
-            *last_logits = outs.swap_remove(keep - 1);
+            if outs_top.is_empty() {
+                *last_logits = outs.swap_remove(keep - 1);
+            } else {
+                // the next token is drawn from these at the top of the loop; the full logits are not kept (a request that ends here has none to reuse)
+                last_top = Some(outs_top.swap_remove(keep - 1));
+                last_logits.clear();
+            }
             if cancelled {
                 finish = "cancelled";
                 break;
@@ -1612,6 +1632,7 @@ fn answer<'c>(
             continue;
         }
         *last_logits = sess.step(next);
+        last_top = None;
     }
     if spec > 0 {
         eprintln!("shadow serve: speculation: {} passes ({} drafted by lookup), {} of {} drafted tokens accepted, {} tokens in {:.1} s                    (drafting {:.2} s, checking {:.2} s, rolling back {:.2} s)",
