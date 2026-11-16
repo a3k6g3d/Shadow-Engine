@@ -30,6 +30,7 @@ CUDA index, `safetensors`, `numpy`, `matplotlib`).
 | `tools/nsys_decode_rounds.py X.sqlite` | decode only from an Nsight Systems export (`--cuda-graph-trace=node`): per DFlash round the kernel, copy and idle time, the kernels by name, the gaps by size and by the CUDA call running in them |
 | `tools/nsys_decode_capture.ps1 -Tag NAME [-Flags "..."]` + `tools/nsys_decode_client.py` | nsys capture of a served conversation (`--cuda-graph-trace=node`, the first six `varied36` prompts) of any flag set, the shadow.exe child capped like `run_capped`; export with `nsys export --type sqlite` (STATUS 155) |
 | `tools/nsys_pair_rounds.py X.sqlite` | per DFlash round on one or two cards: busy time per device, both busy at once, idle, copies by kind and device, kernels by name per device, and the segment timeline of a typical round (STATUS 155) |
+| `tools/nsys_prompt_bound.py X.sqlite` + `tools/nsys_prompt_client.py` | long prompts under nsys (`nsys_decode_capture.ps1 -Client tools/nsys_prompt_client.py`): per prompt burst the wall time, kernel-busy, H2D-copy-busy, both, neither, GiB copied and the kernel time by name (STATUS 157) |
 | `tools/spec_probe.py` | what speculation could buy from routing logs: expert-union size per verify pass, accepted tokens per pass |
 | `tools/serve_check.py [URL]` | live checks of a running `shadow serve`: every route, streamed vs whole answers identical, prefix reuse, refusals, concurrent requests |
 
