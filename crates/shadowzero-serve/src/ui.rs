@@ -2514,6 +2514,60 @@ canvas.spark { width: 100%; height: 64px; display: block; }
       return [`The server answered ${status}.`, msg];
     }
 
+    function latestDecodeSpeed(d) {
+      const rec = d && Array.isArray(d.recent) ? d.recent : [];
+      const last = rec[rec.length - 1];
+      if (last && last.predicted_ms > 0) return last.completion_tokens / (last.predicted_ms / 1000);
+      return d && d.process && d.process.tok_per_sec > 0 ? d.process.tok_per_sec : 0;
+    }
+
+    function classifyEmptyStop(rawContent, rawThinking, cutOff) {
+      if (cutOff) {
+        return { reason: 'cut off at the context limit', title: '', detail: '' };
+      }
+      if (/<tool_call>/i.test(rawContent || '')) {
+        const trimmed = String(rawContent).trim();
+        const snippet = trimmed.slice(0, 180);
+        return {
+          reason: 'incomplete or unrecognized tool call',
+          title: 'Stopped: the model emitted an incomplete or unrecognized tool call.',
+          detail: snippet ? `${snippet}${trimmed.length > 180 ? '…' : ''} — send "continue" or click Retry.` : 'Send "continue" or click Retry.'
+        };
+      }
+      return {
+        reason: 'model ended turn with an empty reply',
+        title: `Stopped: the model ended its turn without writing a reply or tool call${rawThinking ? ' (after thinking)' : ''}.`,
+        detail: 'Send "continue" to ask it to go on, or click Retry.'
+      };
+    }
+
+    function unfinishedTurnNudge(cleanFinal, rawContent, opts) {
+      const o = opts || {};
+      if (!o.toolsEnabled || o.cutOff || (o.autoNudges || 0) >= 3) return null;
+      if (/<tool_call>/i.test(rawContent || '')) {
+        return {
+          kind: 'malformed_tool',
+          nudge: 'Your last message contained an incomplete or unrecognized <tool_call> block. Emit the tool call again using exact <tool_call><function=NAME><parameter=KEY>VALUE</parameter></function></tool_call> tags.'
+        };
+      }
+      if ((o.loopTurns || 1) > 1 && !(cleanFinal || '').trim()) {
+        return {
+          kind: 'empty_mid_task',
+          nudge: 'You ended your turn without calling a tool or answering. Continue the task by calling the next tool, or call finish if you are done.'
+        };
+      }
+      if ((o.loopTurns || 1) > 1 && o.finishActive) {
+        const tail = String(cleanFinal || '').trim();
+        if (/:[\s`"'*]*$/.test(tail) || /\b(?:let me|i(?:'ll| will) (?:now )?(?:read|check|inspect|edit|write|run|search|grep|find|update|verify|test|compile|open)|next,?\s+(?:let me|i(?:'ll| will)))\b[^.?!]{0,120}$/i.test(tail)) {
+          return {
+            kind: 'dropped_tool_call',
+            nudge: 'You described your next step but stopped without emitting the <tool_call>. Call the tool now, or call finish if the task is complete.'
+          };
+        }
+      }
+      return null;
+    }
+
     let resumeOnly = false;
     let retryAction = null;
     function retryFailed() { if (retryAction && !isGenerating) retryAction(); }
@@ -2558,7 +2612,8 @@ canvas.spark { width: 100%; height: 64px; display: block; }
       let loopTurns = 0;
       // no limit on the number of steps (the rolling context keeps the request bounded, Stop ends it); the one guard is a model stuck on the same tool call
       const MAX_SAME_CALLS = 4;
-      let lastCallSig = '', sameCalls = 0, stuck = false;
+      let lastCallSig = '', sameCalls = 0, stuck = false, emptyStopReason = '', autoNudges = 0;
+      let nudgeMsgs = [];
       const callCounts = new Map();   // how often each exact tool call was made in this task
       let readStreak = 0;             // read-only calls since the last notes / edit
       const aggTimings = { predN: 0, predMs: 0, promptN: 0, promptMs: 0 };
@@ -2610,6 +2665,8 @@ canvas.spark { width: 100%; height: 64px; display: block; }
         let rawThinking = '';
         let streamError = null;
         let cutOff = false;
+        let streamFinished = false;
+        let finishReason = null;
         let lastTimings = null;
         let thinkStart = performance.now();
         let isThinking = false;
@@ -2617,7 +2674,7 @@ canvas.spark { width: 100%; height: 64px; display: block; }
         const payloadMessages = [];
         const sys = systemPrompt();
         if (sys) payloadMessages.push({ role: 'system', content: sys });
-        payloadMessages.push(...withNotes(buildContextMessages(history)));
+        payloadMessages.push(...withNotes(buildContextMessages(history)), ...nudgeMsgs);
 
         const requestBody = {
           messages: payloadMessages,
@@ -2653,20 +2710,23 @@ canvas.spark { width: 100%; height: 64px; display: block; }
 
           while (true) {
             const { done, value } = await reader.read();
-            if (done) break;
-
-            buffer += decoder.decode(value, { stream: true });
+            if (value) buffer += decoder.decode(value, { stream: !done });
+            else if (done) buffer += decoder.decode();
             const lines = buffer.split('\n');
-            buffer = lines.pop();
+            buffer = done ? '' : lines.pop();
 
             for (const line of lines) {
               const trimmed = line.trim();
-              if (!trimmed || trimmed === 'data: [DONE]') continue;
+              if (!trimmed) continue;
+              if (trimmed === 'data: [DONE]') { streamFinished = true; continue; }
               if (trimmed.startsWith('data: ')) {
                 try {
                   const parsed = JSON.parse(trimmed.slice(6));
                   if (parsed.timings) lastTimings = parsed.timings;
-                  if (parsed.choices && parsed.choices[0] && parsed.choices[0].finish_reason === 'length') cutOff = true;
+                  if (parsed.choices && parsed.choices[0] && parsed.choices[0].finish_reason) {
+                    finishReason = parsed.choices[0].finish_reason;
+                    if (finishReason === 'length') cutOff = true;
+                  }
                   if (parsed.error) { streamError = parsed.error.message || 'The server reported an error.'; continue; }
                   const delta = parsed.choices?.[0]?.delta;
                   if (!delta) continue;
@@ -2732,22 +2792,11 @@ canvas.spark { width: 100%; height: 64px; display: block; }
                 } catch (_) {}
               }
             }
+            if (done) break;
           }
 
-          // the server's error mid-stream (e.g. a picture it could not encode): shown in place of the reply, the question taken back
-          if (streamError) {
-            thinkBlock.style.display = 'none';
-            if (loopTurns === 1 && !resume) {
-              // the question itself failed: take it back (it goes into the box again with Retry), as if it had not been sent
-              history.pop();
-              retryAction = () => { inputEl.value = text; attachments.push(...sentAtts); renderTray(); sendMessage(); };
-            } else {
-              // part-way through an agent turn: what was done stays in the conversation, and Retry asks for the next step again
-              retryAction = () => { resumeOnly = true; sendMessage(); };
-            }
-            msgContent.innerHTML = `<div class="msg-error">${escapeHtml(streamError)} <button class="retry-btn" onclick="retryFailed()">Retry</button></div>`;
-            failed = true;
-            break;
+          if (!streamError && !streamFinished && !finishReason) {
+            streamError = 'The response stream ended unexpectedly before finishing.';
           }
 
           if (isThinking) {
@@ -2764,6 +2813,22 @@ canvas.spark { width: 100%; height: 64px; display: block; }
             const chevron = thinkBlock.querySelector('.think-chevron');
             if (chevron) chevron.style.display = 'inline-block';
             if (thinkContent.style.display !== 'none') toggleThinkBlock(thinkBlock.querySelector('.think-header-left'));
+          }
+
+          // the server's error mid-stream (e.g. a picture it could not encode): shown in place of the reply, the question taken back
+          if (streamError) {
+            if (!rawThinking) thinkBlock.style.display = 'none';
+            if (loopTurns === 1 && !resume) {
+              // the question itself failed: take it back (it goes into the box again with Retry), as if it had not been sent
+              history.pop();
+              retryAction = () => { inputEl.value = text; attachments.push(...sentAtts); renderTray(); sendMessage(); };
+            } else {
+              // part-way through an agent turn: what was done stays in the conversation, and Retry asks for the next step again
+              retryAction = () => { resumeOnly = true; sendMessage(); };
+            }
+            msgContent.innerHTML = `<div class="msg-error">${escapeHtml(streamError)} <button class="retry-btn" onclick="retryFailed()">Retry</button></div>`;
+            failed = true;
+            break;
           }
 
           // Check if assistant called tools (OpenAI delta.tool_calls from /v1/chat/completions or inline <tool_call> XML)
@@ -2833,6 +2898,7 @@ canvas.spark { width: 100%; height: 64px; display: block; }
           }
 
           if (toolsEnabled && toolCalls.length > 0) {
+            nudgeMsgs = [];
             history.push({ role: 'assistant', content: historyRawContent });
             const callSig = JSON.stringify(toolCalls.map(tc => [tc.name, tc.arguments]));
             sameCalls = callSig === lastCallSig ? sameCalls + 1 : 1;
@@ -2907,8 +2973,41 @@ canvas.spark { width: 100%; height: 64px; display: block; }
             // Loop continues to let ShadowZero formulate final answer using the tool output
             continue;
           } else {
-            // No more tool calls; finish turn
-            history.push({ role: 'assistant', content: rawContent });
+            const nudge = unfinishedTurnNudge(cleanFinal, rawContent, {
+              toolsEnabled,
+              finishActive: finishActive(),
+              loopTurns,
+              cutOff,
+              autoNudges
+            });
+            if (nudge) {
+              autoNudges++;
+              if (cleanFinal) {
+                const g = toolGroupFor(bubbleEl);
+                const note = document.createElement('div');
+                note.className = 'msg-content';
+                note.style.margin = '0.25rem 0';
+                note.innerHTML = renderMarkdown(cleanFinal);
+                g.querySelector('.tool-group-body').appendChild(note);
+                msgContent.innerHTML = '';
+                msgContent.style.display = 'none';
+              }
+              timingInfo.textContent = 'Model paused mid-step without a tool call — continuing automatically...';
+              nudgeMsgs.push({ role: 'assistant', content: rawContent.trim() || '(stopped without output)' });
+              nudgeMsgs.push({ role: 'user', content: nudge.nudge });
+              continue;
+            }
+            // No more tool calls; finish turn (never exit silently on an empty or stripped unparsed tool-call reply)
+            if (!cleanFinal) {
+              const info = classifyEmptyStop(rawContent, rawThinking, cutOff);
+              emptyStopReason = info.reason;
+              if (!cutOff) {
+                retryAction = () => { resumeOnly = true; sendMessage(); };
+                msgContent.innerHTML = `<div class="msg-error">${escapeHtml(info.title)}<small>${escapeHtml(info.detail)}</small> <button class="retry-btn" onclick="retryFailed()">Retry</button></div>`;
+              }
+            } else {
+              history.push({ role: 'assistant', content: rawContent });
+            }
             break;
           }
         } catch (err) {
@@ -2953,6 +3052,8 @@ canvas.spark { width: 100%; height: 64px; display: block; }
         timingInfo.textContent = 'Failed - nothing was generated';
       } else if (hitStuck) {
         timingInfo.textContent = `Stopped after ${dt.toFixed(2)}s: the same tool call ${MAX_SAME_CALLS} times in a row`;
+      } else if (emptyStopReason) {
+        timingInfo.textContent = `Stopped after ${dt.toFixed(2)}s: ${emptyStopReason}`;
       } else if (timingInfo.textContent !== 'Generation stopped by user') {
         timingInfo.textContent = `Completed in ${dt.toFixed(2)}s`;
       }
@@ -3024,8 +3125,11 @@ canvas.spark { width: 100%; height: 64px; display: block; }
             ? 'ShadowZero is loading the model - you can type, sending opens when it is ready'
             : 'Message ShadowZero (Enter to send, Shift+Enter for a new line)';
         }
-        if (d.process.tok_per_sec > 0) {
-          speedPill.innerHTML = `Speed: <strong>${d.process.tok_per_sec.toFixed(1)} tok/s</strong>`;
+        const lastTps = latestDecodeSpeed(d);
+        if (lastTps > 0) {
+          speedPill.innerHTML = `Speed: <strong>${lastTps.toFixed(1)} tok/s</strong>`;
+          const avg = d.process.tok_per_sec > 0 ? ` (session avg ${d.process.tok_per_sec.toFixed(1)} tok/s)` : '';
+          speedPill.title = `Last reply decode speed${avg}`;
         }
       }
       if (d.gpu) {
@@ -3087,26 +3191,20 @@ canvas.spark { width: 100%; height: 64px; display: block; }
     }
     connectEvents();
 
-    // ---- saved conversations (the sidebar): in this browser's localStorage, pictures included until the space runs out
-    const CHATS_KEY = 'shadow_chats_v1';
+    // ---- saved conversations (the sidebar): on the server, this browser keeps only the list it fetched
     let chats = [];
-    try { chats = JSON.parse(localStorage.getItem(CHATS_KEY) || '[]'); } catch (_) { chats = []; }
     let currentChatId = null;
-    function stripPics(m) {
-      if (!Array.isArray(m.content)) return m;
-      return { ...m, content: m.content.map(p => p.type === 'image_url' ? { type: 'text', text: '[picture removed to save space]' } : p) };
+    async function refreshChats() {
+      try { const r = await fetch('/v1/sessions'); const j = await r.json(); chats = (j && j.sessions) || []; } catch (_) { chats = []; }
+      renderChatList();
     }
-    function persistChats() {
-      for (let tries = 0; tries < 40; tries++) {
-        try { localStorage.setItem(CHATS_KEY, JSON.stringify(chats)); return; } catch (_) {
-          // out of space: drop the pictures of the oldest conversation that has any, else the oldest conversation
-          const old = chats.filter(c => c.id !== currentChatId).sort((a, b) => a.ts - b.ts);
-          const withPics = old.find(c => c.history.some(m => Array.isArray(m.content) && m.content.some(p => p.type === 'image_url')));
-          if (withPics) withPics.history = withPics.history.map(stripPics);
-          else if (old.length) chats.splice(chats.indexOf(old[0]), 1);
-          else return;
-        }
-      }
+    function migrateChats() {
+      // one-time move of this browser's old localStorage chats onto the server
+      let arr = [];
+      try { arr = JSON.parse(localStorage.getItem('shadow_chats_v1') || '[]'); } catch (_) { return; }
+      if (!Array.isArray(arr) || !arr.length) return;
+      fetch('/v1/sessions/import', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(arr) })
+        .then(() => { localStorage.removeItem('shadow_chats_v1'); refreshChats(); }).catch(() => {});
     }
     function messageText(m) {
       return Array.isArray(m.content) ? m.content.filter(p => p.type === 'text').map(p => p.text).join(' ') : String(m.content || '');
@@ -3119,15 +3217,17 @@ canvas.spark { width: 100%; height: 64px; display: block; }
       t = t.replace(/\s+/g, ' ').trim();
       return t ? (t.length > 52 ? t.slice(0, 50) + '...' : t) : 'New chat';
     }
-    function saveCurrent() {
+    async function saveCurrent() {
       if (!history.length) return;
-      let c = chats.find(x => x.id === currentChatId);
-      if (!c) { c = { id: 'c' + Date.now().toString(36), title: '', ts: 0, history: [] }; chats.push(c); currentChatId = c.id; }
-      c.history = JSON.parse(JSON.stringify(history));
-      c.notes = scratchpad;
-      c.ts = Date.now();
-      c.title = chatTitle(c.history);
-      persistChats();
+      try {
+        const r = await fetch('/v1/sessions', { method: 'POST', headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ history: JSON.parse(JSON.stringify(history)), notes: scratchpad, id: currentChatId }) });
+        const j = await r.json();
+        if (j && j.id) currentChatId = j.id;
+      } catch (_) {}
+      const row = { id: currentChatId, title: chatTitle(history), ts: Date.now(), n: history.length, notes: scratchpad };
+      const at = chats.findIndex(x => x.id === currentChatId);
+      if (at >= 0) chats[at] = row; else chats.unshift(row);
       renderChatList();
     }
     function dayLabel(ts) {
@@ -3139,7 +3239,9 @@ canvas.spark { width: 100%; height: 64px; display: block; }
       const box = document.getElementById('chat-list');
       if (!box) return;
       const q = (document.getElementById('chat-search').value || '').toLowerCase();
-      const list = chats.filter(c => !q || c.title.toLowerCase().includes(q) || c.history.some(m => messageText(m).toLowerCase().includes(q))).sort((a, b) => b.ts - a.ts);
+      if (currentChatId && history.length && !chats.find(c => c.id === currentChatId))
+        chats.unshift({ id: currentChatId, title: chatTitle(history), ts: Date.now(), n: history.length, notes: scratchpad });
+      const list = chats.filter(c => !q || (c.title || '').toLowerCase().includes(q) || (c.history || []).some(m => messageText(m).toLowerCase().includes(q))).sort((a, b) => b.ts - a.ts);
       if (!list.length) { box.innerHTML = `<div class="side-empty">${q ? 'No conversation matches.' : 'Your conversations will be listed here.'}</div>`; return; }
       let last = '', html = '';
       for (const c of list) {
@@ -3202,9 +3304,10 @@ canvas.spark { width: 100%; height: 64px; display: block; }
       absorbPreviousToolGroup(row);
       if (truncOn) row.querySelectorAll('.tool-output').forEach(markClipped);
     }
-    function openChat(id) {
-      const c = chats.find(x => x.id === id);
-      if (!c) return;
+    async function openChat(id) {
+      let c;
+      try { c = await (await fetch('/v1/sessions/' + encodeURIComponent(id))).json(); } catch (_) { return; }
+      if (!c || !Array.isArray(c.history)) return;
       if (isGenerating && currentAbortController) currentAbortController.abort();
       saveCurrent();
       currentChatId = id;
@@ -3226,18 +3329,17 @@ canvas.spark { width: 100%; height: 64px; display: block; }
       const c = chats.slice().sort((a, b) => b.ts - a.ts)[0];
       if (c) openChat(c.id); else switchView('chat');
     }
-    function deleteChat(id) {
-      chats = chats.filter(c => c.id !== id);
+    async function deleteChat(id) {
       if (id === currentChatId) { currentChatId = null; history.length = 0; messagesEl.innerHTML = welcomeHTML; }
-      persistChats();
-      renderChatList();
+      try { await fetch('/v1/sessions/' + encodeURIComponent(id), { method: 'DELETE' }); } catch (_) {}
+      await refreshChats();
     }
     function toggleSidebar() {
       document.body.classList.toggle('side-closed');
       localStorage.setItem('shadow_side_closed', document.body.classList.contains('side-closed') ? '1' : '0');
     }
     if (localStorage.getItem('shadow_side_closed') === '1') document.body.classList.add('side-closed');
-    renderChatList();
+    migrateChats(); refreshChats();
 
     // ---- the dashboard: what the engine is doing, from /v1/telemetry (every second) and its log of recent requests
     const dashHist = { gpu: [], gpus: [], ram: [], cpu: [], cpuSys: [] };
@@ -3646,8 +3748,13 @@ html('d-ramfree', gib(ram.system_available_bytes || 0) + '<small>GiB free</small
       if (isGenerating) { note.textContent = 'Wait for the reply in progress.'; return; }
       const asked = [];
       let size = 0;
-      for (const c of chats.slice().sort((a, b) => b.ts - a.ts)) {
-        for (const m of c.history) {
+      const rows = chats.slice().sort((a, b) => b.ts - a.ts).slice(0, 12);
+      for (const c of rows) {
+        let hist = c.history;
+        if (!Array.isArray(hist)) {
+          try { const j = await (await fetch('/v1/sessions/' + encodeURIComponent(c.id))).json(); hist = j.history || []; } catch (_) { continue; }
+        }
+        for (const m of hist) {
           if (m.role !== 'user') continue;
           let t = messageText(m);
           if (t.startsWith('File: ') && t.lastIndexOf('```') >= 0) t = t.slice(t.lastIndexOf('```') + 3);
@@ -3655,6 +3762,7 @@ html('d-ramfree', gib(ram.system_available_bytes || 0) + '<small>GiB free</small
           if (t.length < 8 || size + t.length > 12000 || asked.length >= 80) continue;
           asked.push(t); size += t.length;
         }
+        if (asked.length >= 80 || size >= 12000) break;
       }
       if (asked.length < 3) { note.textContent = 'Not enough saved chats yet: chat a little first.'; return; }
       btn.disabled = true; box.innerHTML = '';

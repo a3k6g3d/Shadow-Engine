@@ -9,7 +9,7 @@ function grab(name) {
   for (; k < ui.length; k++) { if (ui[k] === '{') d++; else if (ui[k] === '}') { d--; if (d === 0) break; } }
   return ui.slice(i, k + 1);
 }
-const names = ['readOnlyStreak', 'treadmillNote', 'runNotesTool', 'withNotes', 'recallMessages', 'buildContextMessages', 'parseToolCallsFromText', 'stripToolCalls', 'messageText', 'unwrapToolResponse'];
+const names = ['readOnlyStreak', 'treadmillNote', 'runNotesTool', 'withNotes', 'recallMessages', 'buildContextMessages', 'parseToolCallsFromText', 'stripToolCalls', 'messageText', 'unwrapToolResponse', 'latestDecodeSpeed', 'classifyEmptyStop', 'unfinishedTurnNudge'];
 function grabConst(name) {
   const i = ui.indexOf('const ' + name + ' =');
   if (i < 0) throw new Error('no ' + name);
@@ -29,7 +29,7 @@ const factory = new Function('state', `
   const renderNotes = () => {}, saveCurrent = () => {};
   const timingInfo = { textContent: '' }, document = { getElementById: () => ({}) };
   ${src}
-  return { readOnlyStreak, treadmillNote, runNotesTool, withNotes, recallMessages, buildContextMessages, getNotes: () => scratchpad, setNotes: v => { scratchpad = v; } };
+  return { readOnlyStreak, treadmillNote, runNotesTool, withNotes, recallMessages, buildContextMessages, latestDecodeSpeed, classifyEmptyStop, unfinishedTurnNudge, getNotes: () => scratchpad, setNotes: v => { scratchpad = v; } };
 `);
 let fails = 0;
 const ok = (c, m) => { if (!c) { fails++; console.log('FAIL:', m); } else console.log('ok:  ', m); };
@@ -150,5 +150,17 @@ ok(/read-only calls in a row without saving notes or editing/.test(notes[0][1] +
 ok(tm.readOnlyStreak('notes', 12) === 0 && tm.readOnlyStreak('replace_lines', 12) === 0 && tm.readOnlyStreak('edit_file', 12) === 0, 'notes and edits reset the streak');
 ok(tm.readOnlyStreak('cmd', 5) === 5 && tm.readOnlyStreak('web_fetch', 5) === 5, 'other tools neither add nor reset');
 ok(tm.treadmillNote(7) === '' && tm.treadmillNote(9) === '' && tm.treadmillNote(15) === '', 'no note in between');
+
+// ---- header decode speed matches last reply and empty/malformed stops explain why
+ok(Math.abs(tm.latestDecodeSpeed({ process: { tok_per_sec: 52.6 }, recent: [{ completion_tokens: 100, predicted_ms: 2000 }, { completion_tokens: 595, predicted_ms: 10000 }] }) - 59.5) < 1e-6, 'header speed uses last reply decode speed');
+ok(Math.abs(tm.latestDecodeSpeed({ process: { tok_per_sec: 52.6 }, recent: [] }) - 52.6) < 1e-6, 'header speed falls back to session avg when recent is empty');
+ok(tm.classifyEmptyStop('', 'thought', false).reason === 'model ended turn with an empty reply' && /after thinking/.test(tm.classifyEmptyStop('', 'thought', false).title), 'empty reply after thinking explains why it stopped');
+ok(tm.classifyEmptyStop('<tool_call><function=edit_file>', '', false).reason === 'incomplete or unrecognized tool call', 'unparsed tool_call stripped to empty explains why it stopped');
+ok(tm.classifyEmptyStop('', '', true).reason === 'cut off at the context limit', 'cut-off empty reply classifies as context limit');
+ok(tm.unfinishedTurnNudge('The server side of F2 is complete and compiles. Now the client rewiring in ui.rs. Let me read the exact chat-store block:', '...', { toolsEnabled: true, finishActive: true, loopTurns: 5, cutOff: false, autoNudges: 0 })?.kind === 'dropped_tool_call', 'trailing colon mid-task triggers dropped_tool_call nudge');
+ok(tm.unfinishedTurnNudge('', '<tool_call><function=read_file>', { toolsEnabled: true, finishActive: true, loopTurns: 1, cutOff: false, autoNudges: 0 })?.kind === 'malformed_tool', 'unparsed tool_call triggers malformed_tool nudge');
+ok(tm.unfinishedTurnNudge('', '', { toolsEnabled: true, finishActive: true, loopTurns: 3, cutOff: false, autoNudges: 0 })?.kind === 'empty_mid_task', 'empty reply mid-task triggers empty_mid_task nudge');
+ok(tm.unfinishedTurnNudge('All done, everything passed.', 'All done, everything passed.', { toolsEnabled: true, finishActive: true, loopTurns: 3, cutOff: false, autoNudges: 0 }) === null, 'complete normal reply does not trigger nudge');
+ok(tm.unfinishedTurnNudge('Let me read the file:', 'Let me read the file:', { toolsEnabled: true, finishActive: true, loopTurns: 3, cutOff: false, autoNudges: 3 }) === null, 'auto-nudge stops at cap 3');
 console.log(fails ? `${fails} FAILED` : 'all passed');
 process.exit(fails ? 1 : 0);

@@ -2,6 +2,15 @@
 
 All notable changes to ShadowZero will be documented in this file.
 
+## [0.1.45] — 2026-11-17
+### Fixed
+- **Auto-resume when the model drops a `<tool_call>` mid-task (`crates/shadowzero-serve/src/ui.rs`)**: Added `unfinishedTurnNudge(...)` (capped at `3` automatic nudges per user turn using ephemeral `nudgeMsgs` so saved `history` stays clean) to automatically continue when an active tool loop stops on a malformed `<tool_call>`, an empty mid-task reply, or a mid-step trailing intent (e.g. `"Let me read the exact chat-store block:"` ending without emitting `<tool_call>`).
+
+## [0.1.44] — 2026-11-17
+### Fixed
+- **Header `Speed:` pill now matches Dashboard `DECODE SPEED` (`crates/shadowzero-serve/src/ui.rs`)**: Added `latestDecodeSpeed(d)` so the top header pill displays the latest reply's decode speed from `d.recent` (matching `#d-tps` instead of drifting behind the session-wide lifetime average `d.process.tok_per_sec`, while keeping the session average in the pill tooltip and falling back to it when `recent` is empty).
+- **Clear reason instead of silent stops on empty/unparsed replies (`crates/shadowzero-serve/src/ui.rs`)**: Added `classifyEmptyStop(...)`, trailing SSE buffer flush, and premature-EOF detection (`!streamFinished && !finishReason`) so a turn that ends after thinking with an empty reply, an incomplete/unrecognized `<tool_call>` stripped to empty, context cut-off, or an unexpected stream end displays an explicit stop reason and `Retry` button instead of leaving an empty bubble with `Completed in ...s`, and does not append an empty assistant turn to `history`.
+
 ## [0.1.43] — 2026-11-17
 ### Fixed
 - **Post-folder-rename path cleanup (`J:\Shadow` -> `J:\ShadowZero`)**: Updated remaining path references in `mcp.json`, `tools/swap_and_relaunch.ps1` (including `Get-Process shadowzero`), `tools/make_headless_shortcut.ps1`, `crates/shadowzero-serve/src/ui.rs` (chat suggestion chip and `%APPDATA%\ShadowZero` help text), `docs/USAGE.md`, `CLAUDE.md`, and `tools/` scripts, and refreshed Start Menu shortcuts.
@@ -177,8 +186,8 @@ Prompt reading with `--tensor-prompt` (the default fast mode) is about 5% / 11% 
 
 ## [Unreleased]
 ### Added
-- Long prompts (128+ unread tokens) borrow the tail of the VRAM expert cache as staging and are read in 256-token chunks; the cache is restored from the RAM tier afterwards.
-  Prompt reading 51 -> 78-86 tok/s in the default mode (2.3x in `--exact`), output unchanged, decode unaffected. `SHADOWZERO_NO_LEND=1` turns it off (docs/STATUS.md).
+- `/v1/events`: a server-sent-events stream pushing telemetry once a second and status changes, so the web UI's header gauges update by push instead of polling (`EventSource`, with the 1 s poll kept as fallback).
+- Server-side chat sessions (`/v1/sessions` CRUD + `/v1/sessions/import`): the sidebar list and every conversation now live on the server instead of the browser's localStorage, so chats survive a browser change and are readable by other clients; the first load migrates any old localStorage chats onto the server automatically.
 ### Changed
 - Tensor-core prompt kernels (`--tensor-prompt`, default mode): the Q6_K / IQ4_XS projections and the grouped experts run on `mma.sync` FP16 tiles (3e-4 relative error, 7x faster kernels); one batched copy call per layer: prompts of 1,024+ tokens read 185-225 tok/s with the default tier in 2,048-token batches (was 130-145).
 - Prompt reading of 1,024+ tokens: a layer-ahead pipeline (next layer's experts copied and its file reads started while this one computes) and 1,024-token batches from buffers carved out of the lent cache: 77-87 -> 128-144 tok/s, `--exact` 40 -> 62; decode unchanged.
