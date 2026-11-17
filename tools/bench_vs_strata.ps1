@@ -1,4 +1,4 @@
-# Shadow against Strata on the same bench, same prompts, same machine, one interleaved run: scored by total throughput
+# ShadowZero against Strata on the same bench, same prompts, same machine, one interleaved run: scored by total throughput
 # (tools/bench_total.py) and charted with the machine's resource use (tools/plot_bench.py).  See docs/BENCHMARKING.md.
 #
 #   powershell -File tools/bench_vs_strata.ps1 -Out bench/vs-strata-varied -Runs 3 `
@@ -13,8 +13,8 @@ param(
   [int]$Turns = 6,
   [string]$Placement = 'profiles/routing-varied300.shrc',
   [string]$ShadowFlags = '',
-  [string]$ShadowExe = 'target/release/shadow.exe',
-  [string]$Bench = 'target/release/shadow-bench.exe'
+  [string]$ShadowExe = 'target/release/shadowzero.exe',
+  [string]$Bench = 'target/release/shadowzero-bench.exe'
 )
 Set-Location (Split-Path $PSScriptRoot -Parent)
 $L = "& '$PSScriptRoot\run_strata.ps1' -Port {port} -Out '{log}' -Config '$StrataConfig'"

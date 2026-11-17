@@ -1,5 +1,5 @@
 param([string]$Tag, [string]$Flags = '', [string]$Client = 'J:\Shadow\tools\nsys_decode_client.py', [string]$Model = 'J:/Models/Lygodactylus-Qwen3.8-Flash-Next-Uncensored-exl3-2bpw', [int]$CapGiB = 56, [double]$FloorGiB = 3.5)
-# Decode under Nsight Systems: nsys starts shadow.exe; this script caps the shadow.exe child's working set and kills it below the free-RAM floor
+# Decode under Nsight Systems: nsys starts shadowzero.exe; this script caps the shadowzero.exe child's working set and kills it below the free-RAM floor
 # (the rule of tools/run_capped.ps1, applied to the child because run_capped would cap nsys itself).
 Set-Location J:\Shadow
 $sp = $env:TEMP
@@ -14,19 +14,19 @@ public static class Ws2 {
   public static extern bool SetProcessWorkingSetSizeEx(IntPtr h, UIntPtr min, UIntPtr max, uint flags);
 }
 '@
-$nargs = "profile --trace=cuda --cuda-graph-trace=node --sample=none --cpuctxsw=none -o `"$rep`" -f true J:\Shadow\target-dev\release\shadow.exe serve $model --port 8095 --ctx 24576 $Flags"
+$nargs = "profile --trace=cuda --cuda-graph-trace=node --sample=none --cpuctxsw=none -o `"$rep`" -f true J:\Shadow\target-dev\release\shadowzero.exe serve $model --port 8095 --ctx 24576 $Flags"
 $p = Start-Process -FilePath $nsys -ArgumentList $nargs -PassThru -WindowStyle Hidden -RedirectStandardOutput "$sp\nsys_$Tag.out" -RedirectStandardError "$sp\nsys_$Tag.err"
 $child = $null
 for ($i = 0; $i -lt 60 -and -not $child; $i++) {
   Start-Sleep -Milliseconds 500
-  $child = Get-CimInstance Win32_Process -Filter "Name='shadow.exe'" | Where-Object { $_.CommandLine -match 'port 8095' } | Select-Object -First 1
+  $child = Get-CimInstance Win32_Process -Filter "Name='shadowzero.exe'" | Where-Object { $_.CommandLine -match 'port 8095' } | Select-Object -First 1
 }
-if (-not $child) { 'no shadow.exe child appeared'; Stop-Process -Id $p.Id -Force; exit 1 }
+if (-not $child) { 'no shadowzero.exe child appeared'; Stop-Process -Id $p.Id -Force; exit 1 }
 $cp = Get-Process -Id $child.ProcessId
 if (-not [Ws2]::SetProcessWorkingSetSizeEx($cp.Handle, [UIntPtr]([uint64]256MB), [UIntPtr]([uint64]$CapGiB * 1GB), 0x6)) {
   Stop-Process -Id $cp.Id -Force; Stop-Process -Id $p.Id -Force; 'cap NOT set - killed'; exit 1
 }
-"capped shadow.exe $($cp.Id) at $CapGiB GiB"
+"capped shadowzero.exe $($cp.Id) at $CapGiB GiB"
 $watch = Start-Job -ArgumentList $cp.Id, $FloorGiB -ScriptBlock {
   param($id, $floor)
   while (Get-Process -Id $id -ErrorAction SilentlyContinue) {

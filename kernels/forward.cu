@@ -1,6 +1,6 @@
 // Everything in a forward pass that is not a matrix-vector product (matvec.cu does those): norms, the
 // hyper-connection glue, the DeltaNet step, attention with its sparse indexer, the MoE glue and the n-gram memory.
-// Each kernel follows the CPU reference (crates/shadow-model/src/forward.rs) step for step, including where the
+// Each kernel follows the CPU reference (crates/shadowzero-model/src/forward.rs) step for step, including where the
 // reference widens to double (norm sums, dot products, exp/log), so the GPU session can be held to the reference
 // fixtures stream by stream.  Kernels take no doubles as arguments (the launcher has none); positions are u32 and the
 // RoPE base is passed as a float (1e7 is exact in float).
@@ -3099,11 +3099,11 @@ extern "C" __global__ void fill_words(unsigned int* p, unsigned int n, unsigned 
     for (unsigned int i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += gridDim.x * blockDim.x) p[i] = v;
 }
 
-// `shadow_model::forward::route` for token j = one thread: the f64 exponentials of (logit - max), their sum in index order, the top k by (score descending, index
+// `shadowzero_model::forward::route` for token j = one thread: the f64 exponentials of (logit - max), their sum in index order, the top k by (score descending, index
 // ascending) kept by insertion, the weights (ex / z) / (sum of the top k's ex / z).  Writes the k expert numbers (tidx) and weights (as f32, the form the combine
 // reads) of token j and counts the token among each chosen expert's users (cnt).  The CUDA exp() is not the host library's: weights can differ in the last bit of
 // a double, which is below an f32's rounding except by chance, so this is a fast-mode kernel, not an `--exact` one.
-// the one-thread-a-token router (`SHADOW_ROUTE_1T=1`)
+// the one-thread-a-token router (`SHADOWZERO_ROUTE_1T=1`)
 extern "C" __global__ void route_topk_rows_1t(const float* logits, unsigned int* tidx, float* weights, unsigned int* cnt, unsigned int ne, unsigned int k,
                                            unsigned int m) {
     const unsigned int j = blockIdx.x * blockDim.x + threadIdx.x;
@@ -3191,7 +3191,7 @@ extern "C" __global__ void __launch_bounds__(256) route_topk_rows(const float* l
     }
 }
 
-// Debug only (`SHADOW_ROUTE_UNIFORM=1`, wrong output): every token routes to experts (j * k + i) % ne with weight 1 / k, so each expert gets m * k / ne tokens, to time the MoE products
+// Debug only (`SHADOWZERO_ROUTE_UNIFORM=1`, wrong output): every token routes to experts (j * k + i) % ne with weight 1 / k, so each expert gets m * k / ne tokens, to time the MoE products
 // on evenly filled groups.
 extern "C" __global__ void route_uniform_rows(const float* logits, unsigned int* tidx, float* weights, unsigned int* cnt, unsigned int ne, unsigned int k, unsigned int m) {
     for (unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x; idx < m * k; idx += gridDim.x * blockDim.x) {

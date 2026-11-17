@@ -1,6 +1,6 @@
 """A small auto-graded task suite for deciding whether an inexact decode mode (router bias, skipping) makes answers *worse*, not just different from `--exact`.
 
-  py tools/task_check.py [port]      # against a running `shadow serve`; prints correct/total per kind and overall
+  py tools/task_check.py [port]      # against a running `shadowzero serve`; prints correct/total per kind and overall
 
 48 short tasks from a fixed seed: arithmetic, word problems, string work, sorting, counting, facts.  The answer is graded by looking for the expected token in
 the reply; the model is asked for only the final answer."""

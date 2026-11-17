@@ -1543,7 +1543,7 @@ extern "C" __global__ void hc_down_inject_cols_bf16(const u8* w_down, float* dow
 #define GROUPED_UNROLL_COLS 1024
 #endif
 // Registers: the grouped kernels asked for 88-114 a thread (2 blocks of 256 an SM, 30% occupancy); capping them so 4 blocks fit makes the down shape 36% and the gate / up shape 15-17% faster in
-// the harness with the same bits (5 and 6 blocks help the down shape a little more and hurt gate / up).  `SHADOW_GROUPED_BOUNDS=0` (GROUPED_NO_BOUNDS) leaves the attribute off, the old allocation
+// the harness with the same bits (5 and 6 blocks help the down shape a little more and hurt gate / up).  `SHADOWZERO_GROUPED_BOUNDS=0` (GROUPED_NO_BOUNDS) leaves the attribute off, the old allocation
 // (a bound of (256, 1) is NOT the same: the compiler then takes more registers and the kernels run 80% slower).
 #ifdef GROUPED_NO_BOUNDS
 #define GROUPED_LB
@@ -1588,7 +1588,7 @@ static __device__ __forceinline__ void grouped_m(const u8* w, const float* x, un
     };
     // The gate / up shape (rows of 2,560 columns: 10 chunks a lane) runs the loop unrolled GROUPED_UNROLL times, so the loads of several chunks are in flight together (the plain loop waited
     // for each chunk's loads before issuing the next: 19-29% of a verify pass's grouped gate / up kernels, bit for bit the same results, STATUS 114); the down shape (2-3 chunks a lane)
-    // gains nothing from it and keeps the plain loop.  `SHADOW_GROUPED_UNROLL=0` makes every shape take the plain loop (GROUPED_UNROLL_COLS is then out of reach).
+    // gains nothing from it and keeps the plain loop.  `SHADOWZERO_GROUPED_UNROLL=0` makes every shape take the plain loop (GROUPED_UNROLL_COLS is then out of reach).
     if (cols >= GROUPED_UNROLL_COLS) {
 #pragma unroll GROUPED_UNROLL
         for (unsigned int c = lane; c < cols / 8; c += 32) chunk(c);

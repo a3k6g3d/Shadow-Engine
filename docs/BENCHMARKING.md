@@ -1,12 +1,12 @@
-# Benchmarking Shadow
+# Benchmarking ShadowZero
 
 How speed is measured here, what the numbers mean, how the machine's resources are recorded and charted, and every way a
 benchmark on this PC has misled us. [BENCH_NOISE.md](BENCH_NOISE.md) is the original study of the machine's noise;
 [STATUS.md](STATUS.md) holds the results.
 
-## The rules (`shadow-bench`)
+## The rules (`shadowzero-bench`)
 
-`crates/shadow-bench` runs arms of `shadow serve` configurations the way a measurement has to be made on this machine:
+`crates/shadowzero-bench` runs arms of `shadowzero serve` configurations the way a measurement has to be made on this machine:
 
 * **Interleaved.** Run i of every arm before run i+1 of any arm, the order rotated each round, so no arm owns the warm or
   the cold end of the session.
@@ -20,10 +20,10 @@ benchmark on this PC has misled us. [BENCH_NOISE.md](BENCH_NOISE.md) is the orig
   (`bench/floor-2026-10-27`); about 0.1 to 0.5% for total throughput in the fastest mode.
 
 ```bash
-shadow-bench run --model MODEL.gguf --out bench/NAME --runs 3 --turns 6 --tokens 96 \
+shadowzero-bench run --model MODEL.gguf --out bench/NAME --runs 3 --turns 6 --tokens 96 \
     --arm "a=--ctx 8192 --spec 3" --arm "b=--ctx 8192 --spec 5" \
-    [--arm-exe "a=path/to/other/shadow.exe"] [--prompts-file turns.json] [--no-resources]
-shadow-bench summary bench/NAME
+    [--arm-exe "a=path/to/other/shadowzero.exe"] [--prompts-file turns.json] [--no-resources]
+shadowzero-bench summary bench/NAME
 ```
 
 `--arm-launch "name=POWERSHELL"` runs another engine as an arm (`{port}` and `{log}` are filled in): it must serve `/health` and
@@ -50,7 +50,7 @@ which is deterministic run to run (runs agree to 0.1 to 0.3%). `tools/autotune.p
 | standard | 6 hash-table follow-ups, 96 tokens each | the project's historical yardstick; short; low noise | ~500 tokens a run on one topic, with a routing profile (`routing-6prompts.shrc`) from other prompts but similar content; which tokens come out moves a run by several percent |
 | varied | 36 unseen alpaca / code-alpaca prompts (`bench/dfdata/varied36.json`) | the more representative one | needs its own placement (`profiles/routing-varied300.shrc`, recorded from 300 *other* prompts); with the six-prompt placement its expert misses dominate and identical configs swung 9 to 47 tok/s |
 
-Build a placement for any prompt set with `SHADOW_RECORD_ROUTING=profile.shrc shadow serve ...` and post the prompts (a profile
+Build a placement for any prompt set with `SHADOWZERO_RECORD_ROUTING=profile.shrc shadowzero serve ...` and post the prompts (a profile
 only helps text like the text it was recorded on, so the test prompts must not be in it).
 
 ## Recording the machine
@@ -83,7 +83,7 @@ Reading them: a faster arm should show *why*: higher GPU utilisation with the sa
 pass; lower PCIe rx for the same tokens is a better expert cache; a lower minimum RAM available is the cost of a bigger tier.
 GPU power is board power from `nvidia-smi`, not wall power.
 
-## Shadow against another engine
+## ShadowZero against another engine
 
 ```bash
 powershell -File tools/bench_vs_strata.ps1 -Out bench/vs-strata-varied -Model MODEL.gguf \
@@ -93,14 +93,14 @@ powershell -File tools/bench_vs_strata.ps1 -Out bench/vs-strata-varied -Model MO
 
 `tools/strata_bench_cfg.py DIR` writes a bench copy of a Strata config: the same engine flags, but Discord, MCP tools, the
 conversation store and learned-profile saving off, slots and log to scratch, loopback only, no vision, context 8192, greedy.
-Both arms get *their own* best configuration (Shadow its default fastest mode with the placement for the prompts, Strata its
+Both arms get *their own* best configuration (ShadowZero its default fastest mode with the placement for the prompts, Strata its
 tuned flags and expert profile), the same model file, prompts, context and token budget, and are interleaved. Report the
 total throughput and the charts, not the medians.
 
 ## Autotune
 
 ```bash
-python tools/autotune.py --exe PATH/shadow.exe --bench PATH/shadow-bench.exe --out bench/autotune \
+python tools/autotune.py --exe PATH/shadowzero.exe --bench PATH/shadowzero-bench.exe --out bench/autotune \
     --runs 2 --passes 1 --placement profiles/routing-varied300.shrc \
     "--bench-args=--turns 36 --prompts-file bench/dfdata/varied36.json" "--knobs=--spec,--tail-skip,--dflash-min-p"
 ```
@@ -125,7 +125,7 @@ environment variables).
 6. **A cold first run.** The first arm after a long idle has read slow and noisy (33 against 41 tok/s); interleaving and 3+ runs average it out.
 7. **Speed bought by shorter answers.** A mode that cuts replies short (premature end-of-sequence) decodes "fast" and, worse,
    pollutes the conversation history so later replies shrink too. `tools/bench_total.py` prints tokens a run and early
-   stops, and `shadow-bench` records each turn's `finish`; compare arms only when their token counts are close. For a
+   stops, and `shadowzero-bench` records each turn's `finish`; compare arms only when their token counts are close. For a
    same-text fidelity check use `tools/quality_test.py` (every config sees the exact run's replies as history; mean reply
    prefix match) and `tools/trunc_test.py` (free-running; early stops and tokens).
 8. **Thinking mode.** Training and testing a drafter on thinking-mode text while the bench sends `enable_thinking: false`

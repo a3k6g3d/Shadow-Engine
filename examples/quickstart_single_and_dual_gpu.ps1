@@ -1,6 +1,6 @@
 ﻿<#
 .SYNOPSIS
-    Common ways to probe GPUs and start Shadow on one or two cards.
+    Common ways to probe GPUs and start ShadowZero on one or two cards.
 
 .EXAMPLE
     .\examples\quickstart_single_and_dual_gpu.ps1 -Mode probe
@@ -14,28 +14,28 @@ param(
     [int]$Ctx = 24576
 )
 
-$Shadow = Join-Path $PSScriptRoot "..\target\release\shadow.exe"
-if (-not (Test-Path $Shadow)) {
-    Write-Host "Release binary not found at $Shadow — building..."
-    cargo build --release -p shadow
+$ShadowZero = Join-Path $PSScriptRoot "..\target\release\shadowzero.exe"
+if (-not (Test-Path $ShadowZero)) {
+    Write-Host "Release binary not found at $ShadowZero — building..."
+    cargo build --release -p shadowzero
     if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 }
 
 switch ($Mode) {
     "probe" {
         # Lists detected CUDA devices, BAR1 sizes, P2P capability, host<->GPU bandwidth, and hop latency
-        & $Shadow gpus
+        & $ShadowZero gpus
     }
     "single" {
         # Fast defaults (--tail-skip 3, --tensor-prompt, --verify-rank 2, DFlash 2, pinned RAM tier) on GPU 0
-        & $Shadow serve $Model --gpus 0 --port $Port --ctx $Ctx --power-limit 5070=200
+        & $ShadowZero serve $Model --gpus 0 --port $Port --ctx $Ctx --power-limit 5070=200
     }
     "pair" {
         # Splits layers across two cards (auto puts the larger-VRAM card first as Stage 0) and opens http://127.0.0.1:$Port
-        & $Shadow serve $Model --gpus 0,1 --port $Port --ctx $Ctx --power-limit 5070=200,5060=150
+        & $ShadowZero serve $Model --gpus 0,1 --port $Port --ctx $Ctx --power-limit 5070=200,5060=150
     }
     "exact" {
         # Switches speculation and fast approximations off (bit-exact match against the scalar reference)
-        & $Shadow serve $Model --gpus 0,1 --port $Port --ctx $Ctx --exact --power-limit 5070=200,5060=150
+        & $ShadowZero serve $Model --gpus 0,1 --port $Port --ctx $Ctx --exact --power-limit 5070=200,5060=150
     }
 }

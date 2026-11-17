@@ -1,4 +1,4 @@
-"""Poll Shadow's /v1/telemetry endpoint and print per-GPU + cache + spec stats."""
+"""Poll ShadowZero's /v1/telemetry endpoint and print per-GPU + cache + spec stats."""
 
 import json
 import os
@@ -6,7 +6,7 @@ import sys
 import time
 import urllib.request
 
-BASE = os.environ.get("SHADOW_URL", "http://127.0.0.1:8081").rstrip("/")
+BASE = os.environ.get("SHADOWZERO_URL", "http://127.0.0.1:8081").rstrip("/")
 GIB = 1024 ** 3
 
 

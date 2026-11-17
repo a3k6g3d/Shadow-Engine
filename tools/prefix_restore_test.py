@@ -1,6 +1,6 @@
 """Regression test for the garbled reply of a chat that starts from the stored shared-prefix snapshot (docs/STATUS.md 2026-11-06 (53)).
 
-  py tools/prefix_restore_test.py [port] [items]      # against a running `shadow serve` (fast mode, default flags)
+  py tools/prefix_restore_test.py [port] [items]      # against a running `shadowzero serve` (fast mode, default flags)
 
 Two short requests that share the system prompt and the tool list make the server keep a snapshot of that shared start; the next request then restores it and reads the rest of a
 ~7k-token conversation (tool results from docs/STATUS.md with a code word buried in one of them), and the reply to the question at its end must contain the code.  A server that
@@ -17,7 +17,7 @@ words = ['ZEBRA', 'MAPLE', 'COBALT', 'FALCON', 'ORCHID', 'TUNDRA', 'QUARTZ', 'LA
 tools = json.load(urllib.request.urlopen(f'http://127.0.0.1:{port}/v1/tools', timeout=30))
 if isinstance(tools, dict):
     tools = tools.get('tools', tools.get('data', tools))
-system = {'role': 'system', 'content': 'You are Shadow, an assistant on the user\'s Windows PC. Be direct and use the tools when asked.'}
+system = {'role': 'system', 'content': 'You are ShadowZero, an assistant on the user\'s Windows PC. Be direct and use the tools when asked.'}
 
 
 def post(messages, max_tokens):

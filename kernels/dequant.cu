@@ -1,6 +1,6 @@
 // Dequantization on the GPU, one quant block per thread block, one weight per thread: the decoders of quants.cuh
-// laid out as plain kernels, so crates/shadow-cuda/tests/dequant.rs can hold each one to the Rust reference
-// (shadow_model::quant, itself bit-exact against ggml's) bit for bit.  Launch: grid = number of blocks, block = QK.
+// laid out as plain kernels, so crates/shadowzero-cuda/tests/dequant.rs can hold each one to the Rust reference
+// (shadowzero_model::quant, itself bit-exact against ggml's) bit for bit.  Launch: grid = number of blocks, block = QK.
 // BF16 is one weight per thread over any count.
 
 template <typename Q>

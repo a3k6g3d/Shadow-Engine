@@ -1,4 +1,4 @@
-"""power_run.py PORT PHYSICAL_INDEX OUT.json : drives a running `shadow serve` through heavy phases while sampling the card's power every 200 ms."""
+"""power_run.py PORT PHYSICAL_INDEX OUT.json : drives a running `shadowzero serve` through heavy phases while sampling the card's power every 200 ms."""
 import json, subprocess, sys, time, urllib.request, datetime, statistics, csv, io
 port, idx, out = sys.argv[1], int(sys.argv[2]), sys.argv[3]
 text = open('J:/Shadow/docs/STATUS.md', encoding='utf-8').read()

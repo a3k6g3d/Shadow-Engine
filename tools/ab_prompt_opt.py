@@ -59,7 +59,7 @@ def run_arm(arm_name, extra_flags, run_idx, out_dir):
     log_out = os.path.join(out_dir, f"{arm_name}_r{run_idx}.out")
     log_err = os.path.join(out_dir, f"{arm_name}_r{run_idx}.err")
     args = [
-        "J:/Shadow/target/release/shadow.exe",
+        "J:/Shadow/target/release/shadowzero.exe",
         "serve",
         MODEL,
         "--port", str(PORT),
@@ -68,7 +68,7 @@ def run_arm(arm_name, extra_flags, run_idx, out_dir):
         "--ram-floor-gib", str(FLOOR),
     ] + extra_flags
     env = os.environ.copy()
-    env["SHADOW_PHASES"] = "1"
+    env["SHADOWZERO_PHASES"] = "1"
     with open(log_out, "w") as fout, open(log_err, "w") as ferr:
         proc = subprocess.Popen(args, stdout=fout, stderr=ferr, env=env)
         try:

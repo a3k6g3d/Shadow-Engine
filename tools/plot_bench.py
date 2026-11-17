@@ -1,6 +1,6 @@
-"""Charts and tables of the machine's resource use during a shadow-bench run (docs/BENCHMARKING.md).
+"""Charts and tables of the machine's resource use during a shadowzero-bench run (docs/BENCHMARKING.md).
 
-`shadow-bench run` samples the PC once a second for every run (CPU, available RAM, disk, paging, GPU utilisation, GPU memory,
+`shadowzero-bench run` samples the PC once a second for every run (CPU, available RAM, disk, paging, GPU utilisation, GPU memory,
 power, temperature, clocks, PCIe throughput) into DIR/ARM-runN.{sys,gpu,pcie}.csv, and records each turn's start and end in
 results.jsonl.  This script lines the two up:
 

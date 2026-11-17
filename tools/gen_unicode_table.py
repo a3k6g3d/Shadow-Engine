@@ -1,4 +1,4 @@
-"""Writes crates/shadow-model/src/unicode_table.rs: the code point ranges in the general categories used by the
+"""Writes crates/shadowzero-model/src/unicode_table.rs: the code point ranges in the general categories used by the
 qwen35 pre-tokenizer:
   LU_LT = 1   (\\p{Lu}, \\p{Lt})
   LL    = 2   (\\p{Ll})
@@ -17,7 +17,7 @@ import pathlib
 import sys
 import unicodedata
 
-OUT = pathlib.Path(__file__).resolve().parent.parent / "crates" / "shadow-model" / "src" / "unicode_table.rs"
+OUT = pathlib.Path(__file__).resolve().parent.parent / "crates" / "shadowzero-model" / "src" / "unicode_table.rs"
 
 
 def flag_for(cat: str) -> int:

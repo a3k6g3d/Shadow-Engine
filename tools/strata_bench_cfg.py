@@ -1,6 +1,6 @@
 """Writes a bench copy of J:/Strata-work/strata.json: same engine flags, but nothing outward-facing or state-changing
 (Discord off, no MCP tools, no conversation store, no learned-profile save, slots and log to scratch, loopback, no
-API key), and matched to Shadow's bench (no vision, context 8192, greedy)."""
+API key), and matched to ShadowZero's bench (no vision, context 8192, greedy)."""
 import json
 import sys
 

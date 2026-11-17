@@ -1,24 +1,24 @@
-# Shadow
+# ShadowZero
 
 An engine for running Qwen3.8-Flash-Next mixture-of-experts models, built mainly in Rust.
 
 **Based on [Strata](https://github.com/Niko1221/strata)** by Niko1221 and the Strata contributors, MIT licensed —
-see [LICENSE](LICENSE) and [NOTICE](NOTICE). Shadow keeps that license and the upstream notice. It is not a copy
-of Strata: its engine is its own. It does borrow parts, from Strata and from other projects, where they make Shadow
+see [LICENSE](LICENSE) and [NOTICE](NOTICE). ShadowZero keeps that license and the upstream notice. It is not a copy
+of Strata: its engine is its own. It does borrow parts, from Strata and from other projects, where they make ShadowZero
 better, faster or more efficient, and [NOTICE](NOTICE) lists each one and where it came from.
 
 ## What it is
 
 The plan is in [docs/SHADOW_PLAN.md](docs/SHADOW_PLAN.md), rewritten 2026-10-26. The short version:
 
-- **Shadow is its own engine, start to finish.** A Rust host and CUDA kernels we write ourselves; the engine is not
+- **ShadowZero is its own engine, start to finish.** A Rust host and CUDA kernels we write ourselves; the engine is not
   Strata's. Borrowed parts are welcome when they earn their place (the optional MTP draft head is one), and each is
   credited in NOTICE. The only required input is the GGUF.
 - **The kernels are CUDA C++ source in this repo, compiled at run time by NVRTC** for whatever GPU is present, cached
   as CUBIN, and launched through the CUDA driver API (`nvcuda.dll`), hand-bound with no bindgen and no bindings
-  crate. `cargo build` is the whole build: no nvcc, no CMake, no CUDA toolkit needed to compile Shadow.
+  crate. `cargo build` is the whole build: no nvcc, no CMake, no CUDA toolkit needed to compile ShadowZero.
 - **The drive is the bound, not the language.** One process, 4 threads, queue depth 256: ~155k reads/s, and more
-  threads or processes never add up to more. Shadow's ceiling on this PC is the same as any engine's. What it buys
+  threads or processes never add up to more. ShadowZero's ceiling on this PC is the same as any engine's. What it buys
   is an engine we own, safe by construction where Rust can make it so, with scheduling we can change.
 - **Correctness before speed.** The stages each end in tokens: a scalar CPU reference first, the GPU dense path
   checked against it, then the memory tiers, the server, and only then speed, one lever at a time.
@@ -34,7 +34,7 @@ Measured on the project test box (RTX 5070 12 GiB @ 200W + RTX 5060 Ti 16 GiB @ 
 | Single (`--gpus 0`, v0.1.41) | 75.76 (76.21) tok/s | 75.65 tok/s | 878.5 tok/s | 1163.6 tok/s | 1204.0 tok/s |
 
 - **One GPU vs. two GPUs on this board:** Because the second PCIe slot on this motherboard is chipset-wired PCIe 3.0 x4 (`~3.4 GB/s` vs `27.4 GB/s` on the main slot) and WDDM disables P2P, single-card RTX 5070 keeps a ~4–5% decode edge while **two cards load faster (`39.6s` vs `45.6s`) and pull well ahead on prompts** (+65.5% on short prompts, +11.6% at 9.7k, +16.0% at 15.2k) because layers `0..15` stay 100% resident on the 5060 Ti.
-- **Earlier IQ3_S GGUF baseline vs. Strata:** On single-card IQ3_S (`v0.1.35–v0.1.36`), Shadow hit **55.7 tok/s** decode against Strata's **49.5 tok/s** (`+12.5%`, [docs/COMPARISON_STRATA_2026-11-11.md](docs/COMPARISON_STRATA_2026-11-11.md)) and up to **1,764 tok/s** on 15k prompts (`+16%`). Exact mode (`--exact`) turns off speculation and fast approximations (~20 tok/s on IQ3_S) to match the scalar reference bit for bit.
+- **Earlier IQ3_S GGUF baseline vs. Strata:** On single-card IQ3_S (`v0.1.35–v0.1.36`), ShadowZero hit **55.7 tok/s** decode against Strata's **49.5 tok/s** (`+12.5%`, [docs/COMPARISON_STRATA_2026-11-11.md](docs/COMPARISON_STRATA_2026-11-11.md)) and up to **1,764 tok/s** on 15k prompts (`+16%`). Exact mode (`--exact`) turns off speculation and fast approximations (~20 tok/s on IQ3_S) to match the scalar reference bit for bit.
 
 ![Decode and short-prompt progression from v0.1.37 to v0.1.41](docs/charts/decode-progression.svg)
 
@@ -46,14 +46,14 @@ Measured on the project test box (RTX 5070 12 GiB @ 200W + RTX 5060 Ti 16 GiB @ 
 
 ```bash
 cargo build --release
-shadow gpus                                # list cards and measure host <-> GPU / hop bandwidth
-shadow serve path/to/model --gpus 0        # single GPU, fastest defaults (add --exact for bit-exact)
-shadow serve path/to/model --gpus 0,1      # dual GPU, auto-splits layers across both cards
+shadowzero gpus                                # list cards and measure host <-> GPU / hop bandwidth
+shadowzero serve path/to/model --gpus 0        # single GPU, fastest defaults (add --exact for bit-exact)
+shadowzero serve path/to/model --gpus 0,1      # dual GPU, auto-splits layers across both cards
 ```
 
 That opens the web chat UI at `http://127.0.0.1:8081/` (with a live multi-GPU Dashboard at `/#dash`) and an OpenAI-compatible API at `/v1/chat/completions`.
 
-What every flag and environment switch does is in [docs/USAGE.md](docs/USAGE.md). Shadow keeps at least 4 GiB of system RAM free when sizing the pinned host expert tier, so on smaller machines pass `--ram-tier-gib` explicitly.
+What every flag and environment switch does is in [docs/USAGE.md](docs/USAGE.md). ShadowZero keeps at least 4 GiB of system RAM free when sizing the pinned host expert tier, so on smaller machines pass `--ram-tier-gib` explicitly.
 
 ## Examples
 
@@ -77,30 +77,30 @@ Standalone, zero-dependency examples live in [`examples/`](examples/README.md):
 | [docs/SHADOW_PLAN.md](docs/SHADOW_PLAN.md), [docs/HANDOFF.md](docs/HANDOFF.md) | the plan and the state handed over |
 | [CHANGELOG.md](CHANGELOG.md) | release notes |
 
-Shadow runs one model family: Qwen3.8-Flash-Next (everything above). Flint (`RecursiveSI/flint`, NVFP4) was removed from this
+ShadowZero runs one model family: Qwen3.8-Flash-Next (everything above). Flint (`RecursiveSI/flint`, NVFP4) was removed from this
 build on 2026-11-07 (it stays in git history, tag `pre-flint-removal`; it will be tested on tandem.cpp later), and a Flint file
 is refused with a clear message. It is not a general LLM runner: a dense Llama or Qwen3 GGUF has no forward pass here.
 
 ## Server & Web UI
 
-* **Desktop app (`shadow-ui.exe`)**: Windows launcher built with Tauri 2 (and headless server-only tray mode via `shadow-ui.exe --headless`), pointing at `http://127.0.0.1:8081`.
+* **Desktop app (`shadowzero-ui.exe`)**: Windows launcher built with Tauri 2 (and headless server-only tray mode via `shadowzero-ui.exe --headless`), pointing at `http://127.0.0.1:8081`.
 * **Chat UI & Dashboard**: Streaming chat with collapsible thinking blocks, reasoning-effort control, and local file/command/MCP tools folded into a single collapsible bubble per turn. Rolling context compaction keeps long agent sessions inside your VRAM budget, while the Dashboard (`/monitor` or `#dash`) tracks CPU, per-GPU load/VRAM/temps across both cards, expert-cache hit rates, and RAM/disk tier activity.
 * **API**: `POST /v1/chat/completions` (streaming or non-streaming), `GET /v1/models`, `/health`, `/metrics` (Prometheus), `/v1/status`, `/v1/telemetry`, `/v1/tools`, `/v1/tools/execute`.
 
 ## Layout
 
-    crates/          the engine (shadow-model, shadow-cuda, shadow-serve, shadow), shadow-bench, shadow-eval
+    crates/          the engine (shadowzero-model, shadowzero-cuda, shadowzero-serve, shadow), shadowzero-bench, shadowzero-eval
     kernels/         the CUDA C++ compiled at run time with NVRTC
     examples/        quick PowerShell & Python examples (chat, streaming, tools, live GPU telemetry)
     docs/            USAGE, SPECULATION, BENCHMARKING, TOOLS, STATUS, plans, and docs/charts/ SVGs
-    bench/           shadow-bench runs, one directory per comparison
+    bench/           shadowzero-bench runs, one directory per comparison
     profiles/        routing profiles for the RAM tier's placement
-    tools/           the harness and shadow_memory.py
+    tools/           the harness and shadowzero_memory.py
     bin/ models/     the embedder the memory tool drives
     memory/          the store — committed, so it travels with the repo
     eval/            the frozen yardstick: cases.jsonl, baseline.jsonl, prompts/, answers/
 
-`tools/shadow_memory.py` is stdlib-only: `add`, `index`, `search`, `stats`. Embedding is not done in Python —
+`tools/shadowzero_memory.py` is stdlib-only: `add`, `index`, `search`, `stats`. Embedding is not done in Python —
 the tool shells out to `bin/llama-embedding.exe` with `models/bge-small-en-v1.5-q8_0.gguf` (384 dims). Search
 is cosine over the whole store, no ANN, since the store is a few thousand records at most.
 
@@ -111,12 +111,12 @@ is cosine over the whole store, no ANN, since the store is a few thousand record
 a ruler the measured thing is allowed to move stops being a ruler. Grading is substring matching, not an LLM
 judge, because a judge inside the loop is slow and gets gameable the moment the loop learns what it likes.
 
-The tool is `crates/shadow-eval` — Rust, because the project is Rust. Two arms, split on purpose:
+The tool is `crates/shadowzero-eval` — Rust, because the project is Rust. Two arms, split on purpose:
 
-- **`cargo run -p shadow-eval -- rank`** — retrieval only. It touches no model, so it is deterministic and it can be
+- **`cargo run -p shadowzero-eval -- rank`** — retrieval only. It touches no model, so it is deterministic and it can be
   run from inside the session being improved. Baseline 2026-10-26, 16 records: **12/14 top-1, MRR 0.911**, recorded
   in `eval/baseline.jsonl`; `verify` re-ranks and fails loudly if it has moved.
-- **`cargo run -p shadow-eval -- run`** — the answer arm. It needs a live model, and it spawns a **fresh** harness
+- **`cargo run -p shadowzero-eval -- run`** — the answer arm. It needs a live model, and it spawns a **fresh** harness
   session per case (one call, no tools, no skills) so the answer comes from the retrieved notes alone. Baseline, same
   day: **14/14**, graded with `answers`. Two of the fourteen are answered correctly *despite* the retriever ranking
   them 2nd and 4th — the answer arm passes where the rank arm does not, which is the honest reason to keep both arms

@@ -1,9 +1,9 @@
 # Runs the Strata server (its own engine, the bench config from tools/strata_bench_cfg.py) under the RAM floor: the whole
-# process tree is killed if available RAM falls below 4 GiB.  Prints one closing line like run_capped.ps1.  shadow-bench
+# process tree is killed if available RAM falls below 4 GiB.  Prints one closing line like run_capped.ps1.  shadowzero-bench
 # starts it as an `--arm-launch` ({port} and {log} filled in):
 #
 #   $L = "& 'tools/run_strata.ps1' -Port {port} -Out '{log}' -Config 'path/to/strata-bench.json'"
-#   shadow-bench run ... --arm "strata=-" --arm-launch "strata=$L"
+#   shadowzero-bench run ... --arm "strata=-" --arm-launch "strata=$L"
 param([double]$FloorGiB = 4, [int]$Port = 8091, [string]$Out = 'strata.txt', [string]$Config, [string]$StrataDir = 'J:\Strata-work\Strata-0140')
 $env:PYTHONUTF8 = '1'
 $env:PYTHONUNBUFFERED = '1'

@@ -1,4 +1,4 @@
-"""What speculative decoding could buy Shadow, from routing logs (SHADOW_ROUTE_LOG=FILE shadow generate ... --gpu).
+"""What speculative decoding could buy ShadowZero, from routing logs (SHADOWZERO_ROUTE_LOG=FILE shadowzero generate ... --gpu).
 
 Two numbers decide it on an offloaded MoE:
   union(m)   distinct routed experts per layer when m consecutive tokens go through the model together, against

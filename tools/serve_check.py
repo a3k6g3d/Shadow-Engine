@@ -1,4 +1,4 @@
-"""Live checks against a running `shadow serve` (default http://127.0.0.1:8081): every route, a whole and a streamed
+"""Live checks against a running `shadowzero serve` (default http://127.0.0.1:8081): every route, a whole and a streamed
 answer that must be identical, prefix reuse on a follow-up turn, refusals, and two requests at once (queued).
 Prints PASS/FAIL per check and exits non-zero on any failure."""
 import json, sys, threading, time, urllib.request, urllib.error

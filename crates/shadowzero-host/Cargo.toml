@@ -1,0 +1,12 @@
+[package]
+name = "shadowzero-host"
+version.workspace = true
+edition.workspace = true
+
+# The host runtime: the direct-access read ring (lib.rs, ioring.rs), Buffer, the per-drive scheduler, placement, the
+# router's bookkeeping and the transient-window rules.  The C seam it used to export (ffi.rs, a cdylib) and the line
+# protocol (protocol.rs) were retired with shadow-abi; it is a plain Rust library now.  tokio: the scheduler layer
+# (src/scheduler.rs) needs a channel, a oneshot and a waker; rt + sync are the layer, macros + time are the test.
+
+[dependencies]
+tokio = { version = "1.54.1", features = ["rt", "rt-multi-thread", "sync", "macros", "time"] }

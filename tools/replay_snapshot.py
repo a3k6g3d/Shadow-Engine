@@ -1,4 +1,4 @@
-"""Replays a stored conversation snapshot (J:\\ShadowConvCache\\*.cnv) against a running `shadow serve`: the snapshot's tokens are turned back into text, split into chat messages,
+"""Replays a stored conversation snapshot (J:\\ShadowZeroConvCache\\*.cnv) against a running `shadowzero serve`: the snapshot's tokens are turned back into text, split into chat messages,
 and sent as a request, so a long agent conversation can be answered again under other settings (old defaults, `--exact`) and the replies compared.
 
   py tools/replay_snapshot.py FILE.cnv [port] [max_tokens] [gguf]      # prints the reply (reasoning and content) and its timings
@@ -8,7 +8,7 @@ The text is rebuilt from the model's vocabulary (GPT-2 byte mapping), so it matc
 """
 import glob, json, os, re, struct, sys, time, urllib.request
 
-DIR = r'J:/ShadowConvCache'
+DIR = r'J:/ShadowZeroConvCache'
 GGUF = r'J:/Strata-work/models/swift15/IQ3_S/Swift-Qwen3.8-Flash-Next-GSQ-RCO-abliterated-IQ3_S-00001-of-00002.gguf'
 
 

@@ -1,5 +1,5 @@
 """Export the main model's token embedding and (dequantized) output head of an EXL3 checkpoint as float32 files, for tools/dflash2_train.py (which needs them where
-`shadow dump MODEL token_embd.weight|output.weight FILE` gives them for a GGUF; `shadow dump` does not read EXL3 directories).  Run in the exllamav3 venv (CUDA torch):
+`shadowzero dump MODEL token_embd.weight|output.weight FILE` gives them for a GGUF; `shadowzero dump` does not read EXL3 directories).  Run in the exllamav3 venv (CUDA torch):
 
     I:\\tools\\exl3-venv\\Scripts\\python.exe tools\\exl3_export_tables.py MODEL_DIR OUT_DIR [cuda_device]
 

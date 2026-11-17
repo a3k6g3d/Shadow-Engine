@@ -1,0 +1,12 @@
+[package]
+name = "shadowzero-cuda"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# The CUDA driver API and NVRTC, bound by hand and loaded from nvcuda.dll / nvrtc64_*.dll at run time
+# (docs/SHADOW_PLAN.md).  No outside dependencies: the surface is ~45 functions, and a mirror plus a drift test is the
+# rule.  shadowzero-model: the GPU backend implements its forward pass's Backend, and the tests use its references.
+
+[dependencies]
+shadowzero-model = { path = "../shadowzero-model" }

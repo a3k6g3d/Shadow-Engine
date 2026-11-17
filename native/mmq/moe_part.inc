@@ -1,6 +1,6 @@
 
 // ---------------------------------------------------------------------------------------------------------------------------------------------------------
-// Grouped experts of a long prompt (the MoE gate/up projections): Shadow's device planner (plan_fill) leaves, for each group of <= J tokens of one expert, a record
+// Grouped experts of a long prompt (the MoE gate/up projections): ShadowZero's device planner (plan_fill) leaves, for each group of <= J tokens of one expert, a record
 // (1 + 2 * J words: count, J input rows, J output rows) and the address of the expert's matrix; the groups of the gate then the up matrices follow each other (2 * G
 // of them) and share their tokens, so the activations are quantized once for G groups: column g * J + j of the quantized activations is input row j of group g.
 // One block a (J-wide group, tile of I weight rows); the block's weights are read from the group's own address, so experts may lie anywhere (cache slots, the stage
@@ -80,13 +80,13 @@ static __global__ void moe_ids(const unsigned int * rec, int * ids, int ncols, i
 }
 
 // bytes of scratch: the gather list (256-aligned), then the quantized activations
-EXPORT size_t shadow_mmq_moe_bytes(int64_t k, int64_t ny_groups, int64_t chunk) {
-    return (size_t) GGML_PAD(ny_groups * chunk * 4, 256) + shadow_mmq_y_bytes(k, ny_groups * chunk);
+EXPORT size_t shadowzero_mmq_moe_bytes(int64_t k, int64_t ny_groups, int64_t chunk) {
+    return (size_t) GGML_PAD(ny_groups * chunk * 4, 256) + shadowzero_mmq_y_bytes(k, ny_groups * chunk);
 }
 
 // groups: the 2 * G (gate then up) or G (down) groups at xtab (u64 matrix addresses) and rec; ny_groups = G; x: rows of k floats xs apart, named by the records' input
 // rows; dst row r (the records' output rows) at dst + r * dst_stride; chunk = 32 or 64 tokens a group.
-EXPORT int shadow_mmq_moe(int type, unsigned long long xtab, unsigned long long rec, int64_t ngroups, int64_t ny_groups, int64_t chunk, unsigned long long x, int64_t xs,
+EXPORT int shadowzero_mmq_moe(int type, unsigned long long xtab, unsigned long long rec, int64_t ngroups, int64_t ny_groups, int64_t chunk, unsigned long long x, int64_t xs,
                           int64_t k, int64_t rows, unsigned long long dst, int64_t dst_stride, unsigned long long scratch, void * stream) {
     if (k % 256 != 0 || xs % 4 != 0 || (chunk != 32 && chunk != 48 && chunk != 64)) return 2;
     cudaStream_t s = (cudaStream_t) stream;

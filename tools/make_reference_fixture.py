@@ -1,11 +1,11 @@
 """Stage 1's gate: the published reference implementation (Hugging Face transformers, models/qwen4_exp) run in float32
 for the first N layers, with every layer's intermediate streams written out as a fixture.  Two weight sources:
 
-  --weights checkpoint   the BF16 checkpoint's own weights (the true reference; Shadow, which runs on a quantized file,
+  --weights checkpoint   the BF16 checkpoint's own weights (the true reference; ShadowZero, which runs on a quantized file,
                          is expected to agree in direction, not bit for bit)                -> eval/fixtures/reference
-  --weights gguf         the SAME GGUF Shadow runs, dequantized by `shadow dump` (whose dequantizers are bit-exact
+  --weights gguf         the SAME GGUF ShadowZero runs, dequantized by `shadowzero dump` (whose dequantizers are bit-exact
                          against ggml's) and mapped back into the reference's layout.  Now only floating-point order
-                         differs, so Shadow must match to ~1e-5: this separates "Shadow's math is wrong" from
+                         differs, so ShadowZero must match to ~1e-5: this separates "ShadowZero's math is wrong" from
                          "quantization noise"                                            -> eval/fixtures/reference_gguf
 
 Nothing big is downloaded in checkpoint mode.  tools/hf_range.py reads the dense weights of layers 0..N-1 whole and, from
@@ -101,10 +101,10 @@ def untile(x, hd):
 
 
 class GgufSource:
-    """The GGUF Shadow runs, dequantized by `shadow dump` and mapped back into the reference's layout."""
+    """The GGUF ShadowZero runs, dequantized by `shadowzero dump` and mapped back into the reference's layout."""
 
-    def __init__(self, shadow_exe, model):
-        self.exe, self.model = str(shadow_exe), model
+    def __init__(self, shadowzero_exe, model):
+        self.exe, self.model = str(shadowzero_exe), model
         self.tmp = pathlib.Path(tempfile.mkdtemp(prefix="shadow-dump-"))
         self.calls = 0
 
@@ -263,7 +263,7 @@ def main() -> None:
     ap.add_argument("--prompt-file", nargs="+", help="tokenize these files, concatenated, instead of --prompt")
     ap.add_argument("--tokens", type=int, help="keep only the first N token ids of the prompt")
     ap.add_argument("--positions", help="comma-separated positions: write only those rows of every stream (long prompts)")
-    ap.add_argument("--shadow", default=str(ROOT / "target" / "release" / "shadow.exe"))
+    ap.add_argument("--shadow", default=str(ROOT / "target" / "release" / "shadowzero.exe"))
     a = ap.parse_args()
     out = pathlib.Path(a.out or ROOT / "eval" / "fixtures" / ("reference" if a.weights == "checkpoint" else "reference_gguf"))
     t0 = time.time()
@@ -369,7 +369,7 @@ def main() -> None:
     manifest = {"prompt": a.prompt, "ids": ids, "positions": keep, "layers": a.layers, "repo": REPO, "weights": a.weights,
                 "transformers": transformers.__version__, "torch": torch.__version__, "dtype": "float32",
                 "note": ("reference run on the BF16 checkpoint widened to float32" if a.weights == "checkpoint" else
-                         "reference run on Shadow's own GGUF, dequantized by `shadow dump` and mapped back"),
+                         "reference run on ShadowZero's own GGUF, dequantized by `shadowzero dump` and mapped back"),
                 "tensors": []}
     blob = bytearray()
     for name, t in cap.items():

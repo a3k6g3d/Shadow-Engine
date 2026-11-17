@@ -1,4 +1,4 @@
-"""Comprehensive scoring for shadow-bench runs:
+"""Comprehensive scoring for shadowzero-bench runs:
 Calculates:
 1. Prompt throughput: sum(prompt_n) / sum(prompt_ms) * 1000
 2. Decode throughput: sum(predicted_n) / sum(predicted_ms) * 1000

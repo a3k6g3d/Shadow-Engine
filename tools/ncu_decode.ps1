@@ -4,7 +4,7 @@
 #
 # Why it looks like this: `ncu --launch-skip N` makes every skipped matching launch cost ~2 s on this engine (it backs the device memory up each time), so a decode kernel late in a
 # run is unreachable and the first request appears to hang.  Instead ncu starts with `--profile-from-start off` and the engine opens the driver's profiler range itself around
-# batched pass number -Pass (`SHADOW_NCU_RANGE=Pass:1`, session.rs); nothing before it is intercepted.  Graphs are off so every kernel is a plain launch.
+# batched pass number -Pass (`SHADOWZERO_NCU_RANGE=Pass:1`, session.rs); nothing before it is intercepted.  Graphs are off so every kernel is a plain launch.
 # The engine is capped (working set + free-RAM floor, as tools/run_capped.ps1) and stopped alone at the end, so ncu writes its report.
 # Read the report without admin:  ncu --import <Out>.ncu-rep --page details   (or --page raw --csv --metrics ...)
 param([string]$Out = 'bench\ncu_decode_stalls', [int]$Pass = 6, [int]$Kernels = 40, [int]$CapGiB = 30, [double]$FloorGiB = 4)
@@ -12,8 +12,8 @@ $root = Split-Path -Parent $PSScriptRoot
 Set-Location $root
 $ncu = (Get-ChildItem 'C:\Program Files\NVIDIA Corporation\Nsight Compute*\target\windows-desktop-win7-x64\ncu.exe' | Sort-Object FullName -Descending | Select-Object -First 1).FullName
 $model = 'J:/Strata-work/models/swift15/IQ3_S/Swift-Qwen3.8-Flash-Next-GSQ-RCO-abliterated-IQ3_S-00001-of-00002.gguf'
-$exe = Join-Path $root 'target-dev\release\shadow.exe'
-if (Get-Process shadow, shadow-ui -ErrorAction SilentlyContinue | Where-Object { $_.Path -like '*Shadow*' }) { 'a shadow engine is running - stop it first'; exit 1 }
+$exe = Join-Path $root 'target-dev\release\shadowzero.exe'
+if (Get-Process shadow, shadowzero-ui -ErrorAction SilentlyContinue | Where-Object { $_.Path -like '*ShadowZero*' }) { 'a shadow engine is running - stop it first'; exit 1 }
 Add-Type @'
 using System; using System.Runtime.InteropServices;
 public static class WsNcu {
@@ -21,7 +21,7 @@ public static class WsNcu {
   public static extern bool SetProcessWorkingSetSizeEx(IntPtr h, UIntPtr min, UIntPtr max, uint flags);
 }
 '@
-$env:SHADOW_VERIFY_GRAPHS = '0'; $env:SHADOW_GRAPHS = '0'; $env:SHADOW_NCU_RANGE = "${Pass}:1"
+$env:SHADOWZERO_VERIFY_GRAPHS = '0'; $env:SHADOWZERO_GRAPHS = '0'; $env:SHADOWZERO_NCU_RANGE = "${Pass}:1"
 $kern = 'regex:matvec_cols_q6_k|matvec_cols_iq4_xs|matvec_cols_q8_0|matvec_cols_bf16|matvec_grouped_iq4_nl|matvec_grouped_iq2_s|matvec_grouped_iq3_xxs'
 $nargs = @('-o', (Join-Path $root $Out), '-f', '--profile-from-start', 'off', '-k', $kern, '--launch-count', "$Kernels",
   '--section', 'SpeedOfLight', '--section', 'WarpStateStats', '--section', 'SchedulerStats', '--section', 'Occupancy', '--section', 'LaunchStats',
@@ -31,7 +31,7 @@ $p = Start-Process -FilePath $ncu -ArgumentList $nargs -PassThru -WindowStyle Hi
 $child = $null
 for ($i = 0; $i -lt 120 -and -not $child; $i++) {
   Start-Sleep -Milliseconds 500
-  $child = Get-CimInstance Win32_Process -Filter "Name='shadow.exe'" | Where-Object { $_.CommandLine -match 'port 8095' } | Select-Object -First 1
+  $child = Get-CimInstance Win32_Process -Filter "Name='shadowzero.exe'" | Where-Object { $_.CommandLine -match 'port 8095' } | Select-Object -First 1
 }
 if (-not $child) { 'no engine appeared'; Stop-Process -Id $p.Id -Force; exit 1 }
 $cp = Get-Process -Id $child.ProcessId

@@ -1,6 +1,6 @@
 """Writes eval/fixtures/tokenizer.json and eval/fixtures/chat.json: what the checkpoint's own tokenizer
 (tokenizer.json, via Hugging Face `tokenizers`) and chat template (chat_template.jinja, rendered by transformers) make
-of a set of texts and conversations.  crates/shadow-model/tests/tokenizer_fixture.rs holds Shadow's tokenizer and
+of a set of texts and conversations.  crates/shadowzero-model/tests/tokenizer_fixture.rs holds ShadowZero's tokenizer and
 template to them exactly.  That is the outside reference for stage 0's "tokenizer reproduces the fixture ids".
 
     I:/shadow-ref/hf/ holds the files (tools/hf_range.py fetched them).

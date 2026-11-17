@@ -1,4 +1,4 @@
-"""Make a `SHADOW_EXPERT_MASK` file (n_layer x n_expert bytes, 1 = the expert stays, 0 = pruned at run time) from a routing profile (`profiles/routing-*.shrc`, per-layer counts of how often
+"""Make a `SHADOWZERO_EXPERT_MASK` file (n_layer x n_expert bytes, 1 = the expert stays, 0 = pruned at run time) from a routing profile (`profiles/routing-*.shrc`, per-layer counts of how often
 each expert was chosen on a recorded set of prompts): the K most-used experts of every layer stay.
 
     python tools/expert_mask.py PROFILE.shrc K OUT.bin           [--scores SCORES.npy]

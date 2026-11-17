@@ -1,4 +1,4 @@
-# Speculative decoding in Shadow
+# Speculative decoding in ShadowZero
 
 How a pass checks several tokens at once, where the drafts come from, and what was tried. The measurements behind each
 statement are in [STATUS.md](STATUS.md); how they were taken is in [BENCHMARKING.md](BENCHMARKING.md).
@@ -59,13 +59,13 @@ speed gain, or truncated again.
 
 | source | how | when it is used |
 |---|---|---|
-| prompt lookup | the longest recent n-gram (8, 6, then `SHADOW_LOOKUP_MIN`=4 tokens) that repeats earlier in the conversation proposes what followed it | tried first; used when it finds >= 2 tokens |
+| prompt lookup | the longest recent n-gram (8, 6, then `SHADOWZERO_LOOKUP_MIN`=4 tokens) that repeats earlier in the conversation proposes what followed it | tried first; used when it finds >= 2 tokens |
 | DFlash 2 (`--dflash`) | a 5-layer block-diffusion drafter reading features from the main model; one pass drafts a block | the default drafter |
 | MTP head (`--mtp`) | a one-layer draft model (`models/mtp-basalt-ft1`, borrowed from Strata), chained token by token | when `--mtp` is given |
 
 ### DFlash 2
 
-A port of SGLang's `DFlash2DraftModel` (`crates/shadow-cuda/src/dflash.rs`, `session_dflash.rs`, the `df_*` kernels in
+A port of SGLang's `DFlash2DraftModel` (`crates/shadowzero-cuda/src/dflash.rs`, `session_dflash.rs`, the `df_*` kernels in
 `kernels/forward.cu`; the model is `models/dflash2/model.safetensors`, 81 BF16 tensors, 1.2 GB).
 
 * **Features.** After layers 5, 15, 25, 35 and 45 of the *main* model, the residual (4 hyper-connection streams) is averaged
@@ -87,8 +87,8 @@ A port of SGLang's `DFlash2DraftModel` (`crates/shadow-cuda/src/dflash.rs`, `ses
   probability among the 16; `--dflash-min-p` cuts the chain after a draft below it.
 * **Cost.** A round is ~6.3 ms (matrices Q8_0): the output head 2.0 ms, the MLPs ~1.3, the projections ~2, attention 0.4. It
   adds 217 expert-cache slots compared with BF16 because it frees ~0.4 GB of VRAM.
-* **Checked.** `tools/dflash2_ref.py` recomputes a draft in CPU torch from the features Shadow fed it: block hidden state
-  max abs error 6e-5 (relative 1e-6), selector picks identical (use `SHADOW_DF_DUMP=dir`).
+* **Checked.** `tools/dflash2_ref.py` recomputes a draft in CPU torch from the features ShadowZero fed it: block hidden state
+  max abs error 6e-5 (relative 1e-6), selector picks identical (use `SHADOWZERO_DF_DUMP=dir`).
 
 ### Tuning the draft length
 
@@ -102,7 +102,7 @@ something underneath changes.
 
 | idea | result |
 |---|---|
-| fine-tune DFlash 2 on Shadow's own features (LoRA, `tools/dflash2_train.py`) | looked like +25% accepted tokens on a held-out set, but the set counted positions inside the *user's prompt*; on generated text only, stock 3.24 vs tuned 3.35 and a retrain ended at 3.24: no gain with ~150k generated tokens. Total throughput on varied text: stock 46.7 tok/s, tuned 42.8 to 44.6. |
+| fine-tune DFlash 2 on ShadowZero's own features (LoRA, `tools/dflash2_train.py`) | looked like +25% accepted tokens on a held-out set, but the set counted positions inside the *user's prompt*; on generated text only, stock 3.24 vs tuned 3.35 and a retrain ended at 3.24: no gain with ~150k generated tokens. Total throughput on varied text: stock 46.7 tok/s, tuned 42.8 to 44.6. |
 | candidates from only the 106k-token draft vocabulary (the MTP head's list), saving ~1 ms/round | position-1 hits 69% -> 59%, -25% tok/s. Opt-in only via a `draft_vocab.bin` beside the weights. |
 | longer blocks (4 to 7 drafts) | each is slower than 3 on both benches; the verify pass grows faster than acceptance |
 | merging projections into one launch, fusing the hc up-projection and delta norm | bit-identical, measured a tie (off) to -1.1% (all on): the pass is not waiting on launches. `--fuse` keeps them. |
@@ -111,8 +111,8 @@ something underneath changes.
 
 ## Training pipeline (kept for the next attempt)
 
-`SHADOW_DF_DUMP=dir shadow serve ...` writes every position's feature row and token. `tools/dflash2_train.py` loads those,
-the main model's embedding and head (`shadow dump MODEL token_embd.weight FILE`, `... output.weight FILE`), trains LoRA
+`SHADOWZERO_DF_DUMP=dir shadowzero serve ...` writes every position's feature row and token. `tools/dflash2_train.py` loads those,
+the main model's embedding and head (`shadowzero dump MODEL token_embd.weight FILE`, `... output.weight FILE`), trains LoRA
 adapters over the frozen BF16 weights with the loss the drafter is used for (cross entropy through the main model's head
 plus cross entropy over the selector's 16 candidates), scores the *free-running accepted prefix* of the greedy walk on held-out
 conversations, and merges the result back to BF16. **Anchors must be drawn from generated spans only**

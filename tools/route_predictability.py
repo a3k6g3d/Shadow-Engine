@@ -1,6 +1,6 @@
 """How predictable is a token's routed experts from cheap signals?  (the draft-side route predictor question)
 
-Reads routing logs (SHADOW_ROUTE_LOG=FILE shadow generate ... --gpu) and reports, per distance d ahead (a drafted position d
+Reads routing logs (SHADOWZERO_ROUTE_LOG=FILE shadowzero generate ... --gpu) and reports, per distance d ahead (a drafted position d
 tokens after the last committed one) the recall of the actual top-k experts at each MoE layer within a predicted set:
 
   last      the experts of the last committed token at the same layer (|set| = k)

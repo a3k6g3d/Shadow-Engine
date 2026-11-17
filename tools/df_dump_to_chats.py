@@ -1,4 +1,4 @@
-"""Recover the conversations a `SHADOW_DF_DUMP` run recorded (feats.bin: per record p0, m, the m token ids, then m rows of features) as chat text, skipping the feature bytes by seeking:
+"""Recover the conversations a `SHADOWZERO_DF_DUMP` run recorded (feats.bin: per record p0, m, the m token ids, then m rows of features) as chat text, skipping the feature bytes by seeking:
 one JSON line per conversation, {"messages": [{"role", "content"}, ...], "think": bool, "tokens": N}, the roles and contents cut at the chat template's markers.  The assistant's
 content is kept as the model wrote it (a thinking turn starts with its <think> block; a non-thinking turn's empty think block is dropped).  Used to turn the 500k-token mixD18 run into
 distillation data.

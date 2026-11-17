@@ -1,8 +1,8 @@
-"""Replays a routing log (SHADOW_ROUTE_LOG) through VRAM expert-cache policies, per layer, and prints each one's hit rate.
+"""Replays a routing log (SHADOWZERO_ROUTE_LOG) through VRAM expert-cache policies, per layer, and prints each one's hit rate.
 
     python tools/cache_sim.py ROUTE_LOG CACHE_DUMP [--skip N]
 
-CACHE_DUMP is what SHADOW_CACHE_DUMP writes when a session starts: per layer its slot count, how many of them are
+CACHE_DUMP is what SHADOWZERO_CACHE_DUMP writes when a session starts: per layer its slot count, how many of them are
 evictable, and the pinned experts in placement order.  --skip N leaves the first N tokens (the prompt) out of the count
 (they still warm the cache).  Every policy gets the same number of slots per layer as the session had; a token's own
 experts are never evicted by its own misses (as `ExpertCache::victim`).

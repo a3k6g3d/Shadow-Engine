@@ -1,7 +1,7 @@
-"""Autotune Shadow's serving flags with the paired bench (coordinate ascent; each round is one `shadow-bench run`).
+"""Autotune ShadowZero's serving flags with the paired bench (coordinate ascent; each round is one `shadowzero-bench run`).
 
 For each knob in turn, one bench round measures the current best config against every other value of that knob
-(arms interleaved by shadow-bench, so the machine's drift hits all arms alike).  A value is adopted when its median
+(arms interleaved by shadowzero-bench, so the machine's drift hits all arms alike).  A value is adopted when its median
 decode tok/s beats the current best's by more than max(MIN_GAIN, 3 x the current best's own run-to-run floor) and its
 paired median over the same turns is positive.  Passes repeat until a whole pass adopts nothing.  Everything is
 logged to OUT/log.md and the best config to OUT/best.json (resumable: a finished round is not run again).
@@ -97,14 +97,14 @@ def round_(args, name, base, variants, log):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--exe", required=True)
-    ap.add_argument("--bench", default="target-dev/bench-batch/shadow-bench.exe")
+    ap.add_argument("--bench", default="target-dev/bench-batch/shadowzero-bench.exe")
     ap.add_argument("--out", default="bench/autotune")
     ap.add_argument("--runs", type=int, default=3)
     ap.add_argument("--passes", type=int, default=2)
     ap.add_argument("--knobs", default=None)
     ap.add_argument("--space", default=None)
     ap.add_argument("--dry-run", action="store_true")
-    ap.add_argument("--bench-args", default="", help="extra shadow-bench flags, e.g. '--turns 36 --prompts-file F'")
+    ap.add_argument("--bench-args", default="", help="extra shadowzero-bench flags, e.g. '--turns 36 --prompts-file F'")
     ap.add_argument("--placement", default=None, help="replaces the base config's --placement")
     args = ap.parse_args()
     os.makedirs(args.out, exist_ok=True)

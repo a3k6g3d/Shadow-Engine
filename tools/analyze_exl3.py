@@ -1,4 +1,4 @@
-"""Reads the safetensors headers of an EXL3 repo by range requests and summarizes what Shadow's loader cares about: total size, the bit rate K of every routed expert
+"""Reads the safetensors headers of an EXL3 repo by range requests and summarizes what ShadowZero's loader cares about: total size, the bit rate K of every routed expert
 projection (per layer: uniform or mixed), the dense tensors' K, the n-gram table, MTP / vision presence.  usage: analyze_exl3.py REPO [REVISION]"""
 import json, re, struct, sys, collections, urllib.request
 from huggingface_hub import HfApi, get_token, hf_hub_url

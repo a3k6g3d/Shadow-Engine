@@ -1,11 +1,11 @@
 """Writes eval/fixtures/dequant.txt: real blocks of the model, one or more per quant type, with what the gguf Python
-package (ggml's own reference dequantizer, MIT) makes of them.  crates/shadow-model/tests/dequant.rs checks Shadow's
+package (ggml's own reference dequantizer, MIT) makes of them.  crates/shadowzero-model/tests/dequant.rs checks ShadowZero's
 Rust dequantizer against it, bit for bit.
 
-Tensor offsets come from Shadow's own reader (`shadow inspect --tensors`): gguf's GGUFReader refuses the whole
+Tensor offsets come from ShadowZero's own reader (`shadowzero inspect --tensors`): gguf's GGUFReader refuses the whole
 file over the one type it does not know (Q2_0).  Only the chosen blocks are read, by seek.
 
-    cargo build --release -p shadow-model
+    cargo build --release -p shadowzero-model
     python tools/gen_dequant_fixtures.py MODEL-00001-of-0000N.gguf [OTHER_MODEL.gguf ...]
 
 A second file, eval/fixtures/dequant_iq2.txt, holds IQ2_XXS and IQ2_XS blocks (only the Swift file named IQ3_XXS has them; STATUS 128):
@@ -22,7 +22,7 @@ from gguf import quants
 from gguf.constants import GGML_QUANT_SIZES, GGMLQuantizationType
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
-SHADOW = ROOT / "target" / "release" / "shadow.exe"
+SHADOW = ROOT / "target" / "release" / "shadowzero.exe"
 
 OUT = ROOT / "eval" / "fixtures" / "dequant.txt"
 WANT = ["F32", "F16", "BF16", "Q4_K", "Q5_K", "Q6_K", "IQ2_S", "IQ3_XXS", "IQ3_S", "IQ4_NL", "IQ4_XS", "NVFP4"]
@@ -34,7 +34,7 @@ ROW = re.compile(r"^\s+(\S+)\s+(\S+)\s+\[[^\]]*\]\s+shard (\d+) @\s+(\d+)\s+(\d+
 
 
 def tensors(first: pathlib.Path):
-    """(name, type, shard path, offset, bytes) for every tensor, from `shadow inspect --tensors`."""
+    """(name, type, shard path, offset, bytes) for every tensor, from `shadowzero inspect --tensors`."""
     out = subprocess.run([str(SHADOW), "inspect", str(first), "--tensors"], capture_output=True, text=True, check=True)
     paths = [pathlib.Path(l.split()[0]) for l in out.stdout.splitlines() if l.startswith("  ") and " v3 " in l]
     rows = []

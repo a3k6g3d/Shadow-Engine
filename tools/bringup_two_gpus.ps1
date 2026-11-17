@@ -3,12 +3,12 @@
 #   powershell -File tools\bringup_two_gpus.ps1 [-Out bench\two-gpus-bringup] [-Skip bench,tests,exact] [-Peer 1]
 #
 # Steps (each writes its log under -Out and prints one verdict line; a failed step does not stop the rest):
-#   1 gpus     `shadow gpus`: the cards, host bandwidth alone and together, peer access, the host-staged hop (gate G1 of the plan: hop under ~150 us for 40 KiB)
-#   2 tests    the pair tests with the second stage on the second card (SHADOW_PEER_GPU=1): every logit identical to one session, and the drafter's drafts
-#   3 int8     tools of the native int8 kernels on the second card (crates/shadow-cuda/tests/int8_cols.rs, INT8_GPU=1: numerics and timing of the float, MMQ and mul_mat_vec_q paths)
-#   4 exact    `shadow serve --exact` single card against `--gpus 0,1`: the 10-request conversation (tools/pair_e2e_test.py), replies identical or not
+#   1 gpus     `shadowzero gpus`: the cards, host bandwidth alone and together, peer access, the host-staged hop (gate G1 of the plan: hop under ~150 us for 40 KiB)
+#   2 tests    the pair tests with the second stage on the second card (SHADOWZERO_PEER_GPU=1): every logit identical to one session, and the drafter's drafts
+#   3 int8     tools of the native int8 kernels on the second card (crates/shadowzero-cuda/tests/int8_cols.rs, INT8_GPU=1: numerics and timing of the float, MMQ and mul_mat_vec_q paths)
+#   4 exact    `shadowzero serve --exact` single card against `--gpus 0,1`: the 10-request conversation (tools/pair_e2e_test.py), replies identical or not
 #   5 fast     the same conversation in default fast mode on the pair (drafter on the second card): runs, coherent, speculation lines
-#   6 bench    decode of the 36 varied prompts, 2 runs each, interleaved: single card, the pair, the pair with --dflash off (shadow-bench)
+#   6 bench    decode of the 36 varied prompts, 2 runs each, interleaved: single card, the pair, the pair with --dflash off (shadowzero-bench)
 # Power and temperature of every card are logged for the whole run (nvidia-smi, every 5 s).  Nothing here changes a system setting: power limits are the owner's call -
 # on the 650 W supply (until the 1,000 W one) the script PRINTS the command to cap the cards, it does not run it.  Every model load goes through tools\run_capped.ps1.
 param([string]$Out = 'bench\two-gpus-bringup', [string]$Skip = '', [int]$Peer = 1, [int]$CapGiB = 42)
@@ -27,7 +27,7 @@ $n = [int]((nvidia-smi --query-gpu=name --format=csv,noheader | Measure-Object -
 if ($n -lt 2 -and $Peer -ne 0) { Say "the driver lists $n card(s): nothing to bring up (is the second card seated, powered and its PCIe cables on?)"; exit 1 }
 $pairExtra = if ($Peer -eq 0) { ' --expert-cache-gib 0.6 --peer-cache-gib 0.6 --ram-tier-gib 8' } else { '' }
 Say "power: if the two cards plus the CPU trip the 650 W supply, cap them first, e.g.  nvidia-smi -i 0 -pl 200   and   nvidia-smi -i 1 -pl 140   (run by you, as administrator; not done here)"
-if (Get-Process shadow, shadow-ui -ErrorAction SilentlyContinue | Where-Object { $_.Path -like '*Shadow*' }) { Say 'a shadow engine is running (the launcher?): stop it first, this script starts its own servers on port 8095'; exit 1 }
+if (Get-Process shadow, shadowzero-ui -ErrorAction SilentlyContinue | Where-Object { $_.Path -like '*ShadowZero*' }) { Say 'a shadow engine is running (the launcher?): stop it first, this script starts its own servers on port 8095'; exit 1 }
 
 # power / temperature log of every card for the whole run
 $smi = Start-Process nvidia-smi -ArgumentList '--query-gpu=timestamp,index,power.draw,temperature.gpu,clocks.sm,utilization.gpu,memory.used,pcie.link.gen.current,pcie.link.width.current', '--format=csv', '-l', '5' -RedirectStandardOutput "$Out\nvidia-smi.csv" -PassThru -WindowStyle Hidden
@@ -38,7 +38,7 @@ function Run-Capped($log, $exe, $argstr) {
 
 function Serve($tag, $flags, $envs) {
   foreach ($k in $envs.Keys) { Set-Item "Env:$k" $envs[$k] }
-  $argstr = '-NoProfile -ExecutionPolicy Bypass -File tools\run_capped.ps1 -CapGiB ' + $CapGiB + ' -FloorGiB 3.5 -Out "' + "$Out\serve_$tag.log" + '" -Exe ' + "$dev\shadow.exe" + ' -Arguments "serve ' + $model + ' --port 8095 --ctx 8192 ' + $flags + '"'
+  $argstr = '-NoProfile -ExecutionPolicy Bypass -File tools\run_capped.ps1 -CapGiB ' + $CapGiB + ' -FloorGiB 3.5 -Out "' + "$Out\serve_$tag.log" + '" -Exe ' + "$dev\shadowzero.exe" + ' -Arguments "serve ' + $model + ' --port 8095 --ctx 8192 ' + $flags + '"'
   Start-Process powershell -ArgumentList $argstr -WindowStyle Hidden
   foreach ($k in $envs.Keys) { Remove-Item "Env:$k" -ErrorAction SilentlyContinue }
   for ($i = 0; $i -lt 150; $i++) { Start-Sleep 3; try { if ((Invoke-WebRequest http://127.0.0.1:8095/health -UseBasicParsing -TimeoutSec 2).StatusCode -eq 200) { return $true } } catch {} }
@@ -47,32 +47,32 @@ function Serve($tag, $flags, $envs) {
 
 Say 'building the dev binaries (target-dev)'
 $env:CARGO_TARGET_DIR = 'target-dev'
-cargo build --release -p shadow -p shadow-bench 2>&1 | Select-Object -Last 2 | ForEach-Object { Say "   $_" }
-$twoStage = (cargo test --release -p shadow --test two_stage --no-run 2>&1 | Select-String 'Executable.*\((.*two_stage-[0-9a-f]+\.exe)\)' | ForEach-Object { $_.Matches[0].Groups[1].Value } | Select-Object -First 1)
-$int8 = (cargo test --release -p shadow-cuda --test int8_cols --no-run 2>&1 | Select-String 'Executable.*\((.*int8_cols-[0-9a-f]+\.exe)\)' | ForEach-Object { $_.Matches[0].Groups[1].Value } | Select-Object -First 1)
+cargo build --release -p shadowzero -p shadowzero-bench 2>&1 | Select-Object -Last 2 | ForEach-Object { Say "   $_" }
+$twoStage = (cargo test --release -p shadowzero --test two_stage --no-run 2>&1 | Select-String 'Executable.*\((.*two_stage-[0-9a-f]+\.exe)\)' | ForEach-Object { $_.Matches[0].Groups[1].Value } | Select-Object -First 1)
+$int8 = (cargo test --release -p shadowzero-cuda --test int8_cols --no-run 2>&1 | Select-String 'Executable.*\((.*int8_cols-[0-9a-f]+\.exe)\)' | ForEach-Object { $_.Matches[0].Groups[1].Value } | Select-Object -First 1)
 Remove-Item Env:CARGO_TARGET_DIR -ErrorAction SilentlyContinue
 
 if ('gpus' -notin $skipSet) {
   Say '-- 1 gpus'
-  $g = & "$dev\shadow.exe" gpus 2>&1 | ForEach-Object { "$_" }
+  $g = & "$dev\shadowzero.exe" gpus 2>&1 | ForEach-Object { "$_" }
   $g | Out-File -Encoding utf8 "$Out\1_gpus.txt"
   $g | Where-Object { $_.Trim() } | ForEach-Object { Say "   $_" }
 }
 
 if ('tests' -notin $skipSet -and $twoStage) {
   Say "-- 2 pair tests, second stage on card $Peer"
-  $env:SHADOW_MODEL = $model
-  $env:SHADOW_PEER_GPU = "$Peer"
+  $env:SHADOWZERO_MODEL = $model
+  $env:SHADOWZERO_PEER_GPU = "$Peer"
   Run-Capped "$Out\2_two_stage.txt" (Join-Path $root $twoStage) '--test-threads 1'
-  Remove-Item Env:SHADOW_PEER_GPU -ErrorAction SilentlyContinue
+  Remove-Item Env:SHADOWZERO_PEER_GPU -ErrorAction SilentlyContinue
   Say "   result: $((Select-String -Path "$Out\2_two_stage.txt" -Pattern 'test result' | Select-Object -First 1).Line)"
 }
 
 if ('int8' -notin $skipSet -and $int8) {
   Say "-- 3 native int8 kernels on card $Peer"
-  $env:INT8_GPU = "$Peer"; $env:SHADOW_MMQ_DLL = Join-Path $root 'native\mmq\shadow_mmq.dll'; $env:INT8_ROWS = '20000'
+  $env:INT8_GPU = "$Peer"; $env:SHADOWZERO_MMQ_DLL = Join-Path $root 'native\mmq\shadowzero_mmq.dll'; $env:INT8_ROWS = '20000'
   Run-Capped "$Out\3_int8_cols.txt" (Join-Path $root $int8) '--nocapture'
-  Remove-Item Env:INT8_GPU, Env:SHADOW_MMQ_DLL, Env:INT8_ROWS -ErrorAction SilentlyContinue
+  Remove-Item Env:INT8_GPU, Env:SHADOWZERO_MMQ_DLL, Env:INT8_ROWS -ErrorAction SilentlyContinue
   Say "   result: $((Select-String -Path "$Out\3_int8_cols.txt" -Pattern 'test result' | Select-Object -First 1).Line)"
 }
 
@@ -109,8 +109,8 @@ if ('bench' -notin $skipSet) {
   Stop-Mine
   $a = @('run', '--model', $model, '--out', "$Out\bench", '--runs', '2', '--turns', '36', '--prompts-file', 'bench/dfdata/varied36.json',
          '--arm', 'single=--ctx 24576', '--arm', "pair=--ctx 24576 --gpus 0,$Peer$pairExtra", '--arm', "pair_nodflash=--ctx 24576 --gpus 0,$Peer$pairExtra --dflash off",
-         '--arm-exe', "single=$dev/shadow.exe", '--arm-exe', "pair=$dev/shadow.exe", '--arm-exe', "pair_nodflash=$dev/shadow.exe")
-  & "$dev\shadow-bench.exe" @a *> "$Out\6_bench.txt"
+         '--arm-exe', "single=$dev/shadowzero.exe", '--arm-exe', "pair=$dev/shadowzero.exe", '--arm-exe', "pair_nodflash=$dev/shadowzero.exe")
+  & "$dev\shadowzero-bench.exe" @a *> "$Out\6_bench.txt"
   python tools\bench_total.py "$Out\bench" 2>&1 | Tee-Object -FilePath "$Out\6_bench_total.txt" | ForEach-Object { Say "   $_" }
 }
 

@@ -1,10 +1,10 @@
-"""Basic OpenAI-compatible chat and SSE streaming examples against Shadow."""
+"""Basic OpenAI-compatible chat and SSE streaming examples against ShadowZero."""
 
 import json
 import os
 import urllib.request
 
-BASE = os.environ.get("SHADOW_URL", "http://127.0.0.1:8081").rstrip("/")
+BASE = os.environ.get("SHADOWZERO_URL", "http://127.0.0.1:8081").rstrip("/")
 
 
 def check_health() -> None:

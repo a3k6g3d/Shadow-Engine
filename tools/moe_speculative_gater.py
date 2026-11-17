@@ -3,7 +3,7 @@
 `MoESpeculativeGater` decides, for ONE MoE layer of ONE verification block, which experts are allowed to run (and so which
 experts may cross the PCIe bus).  It is the training-free selector of AcceptMoE (arXiv 2608.02989) with the reuse /
 confidence ideas of S2-MoE (2608.15018) and the hard capacity of MoE-Spec (2602.16052), arranged from what was measured in
-Shadow (docs/SPECULATION.md): substitution routing (each token still takes k experts, re-picked inside the set), the anchor
+ShadowZero (docs/SPECULATION.md): substitution routing (each token still takes k experts, re-picked inside the set), the anchor
 position routes naturally, positions are weighted by how likely they are to be committed, and the set is sized by the
 effective rank of the demand under a HARD cap `k_max_experts`.
 
@@ -88,7 +88,7 @@ class MoESpeculativeGater(nn.Module):
         num_experts          E
         top_k                k, the target router's experts per token (2 for Mixtral)
         k_max_experts        hard cap on the eligible set per layer (per sequence, or per batch if shared); >= top_k
-        beta                 sharpness of the offline commitment weights (the paper uses 0.5; Shadow measured 1.0 better)
+        beta                 sharpness of the offline commitment weights (the paper uses 0.5; ShadowZero measured 1.0 better)
         gamma                weight of the draft's own prefix confidence (0: offline commitment only)
         mix                  weight of the draft route predictor against the target prior in the demand (1: draft only)
         size_scale           multiplies the effective-rank set size (<1 tightens, >1 loosens)

@@ -1,6 +1,6 @@
-"""Reference check of the GPU DFlash 2 drafter (crates/shadow-cuda/src/session_dflash.rs) in CPU torch.
+"""Reference check of the GPU DFlash 2 drafter (crates/shadowzero-cuda/src/session_dflash.rs) in CPU torch.
 
-Run shadow with SHADOW_DF_DUMP=DIR (an existing, empty directory): it appends the features the drafter was given
+Run shadow with SHADOWZERO_DF_DUMP=DIR (an existing, empty directory): it appends the features the drafter was given
 (feats.bin) and every draft's input rows, final hidden, candidates, selector inputs and picks (drafts.bin).  This
 script rebuilds the drafter from models/dflash2/model.safetensors, recomputes each draft from the same features, and
 prints how far the GPU's block hidden and selector picks are from it.

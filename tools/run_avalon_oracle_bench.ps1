@@ -4,7 +4,7 @@
 param(
   [string]$Model = "J:/Strata-work/models/swift15/IQ3_S/Swift-Qwen3.8-Flash-Next-GSQ-RCO-abliterated-IQ3_S-00001-of-00002.gguf",
   [string]$Placement = "J:/Shadow/profiles/routing-varied300.shrc",
-  [string]$Bench = "target/release/shadow-bench.exe",
+  [string]$Bench = "target/release/shadowzero-bench.exe",
   [string]$Out = "bench/avalon_oracle_prompt",
   [int]$Runs = 3,
   [int]$Turns = 6,

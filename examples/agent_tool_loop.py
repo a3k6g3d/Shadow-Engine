@@ -1,10 +1,10 @@
-"""Minimal local agent loop using Shadow's built-in /v1/tools endpoints."""
+"""Minimal local agent loop using ShadowZero's built-in /v1/tools endpoints."""
 
 import json
 import os
 import urllib.request
 
-BASE = os.environ.get("SHADOW_URL", "http://127.0.0.1:8081").rstrip("/")
+BASE = os.environ.get("SHADOWZERO_URL", "http://127.0.0.1:8081").rstrip("/")
 
 
 def get_json(path: str):

@@ -1,4 +1,4 @@
-$Bench = "target/release/shadow-bench.exe"
+$Bench = "target/release/shadowzero-bench.exe"
 $Model = "J:/Strata-work/models/swift15/IQ3_S/Swift-Qwen3.8-Flash-Next-GSQ-RCO-abliterated-IQ3_S-00001-of-00002.gguf"
 $Placement = "J:/Shadow/profiles/routing-varied300.shrc"
 $Out = "bench/direct_io_mixed_fixed"

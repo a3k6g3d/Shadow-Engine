@@ -1,7 +1,7 @@
 """Long-prompt reply agreement: the short suites (quality_test, task_check) never reach the long-prompt MoE path (their chunks are too short for the device planner's stage pipeline), so this
 does.  Eight prompts, each a window of docs/STATUS.md (about 5k or 9.5k tokens, at different offsets) and a question about it, temperature 0, 96 tokens, no prompt cache.
 
-  py tools/long_agree.py run PORT OUT.json          # against a running `shadow serve`: save the replies
+  py tools/long_agree.py run PORT OUT.json          # against a running `shadowzero serve`: save the replies
   py tools/long_agree.py cmp REF.json A.json [B.json ...]    # mean prefix match (and replies identical) of each file against the reference, and each pair of the others
 
 Mean prefix match is the quality_test metric: how far a reply follows the reference's, as a fraction of the reference's length (harsh: one different token ends it)."""

@@ -1,4 +1,4 @@
-// EXL3 (ExLlamaV3) trellis kernels: y = x W for a projection stored as a blob (crates/shadow-model/src/exl3.rs has the format and the
+// EXL3 (ExLlamaV3) trellis kernels: y = x W for a projection stored as a blob (crates/shadowzero-model/src/exl3.rs has the format and the
 // CPU reference these are checked against): f16 suh [cols], f16 svh [rows], a 4-byte marker, then the trellis, 16 K u16 words a
 // 16 x 16 tile, tiles in [cols/16][rows/16] order.  The weight is diag(suh) H W_hat H diag(svh) with H the 128 x 128 Hadamard on
 // every 128-block of the input and of the output index, so a block of 256 threads (8 warps, a warp a tile column) owns 128

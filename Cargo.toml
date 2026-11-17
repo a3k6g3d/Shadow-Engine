@@ -1,8 +1,8 @@
 [workspace]
 resolver = "2"
-members = ["crates/shadow-host", "crates/shadow-eval", "crates/shadow-model", "crates/shadow-cuda", "crates/shadow-serve", "crates/shadow-bench", "crates/shadow", "crates/shadow-ui"]
+members = ["crates/shadowzero-host", "crates/shadowzero-eval", "crates/shadowzero-model", "crates/shadowzero-cuda", "crates/shadowzero-serve", "crates/shadowzero-bench", "crates/shadowzero", "crates/shadowzero-ui"]
 
 [workspace.package]
-version = "0.1.41"
+version = "0.1.42"
 edition = "2021"
 license = "MIT"

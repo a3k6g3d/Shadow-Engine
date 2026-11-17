@@ -1,4 +1,4 @@
-"""Total decode throughput per arm from a shadow-bench directory: sum(predicted_n) / sum(predicted_ms) over the warm turns
+"""Total decode throughput per arm from a shadowzero-bench directory: sum(predicted_n) / sum(predicted_ms) over the warm turns
 (turn 0 dropped), per run and over all runs.  The bench's own headline is a median over turns, which compares different
 turns when the arms generate different text (tail-skip, speculation); totals do not.
 

@@ -1,7 +1,7 @@
-"""Writes crates/shadow-model/src/nfc_table.rs and eval/fixtures/nfc.txt.
+"""Writes crates/shadowzero-model/src/nfc_table.rs and eval/fixtures/nfc.txt.
 
 The checkpoint's tokenizer.json normalizes every text to NFC before it is tokenized (the GGUF does not say so), and
-Rust's standard library has no Unicode normalization.  So Shadow carries the three tables NFC is built from, generated
+Rust's standard library has no Unicode normalization.  So ShadowZero carries the three tables NFC is built from, generated
 once from Python's unicodedata (the Unicode version is written into the file):
 
   DECOMP   canonical decompositions: (code point, first, second) with second = 0 for a singleton
@@ -22,7 +22,7 @@ import sys
 import unicodedata
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
-OUT = ROOT / "crates" / "shadow-model" / "src" / "nfc_table.rs"
+OUT = ROOT / "crates" / "shadowzero-model" / "src" / "nfc_table.rs"
 FIX = ROOT / "eval" / "fixtures" / "nfc.txt"
 
 

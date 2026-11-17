@@ -1,0 +1,13 @@
+[package]
+name = "shadowzero"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# The `shadow` command line: the model side (shadowzero-model) and the GPU side (shadowzero-cuda) together.
+
+[dependencies]
+shadowzero-model = { path = "../shadowzero-model" }
+shadowzero-cuda = { path = "../shadowzero-cuda" }
+shadowzero-serve = { path = "../shadowzero-serve" }
+shadowzero-eval = { path = "../shadowzero-eval" }   # its JSON reader, for the fixtures

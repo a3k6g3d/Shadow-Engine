@@ -1,8 +1,8 @@
-"""Fine-tune the DFlash 2 drafter (models/dflash2) on Shadow's own features.
+"""Fine-tune the DFlash 2 drafter (models/dflash2) on ShadowZero's own features.
 
-Data: `feats.bin` files written by `shadow serve` with SHADOW_DF_DUMP=dir (see tools/dflash2_ref.py): per position the
+Data: `feats.bin` files written by `shadowzero serve` with SHADOWZERO_DF_DUMP=dir (see tools/dflash2_ref.py): per position the
 five-layer feature row the main model produced and the token read.  Tables: token_embd.f32 / output.f32 from
-`shadow dump MODEL token_embd.weight|output.weight FILE` (the main model's own embedding and head).
+`shadowzero dump MODEL token_embd.weight|output.weight FILE` (the main model's own embedding and head).
 
 LoRA (fp32) on every linear of the drafter over frozen BF16 weights; the loss is what the drafter is used for:
 full-vocabulary cross entropy of each mask slot's hidden state through the main model's head, plus a cross entropy over
