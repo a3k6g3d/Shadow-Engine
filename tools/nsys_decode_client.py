@@ -1,6 +1,6 @@
 import json, sys, time, urllib.request
 port = int(sys.argv[1])
-P = json.load(open(r'J:\Shadow\bench\dfdata\varied36.json', encoding='utf-8'))
+P = json.load(open(r'J:\ShadowZero\bench\dfdata\varied36.json', encoding='utf-8'))
 for k in range(6):
     body = json.dumps({"messages": [{"role": "user", "content": P[k]}], "max_tokens": 160, "temperature": 0,
                        "chat_template_kwargs": {"enable_thinking": False}}).encode()

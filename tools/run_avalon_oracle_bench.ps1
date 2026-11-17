@@ -3,7 +3,7 @@
 # 4 arms x Runs, interleaved, one fresh launch per run, warm turns only.  Upper bound for any "compute the miss on the CPU" design.
 param(
   [string]$Model = "J:/Strata-work/models/swift15/IQ3_S/Swift-Qwen3.8-Flash-Next-GSQ-RCO-abliterated-IQ3_S-00001-of-00002.gguf",
-  [string]$Placement = "J:/Shadow/profiles/routing-varied300.shrc",
+  [string]$Placement = "J:/ShadowZero/profiles/routing-varied300.shrc",
   [string]$Bench = "target/release/shadowzero-bench.exe",
   [string]$Out = "bench/avalon_oracle_prompt",
   [int]$Runs = 3,

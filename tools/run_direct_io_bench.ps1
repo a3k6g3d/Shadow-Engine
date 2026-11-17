@@ -2,7 +2,7 @@
 # 4 arms x 3 runs, interleaved, fresh launches, warm turns only
 param(
   [string]$Model = "J:/Strata-work/models/swift15/IQ3_S/Swift-Qwen3.8-Flash-Next-GSQ-RCO-abliterated-IQ3_S-00001-of-00002.gguf",
-  [string]$Placement = "J:/Shadow/profiles/routing-varied300.shrc",
+  [string]$Placement = "J:/ShadowZero/profiles/routing-varied300.shrc",
   [string]$Bench = "target/release/shadowzero-bench.exe",
   [int]$Port = 8092
 )

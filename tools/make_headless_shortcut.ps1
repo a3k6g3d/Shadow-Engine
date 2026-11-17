@@ -1,6 +1,6 @@
 # Creates (or refreshes) the Start menu entry "ShadowZero (server only)": shadowzero-ui.exe --headless = the server and a tray icon, no window and no chat page,
 # for running another harness (Hermes, pi, ...) against http://127.0.0.1:8081/v1.  Quit from the tray icon stops the server.
-#   powershell -File tools/make_headless_shortcut.ps1 [-Exe J:\Shadow\target\release\shadowzero-ui.exe]
+#   powershell -File tools/make_headless_shortcut.ps1 [-Exe J:\ShadowZero\target\release\shadowzero-ui.exe]
 param([string]$Exe = (Join-Path (Split-Path $PSScriptRoot -Parent) 'target\release\shadowzero-ui.exe'))
 $dir = Join-Path $env:APPDATA 'Microsoft\Windows\Start Menu\Programs'
 $lnk = Join-Path $dir 'ShadowZero (server only).lnk'

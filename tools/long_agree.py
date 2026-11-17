@@ -11,7 +11,7 @@ NL = chr(10)
 
 
 def prompts():
-    text = open('J:/Shadow/docs/STATUS.md', encoding='utf-8').read()
+    text = open('J:/ShadowZero/docs/STATUS.md', encoding='utf-8').read()
     out = []
     for i, (chars, off) in enumerate([(15000, 40000), (15000, 90000), (15000, 140000), (15000, 190000), (28000, 20000), (28000, 70000), (28000, 120000), (28000, 170000)]):
         doc = text[off:off + chars]

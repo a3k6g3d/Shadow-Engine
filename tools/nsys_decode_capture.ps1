@@ -1,11 +1,11 @@
-param([string]$Tag, [string]$Flags = '', [string]$Client = 'J:\Shadow\tools\nsys_decode_client.py', [string]$Model = 'J:/Models/Lygodactylus-Qwen3.8-Flash-Next-Uncensored-exl3-2bpw', [int]$CapGiB = 56, [double]$FloorGiB = 3.5)
+param([string]$Tag, [string]$Flags = '', [string]$Client = 'J:\ShadowZero\tools\nsys_decode_client.py', [string]$Model = 'J:/Models/Lygodactylus-Qwen3.8-Flash-Next-Uncensored-exl3-2bpw', [int]$CapGiB = 56, [double]$FloorGiB = 3.5)
 # Decode under Nsight Systems: nsys starts shadowzero.exe; this script caps the shadowzero.exe child's working set and kills it below the free-RAM floor
 # (the rule of tools/run_capped.ps1, applied to the child because run_capped would cap nsys itself).
-Set-Location J:\Shadow
+Set-Location J:\ShadowZero
 $sp = $env:TEMP
 $nsys = 'C:\Program Files\NVIDIA Corporation\Nsight Systems 2026.5.2\target-windows-x64\nsys.exe'
 $model = $Model
-$rep = "J:\Shadow\bench\nsys-$Tag"
+$rep = "J:\ShadowZero\bench\nsys-$Tag"
 Remove-Item "$rep.nsys-rep", "$rep.sqlite" -ErrorAction SilentlyContinue
 Add-Type @'
 using System; using System.Runtime.InteropServices;
@@ -14,7 +14,7 @@ public static class Ws2 {
   public static extern bool SetProcessWorkingSetSizeEx(IntPtr h, UIntPtr min, UIntPtr max, uint flags);
 }
 '@
-$nargs = "profile --trace=cuda --cuda-graph-trace=node --sample=none --cpuctxsw=none -o `"$rep`" -f true J:\Shadow\target-dev\release\shadowzero.exe serve $model --port 8095 --ctx 24576 $Flags"
+$nargs = "profile --trace=cuda --cuda-graph-trace=node --sample=none --cpuctxsw=none -o `"$rep`" -f true J:\ShadowZero\target-dev\release\shadowzero.exe serve $model --port 8095 --ctx 24576 $Flags"
 $p = Start-Process -FilePath $nsys -ArgumentList $nargs -PassThru -WindowStyle Hidden -RedirectStandardOutput "$sp\nsys_$Tag.out" -RedirectStandardError "$sp\nsys_$Tag.err"
 $child = $null
 for ($i = 0; $i -lt 60 -and -not $child; $i++) {

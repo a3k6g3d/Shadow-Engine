@@ -13,7 +13,7 @@ n_items = int(sys.argv[2]) if len(sys.argv) > 2 else 8
 chars = int(sys.argv[3]) if len(sys.argv) > 3 else 28000
 multi = len(sys.argv) > 4 and sys.argv[4] == 'multi'
 NL = chr(10)
-text = open('J:/Shadow/docs/STATUS.md', encoding='utf-8').read()[:chars]
+text = open('J:/ShadowZero/docs/STATUS.md', encoding='utf-8').read()[:chars]
 rng = random.Random(20261106)
 words = ['ZEBRA', 'MAPLE', 'COBALT', 'FALCON', 'ORCHID', 'TUNDRA', 'QUARTZ', 'LANTERN', 'MARBLE', 'SPARROW', 'VELVET', 'HARBOR']
 found, failed = 0, []

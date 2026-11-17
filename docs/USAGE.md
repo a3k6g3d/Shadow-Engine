@@ -195,6 +195,6 @@ the one measurement) and decode a little slower. The chat page sends its own fro
 ## MCP tools
 
 `mcp.json` in the ShadowZero folder lists the MCP servers `shadowzero serve` starts (the format of Claude Desktop / Claude Code, so a list can be copied). Shipped on: `time` (current time, time zones) and `thinking`
-(sequential thinking). Shipped off, set `"disabled": false` or delete the line to use them: `git` (`uvx mcp-server-git`) and `files` (the filesystem server on `J:/Shadow`). They need `uvx` / `npx` (installed) and the network
+(sequential thinking). Shipped off, set `"disabled": false` or delete the line to use them: `git` (`uvx mcp-server-git`) and `files` (the filesystem server on `J:/ShadowZero`). They need `uvx` / `npx` (installed) and the network
 the first time (the packages are fetched once). Each tool is offered to the model as `mcp__<server>__<tool>` and costs prompt tokens in every chat's start (the first chat reads them once, then the server caches them);
-`mcp.json` is looked for in the working directory, beside the exe, in the checkout ShadowZero was built from, then `%APPDATA%\Shadow` (`SHADOWZERO_MCP_CONFIG` names one). The Dashboard's Tools card shows each server and its tool count or error.
+`mcp.json` is looked for in the working directory, beside the exe, in the checkout ShadowZero was built from, then `%APPDATA%\ShadowZero` (`SHADOWZERO_MCP_CONFIG` names one). The Dashboard's Tools card shows each server and its tool count or error.

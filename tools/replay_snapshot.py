@@ -102,7 +102,7 @@ if __name__ == '__main__':
     # then passes the context window's budget and the server compacts it (older tool outputs shortened, older turns folded into a summary)
     extra = int(os.environ.get('REPLAY_APPEND_CHARS', '0'))
     if extra:
-        page = open('J:/Shadow/docs/STATUS.md', encoding='utf-8').read()[:extra]
+        page = open('J:/ShadowZero/docs/STATUS.md', encoding='utf-8').read()[:extra]
         msgs.append({'role': 'assistant', 'reasoning_content': 'I need the next page of the list.', 'content': 'Let me read the next page.\n\n<tool_call>\n<function=web_fetch>\n<parameter=url>\nhttps://example.org/page\n</parameter>\n</function>\n</tool_call>'})
         msgs.append({'role': 'user', 'content': '<tool_response>\n<tool_response>\nhttps://example.org/page\n' + page + '\n</tool_response>\n</tool_response>'})
     print(f'{len(ids)} tokens -> {len(text)} chars -> {len(msgs)} messages ({", ".join(m["role"][0] for m in msgs[:3])} ... {msgs[-1]["role"]})', flush=True)

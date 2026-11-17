@@ -1,6 +1,6 @@
 import json, sys, time, urllib.request
 t0 = time.time()
-prompts = json.load(open('J:/Shadow/bench/dfdata/varied36.json'))[:int(sys.argv[1])]
+prompts = json.load(open('J:/ShadowZero/bench/dfdata/varied36.json'))[:int(sys.argv[1])]
 hist = []; rows = []
 for i, p in enumerate(prompts):
     hist.append({'role': 'user', 'content': p})

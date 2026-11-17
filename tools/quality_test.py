@@ -3,7 +3,7 @@
    python quality_test.py cmp REF.json N       # run against another server, history = the reference replies"""
 import json, sys, time, urllib.request
 mode, ref_path, n = sys.argv[1], sys.argv[2], int(sys.argv[3])
-prompts = json.load(open('J:/Shadow/bench/dfdata/varied36.json'))[:n]
+prompts = json.load(open('J:/ShadowZero/bench/dfdata/varied36.json'))[:n]
 ref = json.load(open(ref_path)) if mode == 'cmp' else []
 hist, replies, match, toks = [], [], [], 0
 t0 = time.time()

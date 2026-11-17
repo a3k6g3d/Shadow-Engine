@@ -25,10 +25,10 @@ MODEL = "J:/Strata-work/models/swift15/IQ3_S/Swift-Qwen3.8-Flash-Next-GSQ-RCO-ab
 BASE = {
     "--ctx": 8192,
     "--ram-tier-gib": 30,
-    "--placement": "J:/Shadow/profiles/routing-varied300.shrc",
+    "--placement": "J:/ShadowZero/profiles/routing-varied300.shrc",
     "--tail-skip": 3,
     "--verify-rank": 2,
-    "--dflash": "J:/Shadow/models/dflash2",
+    "--dflash": "J:/ShadowZero/models/dflash2",
     "--spec": 3,
     "--dflash-min-p": 0.5,
 }

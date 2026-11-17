@@ -1,6 +1,6 @@
 import json, sys, time, uuid, urllib.request
 port = int(sys.argv[1]); out = sys.argv[2]
-P = json.load(open(r'J:\Shadow\bench\dfdata\varied36.json', encoding='utf-8'))
+P = json.load(open(r'J:\ShadowZero\bench\dfdata\varied36.json', encoding='utf-8'))
 def chat(hist):
     body = json.dumps({"messages": hist, "max_tokens": 96, "chat_template_kwargs": {"enable_thinking": False}}).encode()
     rq = urllib.request.Request(f"http://127.0.0.1:{port}/v1/chat/completions", data=body, headers={"Content-Type": "application/json"})

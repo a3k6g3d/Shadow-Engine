@@ -9,7 +9,7 @@ PORT = 8091
 TIER = sys.argv[1] if len(sys.argv) > 1 else "45"
 FLOOR = sys.argv[2] if len(sys.argv) > 2 else "3.5"
 
-text = open("J:/Shadow/docs/STATUS.md", encoding="utf-8").read()
+text = open("J:/ShadowZero/docs/STATUS.md", encoding="utf-8").read()
 NL = chr(10)
 
 
@@ -59,7 +59,7 @@ def run_arm(arm_name, extra_flags, run_idx, out_dir):
     log_out = os.path.join(out_dir, f"{arm_name}_r{run_idx}.out")
     log_err = os.path.join(out_dir, f"{arm_name}_r{run_idx}.err")
     args = [
-        "J:/Shadow/target/release/shadowzero.exe",
+        "J:/ShadowZero/target/release/shadowzero.exe",
         "serve",
         MODEL,
         "--port", str(PORT),
@@ -122,7 +122,7 @@ def run_arm(arm_name, extra_flags, run_idx, out_dir):
 
 
 def main():
-    out_dir = "J:/Shadow/bench/prompt-opt-2026-11-10"
+    out_dir = "J:/ShadowZero/bench/prompt-opt-2026-11-10"
     schedule = [
         ("r3", [], 1),
         ("r2", ["--no-prompt-opt-r3"], 1),

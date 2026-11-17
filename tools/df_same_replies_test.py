@@ -1,6 +1,6 @@
 import json, sys, urllib.request
 port = int(sys.argv[1]); out = sys.argv[2]
-P = json.load(open(r'J:\Shadow\bench\dfdata\varied36.json', encoding='utf-8'))
+P = json.load(open(r'J:\ShadowZero\bench\dfdata\varied36.json', encoding='utf-8'))
 res = []
 hist = []
 for k in range(3):

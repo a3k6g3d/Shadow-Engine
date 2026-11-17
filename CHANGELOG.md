@@ -2,6 +2,10 @@
 
 All notable changes to ShadowZero will be documented in this file.
 
+## [0.1.43] — 2026-11-17
+### Fixed
+- **Post-folder-rename path cleanup (`J:\Shadow` -> `J:\ShadowZero`)**: Updated remaining path references in `mcp.json`, `tools/swap_and_relaunch.ps1` (including `Get-Process shadowzero`), `tools/make_headless_shortcut.ps1`, `crates/shadowzero-serve/src/ui.rs` (chat suggestion chip and `%APPDATA%\ShadowZero` help text), `docs/USAGE.md`, `CLAUDE.md`, and `tools/` scripts, and refreshed Start Menu shortcuts.
+
 ## [0.1.42] — 2026-11-17
 ### Renamed project to ShadowZero
 - **Full codebase, binary & native DLL rename**: Renamed workspace crates (`shadowzero`, `shadowzero-model`, `shadowzero-cuda`, `shadowzero-serve`, `shadowzero-bench`, `shadowzero-eval`, `shadowzero-host`, `shadowzero-ui`), binaries (`shadowzero.exe`, `shadowzero-ui.exe`), native CUDA DLLs (`shadowzero_mmq.dll`, `shadowzero_fused.dll`, rebuilt with `nvcc`), runtime env vars (`SHADOWZERO_*`), caches (`ShadowZeroConvCache`, `%LOCALAPPDATA%\shadowzero\kernels`), `%APPDATA%\ShadowZero`, UI branding, tools (`shadowzero_harness.py`, `shadowzero_memory.py`), Start menu shortcuts, and GitHub repository (`a3k6g3d/ShadowZero`).

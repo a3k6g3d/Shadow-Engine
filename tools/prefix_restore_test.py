@@ -11,7 +11,7 @@ import json, random, sys, urllib.request
 port = int(sys.argv[1]) if len(sys.argv) > 1 else 8081
 n_items = int(sys.argv[2]) if len(sys.argv) > 2 else 3
 NL = chr(10)
-text = open('J:/Shadow/docs/STATUS.md', encoding='utf-8').read()
+text = open('J:/ShadowZero/docs/STATUS.md', encoding='utf-8').read()
 rng = random.Random(20261106)
 words = ['ZEBRA', 'MAPLE', 'COBALT', 'FALCON', 'ORCHID', 'TUNDRA', 'QUARTZ', 'LANTERN']
 tools = json.load(urllib.request.urlopen(f'http://127.0.0.1:{port}/v1/tools', timeout=30))

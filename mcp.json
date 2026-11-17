@@ -29,7 +29,7 @@
     "files": {
       "disabled": true,
       "command": "npx",
-      "args": ["-y", "@modelcontextprotocol/server-filesystem", "J:/Shadow"]
+      "args": ["-y", "@modelcontextprotocol/server-filesystem", "J:/ShadowZero"]
     }
   }
 }

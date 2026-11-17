@@ -1,6 +1,6 @@
 import json, sys, urllib.request
 port = int(sys.argv[1]); out = sys.argv[2]
-P = json.load(open(r'J:\Shadow\bench\dfdata\varied36.json', encoding='utf-8'))
+P = json.load(open(r'J:\ShadowZero\bench\dfdata\varied36.json', encoding='utf-8'))
 PARA_A = ("The harbour town of Velmar sits at the mouth of a slow brown river, and every morning the fishing boats leave before the lamps in the market are put out. "
           "Its council keeps a ledger of every cargo, every toll and every dispute, and the clerks who write in it are famous for their small, upright handwriting. ")
 PARA_B = ("In the mountain monastery of Karth, the monks measure the year by the thaw of a single glacier and record its retreat in knots tied on long cords. "

@@ -1210,7 +1210,7 @@ canvas.spark { width: 100%; height: 64px; display: block; }
         <div class="dcard">
           <h3>Memory <span class="tag" id="set-mem-count">--</span></h3>
           <label class="set-toggle"><input type="checkbox" id="set-mem-on" onchange="setMemoryOn(this.checked)"> Use memory in chats</label>
-          <p class="set-help">Short notes about you that ShadowZero reads at the start of every chat. It adds notes itself when you tell it something lasting about you or your work (or say "remember ..."); edit one by clicking it, delete with the cross. Kept on this PC only, in %APPDATA%\Shadow\memory.json.</p>
+          <p class="set-help">Short notes about you that ShadowZero reads at the start of every chat. It adds notes itself when you tell it something lasting about you or your work (or say "remember ..."); edit one by clicking it, delete with the cross. Kept on this PC only, in %APPDATA%\ShadowZero\memory.json.</p>
           <div id="set-mem-list"></div>
           <div class="set-row">
             <input type="text" id="set-mem-new" aria-label="Add a memory note" placeholder="Add a note, e.g. I prefer short answers with the code first" onkeydown="if (event.key === 'Enter' && !event.isComposing && event.keyCode !== 229) { event.preventDefault(); addMemory(); }">
@@ -1236,7 +1236,7 @@ canvas.spark { width: 100%; height: 64px; display: block; }
             <p>Ask anything. With Windows Tools on, it can read and search files, edit them and run commands; it asks the model, never the cloud.</p>
             <div class="chips">
               <button class="chip" onclick="useSuggestion(this)">Explain what a hash table is, briefly</button>
-              <button class="chip" onclick="useSuggestion(this)">List the files in J:\Shadow\docs</button>
+              <button class="chip" onclick="useSuggestion(this)">List the files in J:\ShadowZero\docs</button>
               <button class="chip" onclick="useSuggestion(this)">Write a Rust function that parses comma-separated integers</button>
             </div>
             <div class="kbd-hints">
@@ -3341,7 +3341,7 @@ set('d-model', p.model || '--');
       const mcp = d.mcp || [], mcpTools = mcp.reduce((n, m) => n + m.tools, 0);
       set('d-toolcount', (8 + mcpTools) + ' available (' + mcpTools + ' from MCP)');
       html('d-mcp', mcp.length ? mcp.map(m => `<div class="kv"><span>MCP server <b>${escapeHtml(m.name)}</b></span><b style="color:${m.error ? 'var(--danger)' : 'var(--success)'}" title="${escapeHtml(m.error || '')}">${m.error ? 'failed' : m.tools + ' tools'}</b></div>`).join('')
-        : 'No MCP servers. List them in mcp.json (Claude Desktop / Claude Code format) in the ShadowZero folder or %APPDATA%\\Shadow, then restart.');
+        : 'No MCP servers. List them in mcp.json (Claude Desktop / Claude Code format) in the ShadowZero folder or %APPDATA%\\ShadowZero, then restart.');
       set('d-tps-avg', ts > 0 ? (tt / ts).toFixed(1) + ' tok/s (last ' + tail.length + ')' : '--');
       const read = last ? last.prompt_tokens - last.cached_tokens : 0;
       set('d-pps', last && last.prompt_ms > 0 && read > 0 ? (read / (last.prompt_ms / 1000)).toFixed(0) + ' tok/s, ' + read + ' new' : last ? 'all ' + last.prompt_tokens + ' cached' : '--');

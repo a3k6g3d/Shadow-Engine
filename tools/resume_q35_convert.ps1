@@ -6,5 +6,5 @@ Set-Location I:\tools\exllamav3
 $env:CUDA_VISIBLE_DEVICES = '1'
 $env:PYTHONUNBUFFERED = '1'
 Remove-Item $Log, "$Log.err" -ErrorAction SilentlyContinue
-& 'J:\Shadow\tools\run_capped.ps1' -CapGiB 36 -FloorGiB 3.5 -Out $Log -Exe 'I:\tools\exl3-venv\Scripts\python.exe' -Arguments '-u convert.py -w F:\work\q35-exl3-2.55bpw -r'
+& 'J:\ShadowZero\tools\run_capped.ps1' -CapGiB 36 -FloorGiB 3.5 -Out $Log -Exe 'I:\tools\exl3-venv\Scripts\python.exe' -Arguments '-u convert.py -w F:\work\q35-exl3-2.55bpw -r'
 "CONVERT RESUME ENDED $(Get-Date)" | Out-File 'F:\work\q35-exl3-2.55bpw_resume.done'
