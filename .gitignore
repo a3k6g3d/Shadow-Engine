@@ -1,4 +1,5 @@
 /target
+*.diff
 **/*.rs.bk
 Cargo.lock
 __pycache__/
