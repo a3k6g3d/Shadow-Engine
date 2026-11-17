@@ -25,38 +25,44 @@ The plan is in [docs/SHADOW_PLAN.md](docs/SHADOW_PLAN.md), rewritten 2026-10-26.
 
 ## Speed
 
-Measured on one PC (RTX 5070 12 GB, i7-11700K, 64 GB RAM, NVMe, Windows 11) with the Swift IQ3_S GGUF of Qwen3.8-Flash-Next,
-greedy, 96 tokens a turn, a 36-turn conversation of unseen prompts, scored by **total decode throughput** (tokens / decode
-time; the bench's per-turn median misranks arms that generate different text, see
-[docs/BENCHMARKING.md](docs/BENCHMARKING.md)):
+Measured on the project test box (RTX 5070 12 GiB @ 200W + RTX 5060 Ti 16 GiB @ 150W, i7-11700K, 64 GB RAM, NVMe, Windows 11, `--ctx 24576`) running mixed EXL3 Qwen3.8-Flash-Next (`mixD18`), greedy decoding, with DFlash 2 speculation (`--spec 3`):
 
-| | tok/s | note |
-|---|---|---|
-| Shadow `--exact` | ~20 | no speculation, no inexact modes; bit for bit the reference |
-| Shadow default (`shadow serve MODEL`) | **52.1** | DFlash 2 drafter, `--tail-skip 3`, `--verify-rank 2`, 36 GiB RAM expert tier (30 when under 49 GiB of RAM is free); same-history fidelity about 0.4 (Strata 0.43; the metric moves by about 0.04 between builds) |
-| Strata (its tuned config, same model, prompts, context) | **47.7** | interleaved with Shadow in the same session |
+| setup | varied36 decode (median) | short prompts | 3.3k prompt | 9.7k prompt | 15.2k prompt |
+|---|---|---|---|---|---|
+| Pair (`--gpus 0,1`, v0.1.37) | 63.23 (60.00) tok/s | 115.08 tok/s | 755.2 tok/s | 1095.9 tok/s | — |
+| **Pair (`--gpus 0,1`, v0.1.41)** | **72.32 (72.26) tok/s** | **125.19 tok/s** | **836.0 tok/s** | **1298.5 tok/s** | **1397.0 tok/s** |
+| Single (`--gpus 0`, v0.1.41) | 75.76 (76.21) tok/s | 75.65 tok/s | 878.5 tok/s | 1163.6 tok/s | 1204.0 tok/s |
 
-> **Update 2026-11-11 (supersedes the table above and the decode figures in the next paragraph, which stay for the record):** measured again on v0.1.36 against the same local Strata build, 3 interleaved runs of the same 36 prompts. Shadow default (context 24,576) **55.7** tok/s against Strata **49.5** (+12.5%); in the `--ctx 8192` runs (the setting of the 52.1 above) it reads **46.4** (-6.2%) because of a Shadow bug found while checking: after the server restored an earlier conversation snapshot the DFlash drafter stayed off for the rest of the session (docs/STATUS.md entries 98-99; fixed the same day: the same `--ctx 8192` bench reads **55.7** after the fix, measured in a separate session from the Strata runs). Strata is an older local build, the engines write different text, prompt speed was not re-run. Method, per-turn numbers and what this does not show: [docs/COMPARISON_STRATA_2026-11-11.md](docs/COMPARISON_STRATA_2026-11-11.md).
+- **One GPU vs. two GPUs on this board:** Because the second PCIe slot on this motherboard is chipset-wired PCIe 3.0 x4 (`~3.4 GB/s` vs `27.4 GB/s` on the main slot) and WDDM disables P2P, single-card RTX 5070 keeps a ~4–5% decode edge while **two cards load faster (`39.6s` vs `45.6s`) and pull well ahead on prompts** (+65.5% on short prompts, +11.6% at 9.7k, +16.0% at 15.2k) because layers `0..15` stay 100% resident on the 5060 Ti.
+- **Earlier IQ3_S GGUF baseline vs. Strata:** On single-card IQ3_S (`v0.1.35–v0.1.36`), Shadow hit **55.7 tok/s** decode against Strata's **49.5 tok/s** (`+12.5%`, [docs/COMPARISON_STRATA_2026-11-11.md](docs/COMPARISON_STRATA_2026-11-11.md)) and up to **1,764 tok/s** on 15k prompts (`+16%`). Exact mode (`--exact`) turns off speculation and fast approximations (~20 tok/s on IQ3_S) to match the scalar reference bit for bit.
 
-**Shadow is about 9–11% faster than Strata on decode and 16% faster on 15k prompts** (52.1 against 47.7 tok/s by total decode throughput across 3 interleaved runs of 36 prompts each: Shadow 51.8, 52.2, 52.2, Strata 47.7, 47.4, 48.0; and 52.9–53.1 tok/s on 200-token decode in `v0.1.35`). Shadow's replies are longer (1,781 tokens a run against Strata's 1,518) and its fidelity to the exact model
-is about the same. With AcceptMoE verification (`--accept-moe`) Shadow runs about 3% slower. For prompt reading (`v0.1.35`, with the default 45 GiB chunked RAM tier, fused int8 MMA experts on all 48 layers, fast device planner, VMM handle pool, and retained `StagePipe` buffers; `docs/STATUS.md` entries 88–94 and [docs/HANDOFF.md](docs/HANDOFF.md)): Shadow reads 3k-token prompts at **958–1,001 tok/s** (`2.62–2.99 s`), 9.6k at **1,694–1,702 tok/s** (`5.68–5.71 s`), and 15k at **1,761–1,764 tok/s** (`8.52–8.54 s`), against Strata 0.2.11's **1,210 / 1,735 / 1,543 tok/s** (`2.40 / 5.50 / 9.90 s`) re-measured on the same PC and files (`docs/STATUS.md` entry 65). The resource record
-(`bench/vs-strata-final4/charts/`) shows where the time goes: Shadow's GPU is busier (84% against 78%), it moves more over PCIe (15.4 against 10.1 GB/s, about 296 against 212 MB of expert weights per generated token: the bigger RAM tier serves more of its misses) and uses the CPU and disk far less
-(12% against 51% CPU, 150 against 468 MB/s of disk), but it keeps only about 4-5 GiB of RAM free (Strata 8-9 GiB). Earlier figures in this repository's history that put Shadow at 43 to 47 tok/s came from a mode that cut
-answers short (`--verify-resident`) and from per-turn medians; both are documented in
-[docs/STATUS.md](docs/STATUS.md). Shadow's noise floor is 0.8% median on the exact engine
-(`bench/floor-2026-10-27`), about 0.1 to 0.5% for total throughput in the fastest mode.
+![Decode and short-prompt progression from v0.1.37 to v0.1.41](docs/charts/decode-progression.svg)
+
+![Long-prompt prefill scaling across 3.3k, 9.7k, and 15.2k tokens](docs/charts/prompt-prefill-scaling.svg)
+
+![Dual-GPU layout and layer split sweep](docs/charts/dual-gpu-split-and-pipeline.svg)
 
 ## Quick start
 
 ```bash
 cargo build --release
-shadow serve path/to/model.gguf            # the fastest mode by default; add --exact for the exact path
-# http://127.0.0.1:8081/ chat UI, Dashboard (#dash) and Settings (#settings) tabs, /v1/chat/completions OpenAI API
+shadow gpus                                # list cards and measure host <-> GPU / hop bandwidth
+shadow serve path/to/model --gpus 0        # single GPU, fastest defaults (add --exact for bit-exact)
+shadow serve path/to/model --gpus 0,1      # dual GPU, auto-splits layers across both cards
 ```
 
-What the defaults are, every flag and every environment variable: [docs/USAGE.md](docs/USAGE.md). Shadow never pins memory
-that would leave less than 4 GiB of RAM available, and the default 36 GiB expert tier (30 GiB when under 49 GiB is free) peaks around 41 GiB resident, so on a
-smaller machine pass `--ram-tier-gib` explicitly.
+That opens the web chat UI at `http://127.0.0.1:8081/` (with a live multi-GPU Dashboard at `/#dash`) and an OpenAI-compatible API at `/v1/chat/completions`.
+
+What every flag and environment switch does is in [docs/USAGE.md](docs/USAGE.md). Shadow keeps at least 4 GiB of system RAM free when sizing the pinned host expert tier, so on smaller machines pass `--ram-tier-gib` explicitly.
+
+## Examples
+
+Standalone, zero-dependency examples live in [`examples/`](examples/README.md):
+
+- [`examples/quickstart_single_and_dual_gpu.ps1`](examples/quickstart_single_and_dual_gpu.ps1) — GPU/bandwidth probe and ready-to-run single-card, dual-card, and `--exact` launch commands
+- [`examples/chat_and_streaming.py`](examples/chat_and_streaming.py) — non-streaming and SSE streaming `/v1/chat/completions` calls (including `reasoning_content` and `timings`)
+- [`examples/agent_tool_loop.py`](examples/agent_tool_loop.py) — minimal local tool-calling agent loop using `/v1/tools`, `/v1/tools/execute`, and `finish`
+- [`examples/watch_telemetry.py`](examples/watch_telemetry.py) — live terminal monitor for per-GPU utilization/VRAM, expert cache hit rate, RAM tier activity, and DFlash acceptance
 
 ## Documentation
 
@@ -77,23 +83,19 @@ is refused with a clear message. It is not a general LLM runner: a dense Llama o
 
 ## Server & Web UI
 
-* **Desktop UI (`shadow-ui.exe`)**: Windows launcher built with Rust and Tauri 2 (WebView2); connects to `http://127.0.0.1:8081`.
-* **Web chat and process monitor**: streaming chat with collapsible `<think>` blocks, a reasoning-effort selector, native tool
-  orchestration (`read_file`, `glob`, `grep`, `edit_file`, `write_file`, `cmd`) rendered as collapsible `.tool-call-block` cards,
-  and an **unlimited rolling context window** (`0 B` extra RAM/VRAM) that preserves the system prompt prefix snapshot while
-  compacting older tool outputs and folding older turns into a bounded summary; the Dashboard tab charts CPU, GPU load, temperature,
-  RAM, expert-cache hit rates and the three memory tiers (VRAM, pinned RAM, NVMe).
-* **API**: `POST /v1/chat/completions` (streaming or not), `GET /v1/models`, `/health`, `/metrics` (Prometheus), `/v1/status`,
-  `/v1/telemetry`, `/v1/tools`, `/v1/tools/execute`.
+* **Desktop app (`shadow-ui.exe`)**: Windows launcher built with Tauri 2 (and headless server-only tray mode via `shadow-ui.exe --headless`), pointing at `http://127.0.0.1:8081`.
+* **Chat UI & Dashboard**: Streaming chat with collapsible thinking blocks, reasoning-effort control, and local file/command/MCP tools folded into a single collapsible bubble per turn. Rolling context compaction keeps long agent sessions inside your VRAM budget, while the Dashboard (`/monitor` or `#dash`) tracks CPU, per-GPU load/VRAM/temps across both cards, expert-cache hit rates, and RAM/disk tier activity.
+* **API**: `POST /v1/chat/completions` (streaming or non-streaming), `GET /v1/models`, `/health`, `/metrics` (Prometheus), `/v1/status`, `/v1/telemetry`, `/v1/tools`, `/v1/tools/execute`.
 
 ## Layout
 
     crates/          the engine (shadow-model, shadow-cuda, shadow-serve, shadow), shadow-bench, shadow-eval
-    kernels/         the CUDA C++ the engine compiles with NVRTC at run time
-    docs/            USAGE, SPECULATION, BENCHMARKING, TOOLS, STATUS (what is measured), the plan, HANDOFF; docs/history/ holds the retired designs
+    kernels/         the CUDA C++ compiled at run time with NVRTC
+    examples/        quick PowerShell & Python examples (chat, streaming, tools, live GPU telemetry)
+    docs/            USAGE, SPECULATION, BENCHMARKING, TOOLS, STATUS, plans, and docs/charts/ SVGs
     bench/           shadow-bench runs, one directory per comparison
     profiles/        routing profiles for the RAM tier's placement
-    tools/           the harness and shadow_memory.py, both Python for now
+    tools/           the harness and shadow_memory.py
     bin/ models/     the embedder the memory tool drives
     memory/          the store — committed, so it travels with the repo
     eval/            the frozen yardstick: cases.jsonl, baseline.jsonl, prompts/, answers/

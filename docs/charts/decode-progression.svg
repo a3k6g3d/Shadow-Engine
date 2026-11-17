@@ -1,0 +1,60 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 780 390" font-family="Segoe UI, Arial, sans-serif">
+  <rect width="780" height="390" rx="8" fill="#ffffff" stroke="#e5e7eb"/>
+  <text x="24" y="34" font-size="18" font-weight="700" fill="#111827">Decode &amp; Short-Prompt Speed: v0.1.37 Baseline vs v0.1.41</text>
+  <text x="24" y="54" font-size="12" fill="#4b5563">36 varied prompts (mixD18, ctx 24,576, 160 tokens/turn, greedy, RTX 5070 200W + RTX 5060 Ti 150W)</text>
+
+  <!-- Legend -->
+  <rect x="24" y="72" width="12" height="12" rx="2" fill="#2563eb"/>
+  <text x="42" y="83" font-size="12" fill="#1f2937">Decode total (tok/s)</text>
+  <rect x="190" y="72" width="12" height="12" rx="2" fill="#93c5fd"/>
+  <text x="208" y="83" font-size="12" fill="#1f2937">Decode median (tok/s)</text>
+  <rect x="372" y="72" width="12" height="12" rx="2" fill="#10b981"/>
+  <text x="390" y="83" font-size="12" fill="#1f2937">Short-prompt prefill (tok/s)</text>
+
+  <!-- Axis baseline at x=215, scale: 140 tok/s -> 490 px (3.5 px per tok/s) -->
+  <line x1="215" y1="100" x2="215" y2="322" stroke="#9ca3af"/>
+  <g stroke="#f3f4f6" stroke-width="1">
+    <line x1="355" y1="100" x2="355" y2="322"/>
+    <line x1="495" y1="100" x2="495" y2="322"/>
+    <line x1="635" y1="100" x2="635" y2="322"/>
+  </g>
+  <g font-size="11" fill="#6b7280" text-anchor="middle">
+    <text x="215" y="336">0</text>
+    <text x="355" y="336">40</text>
+    <text x="495" y="336">80</text>
+    <text x="635" y="336">120 tok/s</text>
+  </g>
+
+  <!-- Row 1: v0.1.37 Pair -->
+  <text x="24" y="128" font-size="13" font-weight="600" fill="#111827">Pair (--gpus 0,1)</text>
+  <text x="24" y="145" font-size="11" fill="#6b7280">v0.1.37 baseline</text>
+  <rect x="215" y="109" width="221.3" height="15" rx="3" fill="#2563eb"/>
+  <text x="443" y="121" font-size="12" font-weight="600" fill="#111827">63.23</text>
+  <rect x="215" y="127" width="210.0" height="15" rx="3" fill="#93c5fd"/>
+  <text x="431" y="139" font-size="12" fill="#374151">60.00</text>
+  <rect x="215" y="145" width="402.8" height="15" rx="3" fill="#10b981"/>
+  <text x="624" y="157" font-size="12" font-weight="600" fill="#065f46">115.08</text>
+
+  <!-- Row 2: v0.1.41 Pair -->
+  <text x="24" y="202" font-size="13" font-weight="600" fill="#111827">Pair (--gpus 0,1)</text>
+  <text x="24" y="219" font-size="11" fill="#2563eb" font-weight="600">v0.1.41 (+14.4% dec)</text>
+  <rect x="215" y="183" width="253.1" height="15" rx="3" fill="#2563eb"/>
+  <text x="475" y="195" font-size="12" font-weight="700" fill="#111827">72.32 (+14.4%)</text>
+  <rect x="215" y="201" width="252.9" height="15" rx="3" fill="#93c5fd"/>
+  <text x="474" y="213" font-size="12" fill="#374151">72.26 (+20.4%)</text>
+  <rect x="215" y="219" width="438.2" height="15" rx="3" fill="#10b981"/>
+  <text x="660" y="231" font-size="12" font-weight="700" fill="#065f46">125.19 (+65.5% vs 1-GPU)</text>
+
+  <!-- Row 3: v0.1.41 Single -->
+  <text x="24" y="276" font-size="13" font-weight="600" fill="#111827">Single (--gpus 0)</text>
+  <text x="24" y="293" font-size="11" fill="#6b7280">v0.1.41 (RTX 5070 only)</text>
+  <rect x="215" y="257" width="265.2" height="15" rx="3" fill="#2563eb"/>
+  <text x="487" y="269" font-size="12" font-weight="600" fill="#111827">75.76</text>
+  <rect x="215" y="275" width="266.7" height="15" rx="3" fill="#93c5fd"/>
+  <text x="488" y="287" font-size="12" fill="#374151">76.21</text>
+  <rect x="215" y="293" width="264.8" height="15" rx="3" fill="#10b981"/>
+  <text x="486" y="305" font-size="12" fill="#065f46">75.65</text>
+
+  <text x="24" y="362" font-size="11.5" fill="#4b5563">Why it moved: capturing the 5-layer DFlash drafter + trimmed 3-slot head/walk in a CUDA graph cut drafting ~20% (~4.8 ms -&gt; ~3.1-3.9 ms),</text>
+  <text x="24" y="378" font-size="11.5" fill="#4b5563">and upgrading route_plan_res_small to m4s4 collapsed Stage 0's 6-kernel per-layer MoE planning into 1 launch inside the graph.</text>
+</svg>

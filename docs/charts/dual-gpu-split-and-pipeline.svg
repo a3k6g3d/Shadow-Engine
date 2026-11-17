@@ -1,0 +1,70 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 780 410" font-family="Segoe UI, Arial, sans-serif">
+  <rect width="780" height="410" rx="8" fill="#ffffff" stroke="#e5e7eb"/>
+  <text x="24" y="34" font-size="18" font-weight="700" fill="#111827">Two-Card Layout &amp; Layer Split Sweep (--gpus 0,1)</text>
+  <text x="24" y="54" font-size="12" fill="#4b5563">Asymmetric placement on Windows WDDM (no P2P): bigger VRAM card first, faster card second + RAM tier</text>
+
+  <!-- Left panel: Pipeline architecture -->
+  <rect x="24" y="72" width="356" height="290" rx="6" fill="#f9fafb" stroke="#e5e7eb"/>
+  <text x="40" y="96" font-size="13.5" font-weight="700" fill="#111827">Runtime Stage Layout (auto split = 15)</text>
+
+  <!-- GPU 1 box -->
+  <rect x="40" y="110" width="324" height="72" rx="5" fill="#eff6ff" stroke="#93c5fd"/>
+  <text x="52" y="130" font-size="12.5" font-weight="700" fill="#1e3a8a">Stage 0 — GPU 1: RTX 5060 Ti (15.9 GiB)</text>
+  <text x="52" y="148" font-size="11.5" fill="#1e40af">Layers 0..15 (7,680 experts, 100% VRAM resident)</text>
+  <text x="52" y="165" font-size="11" fill="#3b82f6">Single-launch m4s4 small planner • PCIe 3.0 x4 (~3.4 GB/s)</text>
+
+  <!-- Arrow + HopPipe -->
+  <line x1="202" y1="182" x2="202" y2="232" stroke="#2563eb" stroke-width="2"/>
+  <polygon points="197,226 207,226 202,235" fill="#2563eb"/>
+  <rect x="76" y="190" width="252" height="34" rx="4" fill="#ffffff" stroke="#cbd5e1"/>
+  <text x="202" y="205" font-size="11" font-weight="600" fill="#111827" text-anchor="middle">Double-buffered HopPipe (pinned host)</text>
+  <text x="202" y="219" font-size="10.5" fill="#4b5563" text-anchor="middle">Residual streams + 5x narrower tap_feat (async up_stream)</text>
+
+  <!-- GPU 0 box -->
+  <rect x="40" y="236" width="324" height="74" rx="5" fill="#ecfdf5" stroke="#6ee7b7"/>
+  <text x="52" y="256" font-size="12.5" font-weight="700" fill="#065f46">Stage 1 — GPU 0: RTX 5070 (11.9 GiB)</text>
+  <text x="52" y="274" font-size="11.5" fill="#047857">Layers 15..48 + lm_head + graphed DFlash (3 slots)</text>
+  <text x="52" y="291" font-size="11" fill="#059669">3,990 VRAM cache slots • PCIe 4.0 x16 (~27.4 GB/s)</text>
+
+  <!-- RAM Tier box -->
+  <rect x="40" y="320" width="324" height="30" rx="4" fill="#fefce8" stroke="#fde047"/>
+  <text x="202" y="339" font-size="11.5" font-weight="600" fill="#854d0e" text-anchor="middle">23.2 GiB Pinned System RAM Tier (16,896 Stage 1 experts)</text>
+
+  <!-- Right panel: Split sweep bar chart -->
+  <rect x="396" y="72" width="360" height="290" rx="6" fill="#f9fafb" stroke="#e5e7eb"/>
+  <text x="412" y="96" font-size="13.5" font-weight="700" fill="#111827">Split Sweep on mixD18 (decode[0..5], tok/s)</text>
+  <text x="412" y="114" font-size="11" fill="#4b5563">Layers placed on RTX 5060 Ti (rest on RTX 5070)</text>
+
+  <!-- Bars: baseline x=478, scale: 80 tok/s -> 224 px (2.8 px per tok/s) -->
+  <line x1="478" y1="128" x2="478" y2="334" stroke="#9ca3af"/>
+
+  <text x="412" y="148" font-size="12" fill="#374151">split 6</text>
+  <rect x="478" y="135" width="196.3" height="17" rx="3" fill="#93c5fd"/>
+  <text x="680" y="148" font-size="11.5" fill="#1f2937">70.12 tok/s</text>
+
+  <text x="412" y="177" font-size="12" fill="#374151">split 8</text>
+  <rect x="478" y="164" width="189.4" height="17" rx="3" fill="#93c5fd"/>
+  <text x="673" y="177" font-size="11.5" fill="#1f2937">67.65 tok/s</text>
+
+  <text x="412" y="206" font-size="12" fill="#374151">split 10</text>
+  <rect x="478" y="193" width="195.2" height="17" rx="3" fill="#93c5fd"/>
+  <text x="679" y="206" font-size="11.5" fill="#1f2937">69.72 tok/s</text>
+
+  <text x="412" y="235" font-size="12" fill="#374151">split 12</text>
+  <rect x="478" y="222" width="196.0" height="17" rx="3" fill="#60a5fa"/>
+  <text x="680" y="235" font-size="11.5" fill="#1f2937">70.00 tok/s</text>
+
+  <text x="412" y="264" font-size="12" font-weight="700" fill="#065f46">split 15</text>
+  <rect x="478" y="251" width="198.6" height="17" rx="3" fill="#10b981"/>
+  <text x="683" y="264" font-size="11.5" font-weight="700" fill="#065f46">70.92 (sweet spot)</text>
+
+  <text x="412" y="293" font-size="12" fill="#b45309">split 18</text>
+  <rect x="478" y="280" width="186.4" height="17" rx="3" fill="#fbbf24"/>
+  <text x="670" y="293" font-size="11.5" fill="#92400e">66.56 (49s 9.7k cliff)</text>
+
+  <text x="412" y="322" font-size="12" fill="#b45309">split 20</text>
+  <rect x="478" y="309" width="182.1" height="17" rx="3" fill="#f59e0b"/>
+  <text x="666" y="322" font-size="11.5" fill="#92400e">65.02 (slow prefill)</text>
+
+  <text x="24" y="388" font-size="11.5" fill="#4b5563">Note: Above split 15, RTX 5060 Ti (15.9 GiB) runs close enough to full VRAM that long prompts spill into shared host memory.</text>
+</svg>

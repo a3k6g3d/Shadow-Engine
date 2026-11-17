@@ -1,0 +1,59 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 780 390" font-family="Segoe UI, Arial, sans-serif">
+  <rect width="780" height="390" rx="8" fill="#ffffff" stroke="#e5e7eb"/>
+  <text x="24" y="34" font-size="18" font-weight="700" fill="#111827">Long-Prompt Prefill Speed (tok/s, higher is better)</text>
+  <text x="24" y="54" font-size="12" fill="#4b5563">mixD18, ctx 24,576, 3.3k / 9.7k / 15.2k prompts (RTX 5070 12 GiB 200W + RTX 5060 Ti 16 GiB 150W)</text>
+
+  <!-- Legend -->
+  <rect x="24" y="72" width="12" height="12" rx="2" fill="#9ca3af"/>
+  <text x="42" y="83" font-size="12" fill="#1f2937">v0.1.37 Pair (--gpus 0,1)</text>
+  <rect x="220" y="72" width="12" height="12" rx="2" fill="#10b981"/>
+  <text x="238" y="83" font-size="12" fill="#1f2937">v0.1.41 Pair (--gpus 0,1)</text>
+  <rect x="416" y="72" width="12" height="12" rx="2" fill="#3b82f6"/>
+  <text x="434" y="83" font-size="12" fill="#1f2937">v0.1.41 Single (--gpus 0)</text>
+
+  <!-- Axis baseline at x=190, scale: 1600 tok/s -> 496 px (0.31 px per tok/s) -->
+  <line x1="190" y1="100" x2="190" y2="322" stroke="#9ca3af"/>
+  <g stroke="#f3f4f6" stroke-width="1">
+    <line x1="345" y1="100" x2="345" y2="322"/>
+    <line x1="500" y1="100" x2="500" y2="322"/>
+    <line x1="655" y1="100" x2="655" y2="322"/>
+  </g>
+  <g font-size="11" fill="#6b7280" text-anchor="middle">
+    <text x="190" y="336">0</text>
+    <text x="345" y="336">500</text>
+    <text x="500" y="336">1000</text>
+    <text x="655" y="336">1500 tok/s</text>
+  </g>
+
+  <!-- 3.3k prompt (3,296 tok) -->
+  <text x="24" y="130" font-size="13" font-weight="600" fill="#111827">3.3k tokens</text>
+  <text x="24" y="147" font-size="11" fill="#6b7280">3,296 prompt tokens</text>
+  <rect x="190" y="110" width="234.1" height="15" rx="3" fill="#9ca3af"/>
+  <text x="430" y="122" font-size="12" fill="#374151">755.2 tok/s (4.36 s)</text>
+  <rect x="190" y="128" width="259.2" height="15" rx="3" fill="#10b981"/>
+  <text x="455" y="140" font-size="12" font-weight="700" fill="#065f46">836.0 tok/s (3.94 s, +10.7%)</text>
+  <rect x="190" y="146" width="272.3" height="15" rx="3" fill="#3b82f6"/>
+  <text x="468" y="158" font-size="12" fill="#1e40af">878.5 tok/s (3.75 s)</text>
+
+  <!-- 9.7k prompt (9,690 tok) -->
+  <text x="24" y="204" font-size="13" font-weight="600" fill="#111827">9.7k tokens</text>
+  <text x="24" y="221" font-size="11" fill="#6b7280">9,690 prompt tokens</text>
+  <rect x="190" y="184" width="339.7" height="15" rx="3" fill="#9ca3af"/>
+  <text x="536" y="196" font-size="12" fill="#374151">1095.9 tok/s (8.84 s)</text>
+  <rect x="190" y="202" width="402.5" height="15" rx="3" fill="#10b981"/>
+  <text x="599" y="214" font-size="12" font-weight="700" fill="#065f46">1298.5 tok/s (7.46 s, +18.5%)</text>
+  <rect x="190" y="220" width="360.7" height="15" rx="3" fill="#3b82f6"/>
+  <text x="557" y="232" font-size="12" fill="#1e40af">1163.6 tok/s (8.33 s)</text>
+
+  <!-- 15.2k prompt (15,161 tok) -->
+  <text x="24" y="278" font-size="13" font-weight="600" fill="#111827">15.2k tokens</text>
+  <text x="24" y="295" font-size="11" fill="#6b7280">15,161 prompt tokens</text>
+  <text x="195" y="268" font-size="11" fill="#9ca3af">v0.1.37 not recorded</text>
+  <rect x="190" y="276" width="433.1" height="15" rx="3" fill="#10b981"/>
+  <text x="629" y="288" font-size="12" font-weight="700" fill="#065f46">1397.0 tok/s (10.85 s, +16.0% vs 1-GPU)</text>
+  <rect x="190" y="294" width="373.2" height="15" rx="3" fill="#3b82f6"/>
+  <text x="569" y="306" font-size="12" fill="#1e40af">1204.0 tok/s (12.59 s)</text>
+
+  <text x="24" y="362" font-size="11.5" fill="#4b5563">Why it scales: tap_feat packs only layers below the split (5x smaller copies), HopPipe double-buffers D2H/H2D over a dedicated async</text>
+  <text x="24" y="378" font-size="11.5" fill="#4b5563">upload stream, and Stage 0 runs half 2 inside std::thread::scope concurrently with Stage 1 processing half 1 (load time: 39.6s vs 45.6s).</text>
+</svg>
