@@ -478,6 +478,15 @@ canvas.spark { width: 100%; height: 64px; display: block; }
     .tool-call-block.open > .tool-detail { display: block; }
     .tool-cmd { margin-top: 0.4rem; font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; font-size: 0.8rem; white-space: pre-wrap; word-break: break-word; color: var(--text); }
     .tool-cmd .tool-prompt { color: var(--accent); margin-right: 0.35rem; }
+    .diff-stat { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; font-size: 0.74rem; margin-left: 0.5rem; opacity: 0.85; flex: none; }
+    .diff-tag { font-size: 0.68rem; text-transform: uppercase; letter-spacing: 0.05em; opacity: 0.5; margin-left: 0.4rem; flex: none; }
+    .diff-table { margin-top: 0.4rem; font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; font-size: 0.78rem; line-height: 1.45; border: 1px solid var(--tool-border); border-radius: 0.4rem; overflow: hidden; }
+    .diff-line { display: flex; gap: 0.45rem; padding: 0 0.45rem; white-space: pre-wrap; word-break: break-word; }
+    .diff-line .diff-mark { flex: none; width: 0.85rem; text-align: center; opacity: 0.75; user-select: none; }
+    .diff-add { background: rgba(46, 160, 67, 0.16); }
+    .diff-del { background: rgba(218, 54, 51, 0.16); }
+    .diff-skip { opacity: 0.45; font-style: italic; }
+    .diff-head { margin-top: 0.4rem; font-size: 0.74rem; opacity: 0.65; }
 
     /* Tool Call Card */
     .tool-call-block {
@@ -2080,17 +2089,70 @@ canvas.spark { width: 100%; height: 64px; display: block; }
       if (k === 'notes') return ['Updated the notes', '', false];
       return ['Used', clipText(tc.name.replace(/^mcp__/, '').replace(/__/g, ' / '), 60), true];
     }
-    // the opened call: the command (`$ ...`), or the arguments, then (separately) the output
+    // ---- edit cards show a real diff: what came out and what went in (like Claude Code) ----
+    function diffLines(a, b) {
+      a = String(a ?? '').split('\n'); b = String(b ?? '').split('\n');
+      let lo = 0; while (lo < a.length && lo < b.length && a[lo] === b[lo]) lo++;
+      let ai = a.length - 1, bi = b.length - 1;
+      while (ai >= lo && bi >= lo && a[ai] === b[bi]) { ai--; bi--; }
+      const out = [];
+      for (let i = 0; i < lo; i++) out.push(['=', a[i]]);
+      for (let i = lo; i <= ai; i++) out.push(['-', a[i]]);
+      for (let i = lo; i <= bi; i++) out.push(['+', b[i]]);
+      for (let i = ai + 1; i < a.length; i++) out.push(['=', a[i]]);
+      return out;
+    }
+    function editStats(tc) {
+      const a = tc.arguments || {};
+      if (tc.name === 'edit_file') { const d = diffLines(a.oldText, a.newText); const del = d.filter(x => x[0] === '-').length, add = d.filter(x => x[0] === '+').length; return (add ? '+' + add : '') + (del ? ' \u2212' + del : ''); }
+      if (tc.name === 'replace_lines') { const n = (Number(a.end) || Number(a.start) || 1) - (Number(a.start) || 1) + 1; const add = String(a.newText ?? '').split('\n').filter(x => x.trim()).length; return (add ? '+' + add + ' ' : '') + '\u2212' + n; }
+      if (tc.name === 'write_file') return '+' + String(a.content ?? '').split('\n').filter(x => x.trim()).length;
+      return '';
+    }
+    // long runs of unchanged lines collapse to a couple of context lines around the changes
+    function diffHtml(rows) {
+      const shown = []; let run = 0;
+      for (let i = 0; i < rows.length; i++) {
+        if (rows[i][0] === '=') {
+          let near = false;
+          for (let j = Math.max(0, i - 2); j <= Math.min(rows.length - 1, i + 2); j++) if (rows[j][0] !== '=') { near = true; break; }
+          if (!near) { run++; continue; }
+        }
+        if (run) { shown.push(['~', String(run) + ' unchanged']); run = 0; }
+        shown.push(rows[i]);
+      }
+      if (run) shown.push(['~', String(run) + ' unchanged']);
+      const cap = 140;
+      const cut = shown.length > cap ? shown.slice(0, cap).concat([['~', (shown.length - cap) + ' more']]) : shown;
+      return '<div class="diff-table">' + cut.map(r => '<div class="diff-line ' + (r[0] === '-' ? 'diff-del' : r[0] === '+' ? 'diff-add' : r[0] === '~' ? 'diff-skip' : 'diff-ctx') + '">' +
+        '<span class="diff-mark">' + (r[0] === '~' ? '\u22ef' : escapeHtml(r[0])) + '</span><span>' + escapeHtml(r[1]) + '</span></div>').join('') + '</div>';
+    }
+    function addedOnly(text) {
+      return String(text ?? '').split('\n').filter((l, i, all) => !(all.length === 1 && l === '')).map(l => ['+', l]);
+    }
+    function editDetailHtml(tc) {
+      const a = tc.arguments || {};
+      if (tc.name === 'edit_file') return diffHtml(diffLines(a.oldText, a.newText));
+      if (tc.name === 'write_file') return diffHtml(addedOnly(a.content));
+      const st = Number(a.start) || 1, en = Number(a.end) || st;
+      const head = '<div class="diff-head">lines ' + (st === en ? st : st + '-' + en) + ' of ' + escapeHtml(baseName(a.path || a.file || '')) + (a.expect ? ' (guard: ' + escapeHtml(clipText(a.expect, 60)) + ')' : '') + '</div>';
+      return head + diffHtml(addedOnly(a.newText));
+    }
+    // the opened call: the command (`$ ...`), the edit's diff, or the arguments, then (separately) the output
     function toolDetailHtml(tc) {
       const a = tc.arguments || {};
+      if (tc.name === 'edit_file' || tc.name === 'replace_lines' || tc.name === 'write_file') return editDetailHtml(tc);
       if (tc.name === 'cmd') return '<span class="tool-prompt">$</span>' + escapeHtml(String(a.command || '')) + (a.cwd ? '\n<span style="opacity:0.7">in ' + escapeHtml(String(a.cwd)) + '</span>' : '');
       const keys = Object.keys(a);
       return keys.length ? keys.map(key => '<span style="opacity:0.7">' + escapeHtml(key) + ':</span> ' + escapeHtml(clipText(a[key], 400))).join('\n') : '';
     }
     function toolCardHtml(tc, state, status, out) {
       const [verb, target, code] = toolStep(tc);
+      const stats = editStats(tc);
       return `<div class="tool-call-block${state === 'running' ? ' running' : ''}" data-kind="${toolKind(tc.name)}" data-state="${state}">` +
-        `<div class="tool-header" onclick="toggleToolOutput(this)"><span class="tool-step"><b>${escapeHtml(verb)}</b>${target ? (code ? '<code>' + escapeHtml(target) + '</code>' : escapeHtml(target)) : ''}</span><span class="tool-status">${escapeHtml(status)}</span></div>` +
+        `<div class="tool-header" onclick="toggleToolOutput(this)"><span class="tool-step"><b>${escapeHtml(verb)}</b>${target ? (code ? '<code>' + escapeHtml(target) + '</code>' : escapeHtml(target)) : ''}</span>` +
+        (stats ? `<span class="diff-stat">${stats}</span><span class="diff-tag">diff</span>` : '') +
+        `<span class="tool-status">${escapeHtml(status)}</span></div>` +
         `<div class="tool-detail"><div class="tool-cmd">${toolDetailHtml(tc)}</div><div class="tool-output">${escapeHtml(out)}</div></div></div>`;
     }
     // "Ran 2 commands, read 3 files"
