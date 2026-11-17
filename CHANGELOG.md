@@ -2,6 +2,31 @@
 
 All notable changes to Shadow will be documented in this file.
 
+## [0.1.41] — 2026-11-16
+### Faster dual-GPU prompts & DFlash drafting
+- **Better overlap across both GPUs (`HopPipe` + `tap_feat`)**: Switched the stage handoff to double-buffered async copies on a dedicated upload stream, packed DFlash's capture features 5x smaller (`taps_below` only), and moved Stage 0's second macro-half inside the worker scope so Stage 0 and Stage 1 crunch long prompts at the same time.
+- **Graphed DFlash drafter**: Captured the 5-layer DFlash draft loop and head walk into CUDA graphs using a tiny dynamic metadata buffer, uploaded the mask token embeddings once, and trimmed the head/walk to the requested `--spec 3` slots instead of all 7 — cuts drafting overhead ~20% (`~4.8 ms` down to `3.1–3.9 ms`) with identical drafts.
+- **Cleaner verify planning**: Enabled the single-kernel `m4s4` small-batch MoE planner on resident layers and swapped the `--tail-skip` heap map for stack bitmasks.
+- **Numbers (`mixD18`, `ctx 24576`)**: `72.32 tok/s` decode (`72.26` median, up from `63.23` / `60.00` in `0.1.37`), `125.19 tok/s` short prompts, `1298.5 tok/s` on 9.7k prompts (`+11.6%` over single GPU), and `1397.0 tok/s` on 15.2k prompts (`+16.0%` over single GPU). `two_stage` (`6/6`), `shadow-cuda` (`16/16`), and `shadow-serve` (`57/57`) all pass.
+
+## [0.1.40] — 2026-11-16
+### Chat UI polish
+- Kept multi-step tool turns inside a single assistant bubble in `ui.rs`, rolling intermediate thinking blocks and tool calls into one collapsible group above the final reply with a single aggregated tok/s footer (both live and after reloading saved chats).
+
+## [0.1.39] — 2026-11-16
+### Streaming tool calls fix
+- Fixed `ui.rs` to accumulate streamed `delta.tool_calls` chunks properly, run the requested local/MCP tools, and keep them in chat history so multi-step tool conversations continue instead of stalling after the first thinking block.
+
+## [0.1.38] — 2026-11-16
+### Multi-GPU dashboard & telemetry
+- Updated NVML telemetry (`telemetry.rs`) to report every GPU (`gpu.devices`), and updated the Dashboard card, sparkline, and top header pill to display both cards side by side (utilization, VRAM, memory controller, temperature).
+
+## [0.1.37] — 2026-11-16
+### Two-GPU resident prefix & pinned RAM tier fixes
+- **Lifted the two-card pinned RAM cap**: Switched pinned RAM allocation to 1 GiB `cuMemHostAlloc` chunks (`SHADOW_PIN_ALLOC=1`) so WDDM doesn't double-count registered pages across both GPUs.
+- **Auto card ordering & layer split**: When two GPUs are passed with `--gpus`, Shadow puts the larger-VRAM card first (e.g., `5060 Ti 16 GiB` holding layers `0..15` 100% resident with full-layer DeltaNet CUDA graphs) and the faster card second (`5070 12 GiB` holding layers `15..48`, head, DFlash, and RAM-tier misses).
+- **2D kernels & macro-half prefill**: Collapsed multi-row `mv_cols` and `hc_write` loops into single 2D launches, added a two-half prompt pipeline (`step_batch_opt`) to cut expert reloads on `mixD18`, and verified all `two_stage` parity tests (`6/6`).
+
 ## [0.1.36] — 2026-11-10
 ### Added / Changed
 - **Web UI & Desktop Shell Modernization (`crates/shadow-serve/src/ui.rs`, `crates/shadow-ui/ui/index.html`)**:

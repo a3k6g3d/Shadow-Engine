@@ -78,6 +78,7 @@ struct ExpertCache<'c> {
     evict_range: Vec<std::ops::Range<usize>>,
     slot_bytes: usize,
     arena_bytes: usize,
+    used_bytes: usize,
     slots: usize,
     map: HashMap<(usize, usize), usize>,
     owner: Vec<Option<(usize, usize)>>,
@@ -465,7 +466,10 @@ pub struct GpuSession<'c, 'm> {
     dp_cnt: DeviceBuffer<'c>,
     dp_gstart: DeviceBuffer<'c>,
     dp_copied: DeviceBuffer<'c>,
+    dp_copied_dirty: bool,
     dp_eaddr: DeviceBuffer<'c>,
+    /// Pre-uploaded `[gate, up, down]` device address table (`3 * n_expert * 8` bytes) for each layer whose experts are 100% resident in `cache.arena`.
+    res_eaddr: Vec<Option<DeviceBuffer<'c>>>,
     /// the width-class planner's layout words (`bucket_layout`)
     dp_lay: DeviceBuffer<'c>,
     /// `SHADOW_KV_LEND=1`: the KV window's buffers are virtual-memory regions, and a long prompt borrows the unfilled tail of them (`lend_kv`) for its batch buffers
@@ -500,10 +504,14 @@ pub struct GpuSession<'c, 'm> {
     feat_in: Option<Vec<f32>>,
     df_feat_ok: bool,
     /// The hop between two stages through pinned host memory (STATUS 104): the first stage leaves a description of where its rows are (`hop_src`), the second copies
-    /// them down into `hop_buf` and up into its own row storage in chunks, the event marking when the buffer is free again.
-    hop_buf: Option<crate::driver::PinnedHost>,
+    /// them down into double-buffered `hop.bufs` and up into its own row storage in chunks, alternating slots so DtoH and HtoD overlap cleanly.
+    hop: Option<HopPipe<'c>>,
     hop_src: Option<HopSrc<'c>>,
-    hop_done: Event<'c>,
+    hop_down_stream: Stream<'c>,
+    hop_compute_ev: Event<'c>,
+    hop_down_done: [Event<'c>; 2],
+    defer_peer: bool,
+    hop_pulled: bool,
     spec_bytes: Option<SpecBytes>,
     /// The tokens the session held when it was last `reset` (not emptied by a second reset): the drafter's K/V ring still describes them, so a
     /// snapshot restore right after the reset can keep the positions the two share (`restore`, STATUS 98)
@@ -619,8 +627,9 @@ pub struct GpuSession<'c, 'm> {
     /// the additive mask on the host (`n_layer * n_expert` floats) and on the device (one layer's row at a time is added to the router logits)
     expert_mask: Option<Vec<f32>>,
     expert_mask_dev: Option<DeviceBuffer<'c>>,
-    /// `snapshot_again`'s copies as one launch (STATUS 161): the (dst, src, bytes) entries of the table on the device, and the table
+    /// `snapshot_again`'s and `restore_local`'s copies as one launch (STATUS 161): the (dst, src, bytes) entries of the table on the device, and the table
     snap_copy: std::cell::RefCell<Option<(Vec<[u64; 3]>, DeviceBuffer<'c>)>>,
+    snap_restore: std::cell::RefCell<Option<(Vec<[u64; 3]>, DeviceBuffer<'c>)>>,
     top_buf: Option<DeviceBuffer<'c>>,
     top_out: Vec<Vec<(f32, u32)>>,
     /// `SHADOW_ZERO_COPY=1`: the single-token path's RAM-tier misses are read in place over PCIe, not copied.
@@ -796,7 +805,7 @@ fn int8_decode() -> bool {
 }
 
 /// Rows per copy through the hop's pinned buffer (a chunk is at most `HOP_CHUNK_ROWS` x `NFEAT` floats = 50 MiB of pinned memory, taken at the first hop).
-const HOP_CHUNK_ROWS: usize = 1024;
+const HOP_CHUNK_ROWS: usize = 2048;
 
 /// `HOP_CHUNK_ROWS`, or `SHADOW_HOP_CHUNK=N` rows (the tests make it small to run the chunked path on short passes).
 fn hop_chunk_rows() -> usize {
@@ -808,9 +817,197 @@ fn hop_chunk_rows() -> usize {
 /// rows, device address) and, for the drafter, its feature rows (consecutive, `NFEAT` floats each).
 pub(crate) struct HopSrc<'c> {
     ctx: &'c Context,
+    down_stream: *mut std::ffi::c_void,
+    compute_ev: *mut std::ffi::c_void,
+    down_done: [*mut std::ffi::c_void; 2],
     runs: Vec<(usize, usize, u64)>,
     feat_ptr: Option<u64>,
     feat_rows: usize,
+    feat_w_bytes: usize,
+}
+
+struct HopPipe<'c> {
+    bufs: [Option<crate::driver::PinnedHost>; 2],
+    up_done: [Event<'c>; 2],
+    up_stream: Stream<'c>,
+    slot: usize,
+}
+
+struct SendMut<'a, T>(&'a mut T);
+// SAFETY: Used inside `step_batch_opt`'s scoped thread only to run Stage 1's `batch()` concurrently with Stage 0 on disjoint GPU/host state.
+unsafe impl<T> Send for SendMut<'_, T> {}
+
+impl<'c> HopPipe<'c> {
+    fn sync_up(&self) {
+        for ev in &self.up_done {
+            ev.synchronize().unwrap();
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn pull(
+        &mut self,
+        dst_ctx: &'c Context,
+        row_b: usize,
+        feat_ptr: Option<u64>,
+        feat_dst_w_bytes: usize,
+        src: &HopSrc<'c>,
+        row_ptr: &dyn Fn(usize) -> u64,
+        own_feat_rows: usize,
+        use_up_stream: bool,
+    ) -> bool {
+        use crate::driver::{CuMemcpy2d, CU_MEMORYTYPE_DEVICE, CU_MEMORYTYPE_HOST};
+        static CROSS_WAIT: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+        let api = dst_ctx.api;
+        let timed = hop_time();
+        let (mut t_down, mut t_up) = (0u64, 0u64);
+        let up_s = if use_up_stream { self.up_stream.raw() } else { std::ptr::null_mut() };
+        let pingpong = self.bufs[1].is_some() && !std::env::var("SHADOW_HOP_PINGPONG").is_ok_and(|v| v == "0");
+        let mut bi = if pingpong { self.slot & 1 } else { 0 };
+        let mut src_waited = false;
+        let mut last_down_done: Option<*mut std::ffi::c_void> = None;
+
+        // Helper: async DtoH on src's copy stream (waiting on Stage 0's compute event once), then wait-or-sync cleanly before HtoD on dst's stream.
+        let mut xfer_down = |slot_idx: usize, dev: u64, bytes: usize| -> *mut std::ffi::c_void {
+            self.up_done[slot_idx].synchronize().unwrap();
+            let buf_p = self.bufs[slot_idx].as_ref().expect("hop_ensure first").p;
+            let t0 = timed.then(std::time::Instant::now);
+            src.ctx.bind().unwrap();
+            if !src_waited {
+                let r = unsafe { (api.cuStreamWaitEvent)(src.down_stream, src.compute_ev, 0) };
+                assert_eq!(r, 0, "hop: cuStreamWaitEvent failed ({r})");
+                src_waited = true;
+            }
+            let r = unsafe { (api.cuMemcpyDtoHAsync)(buf_p, dev, bytes, src.down_stream) };
+            assert_eq!(r, 0, "hop: cuMemcpyDtoHAsync failed ({r})");
+            let down_ev = src.down_done[slot_idx];
+            let r = unsafe { (api.cuEventRecord)(down_ev, src.down_stream) };
+            assert_eq!(r, 0, "hop: cuEventRecord failed ({r})");
+            if timed {
+                let r = unsafe { (api.cuEventSynchronize)(down_ev) };
+                assert_eq!(r, 0, "hop: cuEventSynchronize failed ({r})");
+                t_down += t0.unwrap().elapsed().as_nanos() as u64;
+            }
+            last_down_done = Some(down_ev);
+            let mode = CROSS_WAIT.load(std::sync::atomic::Ordering::Relaxed);
+            let mut need_sync = src.ctx.device != dst_ctx.device && mode == 2;
+            dst_ctx.bind().unwrap();
+            if !need_sync {
+                let wr = unsafe { (api.cuStreamWaitEvent)(up_s, down_ev, 0) };
+                if wr == 0 {
+                    if src.ctx.device != dst_ctx.device && mode == 0 {
+                        CROSS_WAIT.store(1, std::sync::atomic::Ordering::Relaxed);
+                    }
+                } else {
+                    CROSS_WAIT.store(2, std::sync::atomic::Ordering::Relaxed);
+                    need_sync = true;
+                }
+            }
+            if need_sync {
+                src.ctx.bind().unwrap();
+                let r = unsafe { (api.cuEventSynchronize)(down_ev) };
+                assert_eq!(r, 0, "hop: cuEventSynchronize failed ({r})");
+                dst_ctx.bind().unwrap();
+            }
+            buf_p
+        };
+
+        for &(j0, n, dev) in &src.runs {
+            let mut k = 0;
+            while k < n {
+                let cnt = (n - k).min(hop_chunk_rows());
+                let buf_p = xfer_down(bi, dev + (k * row_b) as u64, cnt * row_b);
+                let t0 = timed.then(std::time::Instant::now);
+                let mut a = 0;
+                while a < cnt {
+                    let start = row_ptr(j0 + k + a);
+                    let mut e = a + 1;
+                    while e < cnt && row_ptr(j0 + k + e) == start + ((e - a) * row_b) as u64 {
+                        e += 1;
+                    }
+                    let r = unsafe {
+                        (api.cuMemcpyHtoDAsync)(start, (buf_p as *const u8).add(a * row_b) as *const std::ffi::c_void, (e - a) * row_b, up_s)
+                    };
+                    assert_eq!(r, 0, "hop: cuMemcpyHtoDAsync failed ({r})");
+                    a = e;
+                }
+                let r = unsafe { (api.cuEventRecord)(self.up_done[bi].raw(), up_s) };
+                assert_eq!(r, 0, "hop: cuEventRecord failed ({r})");
+                if let Some(t0) = t0 {
+                    t_up += t0.elapsed().as_nanos() as u64;
+                }
+                if pingpong {
+                    bi ^= 1;
+                }
+                k += cnt;
+            }
+        }
+
+        let mut feats_ok = own_feat_rows > 0;
+        if let (Some(fp), Some(df_ptr)) = (src.feat_ptr, feat_ptr) {
+            let w_b = src.feat_w_bytes.min(feat_dst_w_bytes);
+            if own_feat_rows > 0 && src.feat_rows == own_feat_rows && w_b > 0 {
+                let dst_stride_b = crate::dflash::NFEAT * 4;
+                let mut k = 0;
+                while k < src.feat_rows {
+                    let cnt = (src.feat_rows - k).min(hop_chunk_rows());
+                    let buf_p = xfer_down(bi, fp + (k * src.feat_w_bytes) as u64, cnt * src.feat_w_bytes);
+                    let t0 = timed.then(std::time::Instant::now);
+                    if cnt == 1 || src.feat_w_bytes == dst_stride_b {
+                        let r = unsafe { (api.cuMemcpyHtoDAsync)(df_ptr + (k * dst_stride_b) as u64, buf_p as *const std::ffi::c_void, cnt * w_b, up_s) };
+                        assert_eq!(r, 0, "hop: cuMemcpyHtoDAsync (feat) failed ({r})");
+                    } else {
+                        let c2d = CuMemcpy2d {
+                            src_x_in_bytes: 0,
+                            src_y: 0,
+                            src_memory_type: CU_MEMORYTYPE_HOST,
+                            src_host: buf_p as *const std::ffi::c_void,
+                            src_device: 0,
+                            src_array: std::ptr::null_mut(),
+                            src_pitch: src.feat_w_bytes,
+                            dst_x_in_bytes: 0,
+                            dst_y: k,
+                            dst_memory_type: CU_MEMORYTYPE_DEVICE,
+                            dst_host: std::ptr::null_mut(),
+                            dst_device: df_ptr,
+                            dst_array: std::ptr::null_mut(),
+                            dst_pitch: dst_stride_b,
+                            width_in_bytes: w_b,
+                            height: cnt,
+                        };
+                        let r = unsafe { (api.cuMemcpy2DAsync)(&c2d, up_s) };
+                        assert_eq!(r, 0, "hop: cuMemcpy2DAsync (feat) failed ({r})");
+                    }
+                    let r = unsafe { (api.cuEventRecord)(self.up_done[bi].raw(), up_s) };
+                    assert_eq!(r, 0, "hop: cuEventRecord failed ({r})");
+                    if let Some(t0) = t0 {
+                        t_up += t0.elapsed().as_nanos() as u64;
+                    }
+                    if pingpong {
+                        bi ^= 1;
+                    }
+                    k += cnt;
+                }
+            } else {
+                feats_ok = false;
+            }
+        }
+        if !use_up_stream {
+            if let Some(down_ev) = last_down_done {
+                src.ctx.bind().unwrap();
+                let r = unsafe { (api.cuStreamWaitEvent)(std::ptr::null_mut(), down_ev, 0) };
+                assert_eq!(r, 0, "hop: cuStreamWaitEvent sender default failed ({r})");
+                dst_ctx.bind().unwrap();
+            }
+        }
+        self.slot = bi;
+        if timed {
+            hop_add(4, t_down);
+            hop_add(5, t_up);
+            hop_report();
+        }
+        feats_ok
+    }
 }
 
 /// `SHADOW_HOP=0`: the hand-off through host `Vec`s and a copy a row, as before STATUS 104.
@@ -1602,14 +1799,14 @@ impl<'c> RamTier<'c> {
             }
             v_reads.sort_unstable_by_key(|&(l, part, ep, _, _)| (l, part, ep));
             for (l, part, ep, o, nb) in v_reads {
-                m.expert_into(&names(l)[part], ep, &mut region.as_mut_slice()[o..o + nb]);
+                m.expert_into(&names(l)[part], ep, region.slice_mut(o, nb));
             }
             ctx.bind().map_err(e_err)?;
-            let src = region.as_slice();
             for (l, _ep, r_off, slot_off) in v_chosen {
                 let tot: usize = names(l).iter().map(|n| m.expert_bytes(n)).sum();
+                let s = region.slice(r_off, tot);
                 let r = unsafe {
-                    (ctx.api.cuMemcpyHtoDAsync)(arena_ptr + slot_off, src[r_off..r_off + tot].as_ptr() as *const std::ffi::c_void,
+                    (ctx.api.cuMemcpyHtoDAsync)(arena_ptr + slot_off, s.as_ptr() as *const std::ffi::c_void,
                                                 tot, std::ptr::null_mut())
                 };
                 assert_eq!(r, 0, "cuMemcpyHtoDAsync vram_pinned failed ({r})");
@@ -1630,7 +1827,7 @@ impl<'c> RamTier<'c> {
         let mut since_check = 0usize;
         for (l, part, e, o, n_bytes) in reads {
             let n = &names(l)[part];
-            m.expert_into(n, e, &mut region.as_mut_slice()[o..o + n_bytes]);
+            m.expert_into(n, e, region.slice_mut(o, n_bytes));
             since_check += n_bytes;
             if since_check >= 256 << 20 {
                 region.check_floor()?; // the file cache and everything else move while we fill
@@ -2078,7 +2275,9 @@ impl<'c, 'm> GpuSession<'c, 'm> {
         let fused = if tiers.tensor_prompt { crate::fused::Fused::load() } else { None };
         // the largest input a projection takes is the attention output's (n_head * head_dim) or the SSM output's, for the rows of a sub-chunk
         let mmq_y = a(mmq.as_ref().map_or(1, |q| q.y_bytes((c.n_head * c.head_dim).max(c.ssm_v_heads * c.ssm_head_dim).max(c.hidden), sub_rows_cap().max(MAX_BATCH)).div_ceil(4)))?;
-        let (dp_tidx, dp_cnt, dp_gstart, dp_copied, dp_eaddr, dp_lay) = (a(BIG_BATCH_MAX * 16)?, a(1024)?, a(3072)?, a(256)?, a(6144)?, a(32)?);
+        let (mut dp_tidx, mut dp_cnt, mut dp_gstart, mut dp_copied, mut dp_eaddr, mut dp_lay) = (a(BIG_BATCH_MAX * 16)?, a(1024)?, a(3072)?, a(256)?, a(6144)?, a(32)?);
+        dp_copied.zero().map_err(e)?;
+        let _ = (&mut dp_tidx, &mut dp_cnt, &mut dp_gstart, &mut dp_eaddr, &mut dp_lay);
         let kv_lend = !std::env::var("SHADOW_KV_LEND").is_ok_and(|v| v == "0");
         let mut kv_regions: Vec<crate::kvvmm::VmmRegion<'c>> = Vec::new();
         let kv_extra_reg: Option<crate::kvvmm::VmmRegion<'c>> = None; // made at the first lend, when the slot size is known
@@ -2153,9 +2352,10 @@ impl<'c, 'm> GpuSession<'c, 'm> {
             None => None,
         };
 
-        // a first stage feeding a drafter on the next one: room for the features its taps write, taken before the cache sizes itself from what is free
-        let tap_feat = if tiers.df_taps && crate::dflash::TAPS.iter().any(|&t| t < layers.1) {
-            Some(a(crate::dflash::DF_ROWS * crate::dflash::NFEAT)?)
+        // a first stage feeding a drafter on the next one: room for only the taps below its upper boundary, taken before the cache sizes itself
+        let tap_w = Self::taps_below(layers.1) * crate::dflash::HIDDEN;
+        let tap_feat = if tiers.df_taps && tap_w > 0 {
+            Some(a(crate::dflash::DF_ROWS * tap_w)?)
         } else {
             None
         };
@@ -2183,10 +2383,23 @@ impl<'c, 'm> GpuSession<'c, 'm> {
         };
         let mut order = tiers.order.clone().unwrap_or_else(|| uniform_order(c.n_layer, c.n_expert));
         order.retain(|&(l, _)| in_stage(l));
+        {
+            let mut seen_ord: std::collections::HashSet<(usize, usize)> = order.iter().copied().collect();
+            for l in layers.0..layers.1 {
+                if c.is_moe(l) {
+                    for ep in 0..c.n_expert {
+                        if seen_ord.insert((l, ep)) {
+                            order.push((l, ep));
+                        }
+                    }
+                }
+            }
+        }
         let mut arena = None;
         let mut slot_offset = Vec::new();
         let mut layer_range = vec![0..0; c.n_layer];
         let mut arena_bytes = 0usize;
+        let mut used_bytes = 0usize;
         let mut slots = 0usize;
         while budget >= slot_bytes.max(1) * c.n_expert_used.max(1) {
             slot_offset.clear();
@@ -2217,11 +2430,19 @@ impl<'c, 'm> GpuSession<'c, 'm> {
                     }
                     cur_s += n_s;
                 }
-                arena_bytes = cur_off as usize;
+                used_bytes = cur_off as usize;
+                let all_full = (layers.0..layers.1).filter(|&l| c.is_moe(l)).all(|l| l_slots[l] >= c.n_expert);
+                let want_tail = if all_full && tiers.vram_cache.is_none() {
+                    big_batch_bytes(c, sub_rows_cap()) + (64 << 20)
+                } else {
+                    0
+                };
+                arena_bytes = (used_bytes + want_tail).min(budget);
                 slots = cur_s;
             } else {
                 slots = budget / slot_bytes;
                 arena_bytes = slots * slot_bytes;
+                used_bytes = arena_bytes;
                 for s in 0..slots {
                     slot_offset.push((s * slot_bytes) as u64);
                 }
@@ -2240,6 +2461,7 @@ impl<'c, 'm> GpuSession<'c, 'm> {
             slot_offset.clear();
             layer_range = vec![0..0; c.n_layer];
             arena_bytes = 0;
+            used_bytes = 0;
             slots = 0;
             let need = (k * max_expert).max(4);
             if b.wg.bytes < need {
@@ -2290,7 +2512,7 @@ impl<'c, 'm> GpuSession<'c, 'm> {
         let ram = RamTier::fill(ctx, m, ram_bytes, if layers == (0, c.n_layer) { tiers.order.clone() } else { Some(order.clone()) }, &vram_pinned, arena_ptr)?;
         vm("RAM tier filled");
         let mut cache = ExpertCache {
-            arena, slot_offset, layer_range, evict_range, slot_bytes, arena_bytes, slots, map: HashMap::new(),
+            arena, slot_offset, layer_range, evict_range, slot_bytes, arena_bytes, used_bytes, slots, map: HashMap::new(),
             owner: vec![None; slots], stamp: vec![0; slots], clock: 0, hits: 0, misses: 0,
             admit_after: tiers.admit_after, seen: HashMap::new(), scratch_reads: 0,
         };
@@ -2313,9 +2535,8 @@ impl<'c, 'm> GpuSession<'c, 'm> {
         // Pre-warm the remaining (evictable) VRAM expert cache slots from the RAM tier in placement order.
         if let Some(region) = ram.region.as_ref().filter(|_| cache.slots > 0) {
             let names = |l: usize| ["ffn_gate_exps", "ffn_up_exps", "ffn_down_exps"].map(|r| format!("blk.{l}.{r}.weight"));
-            let src = region.as_slice();
             let mut global_s = 0usize;
-            for (l, ep) in order {
+            for &(l, ep) in &order {
                 if cache.map.contains_key(&(l, ep)) {
                     continue;
                 }
@@ -2337,9 +2558,10 @@ impl<'c, 'm> GpuSession<'c, 'm> {
                 let Some(&off) = ram.at.get(&(l, ep)) else { continue };
                 let total: usize = names(l).iter().map(|n| m.expert_bytes(n)).sum();
                 let dst = arena_ptr + cache.slot_offset[s];
+                let src = region.slice(off, total);
                 ctx.bind().map_err(e)?;
                 let r = unsafe {
-                    (ctx.api.cuMemcpyHtoDAsync)(dst, src[off..off + total].as_ptr() as *const std::ffi::c_void, total,
+                    (ctx.api.cuMemcpyHtoDAsync)(dst, src.as_ptr() as *const std::ffi::c_void, total,
                                                 std::ptr::null_mut())
                 };
                 assert_eq!(r, 0, "cuMemcpyHtoDAsync pre-warm failed ({r})");
@@ -2348,6 +2570,95 @@ impl<'c, 'm> GpuSession<'c, 'm> {
             }
             ctx.synchronize().map_err(e)?;
         }
+        if ram.region.is_none()
+            && cache.slots > 0
+            && arena_ptr != 0
+            && (tiers.vram_cache.is_none() || (layers.0..layers.1).any(|l| c.is_moe(l) && cache.layer_range[l].len() >= c.n_expert))
+        {
+            let mut to_warm: Vec<(usize, usize, usize)> = Vec::new();
+            let mut global_s = 0usize;
+            for &(l, ep) in &order {
+                if cache.map.contains_key(&(l, ep)) {
+                    continue;
+                }
+                let s = if per_layer_mode {
+                    if next_in_layer[l] >= cache.layer_range[l].end {
+                        continue;
+                    }
+                    let s = next_in_layer[l];
+                    next_in_layer[l] += 1;
+                    s
+                } else {
+                    if global_s >= cache.slots {
+                        break;
+                    }
+                    let s = global_s;
+                    global_s += 1;
+                    s
+                };
+                to_warm.push((l, ep, s));
+            }
+            if !to_warm.is_empty() {
+                to_warm.sort_unstable_by_key(|&(l, ep, _)| (l, ep));
+                let batch_n = ((64 << 20) / slot_bytes.max(1)).clamp(1, 64);
+                let mut warm_buf = PinnedRegion::new(ctx, batch_n * slot_bytes)?;
+                ctx.bind().map_err(e)?;
+                for batch in to_warm.chunks(batch_n) {
+                    let mut sizes_of: Vec<[usize; 3]> = Vec::with_capacity(batch.len());
+                    let mut names_of: Vec<[String; 3]> = Vec::with_capacity(batch.len());
+                    for &(l, _, _) in batch {
+                        let nms = ["gate", "up", "down"].map(|p| format!("blk.{l}.ffn_{p}_exps.weight"));
+                        sizes_of.push([m.expert_bytes(&nms[0]), m.expert_bytes(&nms[1]), m.expert_bytes(&nms[2])]);
+                        names_of.push(nms);
+                    }
+                    {
+                        let mut jobs: Vec<(&str, usize, &mut [u8])> = Vec::with_capacity(3 * batch.len());
+                        for (((&(_, ep, _), nms), sz), slot) in batch.iter().zip(&names_of).zip(&sizes_of).zip(warm_buf.as_mut_slice().chunks_mut(slot_bytes)) {
+                            let (gate, more) = slot[..sz[0] + sz[1] + sz[2]].split_at_mut(sz[0]);
+                            let (up, down) = more.split_at_mut(sz[1]);
+                            jobs.push((&nms[2], ep, down));
+                            jobs.push((&nms[0], ep, gate));
+                            jobs.push((&nms[1], ep, up));
+                        }
+                        m.experts_into_many(&mut jobs);
+                    }
+                    for (i, &(l, ep, s)) in batch.iter().enumerate() {
+                        let total: usize = sizes_of[i].iter().sum();
+                        let dst = arena_ptr + cache.slot_offset[s];
+                        let src = &warm_buf.as_slice()[i * slot_bytes..i * slot_bytes + total];
+                        let r = unsafe {
+                            (ctx.api.cuMemcpyHtoDAsync)(dst, src.as_ptr() as *const std::ffi::c_void, total, std::ptr::null_mut())
+                        };
+                        assert_eq!(r, 0, "cuMemcpyHtoDAsync file pre-warm failed ({r})");
+                        cache.owner[s] = Some((l, ep));
+                        cache.map.insert((l, ep), s);
+                    }
+                    ctx.synchronize().map_err(e)?;
+                }
+            }
+        }
+        let mut res_eaddr: Vec<Option<DeviceBuffer<'c>>> = (0..c.n_layer).map(|_| None).collect();
+        for l in layers.0..layers.1 {
+            if c.is_moe(l) && (0..c.n_expert).all(|ep| cache.map.contains_key(&(l, ep))) {
+                cache.evict_range[l] = cache.layer_range[l].end..cache.layer_range[l].end;
+                let nms = ["gate", "up", "down"].map(|p| format!("blk.{l}.ffn_{p}_exps.weight"));
+                let s0 = m.expert_bytes(&nms[0]) as u64;
+                let s1 = m.expert_bytes(&nms[1]) as u64;
+                let part = [0u64, s0, s0 + s1];
+                let mut bytes = Vec::with_capacity(3 * c.n_expert * 8);
+                for pt in 0..3 {
+                    for ep in 0..c.n_expert {
+                        let slot = cache.map[&(l, ep)];
+                        let addr = arena_ptr + cache.slot_offset[slot] + part[pt];
+                        bytes.extend_from_slice(&addr.to_le_bytes());
+                    }
+                }
+                let buf = ctx.alloc(bytes.len()).map_err(e)?;
+                buf.upload(&bytes).map_err(e)?;
+                res_eaddr[l] = Some(buf);
+            }
+        }
+        let all_layers_res = cache.slots > 0 && (layers.0..layers.1).filter(|&l| c.is_moe(l)).all(|l| res_eaddr[l].is_some());
         let copy_stream = ctx.stream().map_err(e)?;
         let copy_stream2 = ctx.stream().map_err(e)?;
         let copy_ev2 = ctx.event().map_err(e)?;
@@ -2357,7 +2668,7 @@ impl<'c, 'm> GpuSession<'c, 'm> {
         } else {
             4 * c.n_expert_used
         };
-        let staging = if slot_bytes > 0 && staging_slots > 0 {
+        let staging = if !all_layers_res && slot_bytes > 0 && staging_slots > 0 {
             // room for a prompt chunk's share of misses (`SHADOW_PREFILL_STAGING` slots, else four tokens' worth)
             PinnedRegion::new(ctx, staging_slots * slot_bytes)
                 .or_else(|_| PinnedRegion::new(ctx, 4 * c.n_expert_used * slot_bytes))
@@ -2365,13 +2676,13 @@ impl<'c, 'm> GpuSession<'c, 'm> {
         } else {
             None
         };
-        let sp_spare = if slot_bytes > 0 && !std::env::var("SHADOW_KEEP_PIPE").is_ok_and(|v| v == "0") {
+        let sp_spare = if !all_layers_res && slot_bytes > 0 && !std::env::var("SHADOW_KEEP_PIPE").is_ok_and(|v| v == "0") {
             let ne = c.n_expert;
             let mut per_layer = vec![0usize; c.n_layer];
             for &(l, _) in ram.at.keys() {
                 per_layer[l] += 1;
             }
-            let mut sp_slots = per_layer.iter().map(|&n| ne.saturating_sub(n)).max().unwrap_or(ne).max(1);
+            let mut sp_slots = (layers.0..layers.1).filter(|&l| c.is_moe(l)).map(|l| ne.saturating_sub(per_layer[l])).max().unwrap_or(ne).max(1);
             if let Some(n) = std::env::var("SHADOW_STAGE_SLOTS").ok().and_then(|v| v.parse::<usize>().ok()) {
                 sp_slots = n.max(1);
             }
@@ -2390,7 +2701,7 @@ impl<'c, 'm> GpuSession<'c, 'm> {
         let mut s = GpuSession {
             ctx, m, mvp, ex3, exl3_rot, fw, w, v, b, bb, replay, dscr, mmq, mmq_y, mmq_y_tag: std::cell::Cell::new((0, 0, 0, 0, 0)), fused,
             rparts: Vec::new(), bb_sig: 0, logits_last: false, sub_last: true, sub_first: true,
-            devplan: tiers.tensor_prompt && !std::env::var("SHADOW_PREFILL_DEVPLAN").is_ok_and(|v| v == "0"), dp_tidx, dp_cnt, dp_gstart, dp_copied, dp_eaddr, dp_lay, kv_regions, kv_extra: None, kv_extra_reg, vmm_pool: Vec::new(), prompt_hint: 0, kv_rows: 0, kv_halves: false, router_bias: std::env::var("SHADOW_ROUTER_BIAS").ok().and_then(|v| v.parse().ok()).unwrap_or(0.0), batch_scratch, delta, attn, ple_state, tokens: vec![], layers, layers_in: None, layers_out: None, peer: None, reset_tokens: vec![], pictures: vec![], rope_tab: None, rope_on: false, cap, trace: None, stop_after: None,
+            devplan: tiers.tensor_prompt && !std::env::var("SHADOW_PREFILL_DEVPLAN").is_ok_and(|v| v == "0"), dp_tidx, dp_cnt, dp_gstart, dp_copied, dp_copied_dirty: false, dp_eaddr, res_eaddr, dp_lay, kv_regions, kv_extra: None, kv_extra_reg, vmm_pool: Vec::new(), prompt_hint: 0, kv_rows: 0, kv_halves: false, router_bias: std::env::var("SHADOW_ROUTER_BIAS").ok().and_then(|v| v.parse().ok()).unwrap_or(0.0), batch_scratch, delta, attn, ple_state, tokens: vec![], layers, layers_in: None, layers_out: None, peer: None, reset_tokens: vec![], pictures: vec![], rope_tab: None, rope_on: false, cap, trace: None, stop_after: None,
             resident_bytes, expert_uploads: 0, cache, ram, copy_stream, copy_stream2, copy_ev2, copy_event, staging,
             pending: vec![], routing: RoutingCounts::new(c.n_layer, c.n_expert),
             prof: std::env::var("SHADOW_PROFILE").is_ok_and(|v| v == "1")
@@ -2437,9 +2748,13 @@ impl<'c, 'm> GpuSession<'c, 'm> {
             tap_feat,
             feat_in: None,
             df_feat_ok: true,
-            hop_buf: None,
+            hop: None,
             hop_src: None,
-            hop_done: ctx.event().map_err(e)?,
+            hop_down_stream: ctx.stream().map_err(e)?,
+            hop_compute_ev: ctx.event().map_err(e)?,
+            hop_down_done: [ctx.event().map_err(e)?, ctx.event().map_err(e)?],
+            defer_peer: false,
+            hop_pulled: false,
             spec_bytes: std::env::var("SHADOW_SPEC_BYTES").is_ok_and(|v| v == "1").then(SpecBytes::default),
             graphs: HashMap::new(),
             multi: HashMap::new(),
@@ -2453,6 +2768,7 @@ impl<'c, 'm> GpuSession<'c, 'm> {
             expert_mask: None,
             expert_mask_dev: None,
             snap_copy: std::cell::RefCell::new(None),
+            snap_restore: std::cell::RefCell::new(None),
             top_buf: None,
             top_out: Vec::new(),
             zero_copy: std::env::var("SHADOW_ZERO_COPY").is_ok_and(|v| v == "1"),
@@ -2519,9 +2835,10 @@ impl<'c, 'm> GpuSession<'c, 'm> {
         }
     }
 
-    /// (slots, bytes per slot, hits, misses) of the expert cache.
+    /// (slots, bytes per slot, hits, misses) of the expert cache (summed across both stages when paired).
     pub fn cache_stats(&self) -> (usize, usize, u64, u64) {
-        (self.cache.slots, self.cache.slot_bytes, self.cache.hits, self.cache.misses)
+        let (ps, _, ph, pm) = self.peer.as_ref().map_or((0, 0, 0, 0), |p| p.cache_stats());
+        (self.cache.slots + ps, self.cache.slot_bytes, self.cache.hits + ph, self.cache.misses + pm)
     }
 
     pub fn gpu_name(&self) -> &str {
@@ -2529,7 +2846,9 @@ impl<'c, 'm> GpuSession<'c, 'm> {
     }
 
     pub fn mem_info(&self) -> (usize, usize) {
-        self.ctx.mem_info().unwrap_or((0, 0))
+        let (f0, t0) = self.ctx.mem_info().unwrap_or((0, 0));
+        let (f1, t1) = self.peer.as_ref().map_or((0, 0), |p| p.mem_info());
+        (f0 + f1, t0 + t1)
     }
 
     /// The RAM watchdog's request, acted on here - between steps and batches, where no copy from or read into the tier is pending: the tier gives its last chunks back
@@ -2545,25 +2864,36 @@ impl<'c, 'm> GpuSession<'c, 'm> {
     /// Gives the RAM tier's last chunks back to the OS - at least `bytes`, whole chunks - for the caller that needs the room (the watchdog; a picture's encoder, whose helper takes
     /// ~1.8 GiB above the floor): the experts in them are served from the file afterwards.  Only between steps and batches (the caller owns the session).  Returns the bytes released.
     pub fn release_ram(&mut self, bytes: usize, why: &str) -> usize {
-        if bytes == 0 || self.ram.region.is_none() {
+        if bytes == 0 {
             return 0;
         }
-        let avail0 = crate::pinned::available_ram();
-        let (freed, dropped) = self.ram.trim(self.ctx, bytes);
-        crate::pinned::note_trimmed(freed as u64);
-        let g = |b: u64| b as f64 / (1u64 << 30) as f64;
-        eprintln!("RAM tier: gave back {:.0} GiB {why} ({dropped} experts dropped; tier now {:.0} GiB, {} experts); available RAM {:.2} -> {:.2} GiB",
-                  g(freed as u64), g(self.ram.region.as_ref().map_or(0, |r| r.len()) as u64), self.ram.at.len(), g(avail0), g(crate::pinned::available_ram()));
+        let mut freed = 0usize;
+        if self.ram.region.is_some() {
+            let avail0 = crate::pinned::available_ram();
+            let (f, dropped) = self.ram.trim(self.ctx, bytes);
+            freed += f;
+            crate::pinned::note_trimmed(f as u64);
+            let g = |b: u64| b as f64 / (1u64 << 30) as f64;
+            eprintln!("RAM tier: gave back {:.0} GiB {why} ({dropped} experts dropped; tier now {:.0} GiB, {} experts); available RAM {:.2} -> {:.2} GiB",
+                      g(f as u64), g(self.ram.region.as_ref().map_or(0, |r| r.len()) as u64), self.ram.at.len(), g(avail0), g(crate::pinned::available_ram()));
+        }
+        if freed < bytes {
+            if let Some(p) = self.peer.as_mut() {
+                freed += p.release_ram(bytes - freed, why);
+            }
+        }
         freed
     }
 
     /// (bytes, experts) the RAM tier has given back under RAM pressure.
     pub fn ram_tier_trimmed(&self) -> (usize, usize) {
-        (self.ram.trimmed_bytes, self.ram.trimmed_experts)
+        let (pb, pe) = self.peer.as_ref().map_or((0, 0), |p| p.ram_tier_trimmed());
+        (self.ram.trimmed_bytes + pb, self.ram.trimmed_experts + pe)
     }
 
     pub fn ram_tier_stats(&self) -> (usize, usize, u64, u64) {
-        (self.ram.at.len(), self.ram.region.as_ref().map_or(0, |r| r.len()), self.ram.served, self.ram.drive)
+        let (pe, pb, ps, pd) = self.peer.as_ref().map_or((0, 0, 0, 0), |p| p.ram_tier_stats());
+        (self.ram.at.len() + pe, self.ram.region.as_ref().map_or(0, |r| r.len()) + pb, self.ram.served + ps, self.ram.drive + pd)
     }
 
     /// The tokens this session has read, in order: its state is exactly the state after them.
@@ -2714,11 +3044,11 @@ impl<'c, 'm> GpuSession<'c, 'm> {
 
     /// The copies of `ents` ((dst, src, bytes) device ranges) as one `copy_many` launch on the default stream (ordered with the kernels after it); the table is kept while the entries are the same.
     /// False (nothing copied) when switched off or the table cannot be made.
-    fn copy_many(&self, ents: &[[u64; 3]]) -> bool {
+    fn copy_many_with(&self, slot: &std::cell::RefCell<Option<(Vec<[u64; 3]>, DeviceBuffer<'c>)>>, ents: &[[u64; 3]]) -> bool {
         if ents.is_empty() || std::env::var("SHADOW_SNAP_KERNEL").is_ok_and(|v| v == "0") {
             return false;
         }
-        let mut cache = self.snap_copy.borrow_mut();
+        let mut cache = slot.borrow_mut();
         if cache.as_ref().is_none_or(|(k, _)| k.as_slice() != ents) {
             let Ok(tab) = self.ctx.alloc(ents.len() * 24) else { return false };
             let bytes: Vec<u8> = ents.iter().flatten().flat_map(|v| v.to_le_bytes()).collect();
@@ -2765,7 +3095,7 @@ impl<'c, 'm> GpuSession<'c, 'm> {
         if let Saved::Dev(p, n) = &snap.ple {
             ents.push([p.ptr, self.ple_state.ptr, *n as u64]);
         }
-        if !self.copy_many(&ents) {
+        if !self.copy_many_with(&self.snap_copy, &ents) {
             for (s, d) in snap.delta.iter().zip(&self.delta) {
                 if let (Some((Saved::Dev(a, an), Saved::Dev(b, bn))), Some((st, conv))) = (s, d) {
                     a.copy_prefix_from(st, *an).map_err(e)?;
@@ -2808,13 +3138,36 @@ impl<'c, 'm> GpuSession<'c, 'm> {
                 return Err("restore: this snapshot has no KV and the session no longer starts with its tokens".into());
             }
         }
-        for (d, s) in self.delta.iter().zip(&snap.delta) {
-            if let (Some((st, conv)), Some((ss, sc))) = (d, s) {
-                ss.put(st)?;
-                sc.put(conv)?;
+        let dev_only = !has_kv
+            && matches!(snap.ple, Saved::Dev(..))
+            && self.delta.iter().zip(&snap.delta).all(|(d, s)| match (d, s) {
+                (Some(_), Some((Saved::Dev(..), Saved::Dev(..)))) | (None, None) => true,
+                _ => false,
+            });
+        let restored_fast = if dev_only {
+            let mut ents: Vec<[u64; 3]> = Vec::with_capacity(2 * self.delta.len() + 1);
+            for (d, s) in self.delta.iter().zip(&snap.delta) {
+                if let (Some((st, conv)), Some((Saved::Dev(ss, sn), Saved::Dev(sc, cn)))) = (d, s) {
+                    ents.push([st.ptr, ss.ptr, *sn as u64]);
+                    ents.push([conv.ptr, sc.ptr, *cn as u64]);
+                }
             }
+            if let Saved::Dev(p, n) = &snap.ple {
+                ents.push([self.ple_state.ptr, p.ptr, *n as u64]);
+            }
+            self.copy_many_with(&self.snap_restore, &ents)
+        } else {
+            false
+        };
+        if !restored_fast {
+            for (d, s) in self.delta.iter().zip(&snap.delta) {
+                if let (Some((st, conv)), Some((ss, sc))) = (d, s) {
+                    ss.put(st)?;
+                    sc.put(conv)?;
+                }
+            }
+            snap.ple.put(&self.ple_state)?;
         }
-        snap.ple.put(&self.ple_state)?;
         for (l, a) in self.attn.iter_mut().enumerate() {
             let Some(a) = a.as_mut() else { continue };
             match &snap.kv[l] {
@@ -3268,99 +3621,64 @@ impl<'c, 'm> GpuSession<'c, 'm> {
         self.peer.as_deref()
     }
 
-    /// The pinned buffer of the hop, made at the first use; whether it exists.
+    fn hop_src_make(&self, runs: Vec<(usize, usize, u64)>, feat_rows: usize) -> HopSrc<'c> {
+        self.hop_compute_ev.record(None).unwrap();
+        HopSrc {
+            ctx: self.ctx,
+            down_stream: self.hop_down_stream.raw(),
+            compute_ev: self.hop_compute_ev.raw(),
+            down_done: [self.hop_down_done[0].raw(), self.hop_down_done[1].raw()],
+            runs,
+            feat_ptr: self.tap_feat.as_ref().map(|b| b.ptr),
+            feat_rows,
+            feat_w_bytes: self.tap_feat_width() * 4,
+        }
+    }
+
+    /// The pinned buffers of the hop, made at the first use; whether they exist.
     fn hop_ensure(&mut self) -> bool {
-        if self.hop_buf.is_none() {
-            let bytes = HOP_CHUNK_ROWS * (self.m.cfg.hidden * self.m.cfg.streams).max(crate::dflash::NFEAT) * 4;
-            match crate::driver::PinnedHost::new(self.ctx, bytes) {
-                Ok(buf) => self.hop_buf = Some(buf),
+        if self.hop.is_none() {
+            let row_b = self.m.cfg.hidden * self.m.cfg.streams * 4;
+            let feat_b = Self::taps_below(self.layers.0) * crate::dflash::HIDDEN * 4;
+            let bytes = HOP_CHUNK_ROWS * row_b.max(feat_b);
+            let b0 = match crate::driver::PinnedHost::new(self.ctx, bytes) {
+                Ok(buf) => buf,
                 Err(err) => {
                     eprintln!("hop: {err}: the stages hand over through host vectors");
                     return false;
                 }
-            }
+            };
+            let b1 = if !std::env::var("SHADOW_HOP_PINGPONG").is_ok_and(|v| v == "0") {
+                crate::driver::PinnedHost::new(self.ctx, bytes).ok()
+            } else {
+                None
+            };
+            let (e0, e1, s) = match (self.ctx.event(), self.ctx.event(), self.ctx.stream()) {
+                (Ok(e0), Ok(e1), Ok(s)) => (e0, e1, s),
+                (Err(err), _, _) | (_, Err(err), _) | (_, _, Err(err)) => {
+                    eprintln!("hop: {err}: the stages hand over through host vectors");
+                    return false;
+                }
+            };
+            self.hop = Some(HopPipe { bufs: [Some(b0), b1], up_done: [e0, e1], up_stream: s, slot: 0 });
         }
         true
     }
 
     /// The second stage: the first one's `m` rows of residual streams (and its drafter feature rows) into this stage's row storage (`row_ptr(j)`), copied down into
-    /// the pinned buffer and up from it a chunk at a time, the upload asynchronous.  Returns whether the feature rows were taken (`own_feat_rows` = the rows this
-    /// stage's taps are about to fill: they must be the same ones).
-    fn hop_pull(&self, src: &HopSrc<'c>, row_ptr: &dyn Fn(usize) -> u64, own_feat_rows: usize) -> bool {
-        let buf = self.hop_buf.as_ref().expect("hop_ensure first");
+    /// the double-buffered pinned host staging and up into its own row storage in chunks asynchronously.  Returns whether the feature rows were taken (`own_feat_rows` =
+    /// the rows this stage's taps are about to fill: they must be the same ones).
+    fn hop_pull(&mut self, src: &HopSrc<'c>, row_ptr: &dyn Fn(usize) -> u64, own_feat_rows: usize) -> bool {
+        self.hop_pull_on(src, row_ptr, own_feat_rows, false)
+    }
+
+    fn hop_pull_on(&mut self, src: &HopSrc<'c>, row_ptr: &dyn Fn(usize) -> u64, own_feat_rows: usize, use_up_stream: bool) -> bool {
+        let feat_ptr = self.dflash.as_ref().map(|d| d.bufs.feat.ptr);
+        let feat_dst_w_bytes = Self::taps_below(self.layers.0) * crate::dflash::HIDDEN * 4;
+        let dst_ctx = self.ctx;
+        let hop = self.hop.as_mut().expect("hop_ensure first");
         let row_b = self.m.cfg.hidden * self.m.cfg.streams * 4;
-        let api = self.ctx.api;
-        let timed = hop_time();
-        let (mut t_down, mut t_up) = (0u64, 0u64);
-        // the copies: `bytes` bytes inside the pinned buffer (a chunk is at most HOP_CHUNK_ROWS rows of the larger row size) and inside the sender's rows / this stage's row
-        // storage; the buffer is not written again before `hop_done` says the uploads from it have run
-        let down = |dev: u64, bytes: usize, t: &mut u64| {
-            self.hop_done.synchronize().unwrap();
-            let t0 = timed.then(std::time::Instant::now);
-            src.ctx.bind().unwrap();
-            // SAFETY: see above.
-            let r = unsafe { (api.cuMemcpyDtoH)(buf.p, dev, bytes) };
-            assert_eq!(r, 0, "hop: cuMemcpyDtoH failed ({r})");
-            self.ctx.bind().unwrap();
-            if let Some(t0) = t0 {
-                *t += t0.elapsed().as_nanos() as u64;
-            }
-        };
-        let up = |dst: u64, off: usize, bytes: usize| {
-            // SAFETY: see above.
-            let r = unsafe { (api.cuMemcpyHtoDAsync)(dst, (buf.p as *const u8).add(off) as *const std::ffi::c_void, bytes, std::ptr::null_mut()) };
-            assert_eq!(r, 0, "hop: cuMemcpyHtoDAsync failed ({r})");
-        };
-        for &(j0, n, dev) in &src.runs {
-            let mut k = 0;
-            while k < n {
-                let cnt = (n - k).min(hop_chunk_rows());
-                down(dev + (k * row_b) as u64, cnt * row_b, &mut t_down);
-                let t0 = timed.then(std::time::Instant::now);
-                // consecutive rows here may be several runs in this stage's storage (its sub-chunk parts)
-                let mut a = 0;
-                while a < cnt {
-                    let start = row_ptr(j0 + k + a);
-                    let mut e = a + 1;
-                    while e < cnt && row_ptr(j0 + k + e) == start + ((e - a) * row_b) as u64 {
-                        e += 1;
-                    }
-                    up(start, a * row_b, (e - a) * row_b);
-                    a = e;
-                }
-                self.hop_done.record(None).unwrap();
-                if let Some(t0) = t0 {
-                    t_up += t0.elapsed().as_nanos() as u64;
-                }
-                k += cnt;
-            }
-        }
-        let mut feats_ok = true;
-        if let (Some(fp), Some(df)) = (src.feat_ptr, self.dflash.as_ref()) {
-            if src.feat_rows == own_feat_rows {
-                let fb = crate::dflash::NFEAT * 4;
-                let mut k = 0;
-                while k < src.feat_rows {
-                    let cnt = (src.feat_rows - k).min(hop_chunk_rows());
-                    down(fp + (k * fb) as u64, cnt * fb, &mut t_down);
-                    let t0 = timed.then(std::time::Instant::now);
-                    up(df.bufs.feat.ptr + (k * fb) as u64, 0, cnt * fb);
-                    self.hop_done.record(None).unwrap();
-                    if let Some(t0) = t0 {
-                        t_up += t0.elapsed().as_nanos() as u64;
-                    }
-                    k += cnt;
-                }
-            } else {
-                feats_ok = false;
-            }
-        }
-        if timed {
-            hop_add(4, t_down);
-            hop_add(5, t_up);
-            hop_report();
-        }
-        feats_ok
+        hop.pull(dst_ctx, row_b, feat_ptr, feat_dst_w_bytes, src, row_ptr, own_feat_rows, use_up_stream)
     }
 
     pub fn step_prefill(&mut self, token: u32) {
@@ -3469,7 +3787,7 @@ impl<'c, 'm> GpuSession<'c, 'm> {
         if hi < c.n_layer {
             // not the last stage: the streams go to the next one (and the drafter's features of the taps in this stage's layers)
             if hop_pinned() {
-                let src = HopSrc { ctx: self.ctx, runs: vec![(0, 1, self.b.r.ptr)], feat_ptr: self.tap_feat.as_ref().map(|b| b.ptr), feat_rows: 1 };
+                let src = self.hop_src_make(vec![(0, 1, self.b.r.ptr)], 1);
                 if let Some(p) = self.peer.as_mut().and_then(|p| if p.hop_ensure() { Some(p) } else { None }) {
                     if hop_time() {
                         hop_rows(1);
@@ -3481,7 +3799,9 @@ impl<'c, 'm> GpuSession<'c, 'm> {
                         hop_add(2, (h * cs * 4 + src.feat_ptr.map_or(0, |_| crate::dflash::NFEAT * 4)) as u64);
                     }
                     p.hop_src = Some(src);
-                    return p.step_opt(token, with_logits);
+                    let out = p.step_opt(token, with_logits);
+                    self.stage_at.set(0);
+                    return out;
                 }
             }
             let t_hop = hop_time().then(|| {
@@ -3773,12 +4093,12 @@ impl<'c, 'm> GpuSession<'c, 'm> {
                 self.ram.ring_ref[r_idx] = true;
                 self.ram.claimed.insert(off);
             }
-            let src = self.ram.region.as_ref().unwrap().as_slice();
+            let src = self.ram.region.as_ref().unwrap().slice(off, total);
             if contiguous {
-                self.upload_pinned_on(dst[0], &src[off..off + total], stream);
+                self.upload_pinned_on(dst[0], src, stream);
             } else {
                 for i in 0..3 {
-                    self.upload_pinned_on(dst[i], &src[off + part_offs[i]..off + part_offs[i] + sizes[i]], stream);
+                    self.upload_pinned_on(dst[i], &src[part_offs[i]..part_offs[i] + sizes[i]], stream);
                 }
             }
             self.ram.served += 1;
@@ -3808,26 +4128,28 @@ impl<'c, 'm> GpuSession<'c, 'm> {
         let total = sizes[0] + sizes[1] + sizes[2];
         let part_offs = [0usize, sizes[0], sizes[0] + sizes[1]];
         {
-            let ring = self.ram.region.as_mut().map(|r| r.as_mut_slice());
-            let staging = self.staging.as_mut().map(|r| r.as_mut_slice());
+            let ring = self.ram.region.as_mut().map(|r| r.chunk_slices_mut()).unwrap_or_default();
+            let staging = self.staging.as_mut().map(|r| r.chunk_slices_mut()).unwrap_or_default();
             let mut jobs: Vec<(&str, usize, &mut [u8])> = Vec::with_capacity(3 * pending.len());
-            for (from_ring, buf) in [(true, ring), (false, staging)] {
-                let Some(mut rest) = buf else { continue };
+            for (from_ring, chunks) in [(true, ring), (false, staging)] {
                 let mut mine: Vec<&PendingRead> = pending.iter().filter(|p| p.ring == from_ring).collect();
                 mine.sort_by_key(|p| p.off);
-                let mut at = 0usize;
-                for p in mine {
-                    // carve the expert's bytes off the front of what is left; the offsets are distinct slots
-                    let (_, tail) = std::mem::take(&mut rest).split_at_mut(p.off - at);
-                    let (mut slot, tail) = tail.split_at_mut(total);
-                    rest = tail;
-                    at = p.off + total;
-                    // file-offset order: `ffn_down_exps` @ part 2, `ffn_gate_exps` @ part 0, `ffn_up_exps` @ part 1
-                    let (gate, more) = std::mem::take(&mut slot).split_at_mut(sizes[0]);
-                    let (up, down) = more.split_at_mut(sizes[1]);
-                    jobs.push((&names[2], p.e, down));
-                    jobs.push((&names[0], p.e, gate));
-                    jobs.push((&names[1], p.e, up));
+                for (c_off, mut rest) in chunks {
+                    let c_end = c_off + rest.len();
+                    let mut at = c_off;
+                    for p in mine.iter().copied().filter(|p| p.off >= c_off && p.off < c_end) {
+                        // carve the expert's bytes off the front of what is left; the offsets are distinct slots
+                        let (_, tail) = std::mem::take(&mut rest).split_at_mut(p.off - at);
+                        let (mut slot, tail) = tail.split_at_mut(total);
+                        rest = tail;
+                        at = p.off + total;
+                        // file-offset order: `ffn_down_exps` @ part 2, `ffn_gate_exps` @ part 0, `ffn_up_exps` @ part 1
+                        let (gate, more) = std::mem::take(&mut slot).split_at_mut(sizes[0]);
+                        let (up, down) = more.split_at_mut(sizes[1]);
+                        jobs.push((&names[2], p.e, down));
+                        jobs.push((&names[0], p.e, gate));
+                        jobs.push((&names[1], p.e, up));
+                    }
                 }
             }
             let t_wait = std::time::Instant::now();
@@ -3838,7 +4160,7 @@ impl<'c, 'm> GpuSession<'c, 'm> {
         let stream = self.copy_stream.raw();
         for p in &pending {
             let region = if p.ring { self.ram.region.as_ref() } else { self.staging.as_ref() };
-            let src = &region.unwrap().as_slice()[p.off..p.off + total];
+            let src = region.unwrap().slice(p.off, total);
             if p.dst[1] == p.dst[0] + sizes[0] as u64 && p.dst[2] == p.dst[1] + sizes[1] as u64 {
                 self.upload_pinned_on(p.dst[0], src, stream);
             } else {
@@ -3874,7 +4196,7 @@ impl<'c, 'm> GpuSession<'c, 'm> {
             }
             let s = self.cache.victim(l);
             let base = self.cache.arena.as_ref().unwrap().ptr + self.cache.slot_offset[s];
-            let src = &self.ram.region.as_ref().unwrap().as_slice()[off..off + total];
+            let src = self.ram.region.as_ref().unwrap().slice(off, total);
             self.upload_pinned_on(base, src, stream);
             self.cache.owner[s] = Some((l, e));
             self.cache.map.insert((l, e), s);
@@ -3892,13 +4214,21 @@ impl<'c, 'm> GpuSession<'c, 'm> {
         }
     }
 
+    /// Whether every MoE layer in this session's stage has all `n_expert` experts permanently resident in `cache.arena`.
+    fn all_layers_resident(&self) -> bool {
+        let c = &self.m.cfg;
+        self.cache.slots > 0 && (self.layers.0..self.layers.1).filter(|&l| c.is_moe(l)).all(|l| self.res_eaddr[l].is_some())
+    }
+
     /// Lends the tail of the VRAM expert cache (`SHADOW_PREFILL_LEND_MIB`, else room for all of a layer's experts, at most half
     /// of it) to a long prompt as staging: a prompt chunk's whole expert union for a layer is then copied once and run in one
     /// group, instead of in groups of the few free slots.  The evicted entries come back with `restore_cache`.  False when
     /// there is nothing to lend (no cache, a pinned placement).
     /// Tokens a pass can take now: `MAX_BATCH`, more while a long prompt has the cache lent.
     pub fn batch_rows(&self) -> usize {
-        self.peer.as_ref().map_or(self.batch_max, |p| self.batch_max.min(p.batch_rows()))
+        self.peer.as_ref().map_or(self.batch_max, |p| {
+            if self.all_layers_resident() { p.batch_rows().max(self.batch_max) } else { self.batch_max.min(p.batch_rows()) }
+        })
     }
 
     /// The engine tells the session how many tokens the next long prompt reads (so `lend_kv` knows how much of the window it will fill).
@@ -3996,7 +4326,26 @@ impl<'c, 'm> GpuSession<'c, 'm> {
     }
 
     fn lend_cache_local(&mut self, long: bool) -> bool {
-        if self.lent.is_some() || self.cache.slots == 0 || self.cache.arena.is_none() || self.cache.layer_range != self.cache.evict_range {
+        if self.lent.is_some() || self.cache.slots == 0 || self.cache.arena.is_none() {
+            return false;
+        }
+        if self.all_layers_resident() {
+            if !long || std::env::var("SHADOW_PREFILL_BIG").is_ok_and(|v| v == "0") {
+                return false;
+            }
+            let _ = self.lend_kv(false);
+            let start = self.cache.used_bytes;
+            let n = (self.cache.arena_bytes.saturating_sub(start)) / self.cache.slot_bytes.max(1);
+            let ptr = self.cache.arena.as_ref().unwrap().ptr + start as u64;
+            self.lent = Some(Lent { ptr, n, saved: vec![], evict_saved: self.cache.evict_range.clone() });
+            if !self.big_batch_on() {
+                self.lent = None;
+                self.unlend_kv();
+                return false;
+            }
+            return true;
+        }
+        if self.cache.layer_range != self.cache.evict_range {
             return false;
         }
         let pipe = long && !std::env::var("SHADOW_PREFILL_PIPE").is_ok_and(|v| v == "0");
@@ -4099,7 +4448,7 @@ impl<'c, 'm> GpuSession<'c, 'm> {
         for &(l, _) in self.ram.at.keys() {
             per_layer[l] += 1;
         }
-        let mut slots = per_layer.iter().map(|&n| ne.saturating_sub(n)).max().unwrap_or(ne).max(1);
+        let mut slots = (self.layers.0..self.layers.1).filter(|&l| self.m.cfg.is_moe(l)).map(|l| ne.saturating_sub(per_layer[l])).max().unwrap_or(ne).max(1);
         // debugging a direct-I/O crash: `SHADOW_STAGE_SLOTS=n` sizes the read-ahead buffers for n experts (512 = every expert of a layer, so no buffer is ever replaced)
         if let Some(n) = std::env::var("SHADOW_STAGE_SLOTS").ok().and_then(|v| v.parse::<usize>().ok()) {
             slots = n.max(1);
@@ -4271,7 +4620,7 @@ impl<'c, 'm> GpuSession<'c, 'm> {
             if let Some(&off) = self.ram.at.get(&(l, e)) {
                 let region = self.ram.region.as_ref().unwrap();
                 srcs.push(region.dev_addr(off));
-                host_srcs.push(region.as_slice()[off..off + total].as_ptr() as u64);
+                host_srcs.push(region.slice(off, total).as_ptr() as u64);
                 self.ram.served += 1;
             } else {
                 let sp = self.sp.as_ref().unwrap();
@@ -4353,12 +4702,26 @@ impl<'c, 'm> GpuSession<'c, 'm> {
                     unsafe { DeviceBuffer::view(self.ctx, at, on * sb) }.zero().unwrap();
                 }
             }
-            // the first layer of a pass: read and copy it here, and start layer l + 1's reads
+            // the first layer of a pass: Wait if a prior chunk on the same `StagePipe` still used half `p` or read buffer `l % 3` / `(l + 1) % 3`.
+            if self.sp.as_ref().unwrap().ready[p] != usize::MAX {
+                self.ctx.stream_wait_event(Some(&self.copy_stream), &self.sp.as_ref().unwrap().done[p]).unwrap();
+                if !self.sp.as_ref().unwrap().at[l % 3].is_empty() {
+                    self.sp.as_ref().unwrap().buf_done[l % 3].synchronize().unwrap();
+                }
+            }
             self.stage_pipe_read(l);
             self.stage_copy(l);
-            self.stage_pipe_read(l + 1);
+            if l + 1 < c.n_layer {
+                if self.sp.as_ref().unwrap().ready[(l + 1) & 1] != usize::MAX && !self.sp.as_ref().unwrap().at[(l + 1) % 3].is_empty() {
+                    self.sp.as_ref().unwrap().buf_done[(l + 1) % 3].synchronize().unwrap();
+                }
+                self.stage_pipe_read(l + 1);
+            }
             if lead2 && l + 1 < c.n_layer {
                 // two layers in flight: layer l + 1's copy too (half (l + 1) & 1 is free at the start of a pass)
+                if self.sp.as_ref().unwrap().ready[(l + 1) & 1] != usize::MAX {
+                    self.ctx.stream_wait_event(Some(&self.copy_stream), &self.sp.as_ref().unwrap().done[(l + 1) & 1]).unwrap();
+                }
                 self.stage_copy(l + 1);
             }
         }
@@ -4371,7 +4734,9 @@ impl<'c, 'm> GpuSession<'c, 'm> {
             self.ctx.stream_wait_event(Some(&self.copy_stream), &self.sp.as_ref().unwrap().done[(l + 1) & 1]).unwrap();
             self.stage_copy(l + 1);
             let t1 = t0.elapsed();
-            self.sp.as_ref().unwrap().buf_done[(l + 2) % 3].synchronize().unwrap();
+            if !self.sp.as_ref().unwrap().at[(l + 2) % 3].is_empty() {
+                self.sp.as_ref().unwrap().buf_done[(l + 2) % 3].synchronize().unwrap();
+            }
             let t2 = t0.elapsed();
             self.stage_pipe_read(l + 2);
             if std::env::var("SHADOW_STAGE_TIME").is_ok_and(|v| v == "3") {
@@ -4455,7 +4820,9 @@ impl<'c, 'm> GpuSession<'c, 'm> {
             if early && first_of_pass && sub_fast && self.sub_first && l + 1 < c.n_layer {
                 self.ctx.stream_wait_event(Some(&self.copy_stream), &self.sp.as_ref().unwrap().done[(l + 1) & 1]).unwrap();
                 self.stage_copy(l + 1);
-                self.sp.as_ref().unwrap().buf_done[(l + 2) % 3].synchronize().unwrap();
+                if !self.sp.as_ref().unwrap().at[(l + 2) % 3].is_empty() {
+                    self.sp.as_ref().unwrap().buf_done[(l + 2) % 3].synchronize().unwrap();
+                }
                 self.stage_pipe_read(l + 2);
             }
             // not the layer's last sub-chunk: the copy pipeline moves on once, after the last one
@@ -4467,7 +4834,9 @@ impl<'c, 'm> GpuSession<'c, 'm> {
         if early && first_of_pass && sub_fast && self.sub_first && l + 1 < c.n_layer {
             self.ctx.stream_wait_event(Some(&self.copy_stream), &self.sp.as_ref().unwrap().done[(l + 1) & 1]).unwrap();
             self.stage_copy(l + 1);
-            self.sp.as_ref().unwrap().buf_done[(l + 2) % 3].synchronize().unwrap();
+            if !self.sp.as_ref().unwrap().at[(l + 2) % 3].is_empty() {
+                self.sp.as_ref().unwrap().buf_done[(l + 2) % 3].synchronize().unwrap();
+            }
             self.stage_pipe_read(l + 2);
         }
         if early {
@@ -4480,7 +4849,9 @@ impl<'c, 'm> GpuSession<'c, 'm> {
             if l + 2 < n_layer {
                 if self.sp.as_ref().unwrap().layer[(l + 2) % 3] != l + 2 {
                     // the buffer held layer l - 1's file-only experts: their copy is done before the buffer is read into again
-                    self.sp.as_ref().unwrap().buf_done[(l + 2) % 3].synchronize().unwrap();
+                    if !self.sp.as_ref().unwrap().at[(l + 2) % 3].is_empty() {
+                        self.sp.as_ref().unwrap().buf_done[(l + 2) % 3].synchronize().unwrap();
+                    }
                     self.stage_pipe_read(l + 2);
                 }
                 // the half it fills is the one this layer's experts read: wait for their combine
@@ -4489,7 +4860,9 @@ impl<'c, 'm> GpuSession<'c, 'm> {
             }
             if l + 3 < n_layer {
                 // the buffer layer l + 3 reads into held layer l's file-only experts: their copy has finished
-                self.sp.as_ref().unwrap().buf_done[(l + 3) % 3].synchronize().unwrap();
+                if !self.sp.as_ref().unwrap().at[(l + 3) % 3].is_empty() {
+                    self.sp.as_ref().unwrap().buf_done[(l + 3) % 3].synchronize().unwrap();
+                }
                 self.stage_pipe_read(l + 3);
             }
         } else if l + 1 < self.m.cfg.n_layer {
@@ -4499,7 +4872,9 @@ impl<'c, 'm> GpuSession<'c, 'm> {
             self.stage_copy(l + 1);
             let t_copyq = t_start.elapsed();
             // the buffer layer l + 2 reads into held layer l - 1's file-only experts: their copy was queued two layers ago, and is done (or soon)
-            self.sp.as_ref().unwrap().buf_done[(l + 2) % 3].synchronize().unwrap();
+            if !self.sp.as_ref().unwrap().at[(l + 2) % 3].is_empty() {
+                self.sp.as_ref().unwrap().buf_done[(l + 2) % 3].synchronize().unwrap();
+            }
             let t_sync = t_start.elapsed();
             self.stage_pipe_read(l + 2);
             if stage_time {
@@ -4513,25 +4888,30 @@ impl<'c, 'm> GpuSession<'c, 'm> {
     /// The per-token buffers for `BIG_BATCH` tokens, carved from the lent cache after the stage halves, swapped in for the ones for
     /// `MAX_BATCH` (the buffers that do not grow with the batch are shared); false if the lent room is too small.
     fn big_batch_on(&mut self) -> bool {
-        let (Some(lent), true) = (self.lent.as_ref(), self.sp.is_some()) else { return false };
+        let Some(lent) = self.lent.as_ref() else { return false };
+        let res_mode = self.all_layers_resident();
+        if self.sp.is_none() && !res_mode {
+            return false;
+        }
         let c = &self.m.cfg;
-        let halves = (2 * c.n_expert * self.cache.slot_bytes) as u64;
+        let halves = if self.sp.is_some() { (2 * c.n_expert * self.cache.slot_bytes) as u64 } else { 0 };
+        let sp_base = self.sp.as_ref().map_or(lent.ptr, |sp| sp.base);
         // where the buffers can go: the KV window's lent tail, and the lent part of the arena past the stage halves (both, when the lend took both)
         let ranges: Vec<(u64, u64)> = match self.kv_extra.as_ref() {
             Some(x) => {
                 let mut v = vec![(x.ptr + if self.kv_halves { halves } else { 0 }, x.ptr + x.bytes as u64)];
-                let (a0, a1) = (self.sp.as_ref().unwrap().base + halves, lent.ptr + (lent.n * self.cache.slot_bytes) as u64);
+                let (a0, a1) = (sp_base + halves, lent.ptr + (lent.n * self.cache.slot_bytes) as u64);
                 if !self.kv_halves && a1 > a0 + (1 << 20) {
                     // the arena's part first: the first buffers carved are the biggest
                     v.insert(0, (a0, a1));
                 }
                 v
             }
-            None => vec![(self.sp.as_ref().unwrap().base + halves, lent.ptr + (lent.n * self.cache.slot_bytes) as u64)],
+            None => vec![(sp_base + halves, lent.ptr + (lent.n * self.cache.slot_bytes) as u64)],
         };
         // As many rows as the lent room holds, up to BIG_BATCH: a longer `--ctx` leaves the expert cache (and so the room) smaller, and a prompt that
         // read 2,048 tokens at a time must not drop to 256 for want of a few MiB; each pass copies a layer's experts whatever its token count.
-        let env_cap = big_rows_cap();
+        let env_cap = if res_mode { sub_rows_cap() } else { big_rows_cap() };
         let cap = if self.kv_halves { env_cap.min(self.kv_rows) } else { env_cap };
         let ch = c.streams * c.hidden;
         let ctx = self.ctx;
@@ -4692,7 +5072,7 @@ impl<'c, 'm> GpuSession<'c, 'm> {
                 if let Some(&r) = self.ram.ring_by_off.get(&off) {
                     self.ram.ring_ref[r] = true;
                 }
-                let src = &region.as_slice()[off..off + total];
+                let src = region.slice(off, total);
                 if single {
                     self.upload_pinned_on(arena + self.cache.slot_offset[s], src, stream);
                 } else {
@@ -4788,7 +5168,7 @@ impl<'c, 'm> GpuSession<'c, 'm> {
                 if let Some(&r) = self.ram.ring_by_off.get(&off) {
                     self.ram.ring_ref[r] = true;
                 }
-                let src = &region.as_slice()[off..off + total];
+                let src = region.slice(off, total);
                 if single {
                     self.upload_pinned_on(arena + self.cache.slot_offset[s], src, stream);
                 } else {
@@ -4937,12 +5317,13 @@ impl<'c, 'm> GpuSession<'c, 'm> {
             }
             if !cpu_set.is_empty() {
                 let ub = u_host.clone().expect("the MoE input comes down with the router logits");
-                let base = self.ram.region.as_ref().unwrap().as_slice().as_ptr();
+                let region = self.ram.region.as_ref().unwrap();
                 let refs: Vec<shadow_model::cpu_expert::ExpertRef> = cpu_set.iter().map(|&(_, _, off)| {
+                    let base = region.slice(off, sizes[0] + sizes[1] + sizes[2]).as_ptr();
                     // SAFETY: the RAM tier holds this expert's [gate | up | down] at off, inside the region.
                     unsafe {
-                        shadow_model::cpu_expert::ExpertRef { gate: base.add(off), up: base.add(off + sizes[0]),
-                                                              down: base.add(off + sizes[0] + sizes[1]) }
+                        shadow_model::cpu_expert::ExpertRef { gate: base, up: base.add(sizes[0]),
+                                                              down: base.add(sizes[0] + sizes[1]) }
                     }
                 }).collect();
                 for &(_, _, off) in &cpu_set {
@@ -5418,6 +5799,243 @@ impl<'c, 'm> GpuSession<'c, 'm> {
     }
 
     pub fn step_batch_opt(&mut self, tokens: &[u32], with_logits: bool) -> Vec<Vec<f32>> {
+        if self.batches() && self.peer.is_some() && self.all_layers_resident() && hop_pinned()
+            && !std::env::var("SHADOW_PAIR_PIPE").is_ok_and(|v| v == "0")
+        {
+            let (p_rows, p_bmax, p_rparts_len) = {
+                let p = self.peer.as_ref().unwrap();
+                (p.rows, p.batch_max, p.rparts.len())
+            };
+            let chunk_sz = self.batch_max.min(p_rows);
+            if tokens.len() > chunk_sz && chunk_sz > MAX_VERIFY && self.peer.as_mut().unwrap().hop_ensure() {
+                let ch = self.m.cfg.hidden * self.m.cfg.streams;
+                let (subs, _) = prompt_subchunks(tokens.len(), chunk_sz);
+                let rem_m = tokens.len() - subs[0].1;
+                let mid = subs.len() / 2;
+                let use_two_halves = subs.len() >= 4
+                    && mid >= 2
+                    && chunk_sz == p_rows
+                    && p_rparts_len >= subs.len()
+                    && subs[1..].iter().all(|&(_, l)| l == p_rows)
+                    && {
+                        let split_tok = subs[mid].0;
+                        let half_b = tokens.len() - split_tok;
+                        let p = self.peer.as_ref().unwrap();
+                        split_tok > p_rows
+                            && half_b > p_rows
+                            && split_tok <= p_bmax
+                            && half_b <= p_bmax
+                            && !p.pipeline_ok(split_tok)
+                            && !p.pipeline_ok(half_b)
+                    };
+                let use_rparts_pass = !use_two_halves
+                    && subs.len() >= 2
+                    && chunk_sz == p_rows
+                    && !self.peer.as_ref().unwrap().rparts.is_empty()
+                    && rem_m >= p_rows
+                    && rem_m <= p_bmax
+                    && rem_m.is_multiple_of(p_rows)
+                    && subs.len() - 1 <= p_rparts_len
+                    && !self.peer.as_ref().unwrap().pipeline_ok(rem_m);
+                self.defer_peer = true;
+                if use_two_halves {
+                    let split_tok = subs[mid].0;
+                    let pad_a = (p_rows - subs[0].1) % p_rows;
+                    for (idx, &(s_cur, ms_cur)) in subs[..mid].iter().enumerate() {
+                        self.df_feat_ok = false;
+                        let _ = self.batch(&tokens[s_cur..s_cur + ms_cur], false);
+                        let src = self.hop_src.take().expect("stage 0 queued hop_src");
+                        let p = self.peer.as_mut().unwrap();
+                        let part_ptr = p.rparts[idx].ptr;
+                        let off_rows = if idx == 0 { pad_a } else { 0 };
+                        let _ = p.hop_pull_on(&src, &|j| part_ptr + ((j + off_rows) * ch * 4) as u64, 0, true);
+                        self.stage_at.set(0);
+                    }
+                    {
+                        let p = self.peer.as_mut().unwrap();
+                        p.hop.as_ref().unwrap().sync_up();
+                        p.hop_pulled = true;
+                    }
+                    let mut peer = self.peer.take().unwrap();
+                    let mut hop = peer.hop.take().unwrap();
+                    let p_ctx = peer.ctx;
+                    let p_feat = peer.dflash.as_ref().map(|d| d.bufs.feat.ptr);
+                    let p_feat_w = Self::taps_below(peer.layers.0) * crate::dflash::HIDDEN * 4;
+                    let p_part_ptrs: Vec<u64> = peer.rparts.iter().map(|r| r.ptr).collect();
+                    peer.logits_last = false;
+                    peer.df_feat_ok = false;
+                    let row_b = ch * 4;
+                    let mut last_feat_ok = false;
+                    std::thread::scope(|sc| {
+                        let p_wrap = SendMut(&mut peer);
+                        let h1 = sc.spawn(move || {
+                            let p_wrap = p_wrap;
+                            let p = p_wrap.0;
+                            let _ = p.batch(&tokens[..split_tok], false);
+                            p.ctx.bind().unwrap();
+                            let _ = unsafe { (p.ctx.api.cuStreamQuery)(std::ptr::null_mut()) };
+                        });
+                        let (s_mid, ms_mid) = subs[mid];
+                        self.df_feat_ok = subs.len() == mid + 1;
+                        let _ = self.batch(&tokens[s_mid..s_mid + ms_mid], false);
+                        for idx in mid..subs.len() {
+                            let (_s_cur, ms_cur) = subs[idx];
+                            let is_last = idx + 1 == subs.len();
+                            let src = self.hop_src.take().expect("stage 0 queued hop_src");
+                            let part_ptr = p_part_ptrs[idx];
+                            let f_rows = if is_last { ms_cur.min(crate::dflash::DF_ROWS) } else { 0 };
+                            let ok = hop.pull(p_ctx, row_b, p_feat, p_feat_w, &src, &|j| part_ptr + (j * row_b) as u64, f_rows, true);
+                            if is_last {
+                                last_feat_ok = ok;
+                            }
+                            self.stage_at.set(0);
+                            if !is_last {
+                                let (s_nx, ms_nx) = subs[idx + 1];
+                                self.df_feat_ok = idx + 2 == subs.len();
+                                let _ = self.batch(&tokens[s_nx..s_nx + ms_nx], false);
+                            }
+                        }
+                        h1.join().unwrap();
+                    });
+                    self.defer_peer = false;
+                    self.df_feat_ok = true;
+                    hop.sync_up();
+                    peer.hop = Some(hop);
+                    peer.ctx.synchronize().unwrap();
+                    peer.stage_at.set(0);
+                    peer.rparts.rotate_left(mid);
+                    peer.hop_pulled = true;
+                    peer.df_feat_ok = last_feat_ok;
+                    peer.logits_last = self.logits_last;
+                    let mut part = peer.batch(&tokens[split_tok..], with_logits);
+                    peer.rparts.rotate_right(mid);
+                    peer.logits_last = false;
+                    self.peer = Some(peer);
+                    let mut out = Vec::new();
+                    if with_logits {
+                        out.extend(std::iter::repeat_n(vec![], split_tok));
+                        out.append(&mut part);
+                    }
+                    return out;
+                }
+                if use_rparts_pass {
+                    let (s0, ms0) = subs[0];
+                    self.df_feat_ok = false;
+                    let _ = self.batch(&tokens[s0..s0 + ms0], false);
+                    {
+                        let src = self.hop_src.take().expect("stage 0 queued hop_src");
+                        let p = self.peer.as_mut().unwrap();
+                        let rp = p.bb.r.ptr;
+                        let _ = p.hop_pull_on(&src, &|j| rp + (j * ch * 4) as u64, 0, true);
+                        p.hop.as_ref().unwrap().sync_up();
+                        p.hop_pulled = true;
+                        self.stage_at.set(0);
+                    }
+                    let (s1, ms1) = subs[1];
+                    let mut peer = self.peer.take().unwrap();
+                    let mut hop = peer.hop.take().unwrap();
+                    let p_ctx = peer.ctx;
+                    let p_feat = peer.dflash.as_ref().map(|d| d.bufs.feat.ptr);
+                    let p_feat_w = Self::taps_below(peer.layers.0) * crate::dflash::HIDDEN * 4;
+                    let p_part_ptrs: Vec<u64> = peer.rparts.iter().map(|r| r.ptr).collect();
+                    peer.logits_last = false;
+                    peer.df_feat_ok = false;
+                    let row_b = ch * 4;
+                    let mut last_feat_ok = false;
+                    std::thread::scope(|sc| {
+                        let p_wrap = SendMut(&mut peer);
+                        let h1 = sc.spawn(move || {
+                            let p_wrap = p_wrap;
+                            let p = p_wrap.0;
+                            let _ = p.batch(&tokens[s0..s0 + ms0], false);
+                            p.ctx.bind().unwrap();
+                            let _ = unsafe { (p.ctx.api.cuStreamQuery)(std::ptr::null_mut()) };
+                        });
+                        self.df_feat_ok = subs.len() == 2;
+                        let _ = self.batch(&tokens[s1..s1 + ms1], false);
+                        for idx in 1..subs.len() {
+                            let (_s_cur, ms_cur) = subs[idx];
+                            let is_last = idx + 1 == subs.len();
+                            let src = self.hop_src.take().expect("stage 0 queued hop_src");
+                            let part_ptr = p_part_ptrs[idx - 1];
+                            let f_rows = if is_last { ms_cur.min(crate::dflash::DF_ROWS) } else { 0 };
+                            let ok = hop.pull(p_ctx, row_b, p_feat, p_feat_w, &src, &|j| part_ptr + (j * row_b) as u64, f_rows, true);
+                            if is_last {
+                                last_feat_ok = ok;
+                            }
+                            self.stage_at.set(0);
+                            if !is_last {
+                                let (s_nx, ms_nx) = subs[idx + 1];
+                                self.df_feat_ok = idx + 2 == subs.len();
+                                let _ = self.batch(&tokens[s_nx..s_nx + ms_nx], false);
+                            }
+                        }
+                        h1.join().unwrap();
+                    });
+                    self.defer_peer = false;
+                    self.df_feat_ok = true;
+                    hop.sync_up();
+                    peer.hop = Some(hop);
+                    peer.ctx.synchronize().unwrap();
+                    if subs.len() == 2 {
+                        let r = unsafe { (peer.ctx.api.cuMemcpyDtoDAsync)(peer.bb.r.ptr, peer.rparts[0].ptr, ms1 * row_b, std::ptr::null_mut()) };
+                        assert_eq!(r, 0, "hop: cuMemcpyDtoDAsync (subs2) failed ({r})");
+                    }
+                    peer.stage_at.set(0);
+                    peer.hop_pulled = true;
+                    peer.df_feat_ok = last_feat_ok;
+                    peer.logits_last = self.logits_last;
+                    let mut part = peer.batch(&tokens[s1..], with_logits);
+                    peer.logits_last = false;
+                    self.peer = Some(peer);
+                    let mut out = Vec::new();
+                    if with_logits {
+                        out.extend(std::iter::repeat_n(vec![], ms0));
+                        out.append(&mut part);
+                    }
+                    return out;
+                }
+                let skip_early_df = subs.last().unwrap().1 >= crate::dflash::DF_ROWS;
+                let (s0, ms0) = subs[0];
+                self.df_feat_ok = !skip_early_df;
+                let _ = self.batch(&tokens[s0..s0 + ms0], false);
+                let mut out = Vec::new();
+                for idx in 0..subs.len() {
+                    let (s_cur, ms_cur) = subs[idx];
+                    let is_last = idx + 1 == subs.len();
+                    {
+                        let src = self.hop_src.take().expect("stage 0 queued hop_src");
+                        let p = self.peer.as_mut().unwrap();
+                        let rp = p.bb.r.ptr;
+                        let f_rows = if is_last || !skip_early_df { ms_cur.min(crate::dflash::DF_ROWS) } else { 0 };
+                        p.df_feat_ok = p.hop_pull_on(&src, &|j| rp + (j * ch * 4) as u64, f_rows, false);
+                        p.hop_pulled = true;
+                        self.stage_at.set(0);
+                    }
+                    if !is_last {
+                        let (s_nx, ms_nx) = subs[idx + 1];
+                        self.df_feat_ok = !skip_early_df || idx + 2 == subs.len();
+                        let _ = self.batch(&tokens[s_nx..s_nx + ms_nx], false);
+                    }
+                    let p = self.peer.as_mut().unwrap();
+                    p.hop.as_ref().unwrap().sync_up();
+                    let want_l = with_logits && (!self.logits_last || is_last);
+                    p.logits_last = self.logits_last && is_last;
+                    let mut part = p.batch(&tokens[s_cur..s_cur + ms_cur], want_l);
+                    p.logits_last = false;
+                    if with_logits {
+                        if want_l {
+                            out.append(&mut part);
+                        } else {
+                            out.extend(std::iter::repeat_n(vec![], ms_cur));
+                        }
+                    }
+                }
+                self.defer_peer = false;
+                self.df_feat_ok = true;
+                return out;
+            }
+        }
         let per_token = !self.batches();
         let mut out = Vec::new();
         for chunk in tokens.chunks(self.batch_max) {
@@ -5486,15 +6104,20 @@ impl<'c, 'm> GpuSession<'c, 'm> {
         assert!(sub_mode || m <= self.rows, "a pass of {m} rows with temporaries for {}", self.rows);
         // row j's residual streams are at storage row j + pad (the first sub-chunk, the remainder, ends part 0): a sub-chunk is inside one part
         let pad = if sub_mode { (self.rows - first_rows) % self.rows } else { 0 };
-        let hop = if lo > 0 { self.hop_src.take() } else { None };
-        let stage_in = if lo > 0 && hop.is_none() { Some(self.layers_in.take().expect("a stage after the first needs the previous stage's residual streams (step_batch_stage)")) } else { None };
+        let pulled = std::mem::replace(&mut self.hop_pulled, false);
+        let hop = if lo > 0 && !pulled { self.hop_src.take() } else { None };
+        let stage_in = if lo > 0 && !pulled && hop.is_none() { Some(self.layers_in.take().expect("a stage after the first needs the previous stage's residual streams (step_batch_stage)")) } else { None };
         let row_ptr = |j: usize| -> u64 {
             if sub_mode { self.rparts[(j + pad) / self.rows].ptr + (((j + pad) % self.rows) * ch * 4) as u64 } else { self.bb.r.ptr + (j * ch * 4) as u64 }
         };
         if let Some(src) = hop.as_ref() {
             // the rows this stage's own taps will fill are the last ones of the pass's last sub-chunk (`df_capture`)
             let last = *subs.last().unwrap();
-            self.df_feat_ok = self.hop_pull(src, &row_ptr, last.1.min(crate::dflash::DF_ROWS));
+            let part_ptrs: Vec<u64> = self.rparts.iter().map(|r| r.ptr).collect();
+            let (bb_r_ptr, n_rows) = (self.bb.r.ptr, self.rows);
+            self.df_feat_ok = self.hop_pull(src, &|j| {
+                if sub_mode { part_ptrs[(j + pad) / n_rows] + (((j + pad) % n_rows) * ch * 4) as u64 } else { bb_r_ptr + (j * ch * 4) as u64 }
+            }, last.1.min(crate::dflash::DF_ROWS));
         } else if let Some(r) = stage_in.as_ref() {
             // a stage after the first starts from the previous stage's residual streams, one row of `ch` floats a token
             assert_eq!(r.len(), m * ch, "{m} tokens' residual streams are {} floats", m * ch);
@@ -5509,11 +6132,11 @@ impl<'c, 'm> GpuSession<'c, 'm> {
                 hop_add(5, t.elapsed().as_nanos() as u64);
                 hop_report();
             }
-        } else {
+        } else if lo == 0 {
             let (t, bytes) = self.m.dense("token_embd.weight");
             let (qk, qb) = t.ty.block().unwrap();
             let rb = (t.dims[0] / qk * qb) as usize;
-            let fill = |j: usize, x: &mut [f32]| match self.picture_row(p0 + j) {
+            let fill = |this: &Self, j: usize, x: &mut [f32]| match this.picture_row(p0 + j) {
                 Some(r) => x.copy_from_slice(r),
                 None => dequantize(t.ty, &bytes[toks[j] as usize * rb..(toks[j] as usize + 1) * rb], x).unwrap(),
             };
@@ -5523,7 +6146,7 @@ impl<'c, 'm> GpuSession<'c, 'm> {
             if m < 64 || g_rows < 64 || std::env::var("SHADOW_EMBED_ROWS").is_ok_and(|v| v == "0") {
                 for j in 0..m {
                     let mut x = vec![0f32; h];
-                    fill(j, &mut x);
+                    fill(self, j, &mut x);
                     self.upload_to(self.b.e.ptr, &f32s(&x));
                     self.k1("broadcast", ch, &[Arg::Ptr(self.b.e.ptr), Arg::Ptr(row_ptr(j)), Arg::U32(h as u32),
                                                Arg::U32(cs as u32)]);
@@ -5531,9 +6154,13 @@ impl<'c, 'm> GpuSession<'c, 'm> {
             } else {
                 // groups of rows: one upload and one launch each (a launch and a copy a token took 0.27 s for 15k tokens); a group ends where the residual storage moves to the next part
                 let scratch_ptr = self.bb.rn.ptr;
+                let half_rows = self.mapped.len() / (2 * h * 4);
+                let use_pinned = half_rows >= 64;
+                let g_rows = if use_pinned { g_rows.min(half_rows) } else { g_rows };
                 let mut host = vec![0f32; g_rows * h];
                 let par = self.pictures.is_empty() && !std::env::var("SHADOW_EMBED_PAR").is_ok_and(|v| v == "0");
                 let mut j0 = 0;
+                let mut chunk_idx = 0usize;
                 while j0 < m {
                     let boundary = if sub_mode { (j0 + pad) / self.rows * self.rows + self.rows - pad } else { m };
                     let j1 = (j0 + g_rows).min(m).min(boundary);
@@ -5555,13 +6182,40 @@ impl<'c, 'm> GpuSession<'c, 'm> {
                         });
                     } else {
                         for j in j0..j1 {
-                            fill(j, &mut host[(j - j0) * h..(j - j0 + 1) * h]);
+                            fill(self, j, &mut host[(j - j0) * h..(j - j0 + 1) * h]);
                         }
                     }
                     // one stream (the default): the next group's upload waits for this group's launch
-                    self.upload_to(scratch_ptr, &f32s(&host[..n_rows * h]));
+                    if use_pinned {
+                        let slot = chunk_idx & 1;
+                        let off = slot * g_rows * h * 4;
+                        let n_bytes = n_rows * h * 4;
+                        if chunk_idx >= 2 {
+                            let ev = if slot == 0 { &self.mapped_event } else { &self.mapped_event2 };
+                            ev.synchronize().unwrap();
+                        }
+                        {
+                            let dst = &mut self.mapped.as_mut_slice()[off..off + n_bytes];
+                            // SAFETY: `host` is `n_rows * h` initialized f32 values and `dst` has `n_bytes = n_rows * h * 4` bytes.
+                            unsafe {
+                                std::ptr::copy_nonoverlapping(host.as_ptr() as *const u8, dst.as_mut_ptr(), n_bytes);
+                            }
+                        }
+                        self.upload_pinned_on(scratch_ptr, &self.mapped.as_slice()[off..off + n_bytes], std::ptr::null_mut());
+                        let ev = if slot == 0 { &self.mapped_event } else { &self.mapped_event2 };
+                        ev.record(None).unwrap();
+                    } else {
+                        self.upload_to(scratch_ptr, &f32s(&host[..n_rows * h]));
+                    }
                     self.k1("broadcast_rows", n_rows * ch, &[Arg::Ptr(scratch_ptr), Arg::Ptr(row_ptr(j0)), Arg::U32(h as u32), Arg::U32(cs as u32), Arg::U32(n_rows as u32)]);
                     j0 = j1;
+                    chunk_idx += 1;
+                }
+                if use_pinned && chunk_idx > 0 {
+                    for s in 0..chunk_idx.min(2) {
+                        let ev = if s == 0 { &self.mapped_event } else { &self.mapped_event2 };
+                        ev.synchronize().unwrap();
+                    }
                 }
             }
         }
@@ -5613,7 +6267,7 @@ impl<'c, 'm> GpuSession<'c, 'm> {
                     }
                     let t_pref = t_ple_block.elapsed().as_secs_f64();
                     // the whole batch at once with `--tensor-prompt` (`SHADOW_PLE_BATCH=0`: token by token)
-                    let batched = self.tensor_prompt && !self.replay.on.get() && m >= 16 && !std::env::var("SHADOW_PLE_BATCH").is_ok_and(|v| v == "0") && self.ple_batch(l, p0, m);
+                    let batched = self.tensor_prompt && m >= 2 && (!self.replay.on.get() || m <= MAX_VERIFY) && !std::env::var("SHADOW_PLE_BATCH").is_ok_and(|v| v == "0") && self.ple_batch(l, p0, m);
                     for j in (if batched { m } else { 0 })..m {
                         let r = row(&self.bb.r, ch, j);
                         self.ple_at(l, p0 + j + 1, r);
@@ -5640,22 +6294,56 @@ impl<'c, 'm> GpuSession<'c, 'm> {
                     self.ensure_multi(l, 2, false);
                 }
                 heap_check("layer loop top");
+                let next = if l + 1 == c.ple_layer || (l + 1 == hi && hi < c.n_layer) {
+                    None // the PLE layer's input, or the end of this stage: the next layer norms the streams itself
+                } else if l + 1 < c.n_layer {
+                    Some(format!("blk.{}.hc_attn_norm.weight", l + 1))
+                } else {
+                    Some("output_hc_norm.weight".to_string())
+                };
+                let mut wrote_hc = false;
                 if graphs && !c.is_attention(l) && l != c.ple_layer {
-                    // a DeltaNet layer up to its router is the same launches for every batch of m: one graph
                     let on = self.replay.on.get();
-                    // the key holds where the batch buffers are (the graph's launches carry their addresses): the same row count at another address - a prompt that lent another stretch of the KV window - is another graph
-                    self.batch_graph_segment((l, rn_ready, m, on, self.rows, self.bb.r.ptr), |s| {
-                        s.hc_read_batch(&format!("blk.{l}.hc_attn"), true, rn_ready, m);
-                        s.delta_batch(l, m);
-                        s.hc_write_batch(Some(&format!("blk.{l}.hc_ffn_norm.weight")), m);
-                        s.hc_read_batch(&format!("blk.{l}.hc_ffn"), true, true, m);
-                        s.moe_router_batch(l, m);
-                    });
-                    self.lt_point(if graphs { "delta segment (graph)" } else { "delta segment" });
-                    heap_check("delta segment (graph) queued");
-                    self.moe_batch(l, m, &mut logs[s0..s0 + m], true, None);
-                    heap_check("moe_batch after a graph segment");
-                    self.lt_point("moe (router wait, fetch, experts)");
+                    let res_infos = if self.res_eaddr[l].is_some() {
+                        let names = [format!("blk.{l}.ffn_gate_exps.weight"), format!("blk.{l}.ffn_up_exps.weight"), format!("blk.{l}.ffn_down_exps.weight")];
+                        let infos: Vec<TensorInfo> = names.iter().map(|n| self.expert_info(n)).collect();
+                        if self.resident_dev_plan_ok(l, m, &infos) { Some(infos) } else { None }
+                    } else {
+                        None
+                    };
+                    if let Some(infos) = res_infos {
+                        self.clear_dp_copied_if_dirty();
+                        let next_ref = next.as_deref();
+                        // the key holds where the batch buffers are (the graph's launches carry their addresses): the same row count at another address - a prompt that lent another stretch of the KV window - is another graph
+                        self.batch_graph_segment((l, rn_ready, m, on, self.rows, self.bb.r.ptr), |s| {
+                            s.hc_read_batch(&format!("blk.{l}.hc_attn"), true, rn_ready, m);
+                            s.delta_batch(l, m);
+                            s.hc_write_batch(Some(&format!("blk.{l}.hc_ffn_norm.weight")), m);
+                            s.hc_read_batch(&format!("blk.{l}.hc_ffn"), true, true, m);
+                            s.moe_router_batch(l, m);
+                            s.moe_batch_resident(l, m, &infos);
+                            s.hc_write_batch(next_ref, m);
+                        });
+                        self.cache.hits += (m * c.n_expert_used) as u64;
+                        wrote_hc = true;
+                        self.lt_point("delta full layer (graph)");
+                        heap_check("delta full layer (graph) queued");
+                    } else {
+                        // a DeltaNet layer up to its router is the same launches for every batch of m: one graph
+                        // the key holds where the batch buffers are (the graph's launches carry their addresses): the same row count at another address - a prompt that lent another stretch of the KV window - is another graph
+                        self.batch_graph_segment((l, rn_ready, m, on, self.rows, self.bb.r.ptr), |s| {
+                            s.hc_read_batch(&format!("blk.{l}.hc_attn"), true, rn_ready, m);
+                            s.delta_batch(l, m);
+                            s.hc_write_batch(Some(&format!("blk.{l}.hc_ffn_norm.weight")), m);
+                            s.hc_read_batch(&format!("blk.{l}.hc_ffn"), true, true, m);
+                            s.moe_router_batch(l, m);
+                        });
+                        self.lt_point(if graphs { "delta segment (graph)" } else { "delta segment" });
+                        heap_check("delta segment (graph) queued");
+                        self.moe_batch(l, m, &mut logs[s0..s0 + m], true, None);
+                        heap_check("moe_batch after a graph segment");
+                        self.lt_point("moe (router wait, fetch, experts)");
+                    }
                 } else {
                     heap_check("layer start (eager)");
                     self.hc_read_batch(&format!("blk.{l}.hc_attn"), true, rn_ready, m);
@@ -5674,16 +6362,11 @@ impl<'c, 'm> GpuSession<'c, 'm> {
                     self.lt_point("moe (router wait, fetch, experts)");
                 }
                 self.mark("batch: routed experts + combine");
-                let next = if l + 1 == c.ple_layer || (l + 1 == hi && hi < c.n_layer) {
-                    None // the PLE layer's input, or the end of this stage: the next layer norms the streams itself
-                } else if l + 1 < c.n_layer {
-                    Some(format!("blk.{}.hc_attn_norm.weight", l + 1))
-                } else {
-                    Some("output_hc_norm.weight".to_string())
-                };
-                self.hc_write_batch(next.as_deref(), m);
+                if !wrote_hc {
+                    self.hc_write_batch(next.as_deref(), m);
+                }
                 rn_ready = next.is_some();
-                if self.df_feat().is_some() && (!sub_mode || si + 1 == subs.len()) {
+                if self.df_feat().is_some() && self.df_feat_ok && (!sub_mode || si + 1 == subs.len()) {
                     // the drafter looks back 2,048 positions: the last sub-chunk's features are the ones kept
                     self.df_capture(l, self.bb.r.ptr, m);
                 }
@@ -5721,7 +6404,13 @@ impl<'c, 'm> GpuSession<'c, 'm> {
                     }
                 }
                 let feat_rows = m_obs.min(crate::dflash::DF_ROWS);
-                let src = HopSrc { ctx: self.ctx, runs, feat_ptr: self.tap_feat.as_ref().map(|b| b.ptr), feat_rows };
+                let src = self.hop_src_make(runs, feat_rows);
+                if self.defer_peer {
+                    self.ctx.bind().unwrap();
+                    let _ = unsafe { (self.ctx.api.cuStreamQuery)(std::ptr::null_mut()) };
+                    self.hop_src = Some(src);
+                    return vec![];
+                }
                 if let Some(p) = self.peer.as_mut().and_then(|p| if p.hop_ensure() { Some(p) } else { None }) {
                     if hop_time() {
                         hop_rows(m);
@@ -5736,6 +6425,7 @@ impl<'c, 'm> GpuSession<'c, 'm> {
                     p.logits_last = self.logits_last;
                     let logits = p.batch(toks, with_logits);
                     p.logits_last = false;
+                    self.stage_at.set(0);
                     return logits;
                 }
             }
@@ -5998,6 +6688,16 @@ impl<'c, 'm> GpuSession<'c, 'm> {
             .unwrap_or_else(|err| panic!("{name}: {err}"));
             return;
         }
+        if !entry.starts_with("matvec_cols_ref_") {
+            // SAFETY: as the loop below, with `blockIdx.y` stepping `x` / `y` in 8-token groups across all `m` tokens.
+            unsafe {
+                self.mvp.launch(&entry, ((rows as u32).div_ceil(cols_rows_per_block(&entry, rows)), (m as u32).div_ceil(COLS_MAX as u32), 1), (256, 1, 1), 0, self.ls(),
+                                &[Arg::Ptr(wptr), Arg::Ptr(x), Arg::U32(xs as u32), Arg::Ptr(y), Arg::U32(ys as u32),
+                                  Arg::U32(rows as u32), Arg::U32(t.dims[0] as u32), Arg::U32(m as u32)])
+            }
+            .unwrap_or_else(|err| panic!("{name}: {err}"));
+            return;
+        }
         for j0 in (0..m).step_by(COLS_MAX) {
             let (x, y, n) = (x + (j0 * xs * 4) as u64, y + (j0 * ys * 4) as u64, (m - j0).min(COLS_MAX));
             // SAFETY: `rows` whole rows of t.dims[0] weights at wptr; n inputs of t.dims[0] floats at x + j * xs and n
@@ -6202,9 +6902,8 @@ impl<'c, 'm> GpuSession<'c, 'm> {
                 Arg::U32(h as u32), Arg::F32(c.eps), Arg::U32(cs as u32)]);
             return;
         }
-        for j in 0..m {
-            self.hc_write_at(row(&bb.r, h * cs, j), row(&bb.g, cs, j), row(&bb.y, h, j));
-        }
+        self.k2("hc_write", ((h * cs) as u32).div_ceil(256), m as u32, 256, &[
+            Arg::Ptr(bb.r.ptr), Arg::Ptr(bb.g.ptr), Arg::Ptr(bb.y.ptr), Arg::U32(h as u32), Arg::U32(cs as u32)]);
     }
 
     fn delta_batch(&self, l: usize, m: usize) {
@@ -6548,6 +7247,7 @@ impl<'c, 'm> GpuSession<'c, 'm> {
         }
         self.upload_to(self.dp_eaddr.ptr, &eaddr);
         self.upload_to(self.dp_copied.ptr, &copied);
+        self.dp_copied_dirty = true;
         let (gt, rl) = (self.bb.gtab.ptr, self.bb.rl.ptr);
         let nrec = 2 * 3 * g * (1 + 2 * chunk_n);
         self.k1("zero_words", ne, &[Arg::Ptr(self.dp_cnt.ptr), Arg::U32(ne as u32)]);
@@ -6672,6 +7372,7 @@ impl<'c, 'm> GpuSession<'c, 'm> {
             self.upload_to(self.dp_eaddr.ptr, &eaddr);
             if !fused_only || any_res {
                 self.upload_to(self.dp_copied.ptr, &copied);
+                self.dp_copied_dirty = true;
             }
             if !fused_only {
                 self.upload_to(self.dp_lay.ptr, &lay.lay_words());
@@ -6820,12 +7521,120 @@ impl<'c, 'm> GpuSession<'c, 'm> {
         self.mv_cols(&format!("blk.{l}.ffn_down_shexp.weight"), bb.sa.ptr, sff, bb.so.ptr, h, m);
     }
 
+    fn resident_dev_plan_ok(&self, l: usize, m: usize, infos: &[TensorInfo]) -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let on = *ON.get_or_init(|| std::env::var("SHADOW_RESIDENT_DEVPLAN").map_or(true, |v| v != "0"));
+        on && self.tensor_prompt
+            && self.res_eaddr.get(l).and_then(|x| x.as_ref()).is_some()
+            && m >= 2 && m <= BIG_BATCH_MAX
+            && self.router_bias == 0.0 && self.cpu.is_none() && !self.pipe_active
+            && !self.accept_moe && self.route_log.is_none() && self.trace.is_none()
+            && std::env::var_os("SHADOW_RECORD_ROUTING").is_none()
+            && infos[0].ty == infos[1].ty && infos[0].dims == infos[1].dims
+            && (infos[0].ty.exl3().is_none() || exl3_groups_on())
+            && self.m.cfg.n_expert <= 512 && self.m.cfg.n_expert_used <= 16
+    }
+
+    fn clear_dp_copied_if_dirty(&mut self) {
+        if self.dp_copied_dirty {
+            let nw = self.m.cfg.n_expert.div_ceil(4);
+            self.k1("zero_words", nw, &[Arg::Ptr(self.dp_copied.ptr), Arg::U32(nw as u32)]);
+            self.dp_copied_dirty = false;
+        }
+    }
+
+    fn resident_chunk_n(&self, m: usize, infos: &[TensorInfo]) -> usize {
+        if m >= 64 && self.exl3_mma_experts(infos) {
+            64
+        } else if m >= 64 && self.mma_experts_ok(infos) {
+            mma_group()
+        } else {
+            8
+        }
+    }
+
+    fn moe_batch_resident(&self, l: usize, m: usize, infos: &[TensorInfo]) {
+        let c = &self.m.cfg;
+        let (h, k) = (c.hidden, c.n_expert_used);
+        let chunk_n = self.resident_chunk_n(m, infos);
+        self.shared_expert_batch(l, m);
+        let plan = self.dev_plan_resident(l, m, chunk_n);
+        self.routed_grouped(&plan, 0, 0, m, infos);
+        let bb = &self.bb;
+        self.k2("moe_combine_qwen_rows", (h as u32).div_ceil(256), m as u32, 256, &[
+            Arg::Ptr(row(&bb.y, h, 0)), Arg::Ptr(row(&bb.eo, k * h, 0)), Arg::Ptr(bb.gtab.ptr + plan.weights),
+            Arg::Ptr(row(&bb.so, h, 0)), Arg::Ptr(row(&bb.sgl, 1, 0)), Arg::Ptr(bb.gtab.ptr + plan.counts),
+            Arg::U32(h as u32), Arg::U32(k as u32)]);
+    }
+
+    fn dev_plan_resident(&self, l: usize, m: usize, chunk_n: usize) -> GroupedPlan {
+        let c = &self.m.cfg;
+        let (k, ne) = (c.n_expert_used, c.n_expert);
+        static SMALL_PLAN_ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let small_plan = m <= MAX_VERIFY && m * k <= 128 && chunk_n == 8
+            && !std::env::var("SHADOW_ROUTE_UNIFORM").is_ok_and(|v| v == "1")
+            && !std::env::var("SHADOW_ROUTE_1T").is_ok_and(|v| v == "1")
+            && *SMALL_PLAN_ON.get_or_init(|| !std::env::var("SHADOW_RES_SMALL_PLAN").is_ok_and(|v| v == "0"));
+        let g = if small_plan { m * k } else { (m * k).min(ne + (m * k).div_ceil(chunk_n)).max(1) };
+        let rec = 4 * (1 + 2 * chunk_n);
+        let a0 = 0usize;
+        let r0 = 3 * g * 8;
+        let w = r0 + 3 * g * rec;
+        let counts = w + m * k * 4;
+        assert!(counts + m * 4 <= self.bb.gtab.bytes, "resident device plan: {} bytes of tables for {} rows", counts + m * 4, m);
+        let eaddr_ptr = self.res_eaddr[l].as_ref().unwrap().ptr;
+        let (gt, rl) = (self.bb.gtab.ptr, self.bb.rl.ptr);
+        if small_plan {
+            if let Some(mask) = self.expert_mask_dev.as_ref() {
+                self.k1("add_mask_rows", m * ne, &[Arg::Ptr(rl), Arg::Ptr(mask.ptr + (l * ne * 4) as u64), Arg::U32(ne as u32), Arg::U32((m * ne) as u32)]);
+            }
+            self.k("route_plan_res_small", 1, 256, &[
+                Arg::Ptr(rl), Arg::Ptr(eaddr_ptr), Arg::Ptr(gt),
+                Arg::U32(ne as u32), Arg::U32(k as u32), Arg::U32(m as u32), Arg::U32(g as u32),
+                Arg::U32((self.rows * k) as u32), Arg::U32(a0 as u32), Arg::U32(r0 as u32),
+                Arg::U32(w as u32), Arg::U32(counts as u32),
+            ]);
+            return GroupedPlan { bytes: vec![], phase: [(g, a0 as u64, r0 as u64), (0, 0, 0)], weights: w as u64, counts: counts as u64, chunk_n: 8, max_group: m.min(4) };
+        }
+        let nrec = 3 * g * (1 + 2 * chunk_n);
+        self.k1("zero_words", ne, &[Arg::Ptr(self.dp_cnt.ptr), Arg::U32(ne as u32)]);
+        self.k1("zero_words", nrec, &[Arg::Ptr(gt + r0 as u64), Arg::U32(nrec as u32)]);
+        if let Some(mask) = self.expert_mask_dev.as_ref() {
+            self.k1("add_mask_rows", m * ne, &[Arg::Ptr(rl), Arg::Ptr(mask.ptr + (l * ne * 4) as u64), Arg::U32(ne as u32), Arg::U32((m * ne) as u32)]);
+        }
+        let route_args = [Arg::Ptr(rl), Arg::Ptr(self.dp_tidx.ptr), Arg::Ptr(gt + w as u64), Arg::Ptr(self.dp_cnt.ptr), Arg::U32(ne as u32), Arg::U32(k as u32), Arg::U32(m as u32)];
+        if std::env::var("SHADOW_ROUTE_UNIFORM").is_ok_and(|v| v == "1") {
+            self.k1("route_uniform_rows", m * k, &route_args);
+        } else if std::env::var("SHADOW_ROUTE_1T").is_ok_and(|v| v == "1") {
+            self.k1("route_topk_rows_1t", m, &route_args);
+        } else {
+            self.k("route_topk_rows", m.div_ceil(8) as u32, 256, &route_args);
+        }
+        self.k("plan_scan", 1, 1024, &[Arg::Ptr(self.dp_cnt.ptr), Arg::Ptr(self.dp_copied.ptr), Arg::Ptr(self.dp_gstart.ptr), Arg::U32(ne as u32), Arg::U32(chunk_n as u32)]);
+        self.k("plan_fill", ne as u32, 256, &[Arg::Ptr(self.dp_tidx.ptr), Arg::Ptr(self.dp_cnt.ptr), Arg::Ptr(self.dp_gstart.ptr), Arg::Ptr(self.dp_copied.ptr), Arg::Ptr(eaddr_ptr),
+                                              Arg::Ptr(gt), Arg::U32(ne as u32), Arg::U32(k as u32), Arg::U32(m as u32), Arg::U32(g as u32), Arg::U32((self.rows * k) as u32),
+                                              Arg::U32(a0 as u32), Arg::U32(a0 as u32), Arg::U32(r0 as u32), Arg::U32(r0 as u32), Arg::U32(chunk_n as u32)]);
+        self.k1("fill_words", m, &[Arg::Ptr(gt + counts as u64), Arg::U32(m as u32), Arg::U32(k as u32)]);
+        GroupedPlan { bytes: vec![], phase: [(g, a0 as u64, r0 as u64), (0, 0, 0)], weights: w as u64, counts: counts as u64, chunk_n, max_group: m.min(chunk_n) }
+    }
+
     fn moe_batch(&mut self, l: usize, m: usize, logs: &mut [Vec<u16>], router_done: bool, ticket: Option<usize>) {
         let c = &self.m.cfg;
         let p = format!("blk.{l}");
         let (h, sff, k, ne) = (c.hidden, c.shared_ff, c.n_expert_used, c.n_expert);
         if !router_done {
             self.moe_router_batch(l, m);
+        }
+        if self.res_eaddr[l].is_some() {
+            let names = [format!("{p}.ffn_gate_exps.weight"), format!("{p}.ffn_up_exps.weight"), format!("{p}.ffn_down_exps.weight")];
+            let infos: Vec<TensorInfo> = names.iter().map(|n| self.expert_info(n)).collect();
+            if self.resident_dev_plan_ok(l, m, &infos) {
+                self.clear_dp_copied_if_dirty();
+                self.moe_batch_resident(l, m, &infos);
+                self.cache.hits += (m * k) as u64;
+                let _ = (logs, ticket, sff);
+                return;
+            }
         }
         if self.devplan && self.sp.is_some() && m > MAX_VERIFY {
             let names = [format!("{p}.ffn_gate_exps.weight"), format!("{p}.ffn_up_exps.weight"), format!("{p}.ffn_down_exps.weight")];
@@ -6902,6 +7711,9 @@ impl<'c, 'm> GpuSession<'c, 'm> {
         let t_routed0 = t_woke.elapsed();
         let mut tops: Vec<Vec<(usize, f64)>> = route_all(&logits, k, if self.router_bias != 0.0 { Some((&self.cache.map, l, self.router_bias)) } else { None });
         vt_lap(&mut vt, 2);
+        if self.accept_moe && self.replay.on.get() && m >= 2 {
+            self.accept_route(l, &logits, &mut tops);
+        }
         for (j, top) in tops.iter().enumerate() {
             for &(e, _) in top {
                 self.routing.add(l, e);
@@ -6910,9 +7722,6 @@ impl<'c, 'm> GpuSession<'c, 'm> {
                 logs[j].push(l as u16);
                 logs[j].extend(top.iter().map(|&(e, _)| e as u16));
             }
-        }
-        if self.accept_moe && self.replay.on.get() && m >= 2 {
-            self.accept_route(l, &logits, &mut tops);
         }
         if self.verify_resident && !self.accept_moe && self.replay.on.get() {
             // a verify pass: the drafted positions keep only their resident experts
@@ -6928,17 +7737,33 @@ impl<'c, 'm> GpuSession<'c, 'm> {
         }
         if self.tail_skip > 0 && m <= MAX_VERIFY {
             // --tail-skip over the whole pass: an expert not in VRAM that every token routes only at rank >= R
-            let mut low: HashMap<usize, bool> = HashMap::new();
-            for top in &tops {
-                for (i, &(e, _)) in top.iter().enumerate() {
-                    let tail = low.entry(e).or_insert(true);
-                    *tail &= i >= self.tail_skip;
+            if ne <= 512 {
+                let mut has_head = [0u64; 8];
+                for top in &tops {
+                    for (i, &(e, _)) in top.iter().enumerate() {
+                        if i < self.tail_skip {
+                            has_head[e >> 6] |= 1u64 << (e & 63);
+                        }
+                    }
                 }
-            }
-            for top in tops.iter_mut() {
-                let before = top.len();
-                top.retain(|&(e, _)| !low[&e] || self.cache.map.contains_key(&(l, e)));
-                self.tail_skipped += (before - top.len()) as u64;
+                for top in tops.iter_mut() {
+                    let before = top.len();
+                    top.retain(|&(e, _)| (has_head[e >> 6] >> (e & 63)) & 1 == 1 || self.cache.map.contains_key(&(l, e)));
+                    self.tail_skipped += (before - top.len()) as u64;
+                }
+            } else {
+                let mut low: HashMap<usize, bool> = HashMap::new();
+                for top in &tops {
+                    for (i, &(e, _)) in top.iter().enumerate() {
+                        let tail = low.entry(e).or_insert(true);
+                        *tail &= i >= self.tail_skip;
+                    }
+                }
+                for top in tops.iter_mut() {
+                    let before = top.len();
+                    top.retain(|&(e, _)| !low[&e] || self.cache.map.contains_key(&(l, e)));
+                    self.tail_skipped += (before - top.len()) as u64;
+                }
             }
         }
         vt_lap(&mut vt, 3);
@@ -7004,17 +7829,19 @@ impl<'c, 'm> GpuSession<'c, 'm> {
                 cand.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap().then(a.1.cmp(&b.1)));
                 cand.truncate(max);
                 if !cand.is_empty() {
-                    let mut toks: Vec<usize> = cand.iter().map(|c| c.2).collect();
-                    toks.sort_unstable();
-                    toks.dedup();
-                    let xs: Vec<f32> = toks.iter().flat_map(|&j| ub[j * h..(j + 1) * h].iter().copied()).collect();
-                    let xidx: Vec<usize> = cand.iter().map(|c| toks.iter().position(|&j| j == c.2).unwrap()).collect();
-                    let base = self.ram.region.as_ref().unwrap().as_slice().as_ptr();
+                    let toks: Vec<usize> = cand.iter().map(|c| c.2).collect();
+                    let mut uniq_toks = toks;
+                    uniq_toks.sort_unstable();
+                    uniq_toks.dedup();
+                    let xs: Vec<f32> = uniq_toks.iter().flat_map(|&j| ub[j * h..(j + 1) * h].iter().copied()).collect();
+                    let xidx: Vec<usize> = cand.iter().map(|c| uniq_toks.iter().position(|&j| j == c.2).unwrap()).collect();
+                    let region = self.ram.region.as_ref().unwrap();
                     let refs: Vec<shadow_model::cpu_expert::ExpertRef> = cand.iter().map(|c| {
+                        let base = region.slice(c.4, sizes[0] + sizes[1] + sizes[2]).as_ptr();
                         // SAFETY: the RAM tier holds this expert's [gate | up | down] at its offset, inside the region.
                         unsafe {
-                            shadow_model::cpu_expert::ExpertRef { gate: base.add(c.4), up: base.add(c.4 + sizes[0]),
-                                                                  down: base.add(c.4 + sizes[0] + sizes[1]) }
+                            shadow_model::cpu_expert::ExpertRef { gate: base, up: base.add(sizes[0]),
+                                                                  down: base.add(sizes[0] + sizes[1]) }
                         }
                     }).collect();
                     for c in &cand {
@@ -7575,6 +8402,9 @@ impl<'c, 'm> GpuSession<'c, 'm> {
         self.k2(rn_rows, groups, m as u32, 256, &[Arg::Ptr(bb.r.ptr), Arg::Ptr(self.sv(&format!("{p}.ple_norm_query.weight"))), Arg::Ptr(b_qry), Arg::U32(h as u32), Arg::F32(c.eps), Arg::U32(cs as u32)]);
         self.k2("ple_gate_rows_f", cs as u32, m as u32, 256, &[Arg::Ptr(a_key), Arg::Ptr(b_qry), Arg::Ptr(u_val), Arg::Ptr(c_gv), Arg::U32(h as u32), Arg::U32(ch as u32)]);
         self.k2(rn_rows, groups, m as u32, 256, &[Arg::Ptr(c_gv), Arg::Ptr(self.sv(&format!("{p}.ple_norm_conv.weight"))), Arg::Ptr(d_gvn), Arg::U32(h as u32), Arg::F32(c.eps), Arg::U32(cs as u32)]);
+        if self.replay.on.get() {
+            self.k1("copy", m * ch, &[Arg::Ptr(self.replay.ple.ptr), Arg::Ptr(d_gvn), Arg::U32((m * ch) as u32)]);
+        }
         let (k, dil) = (c.ple_conv_k as u32, c.ple_ngram as u32);
         self.k2("ple_conv_rows_f", (ch as u32).div_ceil(256), m as u32, 256, &[Arg::Ptr(d_gvn), Arg::Ptr(self.ple_state.ptr), Arg::Ptr(self.sv(&format!("{p}.ple_conv1d.weight"))),
                                                                           Arg::Ptr(c_gv), Arg::Ptr(bb.r.ptr), Arg::U32(ch as u32), Arg::U32(k), Arg::U32(dil)]);
@@ -7654,15 +8484,17 @@ impl Stepper for GpuSession<'_, '_> {
     }
     fn report(&self) -> String {
         let (slots, bytes, hits, misses) = self.cache_stats();
-        let arena_gib = self.cache.arena_bytes as f64 / (1u64 << 30) as f64;
-        let avg_mib = if slots > 0 { (self.cache.arena_bytes as f64 / slots as f64) / (1u64 << 20) as f64 } else { bytes as f64 / (1u64 << 20) as f64 };
+        let (ram_exp, ram_bytes, ram_serv, file_serv) = self.ram_tier_stats();
+        let arena_bytes = self.cache.arena_bytes + self.peer.as_ref().map_or(0, |p| p.cache.arena_bytes);
+        let arena_gib = arena_bytes as f64 / (1u64 << 30) as f64;
+        let avg_mib = if slots > 0 { (arena_bytes as f64 / slots as f64) / (1u64 << 20) as f64 } else { bytes as f64 / (1u64 << 20) as f64 };
+        let fill_secs = self.ram.fill_secs + self.peer.as_ref().map_or(0.0, |p| p.ram.fill_secs);
         format!("expert cache: {slots} slots x {avg_mib:.2} MiB = {arena_gib:.2} GiB; {hits} hits, {misses} misses ({:.1}% hits); {} slice uploads",
-                100.0 * hits as f64 / (hits + misses).max(1) as f64, self.expert_uploads)
-            + &(if std::env::var("SHADOW_VRAM_MAP").is_ok() { format!("; vram free now {} MiB", self.ctx.mem_info().map_or(0, |x| x.0 >> 20)) } else { String::new() })
+                100.0 * hits as f64 / (hits + misses).max(1) as f64, self.expert_uploads + self.peer.as_ref().map_or(0, |p| p.expert_uploads))
+            + &(if std::env::var("SHADOW_VRAM_MAP").is_ok() { format!("; vram free now {} MiB", self.mem_info().0 >> 20) } else { String::new() })
             + &(if self.cache.admit_after > 0 { format!("; admit-after {}: {} misses kept out of the cache", self.cache.admit_after, self.cache.scratch_reads) } else { String::new() })
-            + &format!("; RAM tier: {} experts, {:.2} GiB pinned (filled in {:.1} s), misses served {} from RAM, {} from the file",
-                       self.ram.at.len(), self.ram.region.as_ref().map_or(0, |r| r.len()) as f64 / (1u64 << 30) as f64,
-                       self.ram.fill_secs, self.ram.served, self.ram.drive)
+            + &format!("; RAM tier: {ram_exp} experts, {:.2} GiB pinned (filled in {:.1} s), misses served {ram_serv} from RAM, {file_serv} from the file",
+                       ram_bytes as f64 / (1u64 << 30) as f64, fill_secs)
             + &self.cpu.as_ref().map(|c| format!("; CPU experts: up to {} per layer, {} computed", c.1, self.cpu_served))
                 .unwrap_or_default()
             + &(if self.pipeline { format!("; pipelined verify passes: {}", self.pipelined_passes) } else { String::new() })

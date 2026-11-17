@@ -76,22 +76,26 @@ impl<'c, 'm> GpuSession<'c, 'm> {
     }
 
     /// The taps below layer `hi`: they are the first slots of a feature row.
-    fn taps_below(hi: usize) -> usize {
+    pub(super) fn taps_below(hi: usize) -> usize {
         TAPS.iter().filter(|&&t| t < hi).count()
+    }
+
+    /// Packed row width (floats) for `tap_feat`: only the taps below this stage's upper boundary.
+    pub(super) fn tap_feat_width(&self) -> usize {
+        Self::taps_below(self.layers.1) * HIDDEN
     }
 
     /// A first stage handing on: the first `rows` feature rows' slots for the taps in its layers, row after row (`taps x HIDDEN` floats a row); `None` without a
     /// drafter on the next stage.
     pub(super) fn tap_feats_out(&self, rows: usize) -> Option<Vec<f32>> {
         let buf = self.tap_feat.as_ref()?;
-        let w = Self::taps_below(self.layers.1) * HIDDEN;
-        let mut out = Vec::with_capacity(rows * w);
-        let mut bytes = vec![0u8; w * 4];
-        for j in 0..rows {
-            self.download(buf.ptr + (j * NFEAT * 4) as u64, &mut bytes);
-            out.extend(super::floats(&bytes));
+        let w = self.tap_feat_width();
+        if rows == 0 || w == 0 {
+            return Some(Vec::new());
         }
-        Some(out)
+        let mut bytes = vec![0u8; rows * w * 4];
+        self.download(buf.ptr, &mut bytes);
+        Some(super::floats(&bytes))
     }
 
     /// The drafter's stage, at the start of a pass: the first stage's feature rows (`tap_feats_out`) into the first slots of its feature rows.  `own_rows` = the
@@ -118,15 +122,16 @@ impl<'c, 'm> GpuSession<'c, 'm> {
     pub(super) fn df_capture(&self, l: usize, r: u64, m: usize) {
         let Some(slot) = TAPS.iter().position(|&t| t == l) else { return };
         let c = &self.m.cfg;
+        let stride = if self.dflash.is_some() { NFEAT } else { self.tap_feat_width() };
         // a pipelined group writes its rows of the feature buffer, not the first ones
-        let feat = self.df_feat().unwrap() + (self.row_shift * NFEAT * 4) as u64;
+        let feat = self.df_feat().unwrap() + (self.row_shift * stride * 4) as u64;
         // a pass of more rows than the buffers hold: the last ones (the drafter looks back WINDOW positions, `dflash_observe` takes the same)
         let skip = m.saturating_sub(DF_ROWS);
         let r = r + (skip * c.streams * c.hidden * 4) as u64;
         let m = m - skip;
         self.k2("df_capture", (c.hidden as u32).div_ceil(256), m as u32, 256,
                 &[Arg::Ptr(r), Arg::Ptr(feat), Arg::U32(slot as u32), Arg::U32(c.hidden as u32), Arg::U32(c.streams as u32),
-                  Arg::U32(NFEAT as u32)]);
+                  Arg::U32(stride as u32)]);
     }
 
     /// K and V of the m positions p0 .. p0 + m in layer i from the context rows `ctxh`, into the rings.
@@ -136,22 +141,32 @@ impl<'c, 'm> GpuSession<'c, 'm> {
         let p = format!("layers.{i}.self_attn");
         self.df_mv(&format!("{p}.k_proj.weight"), src, HIDDEN, b.kp.ptr, KV_WIDTH, m);
         self.df_mv(&format!("{p}.v_proj.weight"), src, HIDDEN, b.vp.ptr, KV_WIDTH, m);
-        self.df_kv_finish(i, pos0, m);
+        self.df_kv_finish(i, pos0, m, None);
     }
 
     /// K normed and roped, K and V put in layer i's rings, from b.kp / b.vp (m rows).
-    fn df_kv_finish(&self, i: usize, pos0: usize, m: usize) {
+    /// When `pos_ptr` is `Some(meta)`, `df_rope_p` / `df_ring_put_p` read `pos0 = meta[0]` on GPU (graphable).
+    fn df_kv_finish(&self, i: usize, pos0: usize, m: usize, pos_ptr: Option<u64>) {
         let df = self.dflash.as_ref().unwrap();
         let b = &df.bufs;
         let p = format!("layers.{i}.self_attn");
         self.k("df_rmsnorm", (m * N_HEAD_KV) as u32, 256,
                &[Arg::Ptr(b.kp.ptr), Arg::Ptr(df.ptr(&format!("{p}.k_norm.weight"))), Arg::Ptr(b.kp.ptr), Arg::U32(HEAD_DIM as u32),
                  Arg::F32(EPS)]);
-        self.k2("df_rope", N_HEAD_KV as u32, m as u32, 64, &[Arg::Ptr(b.kp.ptr), Arg::U32(pos0 as u32), Arg::U32(KV_WIDTH as u32),
-                                                             Arg::F32(ROPE_THETA)]);
-        for (src, ring) in [(b.kp.ptr, df.kring[i].ptr), (b.vp.ptr, df.vring[i].ptr)] {
-            self.k2("df_ring_put", (KV_WIDTH as u32).div_ceil(256), m as u32, 256,
-                    &[Arg::Ptr(src), Arg::Ptr(ring), Arg::U32(pos0 as u32), Arg::U32(RING as u32), Arg::U32(KV_WIDTH as u32)]);
+        if let Some(pp) = pos_ptr {
+            self.k2("df_rope_p", N_HEAD_KV as u32, m as u32, 64,
+                    &[Arg::Ptr(b.kp.ptr), Arg::Ptr(pp), Arg::U32(KV_WIDTH as u32), Arg::F32(ROPE_THETA)]);
+            for (src, ring) in [(b.kp.ptr, df.kring[i].ptr), (b.vp.ptr, df.vring[i].ptr)] {
+                self.k2("df_ring_put_p", (KV_WIDTH as u32).div_ceil(256), m as u32, 256,
+                        &[Arg::Ptr(src), Arg::Ptr(ring), Arg::Ptr(pp), Arg::U32(RING as u32), Arg::U32(KV_WIDTH as u32)]);
+            }
+        } else {
+            self.k2("df_rope", N_HEAD_KV as u32, m as u32, 64, &[Arg::Ptr(b.kp.ptr), Arg::U32(pos0 as u32), Arg::U32(KV_WIDTH as u32),
+                                                                 Arg::F32(ROPE_THETA)]);
+            for (src, ring) in [(b.kp.ptr, df.kring[i].ptr), (b.vp.ptr, df.vring[i].ptr)] {
+                self.k2("df_ring_put", (KV_WIDTH as u32).div_ceil(256), m as u32, 256,
+                        &[Arg::Ptr(src), Arg::Ptr(ring), Arg::U32(pos0 as u32), Arg::U32(RING as u32), Arg::U32(KV_WIDTH as u32)]);
+            }
         }
     }
 
@@ -242,42 +257,9 @@ impl<'c, 'm> GpuSession<'c, 'm> {
         x
     }
 
-    /// Up to k (at most BLOCK - 1) drafts for the tokens after `next` (the token about to be stepped, which follows the
-    /// session's last position): the block (`next`, then mask tokens) through the drafter's layers against the K/V of
-    /// everything before it, 16 candidates a slot from the main model's head, and the selector's best path.  Empty
-    /// without features for every position so far.
-    pub fn dflash_draft(&mut self, next: u32, k: usize, min_p: f32) -> Vec<u32> {
-        // a pair: the drafter is on the second stage, which holds the same tokens
-        if let Some(p) = self.peer.as_mut() {
-            return p.dflash_draft(next, k, min_p);
-        }
-        let n = self.tokens.len();
-        let Some(df) = self.dflash.as_ref() else { return vec![] };
-        let k = k.min(BLOCK - 1).min(self.cap.saturating_sub(n + 1));
-        if k == 0 || n == 0 || df.valid < n || df.broken {
-            return vec![];
-        }
-        if self.dflash.as_ref().unwrap().mask_emb.is_none() {
-            let e = self.df_embed(MASK_TOKEN);
-            self.dflash.as_mut().unwrap().mask_emb = Some(e);
-        }
+    fn df_draft_kernels(&self, n: usize, lo: usize, next: u32, slots: usize, pos_ptr: Option<u64>, mut lap: impl FnMut(&'static str)) {
         let df = self.dflash.as_ref().unwrap();
-        let mut emb = self.df_embed(next);
-        for _ in 1..BLOCK {
-            emb.extend_from_slice(df.mask_emb.as_ref().unwrap());
-        }
         let b = &df.bufs;
-        let prof = df.prof.is_some();
-        let mut laps: Vec<(&'static str, f64)> = vec![];
-        let mut t0 = std::time::Instant::now();
-        let mut lap = |name: &'static str| {
-            if prof {
-                self.ctx.synchronize().unwrap();
-                laps.push((name, t0.elapsed().as_secs_f64()));
-                t0 = std::time::Instant::now();
-            }
-        };
-        self.upload_to(b.emb.ptr, &super::f32s(&emb));
         let (h, nb) = (HIDDEN as u32, BLOCK as u32);
         let w = |name: &str| Arg::Ptr(df.ptr(name));
         let f = |x: u64| Arg::Ptr(x);
@@ -304,16 +286,27 @@ impl<'c, 'm> GpuSession<'c, 'm> {
             self.df_mv(&format!("{p}.v_proj.weight"), b.xc.ptr, HIDDEN, b.vp.ptr, KV_WIDTH, BLOCK);
             self.k("df_rmsnorm", (BLOCK * N_HEAD) as u32, 256, &[f(b.q.ptr), w(&format!("{p}.q_norm.weight")), f(b.q.ptr),
                                                                  Arg::U32(HEAD_DIM as u32), Arg::F32(EPS)]);
-            self.k2("df_rope", N_HEAD as u32, nb, 64, &[f(b.q.ptr), Arg::U32(n as u32), Arg::U32((N_HEAD * HEAD_DIM) as u32),
-                                                        Arg::F32(ROPE_THETA)]);
-            self.df_kv_finish(i, n, BLOCK);
+            if let Some(pp) = pos_ptr {
+                self.k2("df_rope_p", N_HEAD as u32, nb, 64, &[f(b.q.ptr), Arg::Ptr(pp), Arg::U32((N_HEAD * HEAD_DIM) as u32),
+                                                              Arg::F32(ROPE_THETA)]);
+            } else {
+                self.k2("df_rope", N_HEAD as u32, nb, 64, &[f(b.q.ptr), Arg::U32(n as u32), Arg::U32((N_HEAD * HEAD_DIM) as u32),
+                                                            Arg::F32(ROPE_THETA)]);
+            }
+            self.df_kv_finish(i, n, BLOCK, pos_ptr);
             lap("layer: qkv, norms, rope");
             // SAFETY: q is BLOCK x 4096 floats, the rings RING x 1024, ao BLOCK x 4096; the kernel reads slots
             // (lo + j) % RING for the window and the block, all written (context rows and this block's).
             unsafe {
-                self.fw.launch("df_attention", (N_HEAD as u32, nb, 1), (128, 1, 1), ((WINDOW + BLOCK) * 4) as u32, self.ls(), &[
-                    f(b.q.ptr), f(df.kring[i].ptr), f(df.vring[i].ptr), f(b.ao.ptr), Arg::U32(n as u32), Arg::U32(nb),
-                    Arg::U32(WINDOW as u32), Arg::U32(RING as u32), Arg::F32((HEAD_DIM as f32).powf(-0.5)), Arg::U32(df.lo.min(n) as u32)])
+                if let Some(pp) = pos_ptr {
+                    self.fw.launch("df_attention_p", (N_HEAD as u32, nb, 1), (128, 1, 1), ((WINDOW + BLOCK) * 4) as u32, self.ls(), &[
+                        f(b.q.ptr), f(df.kring[i].ptr), f(df.vring[i].ptr), f(b.ao.ptr), Arg::Ptr(pp), Arg::U32(nb),
+                        Arg::U32(WINDOW as u32), Arg::U32(RING as u32), Arg::F32((HEAD_DIM as f32).powf(-0.5))])
+                } else {
+                    self.fw.launch("df_attention", (N_HEAD as u32, nb, 1), (128, 1, 1), ((WINDOW + BLOCK) * 4) as u32, self.ls(), &[
+                        f(b.q.ptr), f(df.kring[i].ptr), f(df.vring[i].ptr), f(b.ao.ptr), Arg::U32(n as u32), Arg::U32(nb),
+                        Arg::U32(WINDOW as u32), Arg::U32(RING as u32), Arg::F32((HEAD_DIM as f32).powf(-0.5)), Arg::U32(lo as u32)])
+                }
             }
             .unwrap_or_else(|err| panic!("df_attention: {err}"));
             lap("layer: attention");
@@ -333,45 +326,124 @@ impl<'c, 'm> GpuSession<'c, 'm> {
             lap("layer: mlp + convs");
         }
         self.k("df_add_rmsnorm", nb, 256, &[tp[0], tp[1], w("norm.weight"), f(b.hid.ptr), Arg::U32(h), Arg::F32(EPS)]);
-        // slots 1 .. BLOCK - 1 predict the tokens after the anchor: the main model's head, 16 candidates each, the walk
-        let slots = BLOCK - 1;
+        // slots 1 .. slots predict the tokens after the anchor: the main model's head, 16 candidates each, the walk
         let vocab = self.m.cfg.vocab;
         lap("final norm");
         let hid1 = row(&b.hid, HIDDEN, 1);
         match df.draft_ids.as_ref() {
             // the draft vocabulary's rows only, every row decoded once for all the slots
-            Some((ids, n)) => {
+            Some((ids, nv)) => {
                 let (t_out, _) = self.m.dense_meta("output.weight");
                 let head_ty = t_out.ty.name().to_lowercase();
-                // SAFETY: n rows named by ids (all < vocab) of the head as stored; hid1 holds `slots` rows of HIDDEN floats,
-                // logits slots x n floats (n <= vocab).
+                // SAFETY: nv rows named by ids (all < vocab) of the head as stored; hid1 holds `slots` rows of HIDDEN floats,
+                // logits slots x nv floats (nv <= vocab).
                 unsafe {
-                    self.mvp.launch(&format!("matvec_ids_cols_{head_ty}"), ((*n as u32).div_ceil(8), 1, 1), (256, 1, 1), 0, self.ls(),
+                    self.mvp.launch(&format!("matvec_ids_cols_{head_ty}"), ((*nv as u32).div_ceil(8), 1, 1), (256, 1, 1), 0, self.ls(),
                                     &[Arg::Ptr(self.w["output.weight"].ptr), Arg::Ptr(ids.ptr), Arg::Ptr(hid1), Arg::U32(HIDDEN as u32),
-                                      Arg::Ptr(self.bb.logits.ptr), Arg::U32(*n as u32), Arg::U32(*n as u32),
+                                      Arg::Ptr(self.bb.logits.ptr), Arg::U32(*nv as u32), Arg::U32(*nv as u32),
                                       Arg::U32(t_out.dims[0] as u32), Arg::U32(slots as u32)])
                 }
                 .unwrap_or_else(|err| panic!("dflash head: {err}"));
                 lap("head (draft vocabulary)");
-                self.k("df_top16", slots as u32, 256, &[f(self.bb.logits.ptr), Arg::U32(*n as u32), Arg::U32(*n as u32), f(ids.ptr),
+                self.k("df_top16", slots as u32, 256, &[f(self.bb.logits.ptr), Arg::U32(*nv as u32), Arg::U32(*nv as u32), f(ids.ptr),
                                                         f(b.cand.ptr), f(b.unary.ptr)]);
             }
             None => {
                 self.mv_cols("output.weight", hid1, HIDDEN, self.bb.logits.ptr, vocab, slots);
-                lap("head (output.weight x 7)");
+                lap("head (output.weight x slots)");
                 self.k("df_top16", slots as u32, 256, &[f(self.bb.logits.ptr), Arg::U32(vocab as u32), Arg::U32(vocab as u32), Arg::Ptr(0),
                                                         f(b.cand.ptr), f(b.unary.ptr)]);
             }
         }
         lap("top16");
         self.df_mv("candidate_selector.hidden_projection.weight", hid1, HIDDEN, b.hp.ptr, RANK, slots);
-        self.k("df_walk", 1, 512, &[f(b.cand.ptr), f(b.unary.ptr), f(b.hp.ptr), w("candidate_selector.predecessor_codebook"),
-                                    w("candidate_selector.successor_codebook"), Arg::U32(next), Arg::U32(slots as u32),
-                                    Arg::U32(RANK as u32), f(b.out.ptr)]);
+        if let Some(pp) = pos_ptr {
+            self.k("df_walk_p", 1, 512, &[f(b.cand.ptr), f(b.unary.ptr), f(b.hp.ptr), w("candidate_selector.predecessor_codebook"),
+                                          w("candidate_selector.successor_codebook"), Arg::Ptr(pp), Arg::U32(slots as u32),
+                                          Arg::U32(RANK as u32), f(b.out.ptr)]);
+        } else {
+            self.k("df_walk", 1, 512, &[f(b.cand.ptr), f(b.unary.ptr), f(b.hp.ptr), w("candidate_selector.predecessor_codebook"),
+                                        w("candidate_selector.successor_codebook"), Arg::U32(next), Arg::U32(slots as u32),
+                                        Arg::U32(RANK as u32), f(b.out.ptr)]);
+        }
         lap("hidden_projection + walk");
+    }
+
+    /// Up to k (at most BLOCK - 1) drafts for the tokens after `next` (the token about to be stepped, which follows the
+    /// session's last position): the block (`next`, then mask tokens) through the drafter's layers against the K/V of
+    /// everything before it, 16 candidates a slot from the main model's head, and the selector's best path.  Empty
+    /// without features for every position so far.
+    pub fn dflash_draft(&mut self, next: u32, k: usize, min_p: f32) -> Vec<u32> {
+        // a pair: the drafter is on the second stage, which holds the same tokens
+        if let Some(p) = self.peer.as_mut() {
+            return p.dflash_draft(next, k, min_p);
+        }
+        let n = self.tokens.len();
+        let Some(df) = self.dflash.as_ref() else { return vec![] };
+        let k = k.min(BLOCK - 1).min(self.cap.saturating_sub(n + 1));
+        if k == 0 || n == 0 || df.valid < n || df.broken {
+            return vec![];
+        }
+        if self.dflash.as_ref().unwrap().mask_emb.is_none() {
+            let e = self.df_embed(MASK_TOKEN);
+            self.dflash.as_mut().unwrap().mask_emb = Some(e);
+        }
+        if !self.dflash.as_ref().unwrap().mask_uploaded {
+            let (emb_ptr, rest) = {
+                let df = self.dflash.as_ref().unwrap();
+                let me = df.mask_emb.as_ref().unwrap();
+                let mut rest = Vec::with_capacity((BLOCK - 1) * HIDDEN);
+                for _ in 1..BLOCK {
+                    rest.extend_from_slice(me);
+                }
+                (df.bufs.emb.ptr, rest)
+            };
+            self.upload_to(emb_ptr + (HIDDEN * 4) as u64, &super::f32s(&rest));
+            self.dflash.as_mut().unwrap().mask_uploaded = true;
+        }
+        let emb0 = self.df_embed(next);
+        let prof = self.dflash.as_ref().unwrap().prof.is_some();
+        let dump_drafts = std::env::var("SHADOW_DF_DUMP").is_ok() && std::env::var("SHADOW_DF_DUMP_DRAFTS").is_ok_and(|v| v == "1");
+        let full_slots = prof || dump_drafts || std::env::var("SHADOW_DF_FULL_SLOTS").is_ok_and(|v| v == "1");
+        let slots = if full_slots { BLOCK - 1 } else { k };
+        let use_graph = !prof && !dump_drafts && !std::env::var("SHADOW_DF_GRAPH").is_ok_and(|v| v == "0");
+        let mut laps: Vec<(&'static str, f64)> = vec![];
+        let mut t0 = std::time::Instant::now();
+        let (emb_ptr, pos_ptr, out_ptr, lo) = {
+            let df = self.dflash.as_ref().unwrap();
+            (df.bufs.emb.ptr, df.bufs.pos.ptr, df.bufs.out.ptr, df.lo.min(n))
+        };
+        self.upload_to(emb_ptr, &super::f32s(&emb0));
+        if use_graph {
+            let meta = [n as u32, lo as u32, next, 0u32];
+            let meta_bytes: [u8; 16] = unsafe { std::mem::transmute(meta) };
+            self.upload_to(pos_ptr, &meta_bytes);
+            let key = (slots, self.bb.logits.ptr);
+            if !self.dflash.as_ref().unwrap().graphs.contains_key(&key) {
+                self.gstream.begin_capture().unwrap();
+                self.capturing.set(true);
+                self.df_draft_kernels(n, lo, next, slots, Some(pos_ptr), |_| {});
+                self.capturing.set(false);
+                let g = self.gstream.end_capture().unwrap_or_else(|e| panic!("dflash graph capture ({slots}): {e}"));
+                self.dflash.as_mut().unwrap().graphs.insert(key, g);
+            }
+            self.dflash.as_ref().unwrap().graphs[&key].launch(&self.gstream).unwrap();
+            self.mmq_y_tag.set((0, 0, 0, 0, 0));
+        } else {
+            let mut lap = |name: &'static str| {
+                if prof {
+                    self.ctx.synchronize().unwrap();
+                    laps.push((name, t0.elapsed().as_secs_f64()));
+                    t0 = std::time::Instant::now();
+                }
+            };
+            self.df_draft_kernels(n, lo, next, slots, None, &mut lap);
+        }
         let mut out = vec![0u8; 2 * slots * 4];
-        self.download(b.out.ptr, &mut out);
-        lap("download");
+        self.download(out_ptr, &mut out);
+        if prof {
+            laps.push(("download", t0.elapsed().as_secs_f64()));
+        }
         let words: Vec<u32> = out.chunks(4).map(|c| u32::from_le_bytes(c.try_into().unwrap())).collect();
         // the chain stops after a draft the selector is less sure of than min_p (that draft is kept)
         let mut toks = Vec::with_capacity(k);

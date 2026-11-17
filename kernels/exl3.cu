@@ -218,7 +218,7 @@ static __device__ __forceinline__ void exl3_mv2(const u8* w, const float* x, flo
 // part[(y 8 + j) rows + ...] instead of rotating them; `exl3_splitk_combine` adds the nsplit partials in order and rotates (for the shapes with few output blocks)
 template <int KB, int M, int KS, bool G, bool SK = false>
 static __device__ __forceinline__ void exl3_mvc2(const u8* w, const float* x, u32 xs, float* y, u32 ys, u32 rows, u32 cols, u32 m, const u32* gi) {
-    if (G) m = gi[0]; // a routed expert's group: n <= 8 inputs at x + gi[1 + j] xs, outputs at y + gi[9 + j] ys
+    if (G) { m = gi[0]; if (m == 0) return; } // a routed expert's group: n <= 8 inputs at x + gi[1 + j] xs, outputs at y + gi[9 + j] ys
     __shared__ float sxs[KS][M][128];
     __shared__ float red[KS][M][128];
     const u32 ob = blockIdx.x;

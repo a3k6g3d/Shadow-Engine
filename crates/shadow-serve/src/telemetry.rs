@@ -76,6 +76,7 @@ pub struct NvmlUtilization {
 }
 
 pub struct NvmlGpu {
+    index: u32,
     device: *mut std::ffi::c_void,
     get_utilization:
         Option<unsafe extern "C" fn(*mut std::ffi::c_void, *mut NvmlUtilization) -> i32>,
@@ -84,7 +85,7 @@ pub struct NvmlGpu {
     get_memory: Option<unsafe extern "C" fn(*mut std::ffi::c_void, *mut [u64; 3]) -> i32>,
     get_name:
         Option<unsafe extern "C" fn(*mut std::ffi::c_void, *mut std::ffi::c_char, u32) -> i32>,
-    _dylib: Option<shadow_cuda::dylib::Dylib>,
+    _dylib: Option<std::sync::Arc<shadow_cuda::dylib::Dylib>>,
 }
 
 unsafe impl Send for NvmlGpu {}
@@ -97,13 +98,35 @@ impl Default for NvmlGpu {
 }
 
 impl NvmlGpu {
+    fn empty() -> Self {
+        Self {
+            index: 0,
+            device: std::ptr::null_mut(),
+            get_utilization: None,
+            get_temperature: None,
+            get_memory: None,
+            get_name: None,
+            _dylib: None,
+        }
+    }
+
     pub fn new() -> Self {
+        Self::all().into_iter().next().unwrap_or_else(Self::empty)
+    }
+
+    /// Opens all NVML GPUs visible on this system.
+    pub fn all() -> Vec<Self> {
         #[cfg(windows)]
         {
             if let Ok(lib) = shadow_cuda::dylib::Dylib::open(std::path::Path::new("nvml.dll")) {
+                let lib = std::sync::Arc::new(lib);
                 let init: Option<unsafe extern "C" fn() -> i32> = lib
                     .sym("nvmlInit_v2")
                     .or_else(|| lib.sym("nvmlInit"))
+                    .map(|p| unsafe { std::mem::transmute(p) });
+                let get_count: Option<unsafe extern "C" fn(*mut u32) -> i32> = lib
+                    .sym("nvmlDeviceGetCount_v2")
+                    .or_else(|| lib.sym("nvmlDeviceGetCount"))
                     .map(|p| unsafe { std::mem::transmute(p) });
                 let get_handle: Option<
                     unsafe extern "C" fn(u32, *mut *mut std::ffi::c_void) -> i32,
@@ -134,29 +157,36 @@ impl NvmlGpu {
 
                 if let (Some(init_fn), Some(handle_fn)) = (init, get_handle) {
                     if unsafe { init_fn() } == 0 {
-                        let mut dev = std::ptr::null_mut();
-                        if unsafe { handle_fn(0, &mut dev) } == 0 && !dev.is_null() {
-                            return Self {
-                                device: dev,
-                                get_utilization,
-                                get_temperature,
-                                get_memory,
-                                get_name,
-                                _dylib: Some(lib),
-                            };
+                        let mut count = 4u32;
+                        if let Some(count_fn) = get_count {
+                            let mut n = 0u32;
+                            if unsafe { count_fn(&mut n) } == 0 {
+                                count = n.min(8);
+                            }
+                        }
+                        let mut out = Vec::new();
+                        for idx in 0..count {
+                            let mut dev = std::ptr::null_mut();
+                            if unsafe { handle_fn(idx, &mut dev) } == 0 && !dev.is_null() {
+                                out.push(Self {
+                                    index: idx,
+                                    device: dev,
+                                    get_utilization,
+                                    get_temperature,
+                                    get_memory,
+                                    get_name,
+                                    _dylib: Some(lib.clone()),
+                                });
+                            }
+                        }
+                        if !out.is_empty() {
+                            return out;
                         }
                     }
                 }
             }
         }
-        Self {
-            device: std::ptr::null_mut(),
-            get_utilization: None,
-            get_temperature: None,
-            get_memory: None,
-            get_name: None,
-            _dylib: None,
-        }
+        vec![Self::empty()]
     }
 
     /// The device's (total, free) memory in bytes, if NVML answers.
@@ -298,7 +328,7 @@ impl SysMonitor {
 
 pub struct TelemetryService {
     monitor: Mutex<SysMonitor>,
-    nvml: NvmlGpu,
+    gpus: Vec<NvmlGpu>,
     cpu: crate::cpuinfo::CpuLive,
 }
 
@@ -312,7 +342,7 @@ impl TelemetryService {
     pub fn new() -> Self {
         Self {
             monitor: Mutex::new(SysMonitor::new()),
-            nvml: NvmlGpu::new(),
+            gpus: NvmlGpu::all(),
             cpu: crate::cpuinfo::CpuLive::new(),
         }
     }
@@ -326,11 +356,32 @@ impl TelemetryService {
             (m.proc_cpu_pct, m.sys_cpu_pct, m.proc_cores_used)
         };
 
-        let (mut gpu_pct, gpu_mem_pct, gpu_temp) = self.nvml.sample();
-        // If NVML is not available but engine is actively decoding, indicate GPU compute activity
-        if gpu_pct == 0.0 && s.busy {
-            gpu_pct = 75.0;
+        let mut devices = Vec::with_capacity(self.gpus.len());
+        let (mut max_gpu_pct, mut max_mem_pct, mut max_temp) = (0.0f64, 0.0f64, 0u32);
+        let (mut nvml_total_sum, mut nvml_free_sum) = (0u64, 0u64);
+        for g in &self.gpus {
+            let (mut gp, mp, tc) = g.sample();
+            if gp == 0.0 && s.busy && self.gpus.len() == 1 {
+                gp = 75.0;
+            }
+            max_gpu_pct = max_gpu_pct.max(gp);
+            max_mem_pct = max_mem_pct.max(mp);
+            max_temp = max_temp.max(tc);
+            let (vt, vf) = g.memory().unwrap_or((0, 0));
+            nvml_total_sum += vt;
+            nvml_free_sum += vf;
+            devices.push(json!({
+                "index": g.index,
+                "name": g.name().unwrap_or_default(),
+                "utilization_percent": (gp * 10.0).round() / 10.0,
+                "memory_controller_percent": (mp * 10.0).round() / 10.0,
+                "temperature_c": tc,
+                "vram_total_bytes": vt,
+                "vram_free_bytes": vf,
+                "vram_used_bytes": vt.saturating_sub(vf),
+            }));
         }
+        let (gpu_pct, gpu_mem_pct, gpu_temp) = (max_gpu_pct, max_mem_pct, max_temp);
 
         let mut total_ram = 0u64;
         let mut avail_ram = 0u64;
@@ -371,12 +422,15 @@ impl TelemetryService {
             .map(|n| n.get())
             .unwrap_or(1);
         // the session's numbers once it is up; NVML's for the whole device before that (while the model loads)
-        let (vram_total, vram_free) = match (s.vram_total, self.nvml.memory()) {
-            (0, Some((t, f))) => (t as usize, f as usize),
-            _ => (s.vram_total, s.vram_free),
+        let (vram_total, vram_free) = if s.vram_total == 0 && nvml_total_sum > 0 {
+            (nvml_total_sum as usize, nvml_free_sum as usize)
+        } else {
+            (s.vram_total, s.vram_free)
         };
-        let gpu_name = if s.gpu_name.is_empty() {
-            self.nvml.name().unwrap_or_default()
+        let gpu_name = if devices.len() > 1 {
+            format!("{} GPUs", devices.len())
+        } else if s.gpu_name.is_empty() {
+            self.gpus.first().and_then(|g| g.name()).unwrap_or_default()
         } else {
             s.gpu_name.clone()
         };
@@ -440,7 +494,8 @@ impl TelemetryService {
                 "expert_cache_slots": s.vram_slots,
                 "expert_cache_hits": s.vram_hits,
                 "expert_cache_misses": s.vram_misses,
-                "expert_cache_hit_rate": (hit_rate * 10.0).round() / 10.0
+                "expert_cache_hit_rate": (hit_rate * 10.0).round() / 10.0,
+                "devices": devices
             },
             "process": {
                 "pid": std::process::id(),

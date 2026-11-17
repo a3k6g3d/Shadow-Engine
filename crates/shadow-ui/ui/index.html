@@ -30,6 +30,14 @@
   button.primary { background: var(--accent); border-color: var(--accent); color: #fff; font-weight: 600; }
   button.primary:hover { background: #4f46e5; }
   .btns[hidden] { display: none; }
+  /* Scrollbars: match the main UI (ui.rs) — thin, translucent, no buttons.
+     (only the ::-webkit-scrollbar rules: a `scrollbar-color` / `scrollbar-width` would switch them off in Chromium) */
+  *::-webkit-scrollbar { width: 10px; height: 10px; }
+  *::-webkit-scrollbar-track, *::-webkit-scrollbar-corner { background: transparent; }
+  *::-webkit-scrollbar-button { display: none; width: 0; height: 0; }
+  *::-webkit-scrollbar-thumb { background: rgba(132, 146, 166, 0.20); border-radius: 8px; border: 3px solid transparent; background-clip: content-box; min-height: 36px; }
+  *::-webkit-scrollbar-thumb:hover { background: rgba(132, 146, 166, 0.42); background-clip: content-box; }
+  *::-webkit-scrollbar-thumb:active { background: rgba(165, 180, 252, 0.55); background-clip: content-box; }
 </style>
 </head>
 <body>

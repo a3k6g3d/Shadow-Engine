@@ -14,6 +14,30 @@ pub type CuDevice = c_int;
 pub type CuDevicePtr = u64;
 type H = *mut c_void;
 
+/// `CUDA_MEMCPY2D_v2` (from `cuda.h`) for pitched device/host copies (`cuMemcpy2DAsync_v2`).
+#[repr(C)]
+pub struct CuMemcpy2d {
+    pub src_x_in_bytes: usize,
+    pub src_y: usize,
+    pub src_memory_type: c_uint,
+    pub src_host: *const c_void,
+    pub src_device: CuDevicePtr,
+    pub src_array: H,
+    pub src_pitch: usize,
+    pub dst_x_in_bytes: usize,
+    pub dst_y: usize,
+    pub dst_memory_type: c_uint,
+    pub dst_host: *mut c_void,
+    pub dst_device: CuDevicePtr,
+    pub dst_array: H,
+    pub dst_pitch: usize,
+    pub width_in_bytes: usize,
+    pub height: usize,
+}
+
+pub const CU_MEMORYTYPE_HOST: c_uint = 0x01;
+pub const CU_MEMORYTYPE_DEVICE: c_uint = 0x02;
+
 pub const CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT: c_int = 16;
 pub const CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR: c_int = 75;
 pub const CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR: c_int = 76;
@@ -89,6 +113,7 @@ table! {
     cuMemcpyDtoD: fn(CuDevicePtr, CuDevicePtr, usize) = ["cuMemcpyDtoD_v2"];
     cuMemcpyDtoDAsync: fn(CuDevicePtr, CuDevicePtr, usize, H) = ["cuMemcpyDtoDAsync_v2"];
     cuMemcpyDtoHAsync: fn(*mut c_void, CuDevicePtr, usize, H) = ["cuMemcpyDtoHAsync_v2"];
+    cuMemcpy2DAsync: fn(*const CuMemcpy2d, H) = ["cuMemcpy2DAsync_v2"];
     cuMemsetD8: fn(CuDevicePtr, u8, usize) = ["cuMemsetD8_v2"];
     // the virtual memory API (physical chunks mapped into a reserved address range), for lending the unfilled part of the KV window
     cuMemGetAllocationGranularity: fn(*mut usize, *const c_void, c_uint) = ["cuMemGetAllocationGranularity"];
@@ -550,6 +575,10 @@ pub struct Event<'c> {
 }
 
 impl Event<'_> {
+    pub fn raw(&self) -> H {
+        self.event
+    }
+
     pub fn record(&self, stream: Option<&Stream>) -> Result<(), CudaError> {
         self.ctx.bind()?;
         let s = stream.map(|s| s.stream).unwrap_or(std::ptr::null_mut());

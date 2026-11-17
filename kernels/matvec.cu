@@ -720,7 +720,10 @@ template <typename Q>
 static __device__ __forceinline__ void matvec_cols_rows(const u8* w, const float* x, unsigned int xs, float* y,
                                                         unsigned int ys, unsigned int rows, unsigned int cols,
                                                         unsigned int m) {
-    matvec_cols_rows_b<Q>(w, x, xs, y, ys, rows, cols, m, blockIdx.x);
+    const unsigned int j0 = blockIdx.y * 8;
+    if (j0 >= m) return;
+    const unsigned int n = min(m - j0, 8u);
+    matvec_cols_rows_b<Q>(w, x + (u64) j0 * xs, xs, y + (u64) j0 * ys, ys, rows, cols, n, blockIdx.x);
 }
 
 extern "C" __global__ void matvec_cols_q4_k(const u8* w, const float* x, unsigned int xs, float* y, unsigned int ys, unsigned int rows, unsigned int cols, unsigned int m) { matvec_cols_rows<Q4K>(w, x, xs, y, ys, rows, cols, m); }
@@ -1623,6 +1626,7 @@ static __device__ __forceinline__ void grouped_rows(const u64* wtab, const unsig
                                                     unsigned int xs, float* y, unsigned int ys, unsigned int rows,
                                                     unsigned int cols) {
     const unsigned int* gi = gtab + (u64) blockIdx.y * 17;
+    if (gi[0] == 0) return;
     const u8* w = (const u8*) wtab[blockIdx.y];
     // one row a warp (GROUPED_RW): a routed expert has 640 or 2560 rows and a group few inputs, so the GPU needs the
     // warps more than the input reuse of several rows a warp

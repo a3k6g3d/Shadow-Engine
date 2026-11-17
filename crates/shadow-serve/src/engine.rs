@@ -305,6 +305,28 @@ fn auto_split(model: &Model, vram: usize, n_ctx: usize, extra_gib: f64) -> usize
     c.n_layer - n_peer.max(1)
 }
 
+/// How many of the model's first layers (`0..split`) a resident first-stage card (e.g. the 16 GiB RTX 5060 Ti when the faster RTX 5070 runs the tail + head + DFlash)
+/// can hold with every expert resident plus ~3.2 GiB reserved for its dense weights, KV window and 2,048-row prompt batch buffers (capped at 15 so only tap 5 crosses the split).
+fn auto_split_first(model: &Model, vram: usize, n_ctx: usize) -> usize {
+    let c = &model.cfg;
+    let gib = (1u64 << 30) as f64;
+    let per = |l: usize| -> f64 {
+        ["ffn_gate_exps", "ffn_up_exps", "ffn_down_exps"].iter().filter_map(|r| model.g.tensor(&format!("blk.{l}.{r}.weight")).map(|t| t.nbytes() as f64)).sum::<f64>() + 80.0 * 1024.0 * 1024.0
+    };
+    let kv_per_layer = n_ctx as f64 * 57.0 * 1024.0 / c.n_layer as f64;
+    let mut room = vram as f64 - 3.2 * gib;
+    let mut n_first = 0;
+    for l in 0..c.n_layer.min(15) {
+        let need = per(l) + kv_per_layer;
+        if room < need {
+            break;
+        }
+        room -= need;
+        n_first += 1;
+    }
+    n_first.max(1)
+}
+
 /// Starts the engine thread; requests go in through the returned sender.
 pub fn start(cfg: Config, status: Arc<Mutex<Status>>) -> std::sync::mpsc::Sender<Request> {
     let (tx, rx) = std::sync::mpsc::channel::<Request>();
@@ -363,10 +385,25 @@ fn run(
     let mut sess = match (&cfg.pair, ctx1.as_ref()) {
         (Some(pair), Some(c1)) => {
             let n = model.cfg.n_layer;
-            // the drafter (DFlash) lives on the second card, with the head: its weights, rings and feature buffers take ~1.5 GiB there
+            // When the user passes `--gpus 0,1` without a `--split` > n/2 and card 0 has more SMs (faster compute/bandwidth, e.g. RTX 5070) while card 1 has more VRAM
+            // (e.g. 16 GiB RTX 5060 Ti on chipset x4), put the larger-VRAM slower card first (`0..split`, 100% resident in VRAM, zero PCIe expert traffic) and the faster
+            // card second (`split..n` + `lm_head` + `DFlash` + RAM tier on PCIe x16), unless `SHADOW_KEEP_GPU_ORDER=1` is set.
+            let swap = pair.split.is_none_or(|s| s <= n / 2)
+                && ctx.sms > c1.sms
+                && ctx.total_mem < c1.total_mem
+                && !std::env::var("SHADOW_KEEP_GPU_ORDER").is_ok_and(|v| v == "1");
+            let (c_a, ord_a, c_b, ord_b) = if swap { (c1, pair.ordinal, &ctx, cfg.gpu) } else { (&ctx, cfg.gpu, c1, pair.ordinal) };
             let drafter = cfg.tiers.dflash_dir.is_some();
-            let split = pair.split.unwrap_or_else(|| auto_split(&model, c1.total_mem, cfg.n_ctx, if drafter { 1.5 } else { 0.0 })).clamp(1, n - 1);
-            eprintln!("shadow serve: two cards: layers 0..{split} on GPU {} ({}), layers {split}..{n} on GPU {} ({}, {:.1} GiB)", cfg.gpu, ctx.name, pair.ordinal, c1.name, c1.total_mem as f64 / (1u64 << 30) as f64);
+            let first_resident = c_a.sms < c_b.sms || pair.split.is_some_and(|s| s <= n / 2);
+            let split = pair.split.unwrap_or_else(|| {
+                if first_resident {
+                    auto_split_first(&model, c_a.total_mem, cfg.n_ctx)
+                } else {
+                    auto_split(&model, c_b.total_mem, cfg.n_ctx, if drafter { 1.5 } else { 0.0 })
+                }
+            }).clamp(1, n - 1);
+            eprintln!("shadow serve: two cards: layers 0..{split} on GPU {ord_a} ({}, {:.1} GiB), layers {split}..{n} on GPU {ord_b} ({}, {:.1} GiB)",
+                      c_a.name, c_a.total_mem as f64 / (1u64 << 30) as f64, c_b.name, c_b.total_mem as f64 / (1u64 << 30) as f64);
             // the DFlash drafter runs on the second card (STATUS 103): the first keeps the features of the taps below the split and hands them on with the
             // residual streams; the MTP head is not split (it is not the default)
             let mut t0 = cfg.tiers.clone();
@@ -378,11 +415,19 @@ fn run(
             t1.df_taps = false;
             t1.dflash_dir = cfg.tiers.dflash_dir.clone();
             t1.layers = Some((split, n));
-            t1.ram_bytes = 0;
-            t1.ram_auto = false;
-            t1.vram_cache = pair.peer_cache;
-            let mut a = GpuSession::with_tiers(&ctx, &model, cfg.n_ctx, t0)?;
-            let b = GpuSession::with_tiers(c1, &model, cfg.n_ctx, t1)?;
+            if split <= n / 2 {
+                // Stage 0 owns the smaller 100%-VRAM-resident prefix (`0..split`); Stage 1 owns the streaming suffix (`split..n`) and the RAM tier.
+                t0.ram_bytes = 0;
+                t0.ram_auto = false;
+                t0.vram_cache = pair.peer_cache;
+            } else {
+                // Stage 0 owns the larger streaming prefix (`0..split`) and the RAM tier; Stage 1 owns the 100%-VRAM-resident suffix (`split..n`).
+                t1.ram_bytes = 0;
+                t1.ram_auto = false;
+                t1.vram_cache = pair.peer_cache;
+            }
+            let mut a = GpuSession::with_tiers(c_a, &model, cfg.n_ctx, t0)?;
+            let b = GpuSession::with_tiers(c_b, &model, cfg.n_ctx, t1)?;
             a.attach_peer(b)?;
             a
         }

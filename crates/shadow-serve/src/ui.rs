@@ -319,13 +319,6 @@ canvas.spark { width: 100%; height: 64px; display: block; }
     #side-open { display: none; }
     body.side-closed.view-chat #side-open { display: inline-block; }
 
-    /* the OpenCode tab: a thin bar over a frame holding OpenCode's own page */
-    #oc-panel { padding: 0; }
-    #oc-bar { display: flex; align-items: center; gap: 0.75rem; padding: 0.4rem 1rem; border-bottom: 1px solid var(--border, #2a2a35); font-size: 0.85rem; color: var(--text-dim); }
-    #oc-bar .oc-note { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-    #oc-frame { flex: 1; width: 100%; border: 0; min-height: 0; background: #fff; }
-    #oc-msg { padding: 1.5rem; max-width: 46rem; line-height: 1.5; color: var(--text-dim); }
-    #oc-msg code { user-select: all; }
 
     /* Views - Strict Tab Display */
     .view-panel {
@@ -1040,9 +1033,6 @@ canvas.spark { width: 100%; height: 64px; display: block; }
         <button class="nav-tab" id="tab-dash" onclick="switchView('dash')">
           <span>🏠</span> Dashboard
         </button>
-        <button class="nav-tab" id="tab-opencode" onclick="switchView('opencode')" title="OpenCode: a coding agent that uses this Shadow server">
-          <span>⌨</span> OpenCode
-        </button>
         <button class="nav-tab" id="tab-settings" onclick="switchView('settings')">
           <span>⚙</span> Settings
         </button>
@@ -1126,11 +1116,14 @@ canvas.spark { width: 100%; height: 64px; display: block; }
           <h3><span class="grip">&#9776;</span>GPU <span class="tag" id="d-gpuname">--</span></h3>
           <div class="big" id="d-gpu">--<small>% busy</small></div>
           <canvas class="spark" id="c-gpu"></canvas>
-          <div class="kv"><span>VRAM</span><b id="d-vram">--</b></div>
-          <div class="bar"><i id="d-vrambar" style="width:0"></i></div>
-          <div class="kv"><span>Temperature</span><b id="d-temp">--</b></div>
-          <div class="kv"><span>Memory controller busy</span><b id="d-memctl">--</b></div>
-          <div class="kv"><span>Free VRAM</span><b id="d-vramfree">--</b></div>
+          <div id="d-gpu-single">
+            <div class="kv"><span>VRAM</span><b id="d-vram">--</b></div>
+            <div class="bar"><i id="d-vrambar" style="width:0"></i></div>
+            <div class="kv"><span>Temperature</span><b id="d-temp">--</b></div>
+            <div class="kv"><span>Memory controller busy</span><b id="d-memctl">--</b></div>
+            <div class="kv"><span>Free VRAM</span><b id="d-vramfree">--</b></div>
+          </div>
+          <div id="d-gpu-multi" style="display:none"></div>
         </div>
         <div class="dcard" data-tile="cpu">
           <h3><span class="grip">&#9776;</span>CPU <span class="tag" id="d-cputag">--</span></h3>
@@ -1166,16 +1159,7 @@ canvas.spark { width: 100%; height: 64px; display: block; }
       </div>
     </div>
 
-    <!-- VIEW: OPENCODE -->
-    <div class="view-panel" id="oc-panel">
-      <div id="oc-bar">
-        <span class="oc-note" id="oc-note">OpenCode</span>
-        <button class="pill action" id="oc-toggle" onclick="ocToggle()">Start</button>
-        <button class="pill action" onclick="window.open(document.getElementById('oc-frame').src || '', '_blank')" title="Open OpenCode in its own browser tab">Pop out</button>
-      </div>
-      <div id="oc-msg" style="display:none"></div>
-      <iframe id="oc-frame" title="OpenCode"></iframe>
-    </div>
+
 
     <!-- VIEW: SETTINGS -->
     <div class="view-panel" id="settings-panel">
@@ -1869,8 +1853,8 @@ canvas.spark { width: 100%; height: 64px; display: block; }
     // View switching: Chat, Dashboard and Settings are separate tabs
     function switchView(view) {
       currentView = view;
-      const panels = { chat: chatPanel, dash: document.getElementById('dash-panel'), opencode: document.getElementById('oc-panel'), settings: document.getElementById('settings-panel') };
-      const tabs = { chat: tabChat, dash: document.getElementById('tab-dash'), opencode: document.getElementById('tab-opencode'), settings: document.getElementById('tab-settings') };
+      const panels = { chat: chatPanel, dash: document.getElementById('dash-panel'), settings: document.getElementById('settings-panel') };
+      const tabs = { chat: tabChat, dash: document.getElementById('tab-dash'), settings: document.getElementById('tab-settings') };
       for (const k of Object.keys(panels)) {
         panels[k].classList.toggle('active', k === view);
         tabs[k].classList.toggle('active', k === view);
@@ -1879,62 +1863,9 @@ canvas.spark { width: 100%; height: 64px; display: block; }
       window.location.hash = view === 'chat' ? '' : '#' + view;
       if (view === 'dash') dashRefresh();
       if (view === 'settings') settingsOpen();
-      if (view === 'opencode') ocOpen();
     }
 
-    // OpenCode tab: /v1/opencode says whether it is installed and running, /v1/opencode/start and /stop run it; the frame shows its page (served on 127.0.0.1, any port)
-    let ocPort = null;
-    function ocShow(msg) {
-      const m = document.getElementById('oc-msg');
-      m.style.display = msg ? 'block' : 'none';
-      m.innerHTML = msg || '';
-      document.getElementById('oc-frame').style.display = msg ? 'none' : 'block';
-    }
-    function ocRender(st, busy) {
-      const note = document.getElementById('oc-note'), btn = document.getElementById('oc-toggle'), fr = document.getElementById('oc-frame');
-      btn.disabled = !!busy;
-      if (!st.installed) {
-        note.textContent = 'OpenCode is not installed';
-        btn.style.display = 'none';
-        const hint = String(st.install_hint || '').replace(/[<>&]/g, c => ({ '<': '&lt;', '>': '&gt;', '&': '&amp;' }[c]));
-        ocShow('OpenCode is a coding agent with its own web page; here it uses this Shadow server as its model. Shadow does not ship it. To install it: <p><code>' + hint + '</code></p>');
-        return;
-      }
-      btn.style.display = '';
-      if (st.running) {
-        note.textContent = 'OpenCode runs on port ' + st.port + ', model: this Shadow server, folder: ' + st.workdir;
-        btn.textContent = 'Stop';
-        if (ocPort !== st.port) { ocPort = st.port; fr.src = 'http://' + location.hostname + ':' + st.port + '/'; }
-        ocShow('');
-      } else {
-        note.textContent = busy ? 'Starting OpenCode…' : 'OpenCode is stopped';
-        btn.textContent = 'Start';
-        ocPort = null; fr.removeAttribute('src');
-        ocShow(busy ? 'Starting OpenCode (a few seconds)…' : 'OpenCode is stopped. <b>Start</b> runs it on this PC, listening on 127.0.0.1 only.');
-      }
-    }
-    async function ocCall(path, method) {
-      const r = await fetch(path, { method: method || 'GET' });
-      const j = await r.json();
-      if (!r.ok) throw new Error((j.error && j.error.message) || r.statusText);
-      return j;
-    }
-    async function ocOpen() {
-      try {
-        const st = await ocCall('/v1/opencode');
-        ocRender(st);
-        if (st.installed && !st.running) ocStart();   // a click on the tab is the wish to use it
-      } catch (e) { ocShow('Could not ask Shadow about OpenCode: ' + e.message); }
-    }
-    async function ocStart() {
-      ocRender({ installed: true, running: false }, true);
-      try { ocRender(await ocCall('/v1/opencode/start', 'POST')); }
-      catch (e) { ocRender({ installed: true, running: false }); ocShow('OpenCode did not start: ' + String(e.message).replace(/</g, '&lt;')); }
-    }
-    async function ocToggle() {
-      const st = await ocCall('/v1/opencode').catch(() => ({}));
-      if (st.running) { ocRender(await ocCall('/v1/opencode/stop', 'POST')); } else { ocStart(); }
-    }
+
 
     document.getElementById('brand-logo').addEventListener('click', () => switchView('chat'));
 
@@ -2180,11 +2111,19 @@ canvas.spark { width: 100%; height: 64px; display: block; }
         g = document.createElement('div');
         g.className = 'tool-group';
         g.innerHTML = '<div class="tool-group-head" onclick="toggleToolGroup(this)"><span class="tool-group-chev">\u25b8</span><span class="tool-group-label"></span></div><div class="tool-group-body"></div>';
-        bubbleEl.appendChild(g);
-        // the reply's thinking goes into the group, in front of its calls (so a run of tool replies is one group with the thinking and the calls in order)
-        const tb = bubbleEl.querySelector(':scope > .think-block');
-        if (tb) g.querySelector('.tool-group-body').appendChild(tb);
+        const mc = bubbleEl.querySelector(':scope > .msg-content');
+        if (mc) bubbleEl.insertBefore(g, mc);
+        else bubbleEl.appendChild(g);
       }
+      // Move any top-level thinking block into the group in chronological order before the calls it led to.
+      const body = g.querySelector('.tool-group-body');
+      bubbleEl.querySelectorAll(':scope > .think-block').forEach(tb => {
+        if (tb.style.display !== 'none' || (tb.querySelector('.think-content')?.textContent || '').trim()) {
+          body.appendChild(tb);
+        } else {
+          tb.remove();
+        }
+      });
       return g;
     }
     // the group's line follows its calls; a group being worked on is open (and a call waiting for the user keeps it open), a finished one closes unless the user opened it
@@ -2197,20 +2136,29 @@ canvas.spark { width: 100%; height: 64px; display: block; }
       if (g.dataset.live === '1' && !g.dataset.touched) g.classList.toggle('open', running);
       if (cards.some(c => c.dataset.waiting === '1')) g.classList.add('open');
     }
-    // a reply that only called tools hands its group to the next reply that calls tools, so a run of tool-only replies reads as one group (at the last of them)
+    // Fold a prior tool-only assistant bubble cleanly into the next assistant bubble (removing the empty wrapper row) so multi-step loops render in one window.
     function absorbPreviousToolGroup(row) {
-      const g = row && row.querySelector(':scope > .bubble > .tool-group');
+      const bubble = row && row.querySelector(':scope > .bubble');
       const prev = row && row.previousElementSibling;
-      if (!g || !prev || !prev.classList.contains('assistant')) return;
+      if (!bubble || !prev || !prev.classList.contains('assistant')) return;
       const pg = prev.querySelector(':scope > .bubble > .tool-group');
       if (!pg) return;
       const prose = prev.querySelector(':scope > .bubble > .msg-content');
       if (prose && prose.textContent.trim()) return;
-      const body = g.querySelector('.tool-group-body');
-      Array.from(pg.querySelector('.tool-group-body').children).reverse().forEach(c => body.prepend(c));   // its thinking and its calls, in order
-      if (pg.dataset.touched) { g.dataset.touched = '1'; if (pg.classList.contains('open')) g.classList.add('open'); }
-      pg.remove();
-      refreshToolGroup(g);
+      const g = bubble.querySelector(':scope > .tool-group');
+      if (g) {
+        const body = g.querySelector('.tool-group-body');
+        Array.from(pg.querySelector('.tool-group-body').children).reverse().forEach(c => body.prepend(c));
+        if (pg.dataset.touched) { g.dataset.touched = '1'; if (pg.classList.contains('open')) g.classList.add('open'); }
+        refreshToolGroup(g);
+      } else {
+        const anchor = bubble.querySelector(':scope > .think-block, :scope > .msg-content, :scope > .finish-card');
+        pg.dataset.live = '';
+        if (anchor) bubble.insertBefore(pg, anchor);
+        else bubble.appendChild(pg);
+        refreshToolGroup(pg);
+      }
+      prev.remove();
     }
     function refreshToolGroupOf(card) { refreshToolGroup(card && card.closest('.tool-group')); }
     function toggleToolGroup(head) {
@@ -2613,40 +2561,50 @@ canvas.spark { width: 100%; height: 64px; display: block; }
       let lastCallSig = '', sameCalls = 0, stuck = false;
       const callCounts = new Map();   // how often each exact tool call was made in this task
       let readStreak = 0;             // read-only calls since the last notes / edit
+      const aggTimings = { predN: 0, predMs: 0, promptN: 0, promptMs: 0 };
+
+      // Single assistant window across all tool steps and the final answer for this user turn.
+      document.querySelectorAll('.msg-row.working').forEach(r => r.classList.remove('working'));
+      const asstRow = document.createElement('div');
+      asstRow.className = 'msg-row assistant working';
+      asstRow.innerHTML = `<div class="avatar">S</div><div class="bubble"><div class="msg-content"></div></div>`;
+      messagesEl.appendChild(asstRow);
+      const bubbleEl = asstRow.querySelector('.bubble');
+      const msgContent = bubbleEl.querySelector('.msg-content');
+      scrollToBottom(true);
 
       while (true) {
         loopTurns++;
 
-        // Assistant Skeleton
-        const asstRow = document.createElement('div');
-        document.querySelectorAll('.msg-row.working').forEach(r => r.classList.remove('working'));
-        asstRow.className = 'msg-row assistant working';
-        asstRow.innerHTML = `
-          <div class="avatar">S</div>
-          <div class="bubble">
-            <div class="think-block" style="display:none;">
-              <div class="think-header">
-                <div class="think-header-left" onclick="toggleThinkBlock(this)">
-                  <span class="think-spinner"></span>
-                  <span class="think-title">Thinking...</span>
-                  <span class="think-timer" style="opacity:0.75; font-size:0.78rem; font-weight:normal;"></span>
-                  <span class="think-chevron" style="font-size:0.75rem; opacity:0.6; display:none;">▼</span>
-                </div>
-                <button class="think-stop-btn" onclick="stopGeneration(event)" title="Stop thinking">
-                  <span>⏹</span> Stop Thinking
-                </button>
-              </div>
-              <div class="think-content"></div>
+        bubbleEl.querySelectorAll(':scope > .think-block').forEach(tb => {
+          if (tb.style.display === 'none' && !(tb.querySelector('.think-content')?.textContent || '').trim()) {
+            tb.remove();
+          } else {
+            const g = bubbleEl.querySelector(':scope > .tool-group');
+            if (g) g.querySelector('.tool-group-body').appendChild(tb);
+          }
+        });
+        const thinkBlock = document.createElement('div');
+        thinkBlock.className = 'think-block';
+        thinkBlock.style.display = 'none';
+        thinkBlock.innerHTML = `
+          <div class="think-header">
+            <div class="think-header-left" onclick="toggleThinkBlock(this)">
+              <span class="think-spinner"></span>
+              <span class="think-title">Thinking...</span>
+              <span class="think-timer" style="opacity:0.75; font-size:0.78rem; font-weight:normal;"></span>
+              <span class="think-chevron" style="font-size:0.75rem; opacity:0.6; display:none;">▼</span>
             </div>
-            <div class="msg-content"><span class="reading-note">Reading your message...</span><span class="cursor-blink"></span></div>
-          </div>`;
-        messagesEl.appendChild(asstRow);
-        scrollToBottom(loopTurns === 1);
-
-        const bubbleEl = asstRow.querySelector('.bubble');
-        const thinkBlock = bubbleEl.querySelector('.think-block');
-        const thinkContent = bubbleEl.querySelector('.think-content');
-        const msgContent = bubbleEl.querySelector('.msg-content');
+            <button class="think-stop-btn" onclick="stopGeneration(event)" title="Stop thinking">
+              <span>⏹</span> Stop Thinking
+            </button>
+          </div>
+          <div class="think-content"></div>`;
+        bubbleEl.insertBefore(thinkBlock, msgContent);
+        const thinkContent = thinkBlock.querySelector('.think-content');
+        msgContent.style.display = '';
+        msgContent.innerHTML = `<span class="reading-note">${loopTurns === 1 ? 'Reading your message...' : 'Reading tool output...'}</span><span class="cursor-blink"></span>`;
+        if (loopTurns === 1) scrollToBottom(true);
 
         let rawContent = '';
         let rawThinking = '';
@@ -2691,6 +2649,7 @@ canvas.spark { width: 100%; height: 64px; display: block; }
           const reader = response.body.getReader();
           const decoder = new TextDecoder();
           let buffer = '';
+          const streamedToolCalls = [];
 
           while (true) {
             const { done, value } = await reader.read();
@@ -2750,6 +2709,25 @@ canvas.spark { width: 100%; height: 64px; display: block; }
                       : '';
                     msgContent.innerHTML = (cleanStream ? renderMarkdown(cleanStream) : '') + pendingBadge + '<span class="cursor-blink"></span>';
                   }
+                  if (Array.isArray(delta.tool_calls)) {
+                    for (const dtc of delta.tool_calls) {
+                      const idx = Number.isInteger(dtc.index) ? dtc.index : streamedToolCalls.length;
+                      if (!streamedToolCalls[idx]) streamedToolCalls[idx] = { id: '', name: '', rawArgs: '' };
+                      const entry = streamedToolCalls[idx];
+                      if (dtc.id) entry.id = dtc.id;
+                      if (dtc.function) {
+                        if (dtc.function.name) entry.name += dtc.function.name;
+                        if (typeof dtc.function.arguments === 'string') entry.rawArgs += dtc.function.arguments;
+                      }
+                    }
+                    const lastTc = streamedToolCalls.filter(Boolean).slice(-1)[0];
+                    if (lastTc && lastTc.name) {
+                      const cleanStream = stripToolCalls(rawContent);
+                      msgContent.innerHTML = (cleanStream ? renderMarkdown(cleanStream) : '') +
+                        `<div style="margin-top:0.35rem; font-size:0.8rem; color:var(--tool-text); opacity:0.88;">⚡ Preparing tool call (<strong>${escapeHtml(lastTc.name)}</strong>)...</div>` +
+                        '<span class="cursor-blink"></span>';
+                    }
+                  }
                   scrollToBottom(false);
                 } catch (_) {}
               }
@@ -2788,11 +2766,46 @@ canvas.spark { width: 100%; height: 64px; display: block; }
             if (thinkContent.style.display !== 'none') toggleThinkBlock(thinkBlock.querySelector('.think-header-left'));
           }
 
-          // Check if assistant called tools
-          const toolCalls = parseToolCallsFromText(rawContent);
+          // Check if assistant called tools (OpenAI delta.tool_calls from /v1/chat/completions or inline <tool_call> XML)
+          const parsedStreamCalls = streamedToolCalls.filter(Boolean).filter(tc => tc.name).map(tc => {
+            let args = {};
+            const s = (tc.rawArgs || '').trim();
+            if (s) {
+              try {
+                const p = JSON.parse(s);
+                args = (p && typeof p === 'object' && !Array.isArray(p)) ? p : { value: p };
+              } catch (_) { args = { _raw: s }; }
+            }
+            return { id: tc.id || undefined, name: tc.name, arguments: args };
+          });
+          const xmlFromStreamCalls = calls => calls.map(tc => {
+            const params = Object.entries(tc.arguments || {}).map(([k, v]) => {
+              const val = typeof v === 'string' ? v : JSON.stringify(v);
+              return `<parameter=${k}>\n${val}\n</parameter>`;
+            }).join('\n');
+            return `<tool_call>\n<function=${tc.name}>\n${params ? params + '\n' : ''}</function>\n</tool_call>`;
+          }).join('\n');
+          const textToolCalls = parseToolCallsFromText(rawContent);
+          const toolCalls = parsedStreamCalls.length > 0 ? parsedStreamCalls : textToolCalls;
+          const historyRawContent = parsedStreamCalls.length > 0 && textToolCalls.length === 0
+            ? (rawContent ? rawContent + '\n' : '') + xmlFromStreamCalls(parsedStreamCalls)
+            : rawContent;
           const cleanFinal = stripToolCalls(rawContent);
-          msgContent.innerHTML = cleanFinal ? renderMarkdown(cleanFinal) : '';
-          msgContent.style.display = (!cleanFinal && toolCalls.length > 0) ? 'none' : '';
+          if (toolsEnabled && toolCalls.length > 0) {
+            if (cleanFinal) {
+              const g = toolGroupFor(bubbleEl);
+              const note = document.createElement('div');
+              note.className = 'msg-content';
+              note.style.margin = '0.25rem 0';
+              note.innerHTML = renderMarkdown(cleanFinal);
+              g.querySelector('.tool-group-body').appendChild(note);
+            }
+            msgContent.innerHTML = '';
+            msgContent.style.display = 'none';
+          } else {
+            msgContent.innerHTML = cleanFinal ? renderMarkdown(cleanFinal) : '';
+            msgContent.style.display = '';
+          }
           // the reply ran into a length limit (the context is full): without a word the bubble would just stop
           if (cutOff) {
             const note = document.createElement('div');
@@ -2800,17 +2813,27 @@ canvas.spark { width: 100%; height: 64px; display: block; }
             note.innerHTML = 'The reply was cut off: the conversation has no room left. <small>Start a new chat (your notes carry over) or ask for a shorter answer.</small>';
             bubbleEl.appendChild(note);
           }
-          // what this reply cost: tokens and speed, from the final chunk's timings
+          // Aggregate tokens and speed across steps into one summary footer inside the single assistant bubble.
           if (lastTimings && lastTimings.predicted_n) {
-            const t = lastTimings, meta = document.createElement('div');
-            meta.className = 'msg-meta';
-            meta.textContent = `${t.predicted_n} tokens at ${Number(t.predicted_per_second).toFixed(1)} tok/s` +
-              (t.prompt_n ? ` · read ${t.prompt_n} tokens at ${Number(t.prompt_per_second).toFixed(0)} tok/s` : '');
-            bubbleEl.appendChild(meta);
+            const t = lastTimings;
+            aggTimings.predN += Number(t.predicted_n) || 0;
+            aggTimings.predMs += Number(t.predicted_ms) || (t.predicted_per_second ? (t.predicted_n / Number(t.predicted_per_second)) * 1000 : 0);
+            aggTimings.promptN += Number(t.prompt_n) || 0;
+            aggTimings.promptMs += Number(t.prompt_ms) || (t.prompt_n && t.prompt_per_second ? (t.prompt_n / Number(t.prompt_per_second)) * 1000 : 0);
+            let meta = bubbleEl.querySelector(':scope > .msg-meta');
+            if (!meta) {
+              meta = document.createElement('div');
+              meta.className = 'msg-meta';
+              bubbleEl.appendChild(meta);
+            }
+            const predTps = aggTimings.predMs > 0 ? (aggTimings.predN / (aggTimings.predMs / 1000)) : Number(t.predicted_per_second || 0);
+            const promptTps = aggTimings.promptMs > 0 ? (aggTimings.promptN / (aggTimings.promptMs / 1000)) : Number(t.prompt_per_second || 0);
+            meta.textContent = `${aggTimings.predN} tokens at ${predTps.toFixed(1)} tok/s` +
+              (aggTimings.promptN ? ` · read ${aggTimings.promptN} tokens at ${promptTps.toFixed(0)} tok/s` : '');
           }
 
           if (toolsEnabled && toolCalls.length > 0) {
-            history.push({ role: 'assistant', content: rawContent });
+            history.push({ role: 'assistant', content: historyRawContent });
             const callSig = JSON.stringify(toolCalls.map(tc => [tc.name, tc.arguments]));
             sameCalls = callSig === lastCallSig ? sameCalls + 1 : 1;
             lastCallSig = callSig;
@@ -2922,10 +2945,8 @@ canvas.spark { width: 100%; height: 64px; display: block; }
       // stopped because the model kept making the same tool call (the history ends with tool results, no answer): say so instead of ending silently
       const hitStuck = !failed && stuck;
       if (hitStuck) {
-        const capRow = document.createElement('div');
-        capRow.className = 'msg-row assistant';
-        capRow.innerHTML = `<div class="avatar">S</div><div class="bubble"><div class="msg-content"><span style="opacity:0.8;">Stopped: the same tool call ${MAX_SAME_CALLS} times in a row, with nothing new. Tell me what to try instead, or send "continue" to let it go on.</span></div></div>`;
-        messagesEl.appendChild(capRow);
+        msgContent.style.display = '';
+        msgContent.innerHTML = `<span style="opacity:0.8;">Stopped: the same tool call ${MAX_SAME_CALLS} times in a row, with nothing new. Tell me what to try instead, or send "continue" to let it go on.</span>`;
         scrollToBottom(false);
       }
       if (failed) {
@@ -3008,9 +3029,19 @@ canvas.spark { width: 100%; height: 64px; display: block; }
           }
         }
         if (d.gpu) {
-          const usedG = (d.gpu.vram_used_bytes / (1024**3)).toFixed(1);
-          const totalG = (d.gpu.vram_total_bytes / (1024**3)).toFixed(1);
-          gpuHeaderPill.innerHTML = `GPU: <strong>${d.gpu.utilization_percent.toFixed(0)}%</strong> • VRAM: <strong>${usedG}/${totalG} GiB</strong>`;
+          const devs = Array.isArray(d.gpu.devices) ? d.gpu.devices : [];
+          if (devs.length > 1) {
+            const shortGpu = n => (n || 'GPU').replace(/^NVIDIA\s+GeForce\s+/i, '');
+            gpuHeaderPill.innerHTML = devs.map(g => {
+              const u = (g.vram_used_bytes / (1024**3)).toFixed(1);
+              const t = (g.vram_total_bytes / (1024**3)).toFixed(1);
+              return `${escapeHtml(shortGpu(g.name))}: <strong>${g.utilization_percent.toFixed(0)}%</strong> (${u}/${t}G)`;
+            }).join(' · ');
+          } else {
+            const usedG = (d.gpu.vram_used_bytes / (1024**3)).toFixed(1);
+            const totalG = (d.gpu.vram_total_bytes / (1024**3)).toFixed(1);
+            gpuHeaderPill.innerHTML = `GPU: <strong>${d.gpu.utilization_percent.toFixed(0)}%</strong> • VRAM: <strong>${usedG}/${totalG} GiB</strong>`;
+          }
         }
 
       } catch (err) {
@@ -3173,11 +3204,16 @@ canvas.spark { width: 100%; height: 64px; display: block; }
     renderChatList();
 
     // ---- the dashboard: what the engine is doing, from /v1/telemetry (every second) and its log of recent requests
-    const dashHist = { gpu: [], ram: [], cpu: [], cpuSys: [] };
+    const dashHist = { gpu: [], gpus: [], ram: [], cpu: [], cpuSys: [] };
     let lastTel = null;
     function dashPush(d) {
       const keep = (a, v) => { a.push(v); if (a.length > 120) a.shift(); };
       keep(dashHist.gpu, d.gpu ? d.gpu.utilization_percent : 0);
+      const devs = d.gpu && Array.isArray(d.gpu.devices) ? d.gpu.devices : [];
+      devs.forEach((g, i) => {
+        if (!dashHist.gpus[i]) dashHist.gpus[i] = [];
+        keep(dashHist.gpus[i], g.utilization_percent || 0);
+      });
       keep(dashHist.ram, d.ram ? d.ram.system_available_bytes / 2 ** 30 : 0);
       keep(dashHist.cpu, d.cpu ? d.cpu.process_percent : 0);
       keep(dashHist.cpuSys, d.cpu ? d.cpu.system_percent : 0);
@@ -3273,17 +3309,47 @@ set('d-model', p.model || '--');
       set('d-tps-avg', ts > 0 ? (tt / ts).toFixed(1) + ' tok/s (last ' + tail.length + ')' : '--');
       const read = last ? last.prompt_tokens - last.cached_tokens : 0;
       set('d-pps', last && last.prompt_ms > 0 && read > 0 ? (read / (last.prompt_ms / 1000)).toFixed(0) + ' tok/s, ' + read + ' new' : last ? 'all ' + last.prompt_tokens + ' cached' : '--');
-      set('d-gpuname', gpu.name || '--');
-      html('d-gpu', (gpu.utilization_percent != null ? Math.round(gpu.utilization_percent) : '--') + '<small>% busy</small>');
-      spark('c-gpu', dashHist.gpu, 100, '#10b981');
-      set('d-vram', gib(gpu.vram_used_bytes || 0) + ' / ' + gib(gpu.vram_total_bytes || 0) + ' GiB');
-      const vramPct = gpu.vram_total_bytes ? 100 * gpu.vram_used_bytes / gpu.vram_total_bytes : 0;
-      wid('d-vrambar', vramPct);
+      const devs = Array.isArray(gpu.devices) ? gpu.devices : [];
+      const gpuSingle = document.getElementById('d-gpu-single');
+      const gpuMulti = document.getElementById('d-gpu-multi');
       const gpuBig = document.getElementById('d-gpu');
-      if (gpuBig) gpuBig.style.color = vramPct > 85 ? 'var(--danger)' : vramPct > 75 ? 'var(--warning)' : '';
-      set('d-temp', gpu.temperature_c ? gpu.temperature_c + ' °C' : '--');
-      set('d-memctl', (gpu.memory_controller_percent || 0).toFixed(0) + '%');
-      set('d-vramfree', gib(gpu.vram_free_bytes || 0) + ' GiB');
+      if (devs.length > 1 && gpuSingle && gpuMulti) {
+        const colors = ['#10b981', '#38bdf8', '#a78bfa', '#f59e0b'];
+        const shortGpu = n => (n || 'GPU').replace(/^NVIDIA\s+GeForce\s+/i, '');
+        set('d-gpuname', devs.map(g => shortGpu(g.name)).join(' + '));
+        html('d-gpu', devs.map(g => Math.round(g.utilization_percent || 0) + '%').join(' / ') + '<small> busy</small>');
+        devs.forEach((g, i) => {
+          spark('c-gpu', dashHist.gpus[i] || [], 100, colors[i % colors.length], false, i > 0);
+        });
+        gpuSingle.style.display = 'none';
+        gpuMulti.style.display = '';
+        let maxPct = 0;
+        gpuMulti.innerHTML = devs.map((g, i) => {
+          const pct = g.vram_total_bytes ? 100 * g.vram_used_bytes / g.vram_total_bytes : 0;
+          if (pct > maxPct) maxPct = pct;
+          const col = colors[i % colors.length];
+          return `<div style="margin-top:${i ? 8 : 2}px">` +
+            `<div class="kv"><span><i style="color:${col}">&#9632;</i> ${escapeHtml(shortGpu(g.name))}</span>` +
+            `<b>${Math.round(g.utilization_percent || 0)}% · ${g.temperature_c || '--'} °C · ${(g.memory_controller_percent || 0).toFixed(0)}% mem</b></div>` +
+            `<div class="kv"><span>VRAM (${gib(g.vram_free_bytes || 0)} GiB free)</span><b>${gib(g.vram_used_bytes || 0)} / ${gib(g.vram_total_bytes || 0)} GiB</b></div>` +
+            `<div class="bar"><i style="width:${pct.toFixed(1)}%;background:${col}"></i></div>` +
+            `</div>`;
+        }).join('');
+        if (gpuBig) gpuBig.style.color = maxPct > 85 ? 'var(--danger)' : maxPct > 75 ? 'var(--warning)' : '';
+      } else {
+        if (gpuSingle) gpuSingle.style.display = '';
+        if (gpuMulti) gpuMulti.style.display = 'none';
+        set('d-gpuname', gpu.name || '--');
+        html('d-gpu', (gpu.utilization_percent != null ? Math.round(gpu.utilization_percent) : '--') + '<small>% busy</small>');
+        spark('c-gpu', dashHist.gpu, 100, '#10b981');
+        set('d-vram', gib(gpu.vram_used_bytes || 0) + ' / ' + gib(gpu.vram_total_bytes || 0) + ' GiB');
+        const vramPct = gpu.vram_total_bytes ? 100 * gpu.vram_used_bytes / gpu.vram_total_bytes : 0;
+        wid('d-vrambar', vramPct);
+        if (gpuBig) gpuBig.style.color = vramPct > 85 ? 'var(--danger)' : vramPct > 75 ? 'var(--warning)' : '';
+        set('d-temp', gpu.temperature_c ? gpu.temperature_c + ' °C' : '--');
+        set('d-memctl', (gpu.memory_controller_percent || 0).toFixed(0) + '%');
+        set('d-vramfree', gib(gpu.vram_free_bytes || 0) + ' GiB');
+      }
       set('d-hitmiss', (gpu.expert_cache_hits || 0).toLocaleString() + ' / ' + (gpu.expert_cache_misses || 0).toLocaleString());
       set('d-servedn', (ram.ram_served_hits || 0).toLocaleString() + ' / ' + (ram.file_served_misses || 0).toLocaleString());
       set('d-ramused', gib(ram.system_used_bytes || 0) + ' GiB (' + (ram.system_load_percent || 0) + '%)');
@@ -3812,7 +3878,7 @@ html('d-ramfree', gib(ram.system_available_bytes || 0) + '<small>GiB free</small
 
     document.body.classList.toggle('view-chat', currentView === 'chat');
     // (the old #monitor link: the Process Monitor became part of the Dashboard)
-    if (['#dash', '#settings', '#monitor', '#opencode'].includes(window.location.hash)) switchView(window.location.hash === '#settings' ? 'settings' : window.location.hash === '#opencode' ? 'opencode' : 'dash');
+    if (['#dash', '#settings', '#monitor'].includes(window.location.hash)) switchView(window.location.hash === '#settings' ? 'settings' : 'dash');
 
 pollTelemetry();
     setInterval(pollTelemetry, 1000);

@@ -205,6 +205,8 @@ pub struct PinnedRegion<'c> {
     base: *mut u8,
     pub dev_ptr: u64,
     len: usize,
+    /// Driver-allocated host chunks (`cuMemHostAlloc`, `SHADOW_PIN_ALLOC=0` off): (ptr, bytes) in order.
+    ptrs: Vec<(*mut u8, usize)>,
     /// The committed and registered ranges, (offset, bytes), in order.
     chunks: Vec<(usize, usize)>,
     /// Each chunk's device-mapped address (the driver does not put separate registrations at consecutive device addresses) and the chunk size.
@@ -239,29 +241,50 @@ impl<'c> PinnedRegion<'c> {
         #[cfg(windows)]
         {
             let total = len.max(1);
-            // SAFETY: a fresh reservation of address space only; VirtualAlloc returns a page-aligned pointer or null.
-            let base = unsafe { win::VirtualAlloc(std::ptr::null_mut(), total, win::MEM_RESERVE, win::PAGE_READWRITE) } as *mut u8;
-            if base.is_null() {
-                return Err(format!("VirtualAlloc of {len} bytes failed"));
-            }
-            let mut r = PinnedRegion { ctx, base, dev_ptr: 0, len: 0, chunks: Vec::new(), devs: Vec::new(), chunk, available };
+            let alloc = !std::env::var("SHADOW_PIN_ALLOC").is_ok_and(|v| v == "0");
+            let base = if alloc {
+                std::ptr::null_mut()
+            } else {
+                // SAFETY: a fresh reservation of address space only; VirtualAlloc returns a page-aligned pointer or null.
+                let b = unsafe { win::VirtualAlloc(std::ptr::null_mut(), total, win::MEM_RESERVE, win::PAGE_READWRITE) } as *mut u8;
+                if b.is_null() {
+                    return Err(format!("VirtualAlloc of {len} bytes failed"));
+                }
+                b
+            };
+            let mut r = PinnedRegion { ctx, base, dev_ptr: 0, len: 0, ptrs: Vec::new(), chunks: Vec::new(), devs: Vec::new(), chunk, available };
             ctx.bind().map_err(|e| e.to_string())?;
             let mut off = 0usize;
             let mut warned = false;
             while off < total {
                 let n = chunk.min(total - off);
-                // SAFETY: [base + off, base + off + n) lies inside the reservation just made.
-                let at = unsafe { base.add(off) } as *mut c_void;
-                if unsafe { win::VirtualAlloc(at, n, win::MEM_COMMIT, win::PAGE_READWRITE) }.is_null() {
-                    return Err(format!("VirtualAlloc: committing {n} bytes at offset {off} of {len} failed")); // r frees it
-                }
-                // SAFETY: the committed range just made; CU_MEMHOSTREGISTER_DEVICEMAP = 0x02 (`SHADOW_PIN_PORTABLE=1` adds PORTABLE = 0x01: an experiment, STATUS 155).
                 let flags: u32 = std::env::var("SHADOW_PIN_FLAGS").ok().and_then(|v| v.parse().ok()).unwrap_or(if std::env::var("SHADOW_PIN_PORTABLE").is_ok_and(|v| v == "1") { 0x03 } else { 0x02 });
-                let code = unsafe { (ctx.api.cuMemHostRegister)(at, n, flags) };
-                if code != 0 {
-                    // SAFETY: committed above, not registered: Drop would only release the reservation, which holds this commit too.
-                    return Err(format!("cuMemHostRegister of {n} bytes at offset {off} of {len} failed ({code})"));
-                }
+                let at = if alloc {
+                    let mut p: *mut c_void = std::ptr::null_mut();
+                    // SAFETY: driver-allocated page-locked memory (`cuMemHostAlloc`, STATUS 166: not double-charged across two adapters by WDDM).
+                    let code = unsafe { (ctx.api.cuMemHostAlloc)(&mut p, n, flags) };
+                    if code != 0 || p.is_null() {
+                        return Err(format!("cuMemHostAlloc of {n} bytes at offset {off} of {len} failed ({code})"));
+                    }
+                    if off == 0 {
+                        r.base = p as *mut u8;
+                    }
+                    r.ptrs.push((p as *mut u8, n));
+                    p
+                } else {
+                    // SAFETY: [base + off, base + off + n) lies inside the reservation just made.
+                    let at = unsafe { base.add(off) } as *mut c_void;
+                    if unsafe { win::VirtualAlloc(at, n, win::MEM_COMMIT, win::PAGE_READWRITE) }.is_null() {
+                        return Err(format!("VirtualAlloc: committing {n} bytes at offset {off} of {len} failed")); // r frees it
+                    }
+                    // SAFETY: the committed range just made; CU_MEMHOSTREGISTER_DEVICEMAP = 0x02 (`SHADOW_PIN_PORTABLE=1` adds PORTABLE = 0x01: an experiment, STATUS 155).
+                    let code = unsafe { (ctx.api.cuMemHostRegister)(at, n, flags) };
+                    if code != 0 {
+                        // SAFETY: committed above, not registered: Drop would only release the reservation, which holds this commit too.
+                        return Err(format!("cuMemHostRegister of {n} bytes at offset {off} of {len} failed ({code})"));
+                    }
+                    at
+                };
                 r.chunks.push((off, n));
                 PINNED.fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
                 let mut dptr = 0u64;
@@ -320,12 +343,21 @@ impl<'c> PinnedRegion<'c> {
             let mut freed = 0usize;
             while freed < bytes {
                 let Some(&(off, n)) = self.chunks.last() else { break };
-                // SAFETY: the chunk was committed and registered by `build`; it is unregistered, then its pages are returned (the reservation stays).
-                unsafe {
-                    if self.ctx.bind().is_ok() {
-                        (self.ctx.api.cuMemHostUnregister)(self.base.add(off) as *mut c_void);
+                if let Some((p, _)) = self.ptrs.pop() {
+                    // SAFETY: allocated by `cuMemHostAlloc` in `build`; freed once.
+                    unsafe {
+                        if self.ctx.bind().is_ok() {
+                            (self.ctx.api.cuMemFreeHost)(p as *mut c_void);
+                        }
                     }
-                    win::VirtualFree(self.base.add(off) as *mut c_void, n, win::MEM_DECOMMIT);
+                } else {
+                    // SAFETY: the chunk was committed and registered by `build`; it is unregistered, then its pages are returned (the reservation stays).
+                    unsafe {
+                        if self.ctx.bind().is_ok() {
+                            (self.ctx.api.cuMemHostUnregister)(self.base.add(off) as *mut c_void);
+                        }
+                        win::VirtualFree(self.base.add(off) as *mut c_void, n, win::MEM_DECOMMIT);
+                    }
                 }
                 PINNED.fetch_sub(n as u64, std::sync::atomic::Ordering::Relaxed);
                 self.chunks.pop();
@@ -343,13 +375,54 @@ impl<'c> PinnedRegion<'c> {
     }
 
     pub fn as_slice(&self) -> &[u8] {
+        assert!(self.ptrs.len() <= 1, "as_slice on a multi-chunk cuMemHostAlloc region: use slice(off, len)");
         // SAFETY: committed memory of `len` bytes owned by this value.
         unsafe { std::slice::from_raw_parts(self.base, self.len) }
     }
 
     pub fn as_mut_slice(&mut self) -> &mut [u8] {
+        assert!(self.ptrs.len() <= 1, "as_mut_slice on a multi-chunk cuMemHostAlloc region: use slice_mut(off, len)");
         // SAFETY: as as_slice, borrowed mutably once.
         unsafe { std::slice::from_raw_parts_mut(self.base, self.len) }
+    }
+
+    /// A slice `[off .. off + len)` inside a single chunk (`fit` guarantees no expert crosses a chunk boundary).
+    pub fn slice(&self, off: usize, len: usize) -> &[u8] {
+        if self.ptrs.len() <= 1 {
+            &self.as_slice()[off..off + len]
+        } else {
+            let (p, n) = self.ptrs[off / self.chunk];
+            let o = off % self.chunk;
+            assert!(o + len <= n, "pinned slice {off}+{len} crosses chunk boundary {n}");
+            // SAFETY: `[o .. o + len)` lies inside this chunk's `cuMemHostAlloc` allocation of `n` bytes.
+            unsafe { std::slice::from_raw_parts(p.add(o), len) }
+        }
+    }
+
+    /// A mutable slice `[off .. off + len)` inside a single chunk.
+    pub fn slice_mut(&mut self, off: usize, len: usize) -> &mut [u8] {
+        if self.ptrs.len() <= 1 {
+            &mut self.as_mut_slice()[off..off + len]
+        } else {
+            let (p, n) = self.ptrs[off / self.chunk];
+            let o = off % self.chunk;
+            assert!(o + len <= n, "pinned slice_mut {off}+{len} crosses chunk boundary {n}");
+            // SAFETY: `[o .. o + len)` lies inside this chunk's `cuMemHostAlloc` allocation of `n` bytes, borrowed mutably once.
+            unsafe { std::slice::from_raw_parts_mut(p.add(o), len) }
+        }
+    }
+
+    /// Each chunk as `(chunk_start_offset, &mut [u8])`, in order, for carving multiple disjoint slots (`read_drive`).
+    pub fn chunk_slices_mut(&mut self) -> Vec<(usize, &mut [u8])> {
+        if self.ptrs.len() <= 1 {
+            vec![(0, self.as_mut_slice())]
+        } else {
+            let c = self.chunk;
+            self.ptrs.iter().enumerate().map(|(i, &(p, n))| {
+                // SAFETY: each chunk `i` is a disjoint `cuMemHostAlloc` allocation of `n` bytes owned by `self`.
+                (i * c, unsafe { std::slice::from_raw_parts_mut(p, n) })
+            }).collect()
+        }
     }
 
     /// Err if available RAM has fallen below the floor (call it while filling the region and after).
@@ -361,17 +434,30 @@ impl<'c> PinnedRegion<'c> {
 impl Drop for PinnedRegion<'_> {
     fn drop(&mut self) {
         #[cfg(windows)]
-        // SAFETY: unregister what `build` registered, chunk by chunk, then release the whole reservation once.
+        // SAFETY: free each `cuMemHostAlloc` chunk, or unregister what `build` registered and release the reservation once.
         unsafe {
-            if !self.chunks.is_empty() && self.ctx.bind().is_ok() {
-                for &(off, _) in &self.chunks {
-                    (self.ctx.api.cuMemHostUnregister)(self.base.add(off) as *mut c_void);
+            if !self.ptrs.is_empty() {
+                if self.ctx.bind().is_ok() {
+                    for &(p, _) in &self.ptrs {
+                        (self.ctx.api.cuMemFreeHost)(p as *mut c_void);
+                    }
+                }
+                for &(_, n) in &self.chunks {
+                    PINNED.fetch_sub(n as u64, std::sync::atomic::Ordering::Relaxed);
+                }
+            } else {
+                if !self.chunks.is_empty() && self.ctx.bind().is_ok() {
+                    for &(off, _) in &self.chunks {
+                        (self.ctx.api.cuMemHostUnregister)(self.base.add(off) as *mut c_void);
+                    }
+                }
+                for &(_, n) in &self.chunks {
+                    PINNED.fetch_sub(n as u64, std::sync::atomic::Ordering::Relaxed);
+                }
+                if !self.base.is_null() {
+                    win::VirtualFree(self.base as *mut c_void, 0, win::MEM_RELEASE);
                 }
             }
-            for &(_, n) in &self.chunks {
-                PINNED.fetch_sub(n as u64, std::sync::atomic::Ordering::Relaxed);
-            }
-            win::VirtualFree(self.base as *mut c_void, 0, win::MEM_RELEASE);
         }
     }
 }

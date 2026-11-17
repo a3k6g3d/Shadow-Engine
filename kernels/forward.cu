@@ -129,11 +129,12 @@ extern "C" __global__ void hc_mix_rows(const float* rn, const float* up, float* 
     hc_mix_one(rn + y * rs, up + y * rs, u + y * h, h, streams);
 }
 
-// r[s*h+i] += g[s] * y[i]
+// r[s*h+i] += g[s] * y[i], for row j = blockIdx.y
 extern "C" __global__ void hc_write(float* r, const float* g, const float* y, unsigned int h, unsigned int streams) {
     unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= h * streams) return;
-    r[i] += g[i / h] * y[i % h];
+    const u64 j = blockIdx.y, rs = (u64) h * streams;
+    if (i >= rs) return;
+    r[j * rs + i] += g[j * streams + i / h] * y[j * h + i % h];
 }
 
 // Fuses hc_write (r[s*h+i] += g[s] * y[i]) and the next hc_read's rmsnorm_groups (rn[s*h+i] = rmsnorm(r_s, w_s)).
@@ -2718,7 +2719,7 @@ extern "C" __global__ void df_conv(const float* x, const float* delta, const uns
 }
 
 // NeoX RoPE over full 128-wide heads, row j at position pos0 + j; grid = (heads, rows), block 64
-extern "C" __global__ void df_rope(float* x, unsigned int pos0, unsigned int stride, float theta) {
+static __device__ __forceinline__ void df_rope_impl(float* x, unsigned int pos0, unsigned int stride, float theta) {
     float* xr = x + (u64) blockIdx.y * stride + blockIdx.x * 128;
     unsigned int i = threadIdx.x;
     float f = (float) (pos0 + blockIdx.y) * powf(theta, -(float) i / 64.0f);
@@ -2729,11 +2730,27 @@ extern "C" __global__ void df_rope(float* x, unsigned int pos0, unsigned int str
     xr[i + 64] = b * cs + a * sn;
 }
 
+extern "C" __global__ void df_rope(float* x, unsigned int pos0, unsigned int stride, float theta) {
+    df_rope_impl(x, pos0, stride, theta);
+}
+
+extern "C" __global__ void df_rope_p(float* x, const unsigned int* meta, unsigned int stride, float theta) {
+    df_rope_impl(x, meta[0], stride, theta);
+}
+
 // ring[((pos0 + j) % cap) * width ..] = src[j * width ..]; grid = (ceil(width / 256), rows)
-extern "C" __global__ void df_ring_put(const float* src, float* ring, unsigned int pos0, unsigned int cap, unsigned int width) {
+static __device__ __forceinline__ void df_ring_put_impl(const float* src, float* ring, unsigned int pos0, unsigned int cap, unsigned int width) {
     unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= width) return;
     ring[(u64) ((pos0 + blockIdx.y) % cap) * width + i] = src[(u64) blockIdx.y * width + i];
+}
+
+extern "C" __global__ void df_ring_put(const float* src, float* ring, unsigned int pos0, unsigned int cap, unsigned int width) {
+    df_ring_put_impl(src, ring, pos0, cap, width);
+}
+
+extern "C" __global__ void df_ring_put_p(const float* src, float* ring, const unsigned int* meta, unsigned int cap, unsigned int width) {
+    df_ring_put_impl(src, ring, meta[0], cap, width);
 }
 
 // g[i] = silu(g[i]) * u[i]
@@ -2747,8 +2764,8 @@ extern "C" __global__ void df_silu_mul(float* g, const float* u, unsigned int n)
 // `floor_pos` (<= n): the lowest position whose ring slot holds its own K/V (0 normally; higher after the session went back to a
 // snapshot and the old session had already overwritten the slots of the oldest positions: STATUS 98)
 // grid = (32, rows), block 128, dynamic shared = (window + rows) floats
-extern "C" __global__ void df_attention(const float* q, const float* kc, const float* vc, float* out, unsigned int n,
-                                        unsigned int rows, unsigned int window, unsigned int ring, float scale, unsigned int floor_pos) {
+static __device__ __forceinline__ void df_attention_impl(const float* q, const float* kc, const float* vc, float* out, unsigned int n,
+                                                         unsigned int rows, unsigned int window, unsigned int ring, float scale, unsigned int floor_pos) {
     extern __shared__ float sc[];
     __shared__ float qv[128];
     __shared__ float red[128];
@@ -2794,6 +2811,16 @@ extern "C" __global__ void df_attention(const float* q, const float* kc, const f
     float acc = 0.0f;
     for (unsigned int j = 0; j < len; ++j) acc += sc[j] * vc[(u64) ((lo + j) % ring) * 1024 + kvh * 128 + d];
     out[(u64) t * 4096 + h * 128 + d] = acc / sm;
+}
+
+extern "C" __global__ void df_attention(const float* q, const float* kc, const float* vc, float* out, unsigned int n,
+                                        unsigned int rows, unsigned int window, unsigned int ring, float scale, unsigned int floor_pos) {
+    df_attention_impl(q, kc, vc, out, n, rows, window, ring, scale, floor_pos);
+}
+
+extern "C" __global__ void df_attention_p(const float* q, const float* kc, const float* vc, float* out, const unsigned int* meta,
+                                          unsigned int rows, unsigned int window, unsigned int ring, float scale) {
+    df_attention_impl(q, kc, vc, out, meta[0], rows, window, ring, scale, meta[1]);
 }
 
 // The 16 largest of each row of logits (vocab values, rows ls apart), largest first, ties to the lower id; with `map`
@@ -2858,9 +2885,9 @@ extern "C" __global__ void df_top16(const float* logits, unsigned int vocab, uns
 //   unary[e][c] + < pred[p_e] * hp[e], succ[cand[e][c]] >,   p_0 = anchor, p_e = the token chosen for slot e - 1,
 // and takes the best.  One block of 512 threads (a warp a candidate); out[e] = the token chosen, out[slots + e] = the
 // float bits of its probability among the 16 (softmax of the scores).
-extern "C" __global__ void df_walk(const unsigned int* cand, const float* unary, const float* hp, const unsigned short* pred,
-                                   const unsigned short* succ, unsigned int anchor, unsigned int slots, unsigned int rank,
-                                   unsigned int* out) {
+static __device__ __forceinline__ void df_walk_impl(const unsigned int* cand, const float* unary, const float* hp, const unsigned short* pred,
+                                                    const unsigned short* succ, unsigned int anchor, unsigned int slots, unsigned int rank,
+                                                    unsigned int* out) {
     __shared__ float score[16];
     __shared__ float pv[256];
     __shared__ unsigned int ptok;
@@ -2887,6 +2914,18 @@ extern "C" __global__ void df_walk(const unsigned int* cand, const float* unary,
         }
         __syncthreads();
     }
+}
+
+extern "C" __global__ void df_walk(const unsigned int* cand, const float* unary, const float* hp, const unsigned short* pred,
+                                   const unsigned short* succ, unsigned int anchor, unsigned int slots, unsigned int rank,
+                                   unsigned int* out) {
+    df_walk_impl(cand, unary, hp, pred, succ, anchor, slots, rank, out);
+}
+
+extern "C" __global__ void df_walk_p(const unsigned int* cand, const float* unary, const float* hp, const unsigned short* pred,
+                                     const unsigned short* succ, const unsigned int* meta, unsigned int slots, unsigned int rank,
+                                     unsigned int* out) {
+    df_walk_impl(cand, unary, hp, pred, succ, meta[2], slots, rank, out);
 }
 
 // The top `keep` blocks of each row's index scores, as the token lists `attention_*_sel_rows` read: what the host did after a download of the
@@ -3316,6 +3355,110 @@ extern "C" __global__ void plan_fill(const unsigned int* tidx, const unsigned in
         }
         seen += chunk_total;
         __syncthreads();
+    }
+}
+// Fused 1-block router + 2-token group planner for 100%-resident MoE layers on small batches (m <= 8, k <= 16, ne <= 512, G = m * k <= 128).
+// Replaces 6 launches (zero_words x 2, route_topk_rows, plan_scan, 512-block plan_fill, fill_words) with 1 block of 256 threads and caps each group at <= 2 tokens
+// so `routed_grouped` always runs the `m2s4` kernel (since ceil(c / 2) <= c for all c >= 1, total groups <= m * k = G).
+extern "C" __global__ void __launch_bounds__(256) route_plan_res_small(
+    const float* logits, const u64* eaddr, unsigned char* base,
+    unsigned int ne, unsigned int k, unsigned int m, unsigned int G,
+    unsigned int up_off, unsigned int a0, unsigned int r0, unsigned int w_off, unsigned int counts_off)
+{
+    __shared__ double exs[8][512];
+    __shared__ unsigned int s_tidx[128];
+    __shared__ unsigned int s_ngroups;
+    const unsigned int tid = threadIdx.x, lane = tid & 31u, w = tid >> 5;
+    if (tid == 0) s_ngroups = 0u;
+    if (w < m) {
+        double* ex = exs[w];
+        const float* lg = logits + (u64) w * ne;
+        float mx = -3.402823466e+38f;
+        for (unsigned int i = lane; i < ne; i += 32) mx = fmaxf(mx, lg[i]);
+        #pragma unroll
+        for (unsigned int o = 16; o > 0; o >>= 1) mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, o));
+        for (unsigned int i = lane; i < ne; i += 32) ex[i] = exp((double) (lg[i] - mx));
+        __syncwarp();
+        double z = 0.0;
+        if (lane == 0) {
+            for (unsigned int i = 0; i < ne; ++i) z += ex[i];
+        }
+        z = __shfl_sync(0xffffffffu, z, 0);
+        unsigned int taken = 0u;
+        unsigned int top[16];
+        for (unsigned int t = 0; t < k; ++t) {
+            double bv = -1.0;
+            unsigned int bi = 0xffffffffu;
+            for (unsigned int q = 0; q * 32 + lane < ne; ++q) {
+                if (taken >> q & 1u) continue;
+                const unsigned int i = q * 32 + lane;
+                const double v = ex[i];
+                if (v > bv || (v == bv && i < bi)) { bv = v; bi = i; }
+            }
+            #pragma unroll
+            for (unsigned int o = 16; o > 0; o >>= 1) {
+                const double ov = __shfl_xor_sync(0xffffffffu, bv, o);
+                const unsigned int oi = __shfl_xor_sync(0xffffffffu, bi, o);
+                if (ov > bv || (ov == bv && oi < bi)) { bv = ov; bi = oi; }
+            }
+            top[t] = bi;
+            if ((bi & 31u) == lane) taken |= 1u << (bi >> 5);
+        }
+        double tz = 0.0;
+        for (unsigned int t = 0; t < k; ++t) tz += ex[top[t]] / z;
+        if (lane < k) {
+            unsigned int mine = top[0];
+            #pragma unroll
+            for (unsigned int t = 1; t < 16; ++t) if (t == lane) mine = top[t];
+            s_tidx[w * k + lane] = mine;
+            ((float*) (base + w_off))[w * k + lane] = (float) ((ex[mine] / z) / tz);
+        }
+        if (lane == 0) {
+            ((unsigned int*) (base + counts_off))[w] = k;
+        }
+    }
+    __syncthreads();
+    const unsigned int N = m * k;
+    // Deterministic expert-order group assignment (at most 4 tokens per group -> m4s4, matching plan_scan + plan_fill order):
+    // Instead of atomicAdd, each pair tid < N counts how many groups belong to experts e' < e plus occ / 4 for expert e.
+    if (tid < N) {
+        const unsigned int e = s_tidx[tid], j = tid / k;
+        unsigned int occ = 0u, tot = 0u;
+        for (unsigned int t = 0; t < N; ++t) {
+            if (s_tidx[t] == e) {
+                if (t < tid) ++occ;
+                ++tot;
+            }
+        }
+        unsigned int g_before = 0u;
+        for (unsigned int t = 0; t < N; ++t) {
+            const unsigned int et = s_tidx[t];
+            if (et < e) {
+                unsigned int prev_same = 0u;
+                for (unsigned int u = 0; u < t; ++u) if (s_tidx[u] == et) ++prev_same;
+                if ((prev_same & 3u) == 0u) ++g_before;
+            }
+        }
+        const unsigned int g = g_before + (occ >> 2), s = occ & 3u;
+        const unsigned int cnt_g = min(4u, tot - (occ & ~3u));
+        u64* addr = (u64*) (base + a0);
+        unsigned int* rec = (unsigned int*) (base + r0);
+        for (unsigned int part = 0; part < 3; ++part) {
+            unsigned int* r = rec + ((u64) part * G + g) * 17;
+            r[1 + s] = part == 2 ? tid : j;
+            r[1 + 8 + s] = part == 1 ? up_off + tid : tid;
+            if (s == 0u) {
+                r[0] = cnt_g;
+                addr[(u64) part * G + g] = eaddr[(u64) part * ne + e];
+            }
+        }
+        if ((occ & 3u) == 0u) atomicAdd(&s_ngroups, 1u);
+    }
+    __syncthreads();
+    const unsigned int ng = s_ngroups;
+    unsigned int* rec = (unsigned int*) (base + r0);
+    for (unsigned int idx = tid; idx < 3 * G; idx += 256) {
+        if ((idx % G) >= ng) rec[(u64) idx * 17] = 0u;
     }
 }
 // The 64 largest logits of each row, exactly (STATUS 159): largest first, ties to the lower id, the order the host sampler sorts in (`sampler.rs`), so a draw from the 64

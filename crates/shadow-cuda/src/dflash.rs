@@ -6,7 +6,7 @@
 //! a low-rank bilinear selector walks the best path through them.  The layer itself runs in `session::dflash_layer`,
 //! on the session's kernels.  Follows SGLang's `dflash.py` (DFlash2DraftModel) and `worker.py`.
 
-use crate::driver::{Context, DeviceBuffer};
+use crate::driver::{Context, DeviceBuffer, Graph};
 use std::collections::HashMap;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
@@ -73,6 +73,8 @@ pub struct DflashBufs<'c> {
     pub cand: DeviceBuffer<'c>,
     pub unary: DeviceBuffer<'c>,
     pub out: DeviceBuffer<'c>,
+    /// dynamic metadata [n, floor_pos, anchor, 0] read by graphed *_p draft kernels
+    pub pos: DeviceBuffer<'c>,
 }
 
 pub struct DflashModel<'c> {
@@ -100,6 +102,10 @@ pub struct DflashModel<'c> {
     pub prof: Option<std::collections::BTreeMap<&'static str, (f64, u64)>>,
     /// the mask token's embedding row (set when the session first drafts)
     pub mask_emb: Option<Vec<f32>>,
+    /// true after rows 1..BLOCK of `bufs.emb` hold `mask_emb`
+    pub mask_uploaded: bool,
+    /// captured draft graphs keyed by `(slots, head_logits_ptr)` (`SHADOW_DF_GRAPH=0` disables)
+    pub graphs: HashMap<(usize, u64), Graph<'c>>,
     /// rounds drafted, drafted tokens, tokens the main model agreed with (the speculation loop)
     pub stats: (u64, u64, u64),
 }
@@ -311,6 +317,7 @@ impl<'c> DflashModel<'c> {
             cand: a(BLOCK * TOP_K)?,
             unary: a(BLOCK * TOP_K)?,
             out: a(2 * BLOCK)?,
+            pos: a(4)?,
         };
         let _ = cap;
         let draft_ids = match std::fs::read(dir.join("draft_vocab.bin")) {
@@ -325,7 +332,7 @@ impl<'c> DflashModel<'c> {
         let ring = |_| ctx.alloc(RING * KV_WIDTH * 4).map_err(e);
         let kring = (0..LAYERS).map(ring).collect::<Result<Vec<_>, _>>()?;
         let vring = (0..LAYERS).map(ring).collect::<Result<Vec<_>, _>>()?;
-        Ok(Self { weights, tensors, bufs, kring, vring, valid: 0, lo: 0, broken: false, draft_ids, min_p: 0.0, prof: std::env::var("SHADOW_DF_TIME").is_ok_and(|v| v == "1").then(Default::default), mask_emb: None, stats: (0, 0, 0) })
+        Ok(Self { weights, tensors, bufs, kring, vring, valid: 0, lo: 0, broken: false, draft_ids, min_p: 0.0, prof: std::env::var("SHADOW_DF_TIME").is_ok_and(|v| v == "1").then(Default::default), mask_emb: None, mask_uploaded: false, graphs: HashMap::new(), stats: (0, 0, 0) })
     }
 
     pub fn ptr(&self, name: &str) -> u64 {

@@ -308,11 +308,10 @@ fn fastest_defaults(rest: &[String]) -> Vec<String> {
         let g = (1u64 << 30) as f64;
         let avail = available_ram();
         let mut tier = tier_for_available(avail, TIER_MAX, (floor_gib * g) as u64);
-        // two cards (`--gpus A,B`): the driver runs out of memory for small allocations once a process that holds both has pinned ~15 GiB (STATUS 150: 8-14 GiB tiers answer requests in fast mode, 16 GiB starts and fails at the first request, 22 GiB fails with an out-of-memory error
-        // at `cuEventCreate`, the default 37 GiB one at `cuMemHostGetDevicePointer`), so the default tier is capped at 16 GiB there; `--ram-tier-gib` still overrides
+        // two cards (`--gpus A,B`): only when `SHADOW_PIN_ALLOC=0` uses `cuMemHostRegister` (which WDDM double-charges across both contexts, STATUS 151/166) is the default tier capped at 12 GiB
         let pair = rest.iter().position(|a| a == "--gpus").and_then(|i| rest.get(i + 1)).is_some_and(|v| v.split(',').filter(|x| !x.trim().is_empty()).count() >= 2);
-        if pair && tier > (12u64 << 30) {
-            eprintln!("shadow serve: two cards: the RAM tier is capped at 12 GiB (more pinned memory fails with both cards in one process)");
+        if pair && std::env::var("SHADOW_PIN_ALLOC").is_ok_and(|v| v == "0") && tier > (12u64 << 30) {
+            eprintln!("shadow serve: two cards with SHADOW_PIN_ALLOC=0: the RAM tier is capped at 12 GiB (more registered memory fails with both cards in one process)");
             tier = 12u64 << 30;
         }
         eprintln!("shadow serve: {:.1} GiB of RAM available, floor {floor_gib:.1}: RAM tier {:.0} GiB (at most {:.0})", avail as f64 / g, tier as f64 / g, TIER_MAX as f64 / g);

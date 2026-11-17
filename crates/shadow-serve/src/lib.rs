@@ -9,7 +9,7 @@ pub mod cpuinfo;
 pub mod engine;
 pub mod mcp;
 pub mod memory;
-pub mod opencode;
+
 pub mod orchestrator;
 pub mod sampler;
 pub mod semsearch;
@@ -180,28 +180,6 @@ async fn handle(req: Request<Incoming>, app: Arc<App>) -> Result<Response<Body>,
                 s.requests, s.prompt_tokens, s.cached_tokens, s.completion_tokens, s.prompt_secs, s.decode_secs,
                 s.busy as u8, shadow_cuda::pinned::available_ram());
             full(StatusCode::OK, "text/plain; version=0.0.4", text)
-        }
-        // the OpenCode tab (STATUS 153): its own coding-agent server, started and stopped from the UI
-        (&Method::GET, "/v1/opencode") => json_resp(StatusCode::OK, &opencode::status()),
-        (&Method::POST, "/v1/opencode/start") => {
-            let port = req
-                .headers()
-                .get("host")
-                .and_then(|h| h.to_str().ok())
-                .and_then(|h| h.rsplit_once(':'))
-                .and_then(|(_, p)| p.parse::<u16>().ok())
-                .unwrap_or(8081);
-            let s = app.status.lock().unwrap().clone();
-            let model = std::path::Path::new(&s.model).file_name().map_or(s.model.clone(), |f| f.to_string_lossy().trim_end_matches(".gguf").to_string());
-            match tokio::task::spawn_blocking(move || opencode::start(port, &model, s.n_ctx)).await {
-                Ok(Ok(v)) => json_resp(StatusCode::OK, &v),
-                Ok(Err(e)) => error(StatusCode::SERVICE_UNAVAILABLE, &e),
-                Err(e) => error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
-            }
-        }
-        (&Method::POST, "/v1/opencode/stop") => {
-            let _ = tokio::task::spawn_blocking(opencode::stop).await;
-            json_resp(StatusCode::OK, &opencode::status())
         }
         (&Method::GET, "/v1/tools") => json_resp(StatusCode::OK, &orchestrator::tool_definitions()),
         (&Method::GET, "/v1/memory") => json_resp(StatusCode::OK, &memory::list()),
@@ -455,7 +433,7 @@ fn tool_calls_json(calls: &[ToolCall], tools: Option<&Vec<Value>>) -> Vec<Value>
         .collect()
 }
 
-/// A streamed chat answer for a request that carries `tools` (OpenAI streaming: the AI SDK behind OpenCode always streams): text before a `<tool_call>` block goes out as
+/// A streamed chat answer for a request that carries `tools` (OpenAI streaming: a tool-using client always streams): text before a `<tool_call>` block goes out as
 /// `content` deltas (a tail that could be the start of the marker is held back until it is decided); from the marker on, the text is kept, and at the end the parsed calls
 /// go out as one `tool_calls` delta with finish_reason `tool_calls` (a block that does not parse goes out as text).  STATUS 152.
 fn stream_with_tools(rx: tokio::sync::mpsc::UnboundedReceiver<Event>, id: String, model: String, created: u64, tools: Vec<Value>) -> Response<Body> {
