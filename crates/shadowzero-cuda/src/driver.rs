@@ -47,6 +47,41 @@ pub const CU_DEVICE_ATTRIBUTE_PCI_BUS_ID: c_int = 33;
 pub const CU_DEVICE_ATTRIBUTE_PCI_DEVICE_ID: c_int = 34;
 pub const CU_DEVICE_ATTRIBUTE_PCI_DOMAIN_ID: c_int = 50;
 
+/// `CU_LAUNCH_ATTRIBUTE_PROGRAMMATIC_STREAM_SERIALIZATION` (from `cuda.h`): allows a SM 9.0+ kernel to overlap its
+/// epilogue with the prologue of the next kernel on the same stream (Programmatic Dependent Launch, PDL).
+pub const CU_LAUNCH_ATTRIBUTE_PROGRAMMATIC_STREAM_SERIALIZATION: c_int = 6;
+
+/// `CUlaunchAttribute_st` (`cuda.h`, 64-byte struct: 4-byte `id`, 4-byte `pad`, 56-byte `value` union).
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct CuLaunchAttribute {
+    pub id: c_int,
+    pub pad: [c_char; 4],
+    pub val: [u64; 7],
+}
+
+/// `CUlaunchConfig_st` (`cuda.h`, passed to `cuLaunchKernelEx`).
+#[repr(C)]
+pub struct CuLaunchConfig {
+    pub grid_dim_x: c_uint,
+    pub grid_dim_y: c_uint,
+    pub grid_dim_z: c_uint,
+    pub block_dim_x: c_uint,
+    pub block_dim_y: c_uint,
+    pub block_dim_z: c_uint,
+    pub shared_mem_bytes: c_uint,
+    pub h_stream: H,
+    pub attrs: *mut CuLaunchAttribute,
+    pub num_attrs: c_uint,
+}
+
+/// Whether Programmatic Dependent Launch (`cuLaunchKernelEx` with `CU_LAUNCH_ATTRIBUTE_PROGRAMMATIC_STREAM_SERIALIZATION`)
+/// is enabled (`SHADOWZERO_PDL=0` disables it).
+pub fn pdl_enabled() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| !std::env::var("SHADOWZERO_PDL").is_ok_and(|v| v == "0"))
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CudaError {
     pub code: CuResult,
@@ -70,6 +105,8 @@ macro_rules! table {
             $(pub $field: unsafe extern "system" fn($($a),*) -> CuResult,)*
             /// `cuMemcpyBatchAsync_v2` (CUDA 12.8+ drivers): many copies in one call; None on an older driver (the callers copy one by one)
             pub cuMemcpyBatchAsync: Option<unsafe extern "system" fn(*mut u64, *mut u64, *mut usize, usize, *mut c_void, *mut usize, usize, H) -> CuResult>,
+            /// `cuLaunchKernelEx` (CUDA 11.8+ drivers): extended kernel launch with `CUlaunchAttribute` (used for SM 9.0+ PDL).
+            pub cuLaunchKernelEx: Option<unsafe extern "system" fn(*const CuLaunchConfig, H, *mut *mut c_void, *mut *mut c_void) -> CuResult>,
         }
         impl Api {
             fn load(lib: Dylib) -> Result<Api, String> {
@@ -80,6 +117,10 @@ macro_rules! table {
                     // SAFETY: the documented signature of `cuMemcpyBatchAsync_v2`.
                     cuMemcpyBatchAsync: lib.sym_any(&["cuMemcpyBatchAsync_v2"]).ok().map(|p| unsafe {
                         std::mem::transmute::<*mut c_void, unsafe extern "system" fn(*mut u64, *mut u64, *mut usize, usize, *mut c_void, *mut usize, usize, H) -> CuResult>(p)
+                    }),
+                    // SAFETY: the documented signature of `cuLaunchKernelEx`.
+                    cuLaunchKernelEx: lib.sym_any(&["cuLaunchKernelEx"]).ok().map(|p| unsafe {
+                        std::mem::transmute::<*mut c_void, unsafe extern "system" fn(*const CuLaunchConfig, H, *mut *mut c_void, *mut *mut c_void) -> CuResult>(p)
                     }),
                     lib,
                 })
@@ -383,9 +424,26 @@ impl DeviceBuffer<'_> {
 
 impl Drop for DeviceBuffer<'_> {
     fn drop(&mut self) {
-        if self.owned && self.ctx.bind().is_ok() {
-            // SAFETY: the allocation cuMemAlloc made for this value, freed once.
-            unsafe { (self.ctx.api.cuMemFree)(self.ptr) };
+        if !self.owned {
+            return;
+        }
+        match self.ctx.bind() {
+            Ok(()) => {
+                // SAFETY: the allocation cuMemAlloc made for this value, freed once.
+                let r = unsafe { (self.ctx.api.cuMemFree)(self.ptr) };
+                if r != 0 {
+                    static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+                    if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                        eprintln!("cuda drop: cuMemFree failed ({r}) on {}", self.ctx.name);
+                    }
+                }
+            }
+            Err(e) => {
+                static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+                if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                    eprintln!("cuda drop: bind failed in DeviceBuffer::drop on {}: {e}", self.ctx.name);
+                }
+            }
         }
     }
 }
@@ -444,6 +502,28 @@ impl RawFunction<'_> {
                          params: &mut [*mut c_void]) -> Result<(), CudaError> {
         self.ctx.bind()?;
         let s = stream.map(|s| s.stream).unwrap_or(std::ptr::null_mut());
+        if self.ctx.cc.0 >= 9 && pdl_enabled() {
+            if let Some(launch_ex) = self.ctx.api.cuLaunchKernelEx {
+                let mut attr = CuLaunchAttribute {
+                    id: CU_LAUNCH_ATTRIBUTE_PROGRAMMATIC_STREAM_SERIALIZATION,
+                    pad: [0; 4],
+                    val: [1, 0, 0, 0, 0, 0, 0],
+                };
+                let cfg = CuLaunchConfig {
+                    grid_dim_x: grid.0,
+                    grid_dim_y: grid.1,
+                    grid_dim_z: grid.2,
+                    block_dim_x: block.0,
+                    block_dim_y: block.1,
+                    block_dim_z: block.2,
+                    shared_mem_bytes: shared,
+                    h_stream: s,
+                    attrs: &mut attr,
+                    num_attrs: 1,
+                };
+                return check(self.ctx.api, unsafe { launch_ex(&cfg, self.f, params.as_mut_ptr(), std::ptr::null_mut()) }, "cuLaunchKernelEx");
+            }
+        }
         call!(self.ctx.api, cuLaunchKernel(self.f, grid.0, grid.1, grid.2, block.0, block.1, block.2, shared, s,
                                            params.as_mut_ptr(), std::ptr::null_mut()))
     }

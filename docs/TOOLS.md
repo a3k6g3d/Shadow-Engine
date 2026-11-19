@@ -36,6 +36,7 @@ CUDA index, `safetensors`, `numpy`, `matplotlib`).
 | `tools/exl3_export_tables.py MODEL OUT [cuda_device]` | an EXL3 checkpoint's token embedding and dequantized output head as float32 files (`token_embd.f32`, `output.f32`) for `tools/dflash2_train.py`, which `shadowzero dump` cannot make for a directory; run in the exllamav3 venv (STATUS 166) |
 | `tools/spec_probe.py` | what speculation could buy from routing logs: expert-union size per verify pass, accepted tokens per pass |
 | `tools/serve_check.py [URL]` | live checks of a running `shadowzero serve`: every route, streamed vs whole answers identical, prefix reuse, refusals, concurrent requests |
+| `tools/media_mcp.py` | MCP stdio server exposing `generate_photo` (`Tongyi-MAI/Z-Image-Turbo`), `generate_video` (`Wan-AI/Wan2.2-TI2V-5B-Diffusers`), and `upscale_media` (4K AI upscaling via `ai-forever/Real-ESRGAN` + NVENC/H.264); automatically parks dual-GPU VRAM (`POST /v1/engine/park`), runs in an isolated highest-VRAM worker, saves to `outputs/`, and reloads (`POST /v1/engine/resume`) |
 
 ## The DFlash 2 drafter
 

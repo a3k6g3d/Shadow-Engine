@@ -10,6 +10,7 @@ __pycache__/
 models/mtp-basalt-ft1/*.bin
 /target-*/
 .venv-train/
+/outputs/
 
 # bench/: dated result directories are kept; scratch runs, logs and per-experiment outputs are not (`git add -f` a result worth keeping)
 /bench/*

@@ -218,49 +218,122 @@ pub fn render_for_arch(_arch: &str, messages: &[Message], o: &Options) -> Result
     render(messages, o)
 }
 
-/// Extracts `<tool_call>...</tool_call>` blocks from an assistant message's output, returning `(remaining_content, tool_calls)`.
-/// Understands Qwen's `<function=NAME>\n<parameter=KEY>\nVAL\n</parameter>\n</function>` form.
-pub fn parse_tool_calls(text: &str) -> (String, Vec<ToolCall>) {
-    let Some(first_pos) = text.find("<tool_call>") else {
-        return (text.to_string(), Vec::new());
-    };
-    let mut calls = Vec::new();
-    let mut rest = &text[first_pos..];
-    while let Some(s) = rest.find("<tool_call>") {
-        let after_open = &rest[s + "<tool_call>".len()..];
-        let Some(e) = after_open.find("</tool_call>") else { break };
-        let body = after_open[..e].trim();
-        if let Some(fn_body) = body.strip_prefix("<function=") {
-            if let Some(gt) = fn_body.find('>') {
-                let name = fn_body[..gt].trim().to_string();
-                let mut inner = &fn_body[gt + 1..];
-                if let Some(end_fn) = inner.rfind("</function>") {
-                    inner = &inner[..end_fn];
-                }
-                let mut arguments = Vec::new();
-                while let Some(ps) = inner.find("<parameter=") {
-                    let after_p = &inner[ps + "<parameter=".len()..];
-                    let Some(pgt) = after_p.find('>') else { break };
-                    let key = after_p[..pgt].trim().to_string();
-                    let val_rest = &after_p[pgt + 1..];
-                    let Some(pe) = val_rest.find("</parameter>") else { break };
-                    let mut val = &val_rest[..pe];
-                    val = val.strip_prefix("\r\n").or_else(|| val.strip_prefix('\n')).unwrap_or(val);
-                    val = val.strip_suffix("\r\n").or_else(|| val.strip_suffix('\n')).unwrap_or(val);
-                    arguments.push((key, val.to_string()));
-                    inner = &val_rest[pe + "</parameter>".len()..];
-                }
-                if !name.is_empty() {
-                    calls.push(ToolCall { name, arguments });
+/// Finds the next genuine `<tool_call>\s*<function=NAME>` opener at or after `from`,
+/// returning `(open_start, fn_name, body_start)`. Prose mentions like `` `<tool_call>` `` are skipped.
+fn find_tool_call_opener(text: &str, from: usize) -> Option<(usize, String, usize)> {
+    const OPEN: &str = "<tool_call>";
+    const FN: &str = "<function=";
+    let mut pos = from;
+    while let Some(rel) = text[pos..].find(OPEN) {
+        let open_start = pos + rel;
+        let after_open = open_start + OPEN.len();
+        let ws_len = text[after_open..]
+            .bytes()
+            .take_while(|b| matches!(b, b' ' | b'\t' | b'\r' | b'\n'))
+            .count();
+        let fn_start = after_open + ws_len;
+        if text[fn_start..].starts_with(FN) {
+            let name_start = fn_start + FN.len();
+            if let Some(gt_rel) = text[name_start..].find('>') {
+                let name = text[name_start..name_start + gt_rel].trim();
+                if !name.is_empty()
+                    && !name.contains('<')
+                    && !name.chars().any(char::is_whitespace)
+                {
+                    return Some((open_start, name.to_string(), name_start + gt_rel + 1));
                 }
             }
         }
-        rest = &after_open[e + "</tool_call>".len()..];
+        pos = after_open;
     }
-    if calls.is_empty() {
-        (text.to_string(), Vec::new())
-    } else {
-        (text[..first_pos].trim_end().to_string(), calls)
+    None
+}
+
+/// Finds the matching `</function>\s*</tool_call>` close for a tool call body starting at `body_start`,
+/// returning `(body_end, close_end)`. Skips literal `</tool_call>` or `</function>` inside code strings.
+fn find_tool_call_close(text: &str, body_start: usize) -> Option<(usize, usize)> {
+    const END_FN: &str = "</function>";
+    const END_TC: &str = "</tool_call>";
+    let mut pos = body_start;
+    let mut fallback: Option<(usize, usize)> = None;
+    while let Some(rel) = text[pos..].find(END_FN) {
+        let end_fn = pos + rel;
+        let after_fn = end_fn + END_FN.len();
+        let ws_len = text[after_fn..]
+            .bytes()
+            .take_while(|b| matches!(b, b' ' | b'\t' | b'\r' | b'\n'))
+            .count();
+        let tc_start = after_fn + ws_len;
+        if text[tc_start..].starts_with(END_TC) {
+            let close_end = tc_start + END_TC.len();
+            let before = text[body_start..end_fn].trim_end();
+            if before.is_empty() || before.ends_with("</parameter>") {
+                return Some((end_fn, close_end));
+            }
+            if fallback.is_none() {
+                fallback = Some((end_fn, close_end));
+            }
+        }
+        pos = after_fn;
+    }
+    fallback
+}
+
+fn parse_tool_params(inner: &str) -> Vec<(String, String)> {
+    const P_OPEN: &str = "<parameter=";
+    const P_CLOSE: &str = "</parameter>";
+    let mut arguments = Vec::new();
+    let mut pos = 0;
+    while let Some(rel) = inner[pos..].find(P_OPEN) {
+        let after_p = pos + rel + P_OPEN.len();
+        let Some(pgt) = inner[after_p..].find('>') else { break };
+        let key = inner[after_p..after_p + pgt].trim().to_string();
+        let val_start = after_p + pgt + 1;
+        // Find the `</parameter>` followed by whitespace + next `<parameter=` or end of function body.
+        let mut search = val_start;
+        let mut matched_end: Option<usize> = None;
+        while let Some(pe_rel) = inner[search..].find(P_CLOSE) {
+            let pe = search + pe_rel;
+            let after_close = inner[pe + P_CLOSE.len()..].trim_start();
+            if after_close.is_empty() || after_close.starts_with(P_OPEN) {
+                matched_end = Some(pe);
+                break;
+            }
+            search = pe + P_CLOSE.len();
+        }
+        let Some(pe) = matched_end.or_else(|| inner[val_start..].find(P_CLOSE).map(|r| val_start + r)) else {
+            break;
+        };
+        let mut val = &inner[val_start..pe];
+        val = val.strip_prefix("\r\n").or_else(|| val.strip_prefix('\n')).unwrap_or(val);
+        val = val.strip_suffix("\r\n").or_else(|| val.strip_suffix('\n')).unwrap_or(val);
+        arguments.push((key, val.to_string()));
+        pos = pe + P_CLOSE.len();
+    }
+    arguments
+}
+
+/// Extracts `<tool_call>...</tool_call>` blocks from an assistant message's output, returning `(remaining_content, tool_calls)`.
+/// Understands Qwen's `<function=NAME>\n<parameter=KEY>\nVAL\n</parameter>\n</function>` form,
+/// ignoring prose mentions of `<tool_call>` and literal `</tool_call>` tags inside file contents.
+pub fn parse_tool_calls(text: &str) -> (String, Vec<ToolCall>) {
+    let mut calls = Vec::new();
+    let mut first_pos: Option<usize> = None;
+    let mut cursor = 0;
+    while let Some((open_start, name, body_start)) = find_tool_call_opener(text, cursor) {
+        let Some((body_end, close_end)) = find_tool_call_close(text, body_start) else {
+            break;
+        };
+        if first_pos.is_none() {
+            first_pos = Some(open_start);
+        }
+        let arguments = parse_tool_params(&text[body_start..body_end]);
+        calls.push(ToolCall { name, arguments });
+        cursor = close_end;
+    }
+    match first_pos {
+        Some(fp) if !calls.is_empty() => (text[..fp].trim_end().to_string(), calls),
+        _ => (text.to_string(), Vec::new()),
     }
 }
 
@@ -306,5 +379,25 @@ mod tests {
         assert!(render(&[Message::new(Role::Assistant, "x")], &Options::default()).is_err());
         let m = [Message::new(Role::User, "a"), Message::new(Role::System, "late")];
         assert!(render(&m, &Options::default()).is_err());
+    }
+
+    #[test]
+    fn parse_tool_calls_handles_nested_tags_and_prose_mentions() {
+        let txt = "Strip `<tool_call>` and `</tool_call>` blocks in MainActivity.kt.\n\
+<tool_call>\n\
+<function=write_file>\n\
+<parameter=path>\nMainActivity.kt\n</parameter>\n\
+<parameter=content>\nval re = Regex(\"<tool_call>[\\\\s\\\\S]*?</tool_call>\")\n</parameter>\n\
+</function>\n\
+</tool_call>";
+        let (clean, calls) = parse_tool_calls(txt);
+        assert_eq!(clean, "Strip `<tool_call>` and `</tool_call>` blocks in MainActivity.kt.");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "write_file");
+        assert_eq!(calls[0].arguments[0], ("path".into(), "MainActivity.kt".into()));
+        assert_eq!(
+            calls[0].arguments[1],
+            ("content".into(), "val re = Regex(\"<tool_call>[\\\\s\\\\S]*?</tool_call>\")".into())
+        );
     }
 }

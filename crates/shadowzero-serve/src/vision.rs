@@ -50,8 +50,122 @@ pub struct Encoder {
     seq: u64,
 }
 
+fn is_non_text_gguf(name_lower: &str) -> bool {
+    name_lower.contains("mmproj")
+        || name_lower.contains("bge-")
+        || name_lower.contains("embed")
+        || name_lower.contains("draft")
+        || name_lower.contains("mtp")
+}
+
+fn is_secondary_split(name_lower: &str) -> bool {
+    // e.g. model-00002-of-00004.gguf: only open shard 00001
+    let Some(pos) = name_lower.find("-of-") else {
+        return false;
+    };
+    let prefix = &name_lower[..pos];
+    let digits: String = prefix.chars().rev().take_while(|c| c.is_ascii_digit()).collect();
+    !digits.is_empty() && !digits.chars().rev().collect::<String>().ends_with("0001")
+}
+
+fn collect_ggufs(dir: &Path, depth: usize, out: &mut Vec<PathBuf>) {
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let mut subdirs = Vec::new();
+    for entry in rd.flatten() {
+        let p = entry.path();
+        let name = entry.file_name();
+        let name_s = name.to_string_lossy();
+        if name_s.starts_with('.') {
+            continue;
+        }
+        if p.is_dir() {
+            if depth > 0 {
+                subdirs.push(p);
+            }
+        } else if p.is_file() && p.extension().is_some_and(|e| e.eq_ignore_ascii_case("gguf")) {
+            let low = name_s.to_ascii_lowercase();
+            if !is_non_text_gguf(&low) && !is_secondary_split(&low) {
+                out.push(p);
+            }
+        }
+    }
+    for sub in subdirs {
+        collect_ggufs(&sub, depth - 1, out);
+    }
+}
+
+fn rank_text_gguf(p: &Path, model_name_lower: &str) -> (i32, String) {
+    let low = p.file_name().unwrap_or_default().to_string_lossy().to_ascii_lowercase();
+    let mut score = 0;
+    if low.contains("qwen3.8") || low.contains("qwen35") || low.contains("qwen3") {
+        score += 40;
+    }
+    if low.contains("swift") || low.contains("iq3_xxs") {
+        score += 20;
+    }
+    if low.contains("00001-of-") {
+        score += 10;
+    }
+    if model_name_lower.contains("qwen3.8") && low.contains("qwen3.8") {
+        score += 30;
+    }
+    (-score, low)
+}
+
+/// Resolves the GGUF file that `strata-vision` opens vocab-only for model architecture and RoPE metadata.
+/// Single-file or split `.gguf` models are used directly; safetensors/EXL3 directories resolve via `SHADOWZERO_VISION_MODEL`
+/// or a companion Qwen3.8 `.gguf` inside the directory, its sibling folders, or the repo `models/` folders.
+pub fn resolve_vision_model(model: &Path) -> Result<PathBuf, String> {
+    if let Ok(v) = std::env::var("SHADOWZERO_VISION_MODEL") {
+        let p = PathBuf::from(&v);
+        if p.is_file() {
+            return Ok(std::path::absolute(&p).unwrap_or(p));
+        }
+        return Err(format!("SHADOWZERO_VISION_MODEL does not point to a file: {v}"));
+    }
+    if model.is_file() && model.extension().is_some_and(|e| e.eq_ignore_ascii_case("gguf")) {
+        return Ok(model.to_path_buf());
+    }
+    let model_name_low = model
+        .file_name()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .to_ascii_lowercase();
+    let root = Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../.."));
+    let mut roots: Vec<(PathBuf, usize)> = Vec::new();
+    if model.is_dir() {
+        roots.push((model.to_path_buf(), 2));
+    }
+    if let Some(parent) = model.parent() {
+        roots.push((parent.to_path_buf(), 3));
+    }
+    roots.push((PathBuf::from("models"), 2));
+    roots.push((root.join("models"), 2));
+    roots.push((PathBuf::from(r"J:\Models"), 3));
+    roots.push((PathBuf::from(r"J:\Strata-work\models"), 3));
+
+    for (dir, depth) in roots {
+        if !dir.is_dir() {
+            continue;
+        }
+        let mut found = Vec::new();
+        collect_ggufs(&dir, depth, &mut found);
+        if !found.is_empty() {
+            found.sort_by_key(|p| rank_text_gguf(p, &model_name_low));
+            let chosen = found.into_iter().next().unwrap();
+            return Ok(std::path::absolute(&chosen).unwrap_or(chosen));
+        }
+    }
+    Err(format!(
+        "cannot encode pictures for safetensors/EXL3 model {} without a companion Qwen3.8 .gguf for vision metadata (set SHADOWZERO_VISION_MODEL=path\\to\\model.gguf)",
+        model.display()
+    ))
+}
+
 impl Encoder {
-    /// Starts the helper (`SHADOWZERO_VISION_EXE`, else Strata's build) on the projector (`SHADOWZERO_MMPROJ`) and the text model's first GGUF.
+    /// Starts the helper (`SHADOWZERO_VISION_EXE`, else Strata's build) on the projector (`SHADOWZERO_MMPROJ`) and the text model's GGUF metadata.
     pub fn start(model: &Path) -> Result<Encoder, String> {
         let exe = locate("SHADOWZERO_VISION_EXE", EXE_CANDIDATES);
         let mmproj = locate("SHADOWZERO_MMPROJ", MMPROJ_CANDIDATES);
@@ -62,13 +176,14 @@ impl Encoder {
                 ));
             }
         }
+        let vision_model = resolve_vision_model(model)?;
         let threads =
             std::thread::available_parallelism().map_or(8, |n| (n.get() / 2).clamp(2, 16));
         let mut cmd = Command::new(&exe);
         cmd.arg("--mmproj")
             .arg(&mmproj)
             .arg("--model")
-            .arg(model)
+            .arg(&vision_model)
             .arg("--threads")
             .arg(threads.to_string())
             .stdin(Stdio::piped())
@@ -153,5 +268,33 @@ impl Drop for Encoder {
         let _ = writeln!(self.stdin, "QUIT");
         let _ = self.child.wait();
         let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resolve_vision_model_accepts_direct_gguf_and_finds_sibling_for_exl3_dir() {
+        let base = std::env::temp_dir().join(format!("shadowzero-vision-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let exl3_dir = base.join("Lygodactylus-Qwen3.8-Flash-Next-Uncensored-exl3-mixD18");
+        let gguf_dir = base.join("Huihui-Qwen3.8-Flash-Next-abliterated-v2-GGUF").join("swift-IQ3_XXS");
+        std::fs::create_dir_all(&exl3_dir).unwrap();
+        std::fs::create_dir_all(&gguf_dir).unwrap();
+        std::fs::write(exl3_dir.join("config.json"), "{}").unwrap();
+        let mmproj = base.join("Huihui-Qwen3.8-Flash-Next-abliterated-v2-GGUF").join("mmproj-Swift-Qwen3.8.gguf");
+        let shard2 = gguf_dir.join("Swift-Qwen3.8-00002-of-00002.gguf");
+        let shard1 = gguf_dir.join("Swift-Qwen3.8-00001-of-00002.gguf");
+        std::fs::write(&mmproj, b"gguf").unwrap();
+        std::fs::write(&shard2, b"gguf").unwrap();
+        std::fs::write(&shard1, b"gguf").unwrap();
+
+        assert_eq!(resolve_vision_model(&shard1).unwrap(), shard1);
+        let resolved = resolve_vision_model(&exl3_dir).unwrap();
+        assert_eq!(resolved.file_name().unwrap(), "Swift-Qwen3.8-00001-of-00002.gguf");
+
+        let _ = std::fs::remove_dir_all(&base);
     }
 }

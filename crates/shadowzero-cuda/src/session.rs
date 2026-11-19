@@ -15,7 +15,7 @@
 use crate::driver::{Context, DeviceBuffer, Event, Graph, Stream};
 use crate::kernels::{file, Arg, Program, FAST_KERNELS, PAIR2_KERNELS, PAIR_KERNELS, QUANT_KERNELS};
 use crate::pinned::PinnedRegion;
-use shadowzero_model::forward::{ple_rows, route, route_biased, Model, Stepper};
+use shadowzero_model::forward::{ple_rows, route, route_biased, route_into, Model, Stepper};
 use shadowzero_model::gguf::TensorInfo;
 use shadowzero_model::placement::{uniform_order, RoutingCounts};
 use shadowzero_model::quant::dequantize;
@@ -425,6 +425,21 @@ fn make_bb<'c>(c: &shadowzero_model::forward::Config, rows: usize,
     })
 }
 
+pub struct HeadProxy<'c> {
+    w_q2: DeviceBuffer<'c>,
+    w_sc: DeviceBuffer<'c>,
+    xq: DeviceBuffer<'c>,
+    x_sc: DeviceBuffer<'c>,
+    x_corr: DeviceBuffer<'c>,
+    bmax: DeviceBuffer<'c>,
+    seen: DeviceBuffer<'c>,
+    sel_blks: DeviceBuffer<'c>,
+    bits: &'static str,
+    rows: usize,
+    cols: usize,
+    k_blk: usize,
+}
+
 pub struct GpuSession<'c, 'm> {
     ctx: &'c Context,
     m: &'m Model,
@@ -433,6 +448,8 @@ pub struct GpuSession<'c, 'm> {
     ex3: Option<Program<'c>>,
     /// The rotated f16 rows of an EXL3 projection's prompt input (`exl3_rotate_rows`, then `mma_cols_exl3_pre_*`): `EXL3_ROT_ROWS` rows of the widest EXL3 dense input, and that width.
     exl3_rot: Option<(DeviceBuffer<'c>, usize)>,
+    /// 2-bit dp4a `lm_head` proxy screen + sparse EXL3 rescore state (`SHADOWZERO_HEAD_PROXY=0` off; default ON with `--tensor-prompt`).
+    head_proxy: Option<HeadProxy<'c>>,
     fw: Program<'c>,
     w: HashMap<String, DeviceBuffer<'c>>,
     v: HashMap<String, DeviceBuffer<'c>>,
@@ -474,6 +491,12 @@ pub struct GpuSession<'c, 'm> {
     dp_lay: DeviceBuffer<'c>,
     /// `SHADOWZERO_KV_LEND=1`: the KV window's buffers are virtual-memory regions, and a long prompt borrows the unfilled tail of them (`lend_kv`) for its batch buffers
     kv_regions: Vec<crate::kvvmm::VmmRegion<'c>>,
+    /// Packed 16-byte-aligned symmetric Q8_KV cache (`SHADOWZERO_KV_Q8=0` off; default ON with `--tensor-prompt` when `head_dim % 64 == 0`)
+    kv_q8: bool,
+    /// Packed per-32 symmetric Q8 hyper-connection weights (`SHADOWZERO_HC_Q8=0` off; default ON with `--tensor-prompt`).
+    hc_q8: bool,
+    /// Bytes per token position in each attention layer's K and V buffers (`n_kv_head * kv_q8_head_bytes(hd)` when `kv_q8`, else `n_kv_head * hd * 4`)
+    kv_row_bytes: usize,
     kv_extra: Option<DeviceBuffer<'c>>,
     /// the address range `kv_extra` lives in: fixed, so the CUDA graphs captured over the big batch's buffers stay valid from one prompt to the next
     kv_extra_reg: Option<crate::kvvmm::VmmRegion<'c>>,
@@ -489,6 +512,7 @@ pub struct GpuSession<'c, 'm> {
     delta: Vec<Option<(DeviceBuffer<'c>, DeviceBuffer<'c>)>>,
     attn: Vec<Option<Attn<'c>>>,
     ple_state: DeviceBuffer<'c>,
+    ple_tickets: std::collections::VecDeque<u64>,
     tokens: Vec<u32>,
     /// The layers this session runs, `[lo, hi)` (`Tiers::stage`), and the residual streams a stage hands over (`stage_out`) or takes in (`stage_in`) for the one step
     layers: (usize, usize),
@@ -654,6 +678,8 @@ pub struct GpuSession<'c, 'm> {
     verify_rank: usize,
     /// `routed_overlapped` instead of waiting on the host for a layer's copies (`SHADOWZERO_OVERLAP=0`: off).
     overlap: bool,
+    moe_meta: Vec<Option<std::sync::Arc<MoeLayerMeta>>>,
+    moe_scratch: MoeScratch,
     gstream: Stream<'c>,
     capturing: std::cell::Cell<bool>,
 }
@@ -715,6 +741,105 @@ impl SpecBytes {
                 self.passes, self.rows as f64 / n, self.kept as f64 / n, mb(all), mb(file), all as f64 / self.kept.max(1) as f64 / 1e6,
                 mb(waste), 100.0 * waste as f64 / all.max(1) as f64, rows.join(", "), cf.join(", "))
     }
+}
+
+/// Packed 16-byte-aligned symmetric Q8_KV bytes for one KV head (`hd % 32 == 0`):
+/// `hd` int8 elements followed by `hd / 32` fp16 scales padded to a 16-byte multiple.
+/// For `hd = 256`: `256 + 16 = 272` bytes (8 fp16 scales, zero wasted padding).
+pub fn kv_q8_head_bytes(hd: usize) -> usize {
+    hd + (((hd >> 5) * 2 + 15) & !15)
+}
+
+/// Bytes per token position in a Q8_KV K or V buffer (`n_kv_head * kv_q8_head_bytes(hd)`).
+pub fn kv_q8_row_bytes(nkv: usize, hd: usize) -> usize {
+    nkv * kv_q8_head_bytes(hd)
+}
+
+/// Whether packed symmetric Q8_KV is enabled: requires `head_dim % 32 == 0`; `SHADOWZERO_KV_Q8` overrides,
+/// otherwise follows `tensor_prompt` (default ON for `shadowzero serve`, OFF for `--exact`).
+pub fn kv_q8_enabled(head_dim: usize, tensor_prompt: bool) -> bool {
+    head_dim > 0
+        && head_dim % 32 == 0
+        && match std::env::var("SHADOWZERO_KV_Q8").as_deref() {
+            Ok("0") | Ok("off") | Ok("false") => false,
+            Ok("1") | Ok("on") | Ok("true") => true,
+            _ => tensor_prompt,
+        }
+}
+
+/// Whether per-32 symmetric Q8 hyper-connection weights (`hc8`) are enabled: requires `(hidden * streams) % 32 == 0`
+/// and `hc_rank % 32 == 0`; `SHADOWZERO_HC_Q8` overrides, otherwise follows `tensor_prompt` (default ON for `serve`, OFF for `--exact`).
+pub fn hc_q8_enabled(ch: usize, hc_rank: usize, tensor_prompt: bool) -> bool {
+    ch > 0
+        && hc_rank > 0
+        && ch % 32 == 0
+        && hc_rank % 32 == 0
+        && match std::env::var("SHADOWZERO_HC_Q8").as_deref() {
+            Ok("0") | Ok("off") | Ok("false") => false,
+            Ok("1") | Ok("on") | Ok("true") => true,
+            _ => tensor_prompt,
+        }
+}
+
+/// Whether the 2-bit dp4a `lm_head` proxy screen + sparse EXL3 rescore is enabled (`SHADOWZERO_HEAD_PROXY=0` off;
+/// default ON with `tensor_prompt`, OFF in `--exact`).
+pub fn head_proxy_enabled(tensor_prompt: bool) -> bool {
+    match std::env::var("SHADOWZERO_HEAD_PROXY").as_deref() {
+        Ok("0") | Ok("off") | Ok("false") => false,
+        Ok("1") | Ok("on") | Ok("true") => true,
+        _ => tensor_prompt,
+    }
+}
+
+/// Dense weight names quantized to per-32 `hc8` when `hc_q8_enabled` holds.
+pub fn is_hc_weight(name: &str) -> bool {
+    let is_proj = name.ends_with("_down.weight") || name.ends_with("_inject.weight") || name.ends_with("_up.weight");
+    is_proj && (name.contains(".hc_attn_") || name.contains(".hc_ffn_") || name.contains(".attn_hc_") || name.contains(".mlp_hc_") || name.starts_with("output_hc_"))
+}
+
+/// Pack a row-major `[rows, cols]` (`cols % 32 == 0`) BF16 dense weight matrix into `hc8` SOA format:
+/// `[0..rows*cols)` = `i8` weights, `[rows*cols..)` = `rows * (cols / 32)` IEEE `f16` scales.
+pub fn quantize_bf16_hc8(bf16_bytes: &[u8], rows: usize, cols: usize) -> Vec<u8> {
+    assert!(cols % 32 == 0, "hc8 cols ({cols}) must be a multiple of 32");
+    assert_eq!(bf16_bytes.len(), rows * cols * 2, "hc8 BF16 input byte length mismatch");
+    let ngrp = cols >> 5;
+    let payload_len = rows * cols;
+    let mut out = vec![0u8; payload_len + rows * ngrp * 2];
+    let (qs, scs) = out.split_at_mut(payload_len);
+    for r in 0..rows {
+        let row_in = &bf16_bytes[r * cols * 2..(r + 1) * cols * 2];
+        let row_q = &mut qs[r * cols..(r + 1) * cols];
+        let row_s = &mut scs[r * ngrp * 2..(r + 1) * ngrp * 2];
+        for g in 0..ngrp {
+            let mut vals = [0f32; 32];
+            let mut amax = 0f32;
+            let base = g * 32;
+            for k in 0..32 {
+                let b = u16::from_le_bytes([row_in[(base + k) * 2], row_in[(base + k) * 2 + 1]]);
+                let v = shadowzero_model::half::bf16_to_f32(b);
+                vals[k] = v;
+                let a = v.abs();
+                if a > amax {
+                    amax = a;
+                }
+            }
+            let (sh, inv) = if amax > 0.0 {
+                let s = shadowzero_model::half::f32_to_f16(amax / 127.0);
+                let sr = shadowzero_model::half::f16_to_f32(s);
+                (s, if sr > 0.0 { 1.0 / sr } else { 0.0 })
+            } else {
+                (0u16, 0.0)
+            };
+            let sb = sh.to_le_bytes();
+            row_s[g * 2] = sb[0];
+            row_s[g * 2 + 1] = sb[1];
+            for k in 0..32 {
+                let q = (vals[k] * inv).round().clamp(-127.0, 127.0) as i8;
+                row_q[base + k] = q as u8;
+            }
+        }
+    }
+    out
 }
 
 /// `SHADOWZERO_VERIFY_GRAPHS=0`: a verify pass (and any batch of at most `MAX_VERIFY` rows) runs its DeltaNet segments eagerly, as every batch has since
@@ -1982,6 +2107,25 @@ impl BucketLayout {
     }
 }
 
+struct MoeLayerMeta {
+    names: [String; 3],
+    infos: [TensorInfo; 3],
+    sizes: [usize; 3],
+}
+
+#[derive(Default)]
+struct MoeScratch {
+    logits_flat: Vec<f32>,
+    tops: Vec<Vec<(usize, f64)>>,
+    set: Vec<usize>,
+    copying: Vec<(usize, u64)>,
+    extra: Vec<(usize, u64)>,
+    plan_bytes: Vec<u8>,
+    e_slot: Vec<usize>,
+    e_users: Vec<Vec<(usize, usize)>>,
+    groups: [Vec<(usize, usize, usize, usize)>; 2],
+}
+
 /// `moe_batch`'s grouped routed experts for tokens start..end, as one upload: per phase (0: experts resident before
 /// this group's copies, 1: the ones being copied) the groups - an expert and up to 8 of its tokens - as matrix
 /// addresses [gate.., up.., down..] and 17-u32 records [gate.., up.., down..] (count, input rows, output rows), then
@@ -1999,6 +2143,107 @@ struct GroupedPlan {
     chunk_n: usize,
     /// the most tokens any group of this plan holds (a verify pass's groups are mostly 1-2: the EXL3 8-token kernel is made for 2, 4 and 8)
     max_group: usize,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn grouped_plan_into(
+    tops: &[Vec<(usize, f64)>], start: usize, end: usize, set: &[usize], ne: usize, k: usize, up: usize,
+    addr: impl Fn(usize) -> u64, copied: impl Fn(usize) -> bool, part: [u64; 3], chunk_n: usize, sc: &mut MoeScratch,
+) -> GroupedPlan {
+    let slot_len = ne.max(set.iter().copied().max().map_or(0, |e| e + 1));
+    if sc.e_slot.len() < slot_len {
+        sc.e_slot.resize(slot_len, usize::MAX);
+    }
+    if sc.e_users.len() < set.len() {
+        sc.e_users.resize_with(set.len(), Vec::new);
+    }
+    for (idx, &e) in set.iter().enumerate() {
+        sc.e_slot[e] = idx;
+        sc.e_users[idx].clear();
+    }
+    for j in start..end {
+        for (i, &(x, _)) in tops[j].iter().enumerate() {
+            if let Some(&idx) = sc.e_slot.get(x).filter(|&&s| s != usize::MAX) {
+                let u = &mut sc.e_users[idx];
+                if u.last().is_none_or(|l| l.0 != j) {
+                    u.push((j, i));
+                }
+            }
+        }
+    }
+    sc.groups[0].clear();
+    sc.groups[1].clear();
+    let mut max_group = 0usize;
+    for (idx, &e) in set.iter().enumerate() {
+        let len = sc.e_users[idx].len();
+        let ph = copied(e) as usize;
+        for off in (0..len).step_by(chunk_n) {
+            let cnt = chunk_n.min(len - off);
+            max_group = max_group.max(cnt);
+            sc.groups[ph].push((e, idx, off, cnt));
+        }
+    }
+    for &e in set {
+        sc.e_slot[e] = usize::MAX;
+    }
+
+    let rec_words = 1 + 2 * chunk_n;
+    let total_groups = sc.groups[0].len() + sc.groups[1].len();
+    let est_bytes = total_groups * 3 * (8 + 4 * rec_words) + end * (k + 1) * 4;
+    let bytes = &mut sc.plan_bytes;
+    bytes.clear();
+    if bytes.capacity() < est_bytes {
+        bytes.reserve(est_bytes - bytes.capacity());
+    }
+    let mut spans = [(0usize, 0usize, 0usize); 2];
+    for ph in 0..2 {
+        spans[ph].0 = sc.groups[ph].len();
+        spans[ph].1 = bytes.len();
+        for &p in &part {
+            for &(e, _, _, _) in &sc.groups[ph] {
+                bytes.extend_from_slice(&(addr(e) + p).to_le_bytes());
+            }
+        }
+    }
+    let rec_at = bytes.len();
+    let mut rec_words_written = 0usize;
+    for ph in 0..2 {
+        spans[ph].2 = rec_at + rec_words_written * 4;
+        for pi in 0..3usize {
+            for &(_, idx, off, cnt) in &sc.groups[ph] {
+                let base = bytes.len();
+                bytes.resize(base + rec_words * 4, 0);
+                bytes[base..base + 4].copy_from_slice(&(cnt as u32).to_le_bytes());
+                let users = &sc.e_users[idx][off..off + cnt];
+                for (u, &(j, i)) in users.iter().enumerate() {
+                    let pair = (j * k + i) as u32;
+                    let (a, b) = match pi {
+                        0 => (j as u32, pair),
+                        1 => (j as u32, up as u32 + pair),
+                        _ => (pair, pair),
+                    };
+                    let a_off = base + (1 + u) * 4;
+                    let b_off = base + (1 + chunk_n + u) * 4;
+                    bytes[a_off..a_off + 4].copy_from_slice(&a.to_le_bytes());
+                    bytes[b_off..b_off + 4].copy_from_slice(&b.to_le_bytes());
+                }
+                rec_words_written += rec_words;
+            }
+        }
+    }
+    let weights = bytes.len() as u64;
+    for top in tops.iter().take(end) {
+        for i in 0..k {
+            let w = top.get(i).map_or(0.0, |&(_, w)| w as f32);
+            bytes.extend_from_slice(&w.to_le_bytes());
+        }
+    }
+    let counts = bytes.len() as u64;
+    for top in tops.iter().take(end) {
+        bytes.extend_from_slice(&(top.len() as u32).to_le_bytes());
+    }
+    let phase = spans.map(|(n, a, r)| (n, a as u64, r as u64));
+    GroupedPlan { bytes: Vec::new(), phase, weights, counts, chunk_n, max_group }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2197,6 +2442,8 @@ impl<'c, 'm> GpuSession<'c, 'm> {
             None
         };
         let fw = Program::load(ctx, file("forward.cu").ok_or("forward.cu")?)?;
+        let hc_q8 = hc_q8_enabled(c.hidden * c.streams, c.hc_rank, tiers.tensor_prompt);
+        let mut hc_q8_ok = hc_q8;
         let mut w = HashMap::new();
         let mut v = HashMap::new();
         let mut resident_bytes = 0;
@@ -2212,7 +2459,20 @@ impl<'c, 'm> GpuSession<'c, 'm> {
                 None if layers.1 != c.n_layer => continue,
                 _ => {}
             }
-            let bytes = m.read_dense(name)?; // from the RAM copy when the model keeps one, else read from the file now and dropped after the upload
+            let bytes: std::borrow::Cow<'_, [u8]> = if hc_q8 && is_hc_weight(name) {
+                let t = m.g.tensor(name).ok_or_else(|| format!("missing tensor meta for {name}"))?;
+                let cols = t.dims[0] as usize;
+                let rows = t.dims[1] as usize;
+                if t.ty.name() == "BF16" && cols % 32 == 0 && m.scale(name) == 1.0 {
+                    let raw = m.read_dense(name)?;
+                    std::borrow::Cow::Owned(quantize_bf16_hc8(&raw, rows, cols))
+                } else {
+                    hc_q8_ok = false;
+                    m.read_dense(name)?
+                }
+            } else {
+                m.read_dense(name)? // from the RAM copy when the model keeps one, else read from the file now and dropped after the upload
+            };
             let buf = ctx.alloc(bytes.len()).map_err(e)?;
             buf.upload(&bytes).map_err(e)?;
             resident_bytes += bytes.len();
@@ -2279,6 +2539,8 @@ impl<'c, 'm> GpuSession<'c, 'm> {
         dp_copied.zero().map_err(e)?;
         let _ = (&mut dp_tidx, &mut dp_cnt, &mut dp_gstart, &mut dp_eaddr, &mut dp_lay);
         let kv_lend = !std::env::var("SHADOWZERO_KV_LEND").is_ok_and(|v| v == "0");
+        let kv_q8 = kv_q8_enabled(c.head_dim, tiers.tensor_prompt);
+        let kv_row_bytes = if kv_q8 { kv_q8_row_bytes(c.n_kv_head, c.head_dim) } else { kvd * 4 };
         let mut kv_regions: Vec<crate::kvvmm::VmmRegion<'c>> = Vec::new();
         let kv_extra_reg: Option<crate::kvvmm::VmmRegion<'c>> = None; // made at the first lend, when the slot size is known
         let mut delta = Vec::new();
@@ -2300,10 +2562,16 @@ impl<'c, 'm> GpuSession<'c, 'm> {
                         regs.push(r);
                         Ok(v)
                     };
-                    let (k, v, raw) = (mk(kvd * 4, &mut kv_regions)?, mk(kvd * 4, &mut kv_regions)?, mk(id * 4, &mut kv_regions)?);
+                    let (k, v, raw) = (mk(kv_row_bytes, &mut kv_regions)?, mk(kv_row_bytes, &mut kv_regions)?, mk(id * 4, &mut kv_regions)?);
                     Attn { k, v, raw, blocks: a(blocks * id)?, nblocks: 0 }
                 } else {
-                    let mut at = Attn { k: a(cap * kvd)?, v: a(cap * kvd)?, raw: a(cap * id)?, blocks: a(blocks * id)?, nblocks: 0 };
+                    let mut at = Attn {
+                        k: ctx.alloc((cap * kv_row_bytes).max(4)).map_err(e)?,
+                        v: ctx.alloc((cap * kv_row_bytes).max(4)).map_err(e)?,
+                        raw: a(cap * id)?,
+                        blocks: a(blocks * id)?,
+                        nblocks: 0,
+                    };
                     at.k.zero().map_err(e)?;
                     at.v.zero().map_err(e)?;
                     at
@@ -2356,6 +2624,60 @@ impl<'c, 'm> GpuSession<'c, 'm> {
         let tap_w = Self::taps_below(layers.1) * crate::dflash::HIDDEN;
         let tap_feat = if tiers.df_taps && tap_w > 0 {
             Some(a(crate::dflash::DF_ROWS * tap_w)?)
+        } else {
+            None
+        };
+
+        let head_proxy = if head_proxy_enabled(tiers.tensor_prompt) {
+            if let (Some(p3), Some((_, maxc)), Some(w_out), Some(t_out)) = (
+                ex3.as_ref(),
+                exl3_rot.as_ref(),
+                w.get("output.weight"),
+                m.g.tensor("output.weight"),
+            ) {
+                let rate: Option<&'static str> = t_out.ty.exl3().and_then(|(bits, cb)| {
+                    if cb != 2 { return None; }
+                    match (bits, t_out.ty.exl3_half()) {
+                        (2, false) => Some("2"),
+                        (2, true) => Some("2h"),
+                        (3, false) => Some("3"),
+                        (3, true) => Some("3h"),
+                        (4, false) => Some("4"),
+                        (5, false) => Some("5"),
+                        (6, false) => Some("6"),
+                        (8, false) => Some("8"),
+                        _ => None,
+                    }
+                });
+                let rows = t_out.dims[1] as usize;
+                let cols = t_out.dims[0] as usize;
+                if let Some(bits) = rate.filter(|_| rows >= 131072 && rows % 128 == 0 && cols % 128 == 0 && cols <= *maxc && cols <= 4096) {
+                    let n_ob = rows / 128;
+                    let n_b = cols / 128;
+                    let k_blk = std::env::var("SHADOWZERO_HEAD_KBLK").ok().and_then(|v| v.parse().ok()).unwrap_or(128usize).clamp(16, n_ob);
+                    let w_q2 = ctx.alloc(rows * cols / 4).map_err(e)?;
+                    let w_sc = ctx.alloc(rows * n_b * 2).map_err(e)?;
+                    let xq = ctx.alloc(COLS_MAX * n_b * 32 * 4).map_err(e)?;
+                    let x_sc = ctx.alloc(COLS_MAX * n_b * 4).map_err(e)?;
+                    let x_corr = ctx.alloc(COLS_MAX * n_b * 4).map_err(e)?;
+                    let bmax = ctx.alloc(COLS_MAX * n_ob * 4).map_err(e)?;
+                    let mut seen = ctx.alloc(n_ob.div_ceil(32) * 4).map_err(e)?;
+                    seen.zero().map_err(e)?;
+                    let max_sel = (COLS_MAX * k_blk).min(n_ob);
+                    let sel_blks = ctx.alloc((1 + max_sel) * 4).map_err(e)?;
+                    unsafe {
+                        p3.launch(&format!("exl3_build_q2_proxy_{bits}"), (n_ob as u32, n_b as u32, 1), (256, 1, 1), 0, None, &[
+                            Arg::Ptr(w_out.ptr), Arg::Ptr(w_q2.ptr), Arg::Ptr(w_sc.ptr), Arg::U32(rows as u32), Arg::U32(cols as u32),
+                        ]).map_err(|err| format!("exl3_build_q2_proxy_{bits}: {err}"))?;
+                    }
+                    ctx.synchronize().map_err(e)?;
+                    Some(HeadProxy { w_q2, w_sc, xq, x_sc, x_corr, bmax, seen, sel_blks, bits, rows, cols, k_blk })
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
         } else {
             None
         };
@@ -2698,10 +3020,27 @@ impl<'c, 'm> GpuSession<'c, 'm> {
         } else {
             None
         };
+        let mut moe_meta: Vec<Option<std::sync::Arc<MoeLayerMeta>>> = (0..c.n_layer).map(|_| None).collect();
+        for l in layers.0..layers.1 {
+            if !c.is_moe(l) {
+                continue;
+            }
+            let p = format!("blk.{l}");
+            let names = [format!("{p}.ffn_gate_exps.weight"), format!("{p}.ffn_up_exps.weight"), format!("{p}.ffn_down_exps.weight")];
+            if names.iter().all(|n| m.g.tensor(n).is_some()) {
+                let infos = [
+                    { let mut t = m.g.tensor(&names[0]).unwrap().clone(); t.dims = vec![t.dims[0], t.dims[1]]; t },
+                    { let mut t = m.g.tensor(&names[1]).unwrap().clone(); t.dims = vec![t.dims[0], t.dims[1]]; t },
+                    { let mut t = m.g.tensor(&names[2]).unwrap().clone(); t.dims = vec![t.dims[0], t.dims[1]]; t },
+                ];
+                let sizes = [m.expert_bytes(&names[0]), m.expert_bytes(&names[1]), m.expert_bytes(&names[2])];
+                moe_meta[l] = Some(std::sync::Arc::new(MoeLayerMeta { names, infos, sizes }));
+            }
+        }
         let mut s = GpuSession {
-            ctx, m, mvp, ex3, exl3_rot, fw, w, v, b, bb, replay, dscr, mmq, mmq_y, mmq_y_tag: std::cell::Cell::new((0, 0, 0, 0, 0)), fused,
+            ctx, m, mvp, ex3, exl3_rot, head_proxy, fw, w, v, b, bb, replay, dscr, mmq, mmq_y, mmq_y_tag: std::cell::Cell::new((0, 0, 0, 0, 0)), fused,
             rparts: Vec::new(), bb_sig: 0, logits_last: false, sub_last: true, sub_first: true,
-            devplan: tiers.tensor_prompt && !std::env::var("SHADOWZERO_PREFILL_DEVPLAN").is_ok_and(|v| v == "0"), dp_tidx, dp_cnt, dp_gstart, dp_copied, dp_copied_dirty: false, dp_eaddr, res_eaddr, dp_lay, kv_regions, kv_extra: None, kv_extra_reg, vmm_pool: Vec::new(), prompt_hint: 0, kv_rows: 0, kv_halves: false, router_bias: std::env::var("SHADOWZERO_ROUTER_BIAS").ok().and_then(|v| v.parse().ok()).unwrap_or(0.0), batch_scratch, delta, attn, ple_state, tokens: vec![], layers, layers_in: None, layers_out: None, peer: None, reset_tokens: vec![], pictures: vec![], rope_tab: None, rope_on: false, cap, trace: None, stop_after: None,
+            devplan: tiers.tensor_prompt && !std::env::var("SHADOWZERO_PREFILL_DEVPLAN").is_ok_and(|v| v == "0"), dp_tidx, dp_cnt, dp_gstart, dp_copied, dp_copied_dirty: false, dp_eaddr, res_eaddr, dp_lay, kv_regions, kv_q8, hc_q8: hc_q8_ok, kv_row_bytes, kv_extra: None, kv_extra_reg, vmm_pool: Vec::new(), prompt_hint: 0, kv_rows: 0, kv_halves: false, router_bias: std::env::var("SHADOWZERO_ROUTER_BIAS").ok().and_then(|v| v.parse().ok()).unwrap_or(0.0), batch_scratch, delta, attn, ple_state, ple_tickets: std::collections::VecDeque::new(), tokens: vec![], layers, layers_in: None, layers_out: None, peer: None, reset_tokens: vec![], pictures: vec![], rope_tab: None, rope_on: false, cap, trace: None, stop_after: None,
             resident_bytes, expert_uploads: 0, cache, ram, copy_stream, copy_stream2, copy_ev2, copy_event, staging,
             pending: vec![], routing: RoutingCounts::new(c.n_layer, c.n_expert),
             prof: std::env::var("SHADOWZERO_PROFILE").is_ok_and(|v| v == "1")
@@ -2790,6 +3129,8 @@ impl<'c, 'm> GpuSession<'c, 'm> {
             graphs_on: std::env::var("SHADOWZERO_GRAPHS").map_or(true, |v| v != "0")
                 && !std::env::var("SHADOWZERO_KTIME").is_ok_and(|v| v == "1"),
             overlap: std::env::var("SHADOWZERO_OVERLAP").map_or(true, |v| v != "0"),
+            moe_meta,
+            moe_scratch: MoeScratch::default(),
             gstream: ctx.blocking_stream().map_err(e)?,
             capturing: std::cell::Cell::new(false),
             batch_max: std::env::var("SHADOWZERO_BATCH").ok().and_then(|v| v.parse().ok()).unwrap_or(MAX_BATCH).clamp(1, MAX_BATCH),
@@ -3004,7 +3345,6 @@ impl<'c, 'm> GpuSession<'c, 'm> {
         let copy = |b: &DeviceBuffer<'c>, bytes: usize| Saved::take(self.ctx, b, bytes, host);
         let n = self.tokens.len();
         let c = &self.m.cfg;
-        let kvd = c.n_kv_head * c.head_dim;
         let mut delta = Vec::with_capacity(self.delta.len());
         for d in &self.delta {
             delta.push(match d {
@@ -3018,7 +3358,7 @@ impl<'c, 'm> GpuSession<'c, 'm> {
                 Some(a) => {
                     let id = if a.raw.bytes > 0 { a.raw.bytes / self.cap } else { 0 };
                     Some(SnapKv {
-                        k: copy(&a.k, n * kvd * 4)?, v: copy(&a.v, n * kvd * 4)?, raw: copy(&a.raw, n * id)?,
+                        k: copy(&a.k, n * self.kv_row_bytes)?, v: copy(&a.v, n * self.kv_row_bytes)?, raw: copy(&a.raw, n * id)?,
                         blocks: copy(&a.blocks, (a.nblocks * id).min(a.blocks.bytes))?, nblocks: a.nblocks,
                         ratio: c.compress.get(l).map_or(0, |r| (*r).max(1)),
                     })
@@ -3172,6 +3512,11 @@ impl<'c, 'm> GpuSession<'c, 'm> {
             let Some(a) = a.as_mut() else { continue };
             match &snap.kv[l] {
                 Some(k) => {
+                    let expect_kv = snap.tokens.len() * self.kv_row_bytes;
+                    if k.k.len() != expect_kv || k.v.len() != expect_kv {
+                        let got = if snap.tokens.is_empty() { 0 } else { k.k.len() / snap.tokens.len() };
+                        return Err(format!("restore: snapshot KV format mismatch ({got} vs {} bytes/pos)", self.kv_row_bytes));
+                    }
                     for (saved, buf) in [(&k.k, &a.k), (&k.v, &a.v), (&k.raw, &a.raw), (&k.blocks, &a.blocks)] {
                         if saved.len() > buf.bytes {
                             return Err("restore: the snapshot is from a session with a larger context".into());
@@ -3289,11 +3634,26 @@ impl<'c, 'm> GpuSession<'c, 'm> {
     }
 
     /// The EXL3 program and bit rate of an EXL3 matrix (None for any other type).  Only the `mul1` codebook has kernels.
-    fn exl3_prog(&self, t: &TensorInfo) -> Option<(&Program<'c>, String)> {
+    fn exl3_prog(&self, t: &TensorInfo) -> Option<(&Program<'c>, std::borrow::Cow<'static, str>)> {
         let (bits, cb) = t.ty.exl3()?;
         assert_eq!(cb, 2, "{}: only the mul1 codebook has GPU kernels", t.name);
         // the kernels' name suffix: K, or `Kh` for K + 0.5 bits a weight (`matvec_exl3_s4_2h`)
-        let rate = if t.ty.exl3_half() { format!("{bits}h") } else { bits.to_string() };
+        let rate: std::borrow::Cow<'static, str> = match (bits, t.ty.exl3_half()) {
+            (1, false) => "1".into(),
+            (1, true) => "1h".into(),
+            (2, false) => "2".into(),
+            (2, true) => "2h".into(),
+            (3, false) => "3".into(),
+            (3, true) => "3h".into(),
+            (4, false) => "4".into(),
+            (4, true) => "4h".into(),
+            (5, false) => "5".into(),
+            (6, false) => "6".into(),
+            (7, false) => "7".into(),
+            (8, false) => "8".into(),
+            (b, true) => format!("{b}h").into(),
+            (b, false) => b.to_string().into(),
+        };
         Some((self.ex3.as_ref().expect("an EXL3 matrix needs the exl3.cu program"), rate))
     }
 
@@ -3428,6 +3788,22 @@ impl<'c, 'm> GpuSession<'c, 'm> {
     /// (one after another), the host waits for the default stream's event and reads them back.
     fn download_mapped(&self, srcs: &[(u64, usize)]) -> Vec<Vec<f32>> {
         self.download_mapped_with(srcs, &|| {})
+    }
+
+    /// `download_mapped` for one buffer directly into `out`, reusing its capacity.
+    fn download_mapped_into(&self, ptr: u64, n: usize, out: &mut Vec<f32>, between: &dyn Fn()) {
+        assert!(n * 4 <= self.mapped.len(), "mapped download too big");
+        self.k1("copy", n, &[Arg::Ptr(self.mapped.dev_ptr), Arg::Ptr(ptr), Arg::U32(n as u32)]);
+        self.mapped_event.record(None).unwrap();
+        between();
+        self.mapped_event.synchronize().unwrap();
+        self.stage_at.set(0);
+        let base = self.mapped.as_slice().as_ptr() as *const f32;
+        out.resize(n, 0.0);
+        for (i, dst) in out[..n].iter_mut().enumerate() {
+            // SAFETY: see `download_mapped_with`.
+            *dst = unsafe { std::ptr::read_volatile(base.add(i)) };
+        }
     }
 
     /// `download_mapped`, calling `between` once the copy kernels and the event are queued and before the host waits for it: launches queued there run on the GPU while the
@@ -3839,6 +4215,10 @@ impl<'c, 'm> GpuSession<'c, 'm> {
         }
         self.hc_read("output_hc", false, rn_ready);
         self.rec("final_u".into(), self.b.u.ptr, h);
+        if self.top_want && self.top_ready() && self.head_top_at(self.b.u.ptr, h, self.b.logits.ptr, 1, 64) {
+            self.mark("head(q2p) + top 64 down");
+            return vec![];
+        }
         self.mv("output.weight", self.b.u.ptr, self.b.logits.ptr);
         if self.top_want && self.topk_rows_at(self.b.logits.ptr, 1, c.vocab) {
             self.mark("head + top 64 down");
@@ -3864,6 +4244,17 @@ impl<'c, 'm> GpuSession<'c, 'm> {
         } else {
             (0, 0)
         };
+        if self.hc_q8 {
+            unsafe {
+                self.mvp.launch("hc8_down_inject_m1", ((r_down + r_inj).div_ceil(2), 1, 1), (256, 1, 1), 0, self.ls(), &[
+                    Arg::Ptr(self.w[&format!("{p}_down.weight")].ptr), Arg::Ptr(b.down.ptr), Arg::U32(r_down),
+                    Arg::U32(r_down), Arg::Ptr(w_inj), Arg::Ptr(b.g.ptr), Arg::U32(r_inj), Arg::U32(cs),
+                    Arg::Ptr(b.rn.ptr), Arg::U32(h * cs), Arg::U32(h * cs), Arg::F32(cs as f32), Arg::U32(1),
+                ]).unwrap_or_else(|err| panic!("hc8_down_inject_m1: {err}"));
+            }
+            self.hc_up_mix(p, b.down.ptr, c.hc_rank, b.rn.ptr, h as usize * cs as usize, b.u.ptr, h as usize, 1);
+            return;
+        }
         unsafe {
             let (entry, per_block) = if self.fast_order { ("hc_down_inject_fast_bf16", 2) } else { ("hc_down_inject_bf16", 8) };
             self.mvp.launch(entry, ((r_down + r_inj).div_ceil(per_block), 1, 1), (256, 1, 1), 0, self.ls(), &[
@@ -3880,7 +4271,7 @@ impl<'c, 'm> GpuSession<'c, 'm> {
         }
     }
 
-    /// u = the hyper-connection mix of rn and sigmoid(W_up down) for m rows (`hc_up_mix_cols`): the up-projection
+    /// u = the hyper-connection mix of rn and sigmoid(W_up down) for m rows (`hc_up_mix_cols` / `hc8_up_mix_*`): the up-projection
     /// never leaves the kernel.  Rows are ds / rs / us floats apart.
     #[allow(clippy::too_many_arguments)]
     fn hc_up_mix(&self, p: &str, down: u64, ds: usize, rn: u64, rs: usize, u: u64, us: usize, m: usize) {
@@ -3889,14 +4280,19 @@ impl<'c, 'm> GpuSession<'c, 'm> {
         let w = self.w[&format!("{p}_up.weight")].ptr;
         for j0 in (0..m).step_by(COLS_MAX) {
             let n = (m - j0).min(COLS_MAX) as u32;
-            // SAFETY: h x streams BF16 rows of `rank` weights; n rows of down (rank floats), rn (h * streams) and u (h).
+            let entry = if self.hc_q8 {
+                if n == 1 { "hc8_up_mix_m1" } else if n <= 4 { "hc8_up_mix_m4" } else { "hc8_up_mix_cols" }
+            } else {
+                "hc_up_mix_cols"
+            };
+            // SAFETY: h x streams BF16 or hc8 rows of `rank` weights; n rows of down (rank floats), rn (h * streams) and u (h).
             unsafe {
-                self.mvp.launch("hc_up_mix_cols", (h.div_ceil(8), 1, 1), (256, 1, 1), 0, self.ls(), &[
+                self.mvp.launch(entry, (h.div_ceil(8), 1, 1), (256, 1, 1), 0, self.ls(), &[
                     Arg::Ptr(w), Arg::Ptr(down + (j0 * ds * 4) as u64), Arg::U32(ds as u32), Arg::Ptr(rn + (j0 * rs * 4) as u64),
                     Arg::U32(rs as u32), Arg::Ptr(u + (j0 * us * 4) as u64), Arg::U32(us as u32), Arg::U32(h), Arg::U32(cs),
                     Arg::U32(rank), Arg::U32(n)])
             }
-            .unwrap_or_else(|err| panic!("hc_up_mix_cols: {err}"));
+            .unwrap_or_else(|err| panic!("{entry}: {err}"));
         }
     }
 
@@ -3993,10 +4389,17 @@ impl<'c, 'm> GpuSession<'c, 'm> {
         {
             let b = &self.b;
             let at = self.attn[l].as_ref().unwrap();
-            let slot = (pos * nkv * hd * 4) as u64;
             let raw_slot = at.raw.ptr + (pos * id * 4) as u64;
             self.mv(&format!("{p}.attn_q.weight"), b.u.ptr, qg);
-            self.mv_pair(&format!("{p}.attn_k.weight"), kk, &format!("{p}.attn_v.weight"), at.v.ptr + slot, b.u.ptr);
+            if self.kv_q8 {
+                // ao has qd >= kvd floats and is unused until attention_heads_q8 at the end of attention_mid
+                self.mv_pair(&format!("{p}.attn_k.weight"), kk, &format!("{p}.attn_v.weight"), ao, b.u.ptr);
+                self.k2("kv_quant_q8_rows", nkv as u32, 1, 128, &[
+                    Arg::Ptr(ao), Arg::Ptr(at.v.ptr), Arg::U32(pos as u32), Arg::U32(nkv as u32), Arg::U32(hd as u32), Arg::U32(1)]);
+            } else {
+                let slot = (pos * nkv * hd * 4) as u64;
+                self.mv_pair(&format!("{p}.attn_k.weight"), kk, &format!("{p}.attn_v.weight"), at.v.ptr + slot, b.u.ptr);
+            }
             self.mv_pair(&format!("{p}.indexer.q_proj.weight"), iq, &format!("{p}.indexer.k_proj.weight"), raw_slot, b.u.ptr);
         }
         self.attention_mid(l, pos, qg, kk, iq, ao);
@@ -4015,11 +4418,18 @@ impl<'c, 'm> GpuSession<'c, 'm> {
         {
             let b = &self.b;
             let at = self.attn[l].as_ref().unwrap();
-            let slot = (pos * nkv * hd * 4) as u64;
-            self.k("head_norm_rope_qgk", (nh + nkv) as u32, 128, &[
-                Arg::Ptr(qg), Arg::Ptr(b.q.ptr), Arg::Ptr(b.gate.ptr), Arg::Ptr(self.sv(&format!("{p}.attn_q_norm.weight"))),
-                Arg::Ptr(kk), Arg::Ptr(at.k.ptr + slot), Arg::Ptr(self.sv(&format!("{p}.attn_k_norm.weight"))),
-                Arg::U32(nh as u32), Arg::U32(hd as u32), Arg::F32(eps), Arg::U32(pos as u32), Arg::U32(rd), Arg::F32(th)]);
+            if self.kv_q8 {
+                self.k2("head_norm_rope_qgk_rows_q8", (nh + nkv) as u32, 1, 128, &[
+                    Arg::Ptr(qg), Arg::Ptr(b.q.ptr), Arg::Ptr(b.gate.ptr), Arg::Ptr(self.sv(&format!("{p}.attn_q_norm.weight"))),
+                    Arg::Ptr(kk), Arg::Ptr(at.k.ptr), Arg::Ptr(self.sv(&format!("{p}.attn_k_norm.weight"))),
+                    Arg::U32(nh as u32), Arg::U32(nkv as u32), Arg::U32(hd as u32), Arg::F32(eps), Arg::U32(pos as u32), Arg::U32(rd), Arg::F32(th)]);
+            } else {
+                let slot = (pos * nkv * hd * 4) as u64;
+                self.k("head_norm_rope_qgk", (nh + nkv) as u32, 128, &[
+                    Arg::Ptr(qg), Arg::Ptr(b.q.ptr), Arg::Ptr(b.gate.ptr), Arg::Ptr(self.sv(&format!("{p}.attn_q_norm.weight"))),
+                    Arg::Ptr(kk), Arg::Ptr(at.k.ptr + slot), Arg::Ptr(self.sv(&format!("{p}.attn_k_norm.weight"))),
+                    Arg::U32(nh as u32), Arg::U32(hd as u32), Arg::F32(eps), Arg::U32(pos as u32), Arg::U32(rd), Arg::F32(th)]);
+            }
         }
         // complete blocks get their pooled keys once
         let n = pos + 1;
@@ -4061,7 +4471,8 @@ impl<'c, 'm> GpuSession<'c, 'm> {
         {
             let b = &self.b;
             let at = self.attn[l].as_ref().unwrap();
-            self.k("attention_heads", nh as u32, 256, &[
+            let ak = if self.kv_q8 { "attention_heads_q8" } else { "attention_heads" };
+            self.k(ak, nh as u32, 256, &[
                 Arg::Ptr(b.q.ptr), Arg::Ptr(at.k.ptr), Arg::Ptr(at.v.ptr), Arg::Ptr(tptr), Arg::U32(ntok as u32),
                 Arg::Ptr(b.gate.ptr), Arg::Ptr(ao), Arg::Ptr(b.scratch.ptr), Arg::U32(self.cap as u32),
                 Arg::U32(nkv as u32), Arg::U32(hd as u32), Arg::U32((nh / nkv) as u32)]);
@@ -5511,7 +5922,7 @@ impl<'c, 'm> GpuSession<'c, 'm> {
             return false;
         }
         if self.top_buf.is_none() {
-            self.top_buf = self.ctx.alloc(COLS_MAX * (nb * 64 * 8 + 128 * 4)).ok();
+            self.top_buf = self.ctx.alloc(COLS_MAX * (64 * 64 * 8 + 128 * 4)).ok();
         }
         self.top_buf.is_some()
     }
@@ -5536,11 +5947,88 @@ impl<'c, 'm> GpuSession<'c, 'm> {
         self.topk_rows_at(self.bb.logits.ptr, n, vocab)
     }
 
+    /// Screens `output.weight` with the Q2_P dp4a proxy and evaluates only the top-`k_use` 128-row EXL3 blocks per input.
+    /// Writes packed selected logits (`max_sel * 128` stride) into `y_logits` and returns `(max_sel, sparse_ls, sel_blks.ptr)`.
+    pub(crate) fn mv_head_proxy_sparse(&self, x: u64, xs: usize, y_logits: u64, n: usize, need_k: usize) -> Option<(usize, usize, u64)> {
+        let hp = self.head_proxy.as_ref()?;
+        let p3 = self.ex3.as_ref()?;
+        let (rot, maxc) = self.exl3_rot.as_ref()?;
+        if self.pipe_active || !(1..=COLS_MAX).contains(&n) || hp.cols > *maxc || n * hp.cols * 4 > rot.bytes {
+            return None;
+        }
+        let w_out = self.w.get("output.weight")?;
+        let n_ob = hp.rows / 128;
+        let n_b = hp.cols / 128;
+        let k_use = if need_k <= 16 { (hp.k_blk * 3 / 4).max(64).min(hp.k_blk) } else { hp.k_blk };
+        let max_sel = (n * k_use).min(n_ob);
+        let sparse_ls = max_sel * 128;
+        let proxy_k = if n == 1 { "proxy_q2_dp4a_bmax_m1" } else if n <= 4 { "proxy_q2_dp4a_bmax_m4" } else { "proxy_q2_dp4a_bmax_m8" };
+        let rescore_k = if n <= 4 {
+            format!("matvec_cols_exl3_pre_sparse_m4s1_{}", hp.bits)
+        } else {
+            format!("matvec_cols_exl3_pre_sparse_m8s1_{}", hp.bits)
+        };
+        unsafe {
+            p3.launch("exl3_rotate_rows_f32", (((n * n_b) as u32).div_ceil(8), 1, 1), (256, 1, 1), 0, self.ls(), &[
+                Arg::Ptr(w_out.ptr), Arg::Ptr(x), Arg::U32(xs as u32), Arg::Ptr(rot.ptr), Arg::U32(hp.cols as u32), Arg::U32(n as u32),
+            ])
+            .and_then(|_| self.fw.launch("proxy_q2_quant_x", (n_b as u32, n as u32, 1), (128, 1, 1), 0, self.ls(), &[
+                Arg::Ptr(rot.ptr), Arg::U32(hp.cols as u32), Arg::Ptr(hp.xq.ptr), Arg::Ptr(hp.x_sc.ptr), Arg::Ptr(hp.x_corr.ptr), Arg::U32(hp.cols as u32),
+            ]))
+            .and_then(|_| self.fw.launch(proxy_k, (n_ob as u32, 1, 1), (128, 1, 1), 0, self.ls(), &[
+                Arg::Ptr(hp.w_q2.ptr), Arg::Ptr(hp.w_sc.ptr), Arg::Ptr(hp.xq.ptr), Arg::Ptr(hp.x_sc.ptr), Arg::Ptr(hp.x_corr.ptr),
+                Arg::Ptr(hp.bmax.ptr), Arg::U32(n_ob as u32), Arg::U32(hp.cols as u32), Arg::U32(n as u32),
+            ]))
+            .and_then(|_| self.fw.launch("proxy_pick_rows", (n as u32, 1, 1), (256, 1, 1), 0, self.ls(), &[
+                Arg::Ptr(hp.bmax.ptr), Arg::U32(n_ob as u32), Arg::U32(k_use as u32), Arg::Ptr(hp.seen.ptr),
+            ]))
+            .and_then(|_| self.fw.launch("proxy_compact_seen", (1, 1, 1), (256, 1, 1), 0, self.ls(), &[
+                Arg::Ptr(hp.seen.ptr), Arg::U32(n_ob as u32), Arg::U32(max_sel as u32), Arg::Ptr(hp.sel_blks.ptr),
+            ]))
+            .and_then(|_| p3.launch(&rescore_k, (max_sel as u32, 1, 1), (256, 1, 1), 0, self.ls(), &[
+                Arg::Ptr(w_out.ptr), Arg::Ptr(rot.ptr), Arg::Ptr(y_logits), Arg::U32(sparse_ls as u32),
+                Arg::U32(hp.rows as u32), Arg::U32(hp.cols as u32), Arg::U32(n as u32), Arg::Ptr(hp.sel_blks.ptr),
+            ]))
+        }
+        .unwrap_or_else(|err| panic!("mv_head_proxy_sparse: {err}"));
+        Some((max_sel, sparse_ls, hp.sel_blks.ptr))
+    }
+
+    fn head_top_at(&mut self, x: u64, xs: usize, logits: u64, n: usize, need_k: usize) -> bool {
+        if self.top_buf.is_none() {
+            return false;
+        }
+        let Some((max_sel, sparse_ls, sel_ptr)) = self.mv_head_proxy_sparse(x, xs, logits, n, need_k) else {
+            return false;
+        };
+        let nb_sp = max_sel.div_ceil(16);
+        if nb_sp > 64 {
+            return false;
+        }
+        let Some(buf) = self.top_buf.as_ref() else { return false };
+        let (slices_v, slices_i, fin) = (buf.ptr, buf.ptr + (COLS_MAX * 64 * 64 * 4) as u64, buf.ptr + (COLS_MAX * 64 * 64 * 8) as u64);
+        self.k("topk_slices_blks", (n * nb_sp) as u32, 256, &[
+            Arg::Ptr(logits), Arg::U32(sparse_ls as u32), Arg::Ptr(sel_ptr), Arg::U32(nb_sp as u32),
+            Arg::Ptr(slices_v), Arg::Ptr(slices_i),
+        ]);
+        self.k("topk_merge_blks", n as u32, 256, &[Arg::Ptr(slices_v), Arg::Ptr(slices_i), Arg::U32(nb_sp as u32), Arg::Ptr(fin)]);
+        let mut bytes = vec![0u8; n * 128 * 4];
+        self.download(fin, &mut bytes);
+        let words: Vec<u32> = bytes.chunks_exact(4).map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]])).collect();
+        for r in 0..n {
+            self.top_out.push((0..64).map(|t| (f32::from_bits(words[r * 128 + t]), words[r * 128 + 64 + t])).collect());
+        }
+        true
+    }
+
     /// `topk_rows` over `n` rows of `vocab` logits at `logits` (the batch buffers' or the single-token step's).
     fn topk_rows_at(&mut self, logits: u64, n: usize, vocab: usize) -> bool {
         let nb = vocab.div_ceil(4096);
+        if nb > 64 {
+            return false;
+        }
         let Some(buf) = self.top_buf.as_ref() else { return false };
-        let (slices_v, slices_i, fin) = (buf.ptr, buf.ptr + (COLS_MAX * nb * 64 * 4) as u64, buf.ptr + (COLS_MAX * nb * 64 * 8) as u64);
+        let (slices_v, slices_i, fin) = (buf.ptr, buf.ptr + (COLS_MAX * 64 * 64 * 4) as u64, buf.ptr + (COLS_MAX * 64 * 64 * 8) as u64);
         self.k("topk_slices", (n * nb) as u32, 256, &[Arg::Ptr(logits), Arg::U32(vocab as u32), Arg::U32(vocab as u32), Arg::U32(nb as u32), Arg::Ptr(slices_v), Arg::Ptr(slices_i)]);
         self.k("topk_merge", n as u32, 256, &[Arg::Ptr(slices_v), Arg::Ptr(slices_i), Arg::U32(nb as u32), Arg::Ptr(fin)]);
         let mut bytes = vec![0u8; n * 128 * 4];
@@ -5812,7 +6300,16 @@ impl<'c, 'm> GpuSession<'c, 'm> {
                 let (subs, _) = prompt_subchunks(tokens.len(), chunk_sz);
                 let rem_m = tokens.len() - subs[0].1;
                 let mid = subs.len() / 2;
-                let use_two_halves = subs.len() >= 4
+                let use_single_pass = !std::env::var("SHADOWZERO_PAIR_SINGLE_PASS").is_ok_and(|v| v == "0")
+                    && subs.len() >= 2
+                    && subs.len() <= 4
+                    && chunk_sz == p_rows
+                    && p_rparts_len >= subs.len()
+                    && tokens.len() <= p_bmax
+                    && subs.iter().all(|&(_, l)| l <= p_rows)
+                    && !self.peer.as_ref().unwrap().pipeline_ok(tokens.len());
+                let use_two_halves = !use_single_pass
+                    && subs.len() >= 4
                     && mid >= 2
                     && chunk_sz == p_rows
                     && p_rparts_len >= subs.len()
@@ -5828,7 +6325,8 @@ impl<'c, 'm> GpuSession<'c, 'm> {
                             && !p.pipeline_ok(split_tok)
                             && !p.pipeline_ok(half_b)
                     };
-                let use_rparts_pass = !use_two_halves
+                let use_rparts_pass = !use_single_pass
+                    && !use_two_halves
                     && subs.len() >= 2
                     && chunk_sz == p_rows
                     && !self.peer.as_ref().unwrap().rparts.is_empty()
@@ -5838,6 +6336,51 @@ impl<'c, 'm> GpuSession<'c, 'm> {
                     && subs.len() - 1 <= p_rparts_len
                     && !self.peer.as_ref().unwrap().pipeline_ok(rem_m);
                 self.defer_peer = true;
+                self.ple_tickets.clear();
+                let ple_async_prompt = !std::env::var("SHADOWZERO_PLE_PROMPT_ASYNC").is_ok_and(|v| v == "0");
+                if ple_async_prompt && (self.layers.0..self.layers.1).contains(&self.m.cfg.ple_layer) {
+                    let c = &self.m.cfg;
+                    let p0_base = self.tokens.len();
+                    let mut hist = self.tokens.clone();
+                    hist.extend_from_slice(tokens);
+                    for &(s_cur, ms_cur) in &subs {
+                        let rows: Vec<i64> = (0..ms_cur)
+                            .flat_map(|j| shadowzero_model::forward::ple_rows(c, &hist[..p0_base + s_cur + j + 1]))
+                            .collect();
+                        self.ple_tickets.push_back(self.m.ple_prefetch_enqueue(rows));
+                    }
+                }
+                if use_single_pass {
+                    let pad_a = (p_rows - subs[0].1) % p_rows;
+                    let mut last_feat_ok = false;
+                    for (idx, &(s_cur, ms_cur)) in subs.iter().enumerate() {
+                        let is_last = idx + 1 == subs.len();
+                        self.df_feat_ok = is_last;
+                        let _ = self.batch(&tokens[s_cur..s_cur + ms_cur], false);
+                        let src = self.hop_src.take().expect("stage 0 queued hop_src");
+                        let p = self.peer.as_mut().unwrap();
+                        let slot = s_cur + pad_a;
+                        let part_ptr = p.rparts[slot / p_rows].ptr;
+                        let off_rows = slot % p_rows;
+                        let f_rows = if is_last { ms_cur.min(crate::dflash::DF_ROWS) } else { 0 };
+                        let ok = p.hop_pull_on(&src, &|j| part_ptr + ((j + off_rows) * ch * 4) as u64, f_rows, true);
+                        if is_last {
+                            last_feat_ok = ok;
+                        }
+                        self.stage_at.set(0);
+                    }
+                    self.defer_peer = false;
+                    self.df_feat_ok = true;
+                    let p = self.peer.as_mut().unwrap();
+                    p.hop.as_ref().unwrap().sync_up();
+                    p.hop_pulled = true;
+                    p.stage_at.set(0);
+                    p.df_feat_ok = last_feat_ok;
+                    p.logits_last = self.logits_last;
+                    let out = p.batch(tokens, with_logits);
+                    p.logits_last = false;
+                    return out;
+                }
                 if use_two_halves {
                     let split_tok = subs[mid].0;
                     let pad_a = (p_rows - subs[0].1) % p_rows;
@@ -6102,6 +6645,14 @@ impl<'c, 'm> GpuSession<'c, 'm> {
         let sub_mode = m > self.rows && !self.rparts.is_empty() && !self.pipeline_ok(m);
         let (subs, first_rows): (Vec<(usize, usize)>, usize) = if sub_mode { prompt_subchunks(m, self.rows) } else { (vec![(0, m)], 0) };
         assert!(sub_mode || m <= self.rows, "a pass of {m} rows with temporaries for {}", self.rows);
+        if self.ple_tickets.is_empty() && !ple_async && (lo..hi).contains(&c.ple_layer)
+            && !std::env::var("SHADOWZERO_PLE_PROMPT_ASYNC").is_ok_and(|v| v == "0")
+        {
+            for &(s0, ms) in &subs {
+                let rows: Vec<i64> = (0..ms).flat_map(|j| ple_rows(c, &self.tokens[..p0 + s0 + j + 1])).collect();
+                self.ple_tickets.push_back(self.m.ple_prefetch_enqueue(rows));
+            }
+        }
         // row j's residual streams are at storage row j + pad (the first sub-chunk, the remainder, ends part 0): a sub-chunk is inside one part
         let pad = if sub_mode { (self.rows - first_rows) % self.rows } else { 0 };
         let pulled = std::mem::replace(&mut self.hop_pulled, false);
@@ -6261,6 +6812,8 @@ impl<'c, 'm> GpuSession<'c, 'm> {
                     let t_ple_block = std::time::Instant::now();
                     if ple_async {
                         self.m.ple_prefetch_wait();
+                    } else if let Some(seq) = self.ple_tickets.pop_front() {
+                        self.m.ple_prefetch_wait_seq(seq);
                     } else {
                         let all: Vec<i64> = (0..m).flat_map(|j| ple_rows(c, &self.tokens[..p0 + j + 1])).collect();
                         self.m.ple_prefetch(&all);
@@ -6483,6 +7036,10 @@ impl<'c, 'm> GpuSession<'c, 'm> {
         logits.resize(m - m_obs + first, vec![]);
         for j0 in (first..m_obs).step_by(COLS_MAX) {
             let n = (m_obs - j0).min(COLS_MAX);
+            if self.top_want && self.top_ready() && self.head_top_at(row(&self.bb.u, h, j0), h, self.bb.logits.ptr, n, 64) {
+                logits.extend(std::iter::repeat_n(vec![], n));
+                continue;
+            }
             self.mv_cols("output.weight", row(&self.bb.u, h, j0), h, self.bb.logits.ptr, c.vocab, n);
             if self.top_want && self.topk_rows(n, c.vocab) {
                 logits.extend(std::iter::repeat_n(vec![], n));
@@ -6580,14 +7137,27 @@ impl<'c, 'm> GpuSession<'c, 'm> {
             } else {
                 1
             };
+            static EXL3_M4: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            let use_m4 = *EXL3_M4.get_or_init(|| !std::env::var("SHADOWZERO_EXL3_M4").is_ok_and(|v| v == "0"));
+            static EXL3_V1: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            let use_v1 = *EXL3_V1.get_or_init(|| std::env::var("SHADOWZERO_EXL3_V1").is_ok_and(|v| v == "1"));
+            static EXL3_SK4_M4: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            let use_sk4_m4 = *EXL3_SK4_M4.get_or_init(|| !std::env::var("SHADOWZERO_EXL3_SK4_M4").is_ok_and(|v| v == "0"));
+            static EXL3_HEAD_PRE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            let use_head_pre = *EXL3_HEAD_PRE.get_or_init(|| !std::env::var("SHADOWZERO_EXL3_HEAD_PRE").is_ok_and(|v| v == "0"));
             for j0 in (0..m).step_by(COLS_MAX) {
                 let (x, y, n) = (x + (j0 * xs * 4) as u64, y + (j0 * ys * 4) as u64, (m - j0).min(COLS_MAX));
                 if nsplit > 1 {
                     let part = self.exl3_rot.as_ref().map_or(0, |r| r.0.ptr);
+                    let sk_kname = if use_sk4_m4 && use_m4 && !use_v1 && n <= 4 {
+                        format!("matvec_cols_exl3_sk4_m4_{bits}")
+                    } else {
+                        format!("matvec_cols_exl3_sk4_{bits}")
+                    };
                     // SAFETY: a blob of cols x rows weights at wptr; n inputs of `cols` floats xs apart; the scratch holds nsplit x 8 x rows floats (rows <= 24 x 128, nsplit <= 8);
                     // n outputs of `rows` floats ys apart.  Both launches are on this stream, so the next matrix's partials wait for this combine.
                     unsafe {
-                        p.launch(&format!("matvec_cols_exl3_sk4_{bits}"), ((rows / 128) as u32, nsplit as u32, 1), (1024, 1, 1), 0, self.ls(),
+                        p.launch(&sk_kname, ((rows / 128) as u32, nsplit as u32, 1), (1024, 1, 1), 0, self.ls(),
                                  &[Arg::Ptr(wptr), Arg::Ptr(x), Arg::U32(xs as u32), Arg::Ptr(part), Arg::U32(rows as u32), Arg::U32(cols), Arg::U32(n as u32)])
                             .and_then(|_| p.launch("exl3_splitk_combine", ((rows / 128) as u32, 1, 1), (256, 1, 1), 0, self.ls(),
                                                    &[Arg::Ptr(wptr), Arg::Ptr(part), Arg::Ptr(y), Arg::U32(ys as u32), Arg::U32(rows as u32), Arg::U32(cols), Arg::U32(n as u32),
@@ -6598,9 +7168,31 @@ impl<'c, 'm> GpuSession<'c, 'm> {
                 }
                 // SAFETY: a blob of cols x rows weights at wptr; n inputs of `cols` floats xs apart, n outputs of `rows` floats ys apart.
                 unsafe {
-                    let (kname, threads, shared) = exl3_kernel("matvec_cols_exl3", &bits, cols as usize, false);
-                    p.launch(&kname, ((rows as u32).div_ceil(128), 1, 1), (threads, 1, 1), shared, self.ls(),
-                             &[Arg::Ptr(wptr), Arg::Ptr(x), Arg::U32(xs as u32), Arg::Ptr(y), Arg::U32(ys as u32), Arg::U32(rows as u32), Arg::U32(cols), Arg::U32(n as u32)])
+                    if use_m4 && n == 1 && !use_v1 && cols % 128 == 0 && (cols as usize) * 4 <= 48 * 1024 && rows % 128 == 0 {
+                        let (kname, threads, shared) = if rows >= 131072 {
+                            (format!("matvec_exl3_s1_{bits}"), 256u32, cols * 4)
+                        } else {
+                            exl3_kernel("matvec_exl3", &bits, cols as usize, false)
+                        };
+                        p.launch(&kname, ((rows as u32).div_ceil(128), 1, 1), (threads, 1, 1), shared, self.ls(),
+                                 &[Arg::Ptr(wptr), Arg::Ptr(x), Arg::Ptr(y), Arg::U32(rows as u32), Arg::U32(cols)])
+                    } else if use_head_pre && use_m4 && !use_v1 && !self.pipe_active && rows >= 131072 && (3..=4).contains(&n)
+                        && cols % 128 == 0 && rows % 128 == 0
+                        && self.exl3_rot.as_ref().is_some_and(|(r, maxc)| (cols as usize) <= *maxc && n * (cols as usize) * 4 <= r.bytes)
+                    {
+                        let rot_ptr = self.exl3_rot.as_ref().unwrap().0.ptr;
+                        p.launch("exl3_rotate_rows_f32", (((n * (cols as usize / 128)) as u32).div_ceil(8), 1, 1), (256, 1, 1), 0, self.ls(),
+                                 &[Arg::Ptr(wptr), Arg::Ptr(x), Arg::U32(xs as u32), Arg::Ptr(rot_ptr), Arg::U32(cols), Arg::U32(n as u32)])
+                            .and_then(|_| p.launch(&format!("matvec_cols_exl3_pre_m4s1_{bits}"), ((rows as u32).div_ceil(128), 1, 1), (256, 1, 1), 0, self.ls(),
+                                                   &[Arg::Ptr(wptr), Arg::Ptr(rot_ptr), Arg::Ptr(y), Arg::U32(ys as u32), Arg::U32(rows as u32), Arg::U32(cols), Arg::U32(n as u32)]))
+                    } else if use_m4 && (2..=4).contains(&n) && !use_v1 && cols % 128 == 0 {
+                        p.launch(&format!("matvec_cols_exl3_m4s4_{bits}"), ((rows as u32).div_ceil(128), 1, 1), (1024, 1, 1), 0, self.ls(),
+                                 &[Arg::Ptr(wptr), Arg::Ptr(x), Arg::U32(xs as u32), Arg::Ptr(y), Arg::U32(ys as u32), Arg::U32(rows as u32), Arg::U32(cols), Arg::U32(n as u32)])
+                    } else {
+                        let (kname, threads, shared) = exl3_kernel("matvec_cols_exl3", &bits, cols as usize, false);
+                        p.launch(&kname, ((rows as u32).div_ceil(128), 1, 1), (threads, 1, 1), shared, self.ls(),
+                                 &[Arg::Ptr(wptr), Arg::Ptr(x), Arg::U32(xs as u32), Arg::Ptr(y), Arg::U32(ys as u32), Arg::U32(rows as u32), Arg::U32(cols), Arg::U32(n as u32)])
+                    }
                 }
                 .unwrap_or_else(|err| panic!("{name}: {err}"));
             }
@@ -6855,6 +7447,43 @@ impl<'c, 'm> GpuSession<'c, 'm> {
         let (w_inj, r_inj) = if inject { (self.w[&format!("{p}_inject.weight")].ptr, cs as u32) } else { (0, 0) };
         static MMA_HC: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         let mma_hc = self.tensor_prompt && self.fast_order && m >= 16 && ch.is_multiple_of(64) && *MMA_HC.get_or_init(|| !std::env::var("SHADOWZERO_MMA_HC").is_ok_and(|v| v == "0"));
+        if self.hc_q8 {
+            if mma_hc {
+                unsafe {
+                    self.mvp.launch("mma_hc8_down_inject", ((rank as u32 + r_inj).div_ceil(64), (m as u32).div_ceil(32), 1), (128, 1, 1), 0, self.ls(), &[
+                        Arg::Ptr(self.w[&format!("{p}_down.weight")].ptr), Arg::Ptr(bb.down.ptr), Arg::U32(rank as u32),
+                        Arg::U32(rank as u32), Arg::Ptr(w_inj), Arg::Ptr(bb.g.ptr), Arg::U32(r_inj), Arg::U32(cs as u32),
+                        Arg::Ptr(bb.rn.ptr), Arg::U32(ch as u32), Arg::U32(ch as u32), Arg::F32(cs as f32), Arg::U32(m as u32),
+                    ]).unwrap_or_else(|err| panic!("mma_hc8_down_inject: {err}"));
+                }
+            } else {
+                for j0 in (0..m).step_by(COLS_MAX) {
+                    let n = (m - j0).min(COLS_MAX) as u32;
+                    let entry = if n == 1 { "hc8_down_inject_m1" } else if n <= 4 { "hc8_down_inject_m4" } else { "hc8_down_inject_cols" };
+                    unsafe {
+                        self.mvp.launch(entry, ((rank as u32 + r_inj).div_ceil(2), 1, 1), (256, 1, 1), 0, self.ls(), &[
+                            Arg::Ptr(self.w[&format!("{p}_down.weight")].ptr), Arg::Ptr(row(&bb.down, rank, j0)), Arg::U32(rank as u32),
+                            Arg::U32(rank as u32), Arg::Ptr(w_inj), Arg::Ptr(row(&bb.g, cs, j0)), Arg::U32(r_inj), Arg::U32(cs as u32),
+                            Arg::Ptr(row(&bb.rn, ch, j0)), Arg::U32(ch as u32), Arg::U32(ch as u32), Arg::F32(cs as f32),
+                            Arg::U32(n),
+                        ]).unwrap_or_else(|err| panic!("{entry}: {err}"));
+                    }
+                }
+            }
+            if m >= 16 && self.tensor_prompt && rank.is_multiple_of(64) && ch.is_multiple_of(64) {
+                unsafe {
+                    self.mvp.launch("mma_hc8_cols", ((ch as u32).div_ceil(64), (m as u32).div_ceil(32), 1), (128, 1, 1), 0, self.ls(), &[
+                        Arg::Ptr(self.w[&format!("{p}_up.weight")].ptr), Arg::Ptr(bb.down.ptr), Arg::U32(rank as u32),
+                        Arg::Ptr(bb.up.ptr), Arg::U32(ch as u32), Arg::U32(ch as u32), Arg::U32(rank as u32), Arg::U32(m as u32),
+                    ]).unwrap_or_else(|err| panic!("mma_hc8_cols: {err}"));
+                }
+                self.k2("hc_mix_rows", (h as u32).div_ceil(256), m as u32, 256, &[Arg::Ptr(bb.rn.ptr), Arg::Ptr(bb.up.ptr), Arg::Ptr(bb.u.ptr),
+                                                                                 Arg::U32(h as u32), Arg::U32(cs as u32)]);
+            } else {
+                self.hc_up_mix(p, bb.down.ptr, rank, bb.rn.ptr, ch, bb.u.ptr, h, m);
+            }
+            return;
+        }
         if mma_hc {
             // SAFETY: as the launch below, for all m inputs at once; the kernel guards the last row and token tiles.
             unsafe {
@@ -7001,7 +7630,15 @@ impl<'c, 'm> GpuSession<'c, 'm> {
             let at = self.attn[l].as_ref().unwrap();
             self.mv_cols(&format!("{p}.attn_q.weight"), bb.u.ptr, h, bb.qg.ptr, 2 * qd, m);
             self.mv_cols(&format!("{p}.attn_k.weight"), bb.u.ptr, h, bb.kk.ptr, kvd, m);
-            self.mv_cols(&format!("{p}.attn_v.weight"), bb.u.ptr, h, at.v.ptr + (p0 * kvd * 4) as u64, kvd, m);
+            if self.kv_q8 {
+                // bb.ao holds m * qd >= m * kvd floats and is unused until attention writes outputs after V is quantized
+                self.mv_cols(&format!("{p}.attn_v.weight"), bb.u.ptr, h, bb.ao.ptr, kvd, m);
+                self.k2("kv_quant_q8_rows", c.n_kv_head as u32, m as u32, 128, &[
+                    Arg::Ptr(bb.ao.ptr), Arg::Ptr(at.v.ptr), Arg::U32(p0 as u32),
+                    Arg::U32(c.n_kv_head as u32), Arg::U32(c.head_dim as u32), Arg::U32(m as u32)]);
+            } else {
+                self.mv_cols(&format!("{p}.attn_v.weight"), bb.u.ptr, h, at.v.ptr + (p0 * kvd * 4) as u64, kvd, m);
+            }
             self.mv_cols(&format!("{p}.indexer.q_proj.weight"), bb.u.ptr, h, bb.iq.ptr, iqd, m);
             self.mv_cols(&format!("{p}.indexer.k_proj.weight"), bb.u.ptr, h, at.raw.ptr + (p0 * id * 4) as u64, id, m);
         }
@@ -7031,8 +7668,18 @@ impl<'c, 'm> GpuSession<'c, 'm> {
             self.attn[l].as_mut().unwrap().nblocks = (p0 + m) / ratio;
             let bb = &self.bb;
             let at = self.attn[l].as_ref().unwrap();
-            let qgk = if std::env::var("SHADOWZERO_ROPE_F32").is_ok_and(|v| v == "0") { "head_norm_rope_qgk_rows" } else { self.nk("head_norm_rope_qgk_rows", "head_norm_rope_qgk_rows_f") };
-            if qgk.ends_with("_f") {
+            let qgk = if self.kv_q8 {
+                if std::env::var("SHADOWZERO_ROPE_F32").is_ok_and(|v| v == "0") {
+                    "head_norm_rope_qgk_rows_q8"
+                } else {
+                    self.nk("head_norm_rope_qgk_rows_q8", "head_norm_rope_qgk_rows_fq8")
+                }
+            } else if std::env::var("SHADOWZERO_ROPE_F32").is_ok_and(|v| v == "0") {
+                "head_norm_rope_qgk_rows"
+            } else {
+                self.nk("head_norm_rope_qgk_rows", "head_norm_rope_qgk_rows_f")
+            };
+            if qgk.ends_with("_f") || qgk.ends_with("_fq8") {
                 // the float kernel reads base^(2i / dims) from a table made here (a one-block launch)
                 self.k("rope_pow_table", 1, 128, &[Arg::F32(th), Arg::U32(rd)]);
             }
@@ -7055,14 +7702,21 @@ impl<'c, 'm> GpuSession<'c, 'm> {
                     // the scores on the tensor cores (`SHADOWZERO_ATT_TCD=1`, fp16 inputs; the block's heads are the product's 8 columns): docs/STATUS.md 2026-11-06 (52)
                     let tcd = hd % 16 == 0 && hd <= 256 && std::env::var("SHADOWZERO_ATT_TCD").is_ok_and(|v| v == "1");
                     let hb = if tcd { 8.min(group) } else { std::env::var("SHADOWZERO_ATT_HB").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(4).clamp(1, 8).min(group) };
-                    self.k2(if tcd { "attention_group_dense_rows_tc" } else { "attention_group_dense_rows_f32" }, (nkv * group.div_ceil(hb)) as u32, n as u32, 256, &[
+                    let dk = match (self.kv_q8, tcd) {
+                        (true, true) => "attention_group_dense_rows_tc_q8",
+                        (true, false) => "attention_group_dense_rows_f32_q8",
+                        (false, true) => "attention_group_dense_rows_tc",
+                        (false, false) => "attention_group_dense_rows_f32",
+                    };
+                    self.k2(dk, (nkv * group.div_ceil(hb)) as u32, n as u32, 256, &[
                         Arg::Ptr(row(&bb.q, qd, j0)), Arg::Ptr(at.k.ptr), Arg::Ptr(at.v.ptr), Arg::U32((p0 + j0 + 1) as u32),
                         Arg::Ptr(row(&bb.gate, qd, j0)), Arg::Ptr(row(&bb.ao, qd, j0)), Arg::Ptr(bb.att.ptr),
                         Arg::U32(self.cap as u32), Arg::U32(nkv as u32), Arg::U32(hd as u32), Arg::U32(group as u32),
                         Arg::U32(nh as u32), Arg::U32(hb as u32)]);
                     continue;
                 }
-                self.k2("attention_heads_rows", nh as u32, n as u32, 256, &[
+                let rk = if self.kv_q8 { "attention_heads_rows_q8" } else { "attention_heads_rows" };
+                self.k2(rk, nh as u32, n as u32, 256, &[
                     Arg::Ptr(row(&bb.q, qd, j0)), Arg::Ptr(at.k.ptr), Arg::Ptr(at.v.ptr), Arg::U32((p0 + j0 + 1) as u32),
                     Arg::Ptr(row(&bb.gate, qd, j0)), Arg::Ptr(row(&bb.ao, qd, j0)), Arg::Ptr(bb.att.ptr),
                     Arg::U32(self.cap as u32), Arg::U32(nkv as u32), Arg::U32(hd as u32), Arg::U32((nh / nkv) as u32),
@@ -7157,8 +7811,6 @@ impl<'c, 'm> GpuSession<'c, 'm> {
                     if hd % 16 == 0 && hd <= 256 {
                         // the heads of a GQA group share each position's K and V reads, `hb` of them a block
                         let hb = std::env::var("SHADOWZERO_ATT_HB").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(4).clamp(1, 8).min(group);
-                        let mut a = args.to_vec();
-                        a.push(Arg::U32(hb as u32));
                         // float scores, softmax and weighted sum (with `--tensor-prompt`; `SHADOWZERO_ATT_F32=0` keeps the double kernel, FP64-bound at 74% of the pipe): a tie while the
                         // copies paced the pass, +2-7% with the device planner (docs/STATUS.md 2026-11-04)
                         let f32_on = self.tensor_prompt && !std::env::var("SHADOWZERO_ATT_F32").is_ok_and(|v| v == "0");
@@ -7169,13 +7821,27 @@ impl<'c, 'm> GpuSession<'c, 'm> {
                         // the scores on the tensor cores (fp16 inputs, fp32 sums; `SHADOWZERO_ATT_TC=0` keeps the fp32 FMA scores): docs/STATUS.md 2026-11-06 (50)
                         let tcv = std::env::var("SHADOWZERO_ATT_TC").ok();
                         let tc = v3 && tcv.as_deref() != Some("0");
-                        // `SHADOWZERO_ATT_TC=2`: the weighted sum on the tensor cores as well (STATUS 2026-11-06 (51))
-                        let tc2 = tc && hd == 256 && tcv.as_deref() == Some("2");
-                        let kernel = if tc2 { "attention_group_sel_rows_tc2" } else if tc { "attention_group_sel_rows_tc" } else if v3 { "attention_group_sel_rows_v3" } else if v2 { "attention_group_sel_rows_v2" } else if f32_on { "attention_group_sel_rows_f32" } else { "attention_group_sel_rows" };
-                        let hb = if v3 { group } else if v2 { 4 } else { hb };
-                        self.k2(kernel, (nkv * group.div_ceil(hb)) as u32, n as u32, 256, &a);
+                        if self.kv_q8 {
+                            if v3 {
+                                let mut a = args.to_vec();
+                                a.push(Arg::U32(group as u32));
+                                let kernel = if tc { "attention_group_sel_rows_tc_q8" } else { "attention_group_sel_rows_v3_q8" };
+                                self.k2(kernel, nkv as u32, n as u32, 256, &a);
+                            } else {
+                                self.k2("attention_heads_sel_rows_q8", nh as u32, n as u32, 256, &args);
+                            }
+                        } else {
+                            let mut a = args.to_vec();
+                            a.push(Arg::U32(hb as u32));
+                            // `SHADOWZERO_ATT_TC=2`: the weighted sum on the tensor cores as well (STATUS 2026-11-06 (51))
+                            let tc2 = tc && hd == 256 && tcv.as_deref() == Some("2");
+                            let kernel = if tc2 { "attention_group_sel_rows_tc2" } else if tc { "attention_group_sel_rows_tc" } else if v3 { "attention_group_sel_rows_v3" } else if v2 { "attention_group_sel_rows_v2" } else if f32_on { "attention_group_sel_rows_f32" } else { "attention_group_sel_rows" };
+                            let hb = if v3 { group } else if v2 { 4 } else { hb };
+                            self.k2(kernel, (nkv * group.div_ceil(hb)) as u32, n as u32, 256, &a);
+                        }
                     } else {
-                        self.k2("attention_heads_sel_rows", nh as u32, n as u32, 256, &args);
+                        let sk = if self.kv_q8 { "attention_heads_sel_rows_q8" } else { "attention_heads_sel_rows" };
+                        self.k2(sk, nh as u32, n as u32, 256, &args);
                     }
                 }
                 j = e;
@@ -7619,28 +8285,50 @@ impl<'c, 'm> GpuSession<'c, 'm> {
     }
 
     fn moe_batch(&mut self, l: usize, m: usize, logs: &mut [Vec<u16>], router_done: bool, ticket: Option<usize>) {
-        let c = &self.m.cfg;
-        let p = format!("blk.{l}");
-        let (h, sff, k, ne) = (c.hidden, c.shared_ff, c.n_expert_used, c.n_expert);
+        let meta = self.moe_meta[l].clone();
+        let (h, sff, k, ne) = {
+            let c = &self.m.cfg;
+            (c.hidden, c.shared_ff, c.n_expert_used, c.n_expert)
+        };
         if !router_done {
             self.moe_router_batch(l, m);
         }
         if self.res_eaddr[l].is_some() {
-            let names = [format!("{p}.ffn_gate_exps.weight"), format!("{p}.ffn_up_exps.weight"), format!("{p}.ffn_down_exps.weight")];
-            let infos: Vec<TensorInfo> = names.iter().map(|n| self.expert_info(n)).collect();
-            if self.resident_dev_plan_ok(l, m, &infos) {
-                self.clear_dp_copied_if_dirty();
-                self.moe_batch_resident(l, m, &infos);
-                self.cache.hits += (m * k) as u64;
-                let _ = (logs, ticket, sff);
-                return;
+            if let Some(ref mt) = meta {
+                if self.resident_dev_plan_ok(l, m, &mt.infos) {
+                    self.clear_dp_copied_if_dirty();
+                    self.moe_batch_resident(l, m, &mt.infos);
+                    self.cache.hits += (m * k) as u64;
+                    let _ = (logs, ticket, sff);
+                    return;
+                }
+            } else {
+                let p = format!("blk.{l}");
+                let names = [format!("{p}.ffn_gate_exps.weight"), format!("{p}.ffn_up_exps.weight"), format!("{p}.ffn_down_exps.weight")];
+                let infos: Vec<TensorInfo> = names.iter().map(|n| self.expert_info(n)).collect();
+                if self.resident_dev_plan_ok(l, m, &infos) {
+                    self.clear_dp_copied_if_dirty();
+                    self.moe_batch_resident(l, m, &infos);
+                    self.cache.hits += (m * k) as u64;
+                    let _ = (logs, ticket, sff);
+                    return;
+                }
             }
         }
         if self.devplan && self.sp.is_some() && m > MAX_VERIFY {
-            let names = [format!("{p}.ffn_gate_exps.weight"), format!("{p}.ffn_up_exps.weight"), format!("{p}.ffn_down_exps.weight")];
-            let infos: Vec<TensorInfo> = names.iter().map(|n| self.expert_info(n)).collect();
-            if self.dev_plan_ok(m, &infos) {
-                let sizes: Vec<usize> = names.iter().map(|n| self.m.expert_bytes(n)).collect();
+            let p = format!("blk.{l}");
+            let names_v: [String; 3];
+            let infos_v: Vec<TensorInfo>;
+            let sizes_v: Vec<usize>;
+            let (names, infos, sizes): (&[String; 3], &[TensorInfo], &[usize]) = if let Some(ref mt) = meta {
+                (&mt.names, &mt.infos, &mt.sizes)
+            } else {
+                names_v = [format!("{p}.ffn_gate_exps.weight"), format!("{p}.ffn_up_exps.weight"), format!("{p}.ffn_down_exps.weight")];
+                infos_v = names_v.iter().map(|n| self.expert_info(n)).collect();
+                sizes_v = names_v.iter().map(|n| self.m.expert_bytes(n)).collect();
+                (&names_v, &infos_v, &sizes_v)
+            };
+            if self.dev_plan_ok(m, infos) {
                 {
                     // the shared expert
                     let bb = &self.bb;
@@ -7648,7 +8336,7 @@ impl<'c, 'm> GpuSession<'c, 'm> {
                     self.k1("swiglu", m * sff, &[Arg::Ptr(bb.sg.ptr), Arg::Ptr(bb.su.ptr), Arg::Ptr(bb.sa.ptr), Arg::U32((m * sff) as u32)]);
                     self.mv_cols(&format!("{p}.ffn_down_shexp.weight"), bb.sa.ptr, sff, bb.so.ptr, h, m);
                 }
-                self.moe_staged(l, m, None, &infos, &sizes, &names);
+                self.moe_staged(l, m, None, infos, sizes, names);
                 let _ = (logs, ticket, k, ne);
                 return;
             }
@@ -7660,59 +8348,85 @@ impl<'c, 'm> GpuSession<'c, 'm> {
         // the hybrid's CPU experts in a verify pass need the MoE input on the host
         let want_u = self.want_u_rows(m) && !stale;
         let mut u_host: Option<Vec<f32>> = None;
-        let mut shared_done = false;
         if self.pipe_active {
             // the copies below reuse slots the previous group's experts may still be reading: the copy stream waits for them
             self.ctx.stream_wait_event(Some(&self.copy_stream), &self.group_event).unwrap();
         }
-        let mut logits: Vec<Vec<f32>> = if let Some(slot) = ticket {
-            let (lg, u) = self.wait_router_read(slot, m, want_u);
-            u_host = u;
-            lg
-        } else if stale {
-            self.stale_logits[&(l, m)].clone()
+        let host_fast = moe_host_fast_on();
+        let mut sc = std::mem::take(&mut self.moe_scratch);
+        let direct_fast = host_fast && ticket.is_none() && !stale && !want_u && shared_early()
+            && self.expert_mask.is_none() && self.router_bias == 0.0 && !self.accept_moe;
+        let mut tops: Vec<Vec<(usize, f64)>>;
+        let t_woke: std::time::Instant;
+        let t_routed0: std::time::Duration;
+        if direct_fast {
+            self.download_mapped_into(self.bb.rl.ptr, m * ne, &mut sc.logits_flat, &|| self.shared_expert_batch(l, m));
+            self.waits[0] += t_wait.elapsed().as_secs_f64();
+            t_woke = std::time::Instant::now();
+            vt_lap(&mut vt, 1);
+            self.mark("batch: router + logits down");
+            vt_lap(&mut vt, 11);
+            t_routed0 = t_woke.elapsed();
+            tops = std::mem::take(&mut sc.tops);
+            if tops.len() < m {
+                tops.resize_with(m, Vec::new);
+            }
+            tops.truncate(m);
+            for j in 0..m {
+                route_into(&sc.logits_flat[j * ne..(j + 1) * ne], k, &mut tops[j]);
+            }
+            vt_lap(&mut vt, 2);
         } else {
-            let mut srcs = vec![(self.bb.rl.ptr, m * ne)];
-            if want_u {
-                srcs.push((self.bb.u.ptr, m * h));
-            }
-            // the shared expert does not depend on the routing: queued behind the copy, it runs on the GPU while the host waits and routes (`SHADOWZERO_SHARED_EARLY=0`: after the wait)
-            let early = shared_early();
-            let mut got = if early {
-                shared_done = true;
-                self.download_mapped_with(&srcs, &|| self.shared_expert_batch(l, m))
+            let mut shared_done = false;
+            let mut logits = if let Some(slot) = ticket {
+                let (lg, u) = self.wait_router_read(slot, m, want_u);
+                u_host = u;
+                lg
+            } else if stale {
+                self.stale_logits[&(l, m)].clone()
             } else {
-                self.download_mapped(&srcs)
+                let mut srcs = vec![(self.bb.rl.ptr, m * ne)];
+                if want_u {
+                    srcs.push((self.bb.u.ptr, m * h));
+                }
+                // the shared expert does not depend on the routing: queued behind the copy, it runs on the GPU while the host waits and routes (`SHADOWZERO_SHARED_EARLY=0`: after the wait)
+                let early = shared_early();
+                let mut got = if early {
+                    shared_done = true;
+                    self.download_mapped_with(&srcs, &|| self.shared_expert_batch(l, m))
+                } else {
+                    self.download_mapped(&srcs)
+                };
+                if want_u {
+                    u_host = Some(got.remove(1));
+                }
+                let all = got.remove(0);
+                let lg: Vec<Vec<f32>> = all.chunks(ne).map(|c| c.to_vec()).collect();
+                if self.timing_no_sync {
+                    self.stale_logits.insert((l, m), lg.clone());
+                }
+                lg
             };
-            if want_u {
-                u_host = Some(got.remove(1));
+            if self.expert_mask.is_some() {
+                for row in logits.iter_mut() {
+                    self.mask_logits(l, row);
+                }
             }
-            let all = got.remove(0);
-            let lg: Vec<Vec<f32>> = all.chunks(ne).map(|c| c.to_vec()).collect();
-            if self.timing_no_sync {
-                self.stale_logits.insert((l, m), lg.clone());
+            self.waits[0] += t_wait.elapsed().as_secs_f64();
+            t_woke = std::time::Instant::now();
+            vt_lap(&mut vt, 1);
+            self.mark("batch: router + logits down");
+            if !shared_done {
+                // the shared expert, on the GPU while the host routes and the copies run
+                self.shared_expert_batch(l, m);
             }
-            lg
-        };
-        if self.expert_mask.is_some() {
-            for row in logits.iter_mut() {
-                self.mask_logits(l, row);
+            vt_lap(&mut vt, 11);
+            t_routed0 = t_woke.elapsed();
+            tops = route_all(&logits, k, if self.router_bias != 0.0 { Some((&self.cache.map, l, self.router_bias)) } else { None });
+            vt_lap(&mut vt, 2);
+            if self.accept_moe && self.replay.on.get() && m >= 2 {
+                self.accept_route(l, &logits, &mut tops);
             }
-        }
-        self.waits[0] += t_wait.elapsed().as_secs_f64();
-        let t_woke = std::time::Instant::now();
-        vt_lap(&mut vt, 1);
-        self.mark("batch: router + logits down");
-        if !shared_done {
-            // the shared expert, on the GPU while the host routes and the copies run
-            self.shared_expert_batch(l, m);
-        }
-        vt_lap(&mut vt, 11);
-        let t_routed0 = t_woke.elapsed();
-        let mut tops: Vec<Vec<(usize, f64)>> = route_all(&logits, k, if self.router_bias != 0.0 { Some((&self.cache.map, l, self.router_bias)) } else { None });
-        vt_lap(&mut vt, 2);
-        if self.accept_moe && self.replay.on.get() && m >= 2 {
-            self.accept_route(l, &logits, &mut tops);
         }
         for (j, top) in tops.iter().enumerate() {
             for &(e, _) in top {
@@ -7767,9 +8481,18 @@ impl<'c, 'm> GpuSession<'c, 'm> {
             }
         }
         vt_lap(&mut vt, 3);
-        let names = [format!("{p}.ffn_gate_exps.weight"), format!("{p}.ffn_up_exps.weight"), format!("{p}.ffn_down_exps.weight")];
-        let infos: Vec<TensorInfo> = names.iter().map(|n| self.expert_info(n)).collect();
-        let sizes: Vec<usize> = names.iter().map(|n| self.m.expert_bytes(n)).collect();
+        let names_fb: [String; 3];
+        let infos_fb: Vec<TensorInfo>;
+        let sizes_fb: Vec<usize>;
+        let (names, infos, sizes): (&[String; 3], &[TensorInfo], &[usize]) = if let Some(ref mt) = meta {
+            (&mt.names, &mt.infos, &mt.sizes)
+        } else {
+            let p = format!("blk.{l}");
+            names_fb = [format!("{p}.ffn_gate_exps.weight"), format!("{p}.ffn_up_exps.weight"), format!("{p}.ffn_down_exps.weight")];
+            infos_fb = names_fb.iter().map(|n| self.expert_info(n)).collect();
+            sizes_fb = names_fb.iter().map(|n| self.m.expert_bytes(n)).collect();
+            (&names_fb, &infos_fb, &sizes_fb)
+        };
         if self.replay.on.get() {
             if let Some(sb) = self.spec_bytes.as_mut() {
                 let bytes = sizes.iter().sum::<usize>() as u64;
@@ -7867,11 +8590,15 @@ impl<'c, 'm> GpuSession<'c, 'm> {
         }
         if self.sp.is_some() && m > MAX_VERIFY && !cpu_pending && (infos[0].ty.exl3().is_none() || exl3_groups_on()) {
             let t_pre = t_woke.elapsed();
-            self.moe_staged(l, m, Some(&tops), &infos, &sizes, &names);
+            self.moe_staged(l, m, Some(&tops), infos, sizes, names);
             if m >= 2048 && std::env::var("SHADOWZERO_STAGE_TIME").is_ok_and(|v| v == "1") {
                 eprintln!("HOST L{l} m={m}: after the logits arrived: conversion {:.1} ms, route+bookkeeping+plan prep {:.1} ms, moe_staged {:.1} ms (GPU has only the shared expert meanwhile)",
                           t_routed0.as_secs_f64() * 1e3, (t_pre - t_routed0).as_secs_f64() * 1e3, (t_woke.elapsed() - t_pre).as_secs_f64() * 1e3);
             }
+            if direct_fast {
+                sc.tops = tops;
+            }
+            self.moe_scratch = sc;
             return;
         }
         // misses read from the file may wait in the staging buffer, a slot each
@@ -7882,26 +8609,66 @@ impl<'c, 'm> GpuSession<'c, 'm> {
         };
         let arena = self.cache.arena.as_ref().unwrap().ptr;
         let mut start = 0;
+        let mut set = std::mem::take(&mut sc.set);
+        let mut copying = std::mem::take(&mut sc.copying);
+        let mut extra = std::mem::take(&mut sc.extra);
         while start < m {
-            let mut set: Vec<usize> = Vec::new();
+            set.clear();
             let mut end = start;
-            while end < m {
-                let mut cand = set.clone();
-                for &(e, _) in &tops[end] {
-                    if !cand.contains(&e) && !cpu_skip.contains(&e) {
-                        cand.push(e);
+            if host_fast && ne <= 512 {
+                let mut seen = [0u64; 8];
+                let mut miss_cnt = 0usize;
+                let mut file_cnt = 0usize;
+                while end < m {
+                    let prev_len = set.len();
+                    let prev_miss = miss_cnt;
+                    let prev_file = file_cnt;
+                    for &(e, _) in &tops[end] {
+                        if (seen[e >> 6] >> (e & 63)) & 1 == 0 && !cpu_skip.contains(&e) {
+                            seen[e >> 6] |= 1u64 << (e & 63);
+                            set.push(e);
+                            if !self.cache.map.contains_key(&(l, e)) {
+                                miss_cnt += 1;
+                                if !self.ram.at.contains_key(&(l, e)) {
+                                    file_cnt += 1;
+                                }
+                            }
+                        }
                     }
+                    let free = self.cache.evict_range[l].clone()
+                        .filter(|&i| self.cache.owner[i].is_none_or(|(ol, oe)| ol != l || ((seen[oe >> 6] >> (oe & 63)) & 1 == 0)))
+                        .count();
+                    if end > start && (miss_cnt > free + scratch.1 || file_cnt > max_file) {
+                        for &e in &set[prev_len..] {
+                            seen[e >> 6] &= !(1u64 << (e & 63));
+                        }
+                        set.truncate(prev_len);
+                        miss_cnt = prev_miss;
+                        file_cnt = prev_file;
+                        break;
+                    }
+                    end += 1;
                 }
-                let missing = || cand.iter().filter(|&&e| !self.cache.map.contains_key(&(l, e)));
-                let file = missing().filter(|&&e| !self.ram.at.contains_key(&(l, e))).count();
-                let free = self.cache.evict_range[l].clone()
-                    .filter(|&i| self.cache.owner[i].is_none_or(|(ol, oe)| ol != l || !cand.contains(&oe)))
-                    .count();
-                if end > start && (missing().count() > free + scratch.1 || file > max_file) {
-                    break;
+                let _ = (miss_cnt, file_cnt);
+            } else {
+                while end < m {
+                    let mut cand = set.clone();
+                    for &(e, _) in &tops[end] {
+                        if !cand.contains(&e) && !cpu_skip.contains(&e) {
+                            cand.push(e);
+                        }
+                    }
+                    let missing = || cand.iter().filter(|&&e| !self.cache.map.contains_key(&(l, e)));
+                    let file = missing().filter(|&&e| !self.ram.at.contains_key(&(l, e))).count();
+                    let free = self.cache.evict_range[l].clone()
+                        .filter(|&i| self.cache.owner[i].is_none_or(|(ol, oe)| ol != l || !cand.contains(&oe)))
+                        .count();
+                    if end > start && (missing().count() > free + scratch.1 || file > max_file) {
+                        break;
+                    }
+                    set = cand;
+                    end += 1;
                 }
-                set = cand;
-                end += 1;
             }
             vt_lap(&mut vt, 5);
             if start > 0 {
@@ -7922,8 +8689,8 @@ impl<'c, 'm> GpuSession<'c, 'm> {
                 self.cache.touch((l, e));
             }
             // the group's misses get their slots (cache victims, else scratch) first
-            let mut copying: Vec<(usize, u64)> = Vec::new();
-            let mut extra: Vec<(usize, u64)> = Vec::new();
+            copying.clear();
+            extra.clear();
             for &e in &set {
                 if self.cache.map.contains_key(&(l, e)) {
                     self.cache.hits += 1;
@@ -7979,7 +8746,7 @@ impl<'c, 'm> GpuSession<'c, 'm> {
                 }
                 for &(e, base) in &copying {
                     let from_file = !self.ram.at.contains_key(&(l, e));
-                    self.fetch_expert(l, e, n_file, &names, &sizes, [base, base + part[1], base + part[2]]);
+                    self.fetch_expert(l, e, n_file, names, sizes, [base, base + part[1], base + part[2]]);
                     n_file += from_file as usize;
                 }
             }
@@ -7989,16 +8756,24 @@ impl<'c, 'm> GpuSession<'c, 'm> {
                     None => extra.iter().find(|x| x.0 == e).expect("a routed expert neither cached nor fetched").1,
                 };
                 let copied = |e: usize| copying.iter().any(|c| c.0 == e);
-                let chunk_n = if end - start >= 64 && self.mma_experts_ok(&infos) { mma_group() } else if end - start >= 64 && self.exl3_mma_experts(&infos) { 64 } else { 8 };
-                let p = grouped_plan(&tops, start, end, &set, k, self.rows * k, addr, copied, part, chunk_n);
-                assert!(p.bytes.len() <= self.bb.gtab.bytes, "grouped experts: {} bytes of tables", p.bytes.len());
-                self.upload_to(self.bb.gtab.ptr, &p.bytes);
+                let chunk_n = if end - start >= 64 && self.mma_experts_ok(infos) { mma_group() } else if end - start >= 64 && self.exl3_mma_experts(infos) { 64 } else { 8 };
+                let p = if host_fast {
+                    let p = grouped_plan_into(&tops, start, end, &set, ne, k, self.rows * k, addr, copied, part, chunk_n, &mut sc);
+                    assert!(sc.plan_bytes.len() <= self.bb.gtab.bytes, "grouped experts: {} bytes of tables", sc.plan_bytes.len());
+                    self.upload_to(self.bb.gtab.ptr, &sc.plan_bytes);
+                    p
+                } else {
+                    let p = grouped_plan(&tops, start, end, &set, k, self.rows * k, addr, copied, part, chunk_n);
+                    assert!(p.bytes.len() <= self.bb.gtab.bytes, "grouped experts: {} bytes of tables", p.bytes.len());
+                    self.upload_to(self.bb.gtab.ptr, &p.bytes);
+                    p
+                };
                 if start == 0 {
                     self.plan_lat.0 += 1;
                     self.plan_lat.1 += t_woke.elapsed().as_secs_f64();
                 }
                 vt_lap(&mut vt, 7);
-                self.routed_grouped(&p, 0, start, end, &infos);
+                self.routed_grouped(&p, 0, start, end, infos);
                 plan = Some(p);
             }
             vt_lap(&mut vt, 8);
@@ -8017,11 +8792,11 @@ impl<'c, 'm> GpuSession<'c, 'm> {
                 }
                 for &(e, base) in &copying {
                     let from_file = !self.ram.at.contains_key(&(l, e));
-                    self.fetch_expert(l, e, n_file, &names, &sizes, [base, base + part[1], base + part[2]]);
+                    self.fetch_expert(l, e, n_file, names, sizes, [base, base + part[1], base + part[2]]);
                     n_file += from_file as usize;
                 }
             }
-            self.read_drive(&names, &sizes);
+            self.read_drive(names, sizes);
             if cpu_pending {
                 let t_join = std::time::Instant::now();
                 let out = self.cpu.as_mut().unwrap().0.wait();
@@ -8041,7 +8816,7 @@ impl<'c, 'm> GpuSession<'c, 'm> {
                     self.copy_event.record(Some(&self.copy_stream)).unwrap();
                     self.ctx.stream_wait_event(None, &self.copy_event).unwrap();
                 }
-                self.routed_grouped(p, 1, start, end, &infos);
+                self.routed_grouped(p, 1, start, end, infos);
                 let bb = &self.bb;
                 self.k2("moe_combine_qwen_rows", (h as u32).div_ceil(256), (end - start) as u32, 256, &[
                     Arg::Ptr(row(&bb.y, h, start)), Arg::Ptr(row(&bb.eo, k * h, start)),
@@ -8056,7 +8831,7 @@ impl<'c, 'm> GpuSession<'c, 'm> {
                 }
                 self.mark("batch: shared expert + expert fetch");
                 for (j, top) in tops.iter().enumerate().take(end).skip(start) {
-                    self.routed_qwen(l, j, top, &extra, &infos, &sizes);
+                    self.routed_qwen(l, j, top, &extra, infos, sizes);
                 }
             }
             start = end;
@@ -8069,6 +8844,13 @@ impl<'c, 'm> GpuSession<'c, 'm> {
         if self.pipe_active {
             self.group_event.record(None).unwrap();
         }
+        sc.set = set;
+        sc.copying = copying;
+        sc.extra = extra;
+        if direct_fast {
+            sc.tops = tops;
+        }
+        self.moe_scratch = sc;
     }
 
     /// Whether a layer's expert matrices are EXL3 ones the tensor-core group kernel (`mma_grouped_exl3_*`, 64 tokens a group) can take (`--tensor-prompt`, whole 128-blocks;
@@ -8096,7 +8878,6 @@ impl<'c, 'm> GpuSession<'c, 'm> {
         }
         let up = (self.rows * k * ff * 4) as u64;
         let grouped = |t: &TensorInfo, wt: u64, gt: u64, count: usize, x: u64, xs: usize, y: u64, ys: usize| {
-            let ty = t.ty.name().to_lowercase();
             let (rows, cols) = (t.dims[1] as u32, t.dims[0] as u32);
             if let Some((p3, bits)) = self.exl3_prog(t) {
                 // an EXL3 expert: groups of up to 8 tokens (STATUS 140), 1,024 threads a 128-output slice
@@ -8121,7 +8902,16 @@ impl<'c, 'm> GpuSession<'c, 'm> {
                     }
                     return;
                 }
-                let (kernel, block) = if p.chunk_n == 64 { (format!("mma_grouped_exl3_{bits}"), 256) } else { (format!("matvec_grouped_exl3_{}s4_{bits}", match (exl3_gm_on(), p.max_group) { (true, 0..=2) => "m2", (true, 3..=4) => "m4", _ => "" }), 1024) };
+                let gm_mode = match (exl3_gm_on(), p.max_group) {
+                    (true, 0..=2) => 2u8,
+                    (true, 3..=4) => 4u8,
+                    _ => 0u8,
+                };
+                let (kernel, block) = if p.chunk_n == 64 {
+                    (exl3_grouped_kernel(64, 0, &bits), 256)
+                } else {
+                    (exl3_grouped_kernel(8, gm_mode, &bits), 1024)
+                };
                 // SAFETY: as the launches below, with `exl3.cu`'s grouped kernel (the same tables and 17-u32 records).
                 unsafe {
                     p3.launch(&kernel, (rows.div_ceil(128), count as u32, 1), (block, 1, 1), 0, self.ls(),
@@ -8131,14 +8921,15 @@ impl<'c, 'm> GpuSession<'c, 'm> {
                 .unwrap_or_else(|err| panic!("{}: {err}", t.name));
                 return;
             }
+            let ty = ty_lower_static(&t.ty);
             // SAFETY: `count` table entries at gtab + wt (matrix addresses) and + gt (17 u32 each: count, input rows,
             // output rows; 65 for the 32-token records), each a rows x cols matrix in the cache or the scratch slots; the rows
             // they name are inside the batch's buffers at the strides given.
-            let (kernel, grid, block) = if p.chunk_n >= 32 {
-                (match p.chunk_n { 64 => format!("mma_grouped64_{ty}"), 48 => format!("mma_grouped48_{ty}"), _ => format!("mma_grouped_{ty}") }, (rows.div_ceil(64), count as u32, 1), 128)
+            let (kernel, grid, block): (std::borrow::Cow<'static, str>, _, _) = if p.chunk_n >= 32 {
+                (match p.chunk_n { 64 => format!("mma_grouped64_{ty}"), 48 => format!("mma_grouped48_{ty}"), _ => format!("mma_grouped_{ty}") }.into(), (rows.div_ceil(64), count as u32, 1), 128)
             } else {
                 // 8 rows a block: matvec.cu's GROUPED_RW = 1
-                (format!("matvec_grouped_{ty}"), (rows.div_ceil(8), count as u32, 1), 256)
+                (format!("matvec_grouped_{ty}").into(), (rows.div_ceil(8), count as u32, 1), 256)
             };
             unsafe {
                 self.mvp.launch(&kernel, grid, (block, 1, 1), 0, self.ls(),
@@ -8377,14 +9168,38 @@ impl<'c, 'm> GpuSession<'c, 'm> {
         let ch = h * cs;
         let mut e: Vec<f32> = Vec::new();
         let mut width = 0usize;
-        for j in 0..m {
-            for row in ple_rows(c, &self.tokens[..p0 + j + 1]) {
-                e.extend(self.m.ple_row(row));
+        if !std::env::var("SHADOWZERO_PLE_FIFO").is_ok_and(|v| v == "0") {
+            let mut all_rows: Vec<i64> = Vec::new();
+            let mut per_tok = 0usize;
+            for j in 0..m {
+                let rows = ple_rows(c, &self.tokens[..p0 + j + 1]);
+                if j == 0 {
+                    per_tok = rows.len();
+                } else if rows.len() != per_tok {
+                    all_rows.clear();
+                    break;
+                }
+                all_rows.extend_from_slice(&rows);
             }
-            if j == 0 {
-                width = e.len();
-            } else if e.len() != width * (j + 1) {
-                return false;
+            if !all_rows.is_empty() {
+                self.m.ple_extend_rows(&all_rows, &mut e);
+                if e.len().is_multiple_of(m) {
+                    width = e.len() / m;
+                } else {
+                    return false;
+                }
+            }
+        }
+        if e.is_empty() {
+            for j in 0..m {
+                for row in ple_rows(c, &self.tokens[..p0 + j + 1]) {
+                    e.extend(self.m.ple_row(row));
+                }
+                if j == 0 {
+                    width = e.len();
+                } else if e.len() != width * (j + 1) {
+                    return false;
+                }
             }
         }
         let bb = &self.bb;
@@ -8489,8 +9304,14 @@ impl Stepper for GpuSession<'_, '_> {
         let arena_gib = arena_bytes as f64 / (1u64 << 30) as f64;
         let avg_mib = if slots > 0 { (arena_bytes as f64 / slots as f64) / (1u64 << 20) as f64 } else { bytes as f64 / (1u64 << 20) as f64 };
         let fill_secs = self.ram.fill_secs + self.peer.as_ref().map_or(0.0, |p| p.ram.fill_secs);
-        format!("expert cache: {slots} slots x {avg_mib:.2} MiB = {arena_gib:.2} GiB; {hits} hits, {misses} misses ({:.1}% hits); {} slice uploads",
-                100.0 * hits as f64 / (hits + misses).max(1) as f64, self.expert_uploads + self.peer.as_ref().map_or(0, |p| p.expert_uploads))
+        let has_head_proxy = self.head_proxy.is_some() || self.peer.as_ref().is_some_and(|p| p.head_proxy.is_some());
+        let pdl_on = self.ctx.cc.0 >= 9 && crate::driver::pdl_enabled() && self.ctx.api.cuLaunchKernelEx.is_some();
+        format!("expert cache: {slots} slots x {avg_mib:.2} MiB = {arena_gib:.2} GiB; {hits} hits, {misses} misses ({:.1}% hits); {} slice uploads; kv: {}, hc: {}, head: {}, pdl: {}",
+                100.0 * hits as f64 / (hits + misses).max(1) as f64, self.expert_uploads + self.peer.as_ref().map_or(0, |p| p.expert_uploads),
+                if self.kv_q8 { "q8" } else { "f32" },
+                if self.hc_q8 { "q8" } else { "bf16" },
+                if has_head_proxy { "q2p" } else { "exl3" },
+                if pdl_on { "on" } else { "off" })
             + &(if std::env::var("SHADOWZERO_VRAM_MAP").is_ok() { format!("; vram free now {} MiB", self.mem_info().0 >> 20) } else { String::new() })
             + &(if self.cache.admit_after > 0 { format!("; admit-after {}: {} misses kept out of the cache", self.cache.admit_after, self.cache.scratch_reads) } else { String::new() })
             + &format!("; RAM tier: {ram_exp} experts, {:.2} GiB pinned (filled in {:.1} s), misses served {ram_serv} from RAM, {file_serv} from the file",
@@ -8770,4 +9591,67 @@ fn exl3_gm_on() -> bool {
 fn exl3_sk_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var("SHADOWZERO_EXL3_SK").map_or(true, |v| v != "0"))
+}
+
+/// Zero-allocation host MoE routing / group planning in `moe_batch` (`SHADOWZERO_MOE_HOST_FAST=0`: off).
+fn moe_host_fast_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("SHADOWZERO_MOE_HOST_FAST").map_or(true, |v| v != "0"))
+}
+
+fn exl3_grouped_kernel(chunk_n: usize, gm_mode: u8, rate: &str) -> std::borrow::Cow<'static, str> {
+    if chunk_n == 64 {
+        return match rate {
+            "1" => "mma_grouped_exl3_1".into(), "1h" => "mma_grouped_exl3_1h".into(),
+            "2" => "mma_grouped_exl3_2".into(), "2h" => "mma_grouped_exl3_2h".into(),
+            "3" => "mma_grouped_exl3_3".into(), "3h" => "mma_grouped_exl3_3h".into(),
+            "4" => "mma_grouped_exl3_4".into(), "5" => "mma_grouped_exl3_5".into(),
+            "6" => "mma_grouped_exl3_6".into(), "7" => "mma_grouped_exl3_7".into(),
+            "8" => "mma_grouped_exl3_8".into(),
+            _ => format!("mma_grouped_exl3_{rate}").into(),
+        };
+    }
+    match (gm_mode, rate) {
+        (2, "1") => "matvec_grouped_exl3_m2s4_1".into(), (2, "1h") => "matvec_grouped_exl3_m2s4_1h".into(),
+        (2, "2") => "matvec_grouped_exl3_m2s4_2".into(), (2, "2h") => "matvec_grouped_exl3_m2s4_2h".into(),
+        (2, "3") => "matvec_grouped_exl3_m2s4_3".into(), (2, "3h") => "matvec_grouped_exl3_m2s4_3h".into(),
+        (2, "4") => "matvec_grouped_exl3_m2s4_4".into(), (2, "5") => "matvec_grouped_exl3_m2s4_5".into(),
+        (2, "6") => "matvec_grouped_exl3_m2s4_6".into(), (2, "7") => "matvec_grouped_exl3_m2s4_7".into(),
+        (2, "8") => "matvec_grouped_exl3_m2s4_8".into(),
+        (4, "1") => "matvec_grouped_exl3_m4s4_1".into(), (4, "1h") => "matvec_grouped_exl3_m4s4_1h".into(),
+        (4, "2") => "matvec_grouped_exl3_m4s4_2".into(), (4, "2h") => "matvec_grouped_exl3_m4s4_2h".into(),
+        (4, "3") => "matvec_grouped_exl3_m4s4_3".into(), (4, "3h") => "matvec_grouped_exl3_m4s4_3h".into(),
+        (4, "4") => "matvec_grouped_exl3_m4s4_4".into(), (4, "5") => "matvec_grouped_exl3_m4s4_5".into(),
+        (4, "6") => "matvec_grouped_exl3_m4s4_6".into(), (4, "7") => "matvec_grouped_exl3_m4s4_7".into(),
+        (4, "8") => "matvec_grouped_exl3_m4s4_8".into(),
+        (0, "1") => "matvec_grouped_exl3_s4_1".into(), (0, "1h") => "matvec_grouped_exl3_s4_1h".into(),
+        (0, "2") => "matvec_grouped_exl3_s4_2".into(), (0, "2h") => "matvec_grouped_exl3_s4_2h".into(),
+        (0, "3") => "matvec_grouped_exl3_s4_3".into(), (0, "3h") => "matvec_grouped_exl3_s4_3h".into(),
+        (0, "4") => "matvec_grouped_exl3_s4_4".into(), (0, "5") => "matvec_grouped_exl3_s4_5".into(),
+        (0, "6") => "matvec_grouped_exl3_s4_6".into(), (0, "7") => "matvec_grouped_exl3_s4_7".into(),
+        (0, "8") => "matvec_grouped_exl3_s4_8".into(),
+        (2, _) => format!("matvec_grouped_exl3_m2s4_{rate}").into(),
+        (4, _) => format!("matvec_grouped_exl3_m4s4_{rate}").into(),
+        _ => format!("matvec_grouped_exl3_s4_{rate}").into(),
+    }
+}
+
+fn ty_lower_static(ty: &shadowzero_model::gguf::GgmlType) -> std::borrow::Cow<'static, str> {
+    let s = ty.name();
+    match s.as_str() {
+        "Q4_K" => "q4_k".into(),
+        "Q6_K" => "q6_k".into(),
+        "Q8_0" => "q8_0".into(),
+        "IQ4_XS" => "iq4_xs".into(),
+        "IQ4_NL" => "iq4_nl".into(),
+        "IQ3_S" => "iq3_s".into(),
+        "IQ3_XXS" => "iq3_xxs".into(),
+        "IQ2_S" => "iq2_s".into(),
+        "IQ2_XS" => "iq2_xs".into(),
+        "IQ2_XXS" => "iq2_xxs".into(),
+        "BF16" => "bf16".into(),
+        "F16" => "f16".into(),
+        "F32" => "f32".into(),
+        _ => s.to_lowercase().into(),
+    }
 }

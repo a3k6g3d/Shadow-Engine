@@ -74,14 +74,18 @@ static __device__ void rope_one(float* x, unsigned int pos, unsigned int dims, f
 // grid = number of groups, block = 256
 extern "C" __global__ void rmsnorm_groups(const float* x, const float* w, float* y, unsigned int group, float eps) {
     unsigned int g = blockIdx.x;
+    pdl_wait();
     rmsnorm_one(x + (u64) g * group, w + (u64) g * group, y + (u64) g * group, group, eps);
+    pdl_launch_dependents();
 }
 
 // `rmsnorm_groups` for many rows: grid (groups, rows), a row `groups * group` floats (the same arithmetic as one launch a row).
 extern "C" __global__ void rmsnorm_groups_rows(const float* x, const float* w, float* y, unsigned int group, float eps, unsigned int groups) {
     const unsigned int g = blockIdx.x;
     const u64 off = (u64) blockIdx.y * groups * group + (u64) g * group;
+    pdl_wait();
     rmsnorm_one(x + off, w + (u64) g * group, y + off, group, eps);
+    pdl_launch_dependents();
 }
 
 // r[i] += y[i], then u = rmsnorm(r, w, eps) in one block of 256 threads
@@ -134,13 +138,16 @@ extern "C" __global__ void hc_write(float* r, const float* g, const float* y, un
     unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
     const u64 j = blockIdx.y, rs = (u64) h * streams;
     if (i >= rs) return;
+    pdl_wait();
     r[j * rs + i] += g[j * streams + i / h] * y[j * h + i % h];
+    pdl_launch_dependents();
 }
 
 // Fuses hc_write (r[s*h+i] += g[s] * y[i]) and the next hc_read's rmsnorm_groups (rn[s*h+i] = rmsnorm(r_s, w_s)).
 // grid = streams, block = 256.
 static __device__ __forceinline__ void hc_write_rmsnorm_one(float* r, const float* g, const float* y, const float* w,
                                                             float* rn, unsigned int group, float eps, unsigned int s) {
+    pdl_wait();
     float gs = g[s];
     float* rs = r + (u64) s * group;
     const float* ws = w + (u64) s * group;
@@ -156,6 +163,7 @@ static __device__ __forceinline__ void hc_write_rmsnorm_one(float* r, const floa
     for (unsigned int i = threadIdx.x; i < group; i += blockDim.x) {
         ys[i] = (float) ((double) rs[i] * scale) * ws[i];
     }
+    pdl_launch_dependents();
 }
 
 extern "C" __global__ void hc_write_rmsnorm_groups(float* r, const float* g, const float* y, const float* w, float* rn,
@@ -213,11 +221,13 @@ extern "C" __global__ void conv_silu_step(const float* x, float* state, const fl
                                           unsigned int k) {
     unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= ch) return;
+    pdl_wait();
     double acc = (double) w[i * k + (k - 1)] * (double) x[i];
     for (unsigned int t = 0; t + 1 < k; ++t) acc += (double) w[i * k + t] * (double) state[t * ch + i];
     out[i] = siluf_ref((float) acc);
     for (unsigned int t = 0; t + 2 < k; ++t) state[t * ch + i] = state[(t + 1) * ch + i];
     state[(k - 2) * ch + i] = x[i];
+    pdl_launch_dependents();
 }
 
 // conv_silu_step for m consecutive tokens (x and out rows ch apart): each channel walks the tokens in order, so the
@@ -226,6 +236,7 @@ extern "C" __global__ void conv_silu_steps(const float* x, float* state, const f
                                            unsigned int k, unsigned int m) {
     unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= ch) return;
+    pdl_wait();
     for (unsigned int j = 0; j < m; ++j) {
         const float xi = x[(u64) j * ch + i];
         double acc = (double) w[i * k + (k - 1)] * (double) xi;
@@ -234,6 +245,7 @@ extern "C" __global__ void conv_silu_steps(const float* x, float* state, const f
         for (unsigned int t = 0; t + 2 < k; ++t) state[t * ch + i] = state[(t + 1) * ch + i];
         state[(k - 2) * ch + i] = xi;
     }
+    pdl_launch_dependents();
 }
 
 // `conv_silu_steps` with every (token, channel) an independent thread: the window of token j is the k - 1 inputs before it (the carried state for tokens before this batch's
@@ -316,11 +328,14 @@ static __device__ void rmsnorm_one_f(const float* x, const float* w, float* y, u
 extern "C" __global__ void rmsnorm_groups_rows_f(const float* x, const float* w, float* y, unsigned int group, float eps, unsigned int groups) {
     const unsigned int g = blockIdx.x;
     const u64 off = (u64) blockIdx.y * groups * group + (u64) g * group;
+    pdl_wait();
     rmsnorm_one_f(x + off, w + (u64) g * group, y + off, group, eps);
+    pdl_launch_dependents();
 }
 
 static __device__ __forceinline__ void hc_write_rmsnorm_one_f(float* r, const float* g, const float* y, const float* w,
                                                               float* rn, unsigned int group, float eps, unsigned int s) {
+    pdl_wait();
     const float gs = g[s];
     float* rs = r + (u64) s * group;
     const float* ws = w + (u64) s * group;
@@ -333,6 +348,7 @@ static __device__ __forceinline__ void hc_write_rmsnorm_one_f(float* r, const fl
     }
     const float scale = 1.0f / sqrtf(block_sum_f(ss) / (float) group + eps);
     for (unsigned int i = threadIdx.x; i < group; i += blockDim.x) ys[i] = (rs[i] * scale) * ws[i];
+    pdl_launch_dependents();
 }
 
 extern "C" __global__ void hc_write_rmsnorm_rows_f(float* r, const float* g, const float* y, const float* w, float* rn,
@@ -342,6 +358,7 @@ extern "C" __global__ void hc_write_rmsnorm_rows_f(float* r, const float* g, con
 }
 
 extern "C" __global__ void l2norm_qk_rows_f(float* x, unsigned int kh, unsigned int d, float q_div, unsigned int xs) {
+    pdl_wait();
     float* h = x + (u64) blockIdx.y * xs + (u64) blockIdx.x * d;
     const float div = blockIdx.x < kh ? q_div : 1.0f;
     float ss = 0.0f;
@@ -351,12 +368,14 @@ extern "C" __global__ void l2norm_qk_rows_f(float* x, unsigned int kh, unsigned 
         const float v = h[i] * n;
         h[i] = div == 1.0f ? v : v / div;
     }
+    pdl_launch_dependents();
 }
 
 extern "C" __global__ void __launch_bounds__(128) gated_rmsnorm_rows_wf(float* o, const float* w, const float* z, unsigned int d, float eps, unsigned int os,
                                                                           unsigned int heads) {
     const unsigned int lane = threadIdx.x & 31, head = blockIdx.x * 4 + (threadIdx.x >> 5);
     if (head >= heads) return;
+    pdl_wait();
     float* h = o + (u64) blockIdx.y * os + (u64) head * d;
     const float* zh = z + (u64) blockIdx.y * os + (u64) head * d;
     float e[4];
@@ -371,6 +390,7 @@ extern "C" __global__ void __launch_bounds__(128) gated_rmsnorm_rows_wf(float* o
         const unsigned int i = lane + 32 * q;
         h[i] = (e[q] * r) * w[i] * sigmoidf_ref(zh[i]);
     }
+    pdl_launch_dependents();
 }
 
 extern "C" __global__ void conv_silu_steps_par_f(const float* x, const float* state, const float* w, float* out, unsigned int ch, unsigned int k, unsigned int m) {
@@ -569,6 +589,7 @@ static __device__ __forceinline__ void delta_kh_body(const float* q, const float
 #pragma unroll
         for (unsigned int i = 0; i < 32; ++i) st[j][i] = s[(32 * r + i) * d + col];
     }
+    pdl_wait();
     auto stage = [&](unsigned int blk) {   // tokens [8 blk, 8 blk + 8) into buffer blk & 1
         const unsigned int bi = blk & 1, t0 = blk * 8;
         for (unsigned int p = tid; p < 8 * 2 * 32; p += 32 * W) {
@@ -683,6 +704,7 @@ static __device__ __forceinline__ void delta_kh_body(const float* q, const float
         }
         __syncthreads();   // every thread is done with buffer bi and sc: the next block's copy may overwrite
     }
+    pdl_launch_dependents();
 #pragma unroll
     for (unsigned int j = 0; j < 3; ++j) {
         float* s = S + (u64) (qh + j * kh) * d * d;
@@ -2489,7 +2511,10 @@ extern "C" __global__ void index_scores(const float* iq, const float* blocks, fl
 // out = silu(g) * u
 extern "C" __global__ void swiglu(const float* g, const float* u, float* out, unsigned int n) {
     unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < n) out[i] = siluf_ref(g[i]) * u[i];
+    if (i >= n) return;
+    pdl_wait();
+    out[i] = siluf_ref(g[i]) * u[i];
+    pdl_launch_dependents();
 }
 
 // out[j*ff + c] = silu(g[j*ff + c] * gs[j]) * (u[j*ff + c] * us[j]) for expert j in 0..k, channel c in 0..ff
@@ -2531,9 +2556,11 @@ extern "C" __global__ void moe_combine_qwen(float* y, const float* eo, const flo
                                             const float* gl, unsigned int n, unsigned int k) {
     unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
+    pdl_wait();
     float acc = 0.0f;
     for (unsigned int j = 0; j < k; j++) acc += w[j] * eo[(u64) j * n + i];
     y[i] = acc + sigmoidf_ref(gl[0]) * sh_eo[i];
+    pdl_launch_dependents();
 }
 
 // moe_combine_qwen for tokens j = blockIdx.y: y rows n apart, eo rows k * n, weights rows k, shared rows n, gate
@@ -2543,11 +2570,13 @@ extern "C" __global__ void moe_combine_qwen_rows(float* y, const float* eo, cons
     const u64 j = blockIdx.y;
     unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
+    pdl_wait();
     const float* e = eo + j * k * n;
     const float* wj = w + j * k;
     float acc = 0.0f;
     for (unsigned int t = 0; t < cnt[j]; t++) acc += wj[t] * e[(u64) t * n + i];
     y[j * n + i] = acc + sigmoidf_ref(gl[j]) * sh_eo[j * n + i];
+    pdl_launch_dependents();
 }
 
 // moe_combine_qwen with eo's rows in another order: expert j's output is row perm[j] (the sum still runs over j).
@@ -3365,13 +3394,22 @@ extern "C" __global__ void __launch_bounds__(256) route_plan_res_small(
     unsigned int ne, unsigned int k, unsigned int m, unsigned int G,
     unsigned int up_off, unsigned int a0, unsigned int r0, unsigned int w_off, unsigned int counts_off)
 {
-    __shared__ double exs[8][512];
+    __shared__ union {
+        double exs[8][512];
+        struct {
+            unsigned int cnt[512];
+            unsigned int g0[512];
+            unsigned int wsum[8];
+            unsigned int carry;
+        } plan;
+    } sm;
     __shared__ unsigned int s_tidx[128];
     __shared__ unsigned int s_ngroups;
     const unsigned int tid = threadIdx.x, lane = tid & 31u, w = tid >> 5;
+    pdl_wait();
     if (tid == 0) s_ngroups = 0u;
     if (w < m) {
-        double* ex = exs[w];
+        double* ex = sm.exs[w];
         const float* lg = logits + (u64) w * ne;
         float mx = -3.402823466e+38f;
         for (unsigned int i = lane; i < ne; i += 32) mx = fmaxf(mx, lg[i]);
@@ -3419,8 +3457,8 @@ extern "C" __global__ void __launch_bounds__(256) route_plan_res_small(
     }
     __syncthreads();
     const unsigned int N = m * k;
-    // Deterministic expert-order group assignment (at most 4 tokens per group -> m4s4, matching plan_scan + plan_fill order):
-    // Instead of atomicAdd, each pair tid < N counts how many groups belong to experts e' < e plus occ / 4 for expert e.
+#ifdef RES_SMALL_REF
+    // Reference O(N^3) deterministic expert-order group assignment (`SHADOWZERO_RES_SMALL_BITMASK=0`).
     if (tid < N) {
         const unsigned int e = s_tidx[tid], j = tid / k;
         unsigned int occ = 0u, tot = 0u;
@@ -3456,10 +3494,73 @@ extern "C" __global__ void __launch_bounds__(256) route_plan_res_small(
     }
     __syncthreads();
     const unsigned int ng = s_ngroups;
+#else
+    // O(1)-depth SMEM histogram + parallel prefix scan replacing the O(N^3) loop, preserving bit-for-bit table order.
+    for (unsigned int i = tid; i < ne; i += 256u) sm.plan.cnt[i] = 0u;
+    if (tid == 0u) sm.plan.carry = 0u;
+    __syncthreads();
+    unsigned int e = 0u, occ = 0u;
+    if (tid < N) {
+        e = s_tidx[tid];
+        atomicAdd(&sm.plan.cnt[e], 1u);
+        for (unsigned int t = 0u; t < tid; ++t) {
+            if (s_tidx[t] == e) ++occ;
+        }
+    }
+    __syncthreads();
+    for (unsigned int base_e = 0u; base_e < ne; base_e += 256u) {
+        const unsigned int ei = base_e + tid;
+        const unsigned int c = (ei < ne) ? ((sm.plan.cnt[ei] + 3u) >> 2u) : 0u;
+        unsigned int val = c;
+        #pragma unroll
+        for (unsigned int off = 1u; off < 32u; off <<= 1u) {
+            unsigned int up = __shfl_up_sync(0xffffffffu, val, off);
+            if (lane >= off) val += up;
+        }
+        if (lane == 31u) sm.plan.wsum[w] = val;
+        __syncthreads();
+        if (w == 0u) {
+            unsigned int ws = (lane < 8u) ? sm.plan.wsum[lane] : 0u;
+            unsigned int orig = ws;
+            #pragma unroll
+            for (unsigned int off = 1u; off < 8u; off <<= 1u) {
+                unsigned int up = __shfl_up_sync(0xffffffffu, ws, off);
+                if (lane >= off) ws += up;
+            }
+            if (lane < 8u) sm.plan.wsum[lane] = ws - orig;
+        }
+        __syncthreads();
+        const unsigned int inc = sm.plan.carry + sm.plan.wsum[w] + val;
+        if (ei < ne) sm.plan.g0[ei] = inc - c;
+        __syncthreads();
+        if (tid == 255u) sm.plan.carry = inc;
+        __syncthreads();
+    }
+    if (tid < N) {
+        const unsigned int j = tid / k;
+        const unsigned int tot = sm.plan.cnt[e];
+        const unsigned int g = sm.plan.g0[e] + (occ >> 2u), s = occ & 3u;
+        const unsigned int cnt_g = min(4u, tot - (occ & ~3u));
+        u64* addr = (u64*) (base + a0);
+        unsigned int* rec = (unsigned int*) (base + r0);
+        for (unsigned int part = 0; part < 3; ++part) {
+            unsigned int* r = rec + ((u64) part * G + g) * 17;
+            r[1 + s] = part == 2 ? tid : j;
+            r[1 + 8 + s] = part == 1 ? up_off + tid : tid;
+            if (s == 0u) {
+                r[0] = cnt_g;
+                addr[(u64) part * G + g] = eaddr[(u64) part * ne + e];
+            }
+        }
+    }
+    __syncthreads();
+    const unsigned int ng = sm.plan.carry;
+#endif
     unsigned int* rec = (unsigned int*) (base + r0);
     for (unsigned int idx = tid; idx < 3 * G; idx += 256) {
         if ((idx % G) >= ng) rec[(u64) idx * 17] = 0u;
     }
+    pdl_launch_dependents();
 }
 // The 64 largest logits of each row, exactly (STATUS 159): largest first, ties to the lower id, the order the host sampler sorts in (`sampler.rs`), so a draw from the 64
 // is the draw from the whole vocabulary whenever top_k <= 64.  Two launches: `topk_slices` sorts 4,096 logits a block (bitonic, in shared memory) and keeps each slice's
@@ -3544,4 +3645,1084 @@ extern "C" __global__ void copy_many(const unsigned long long* tab, unsigned int
 extern "C" __global__ void add_mask_rows(float* logits, const float* mask, unsigned int ne, unsigned int n) {
     unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) logits[i] += mask[i % ne];
+}
+
+
+// ============================================================================================================
+// Packed 16-byte-aligned symmetric Q8_KV cache (per-32 int8 + fp16 scale)
+// Per KV head (hd % 32 == 0): [0..hd) i8 data + [hd..hd + pad16((hd/32)*2)) u16 fp16 scales (tail zeroed).
+// For hd = 256: 256 + 16 = 272 bytes (8 fp16 scales, zero wasted padding).
+// ============================================================================================================
+static __device__ __forceinline__ unsigned int kv_q8_head_bytes(unsigned int hd) {
+    return hd + (((hd >> 5) * 2u + 15u) & ~15u);
+}
+
+static __device__ __forceinline__ unsigned int kv_q8_row_bytes(unsigned int nkv, unsigned int hd) {
+    return nkv * kv_q8_head_bytes(hd);
+}
+
+static __device__ __forceinline__ void kv_quant_head_q8(const float* src, u8* dst, unsigned int hd) {
+    const unsigned int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, nwarps = blockDim.x >> 5;
+    const unsigned int ng = hd >> 5;
+    i8* qd = (i8*) dst;
+    u16* sc = (u16*) (dst + hd);
+    for (unsigned int grp = warp; grp < ng; grp += nwarps) {
+        const float v0 = src[grp * 32 + lane];
+        float amax = fabsf(v0);
+        amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, 16));
+        amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, 8));
+        amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, 4));
+        amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, 2));
+        amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, 1));
+        const u16 sh = f32_to_f16(amax > 0.0f ? amax * (1.0f / 127.0f) : 0.0f);
+        const float sr = f16_to_f32(sh);
+        const float inv = sr > 0.0f ? (1.0f / sr) : 0.0f;
+        int q0 = __float2int_rn(v0 * inv);
+        q0 = q0 < -127 ? -127 : (q0 > 127 ? 127 : q0);
+        qd[grp * 32 + lane] = (i8) q0;
+        if (lane == 0) sc[grp] = sh;
+    }
+    const unsigned int total_u16 = (kv_q8_head_bytes(hd) - hd) >> 1;
+    for (unsigned int u = ng + threadIdx.x; u < total_u16; u += blockDim.x) sc[u] = 0;
+}
+
+extern "C" __global__ void kv_quant_q8_rows(const float* src, u8* dst, unsigned int pos0, unsigned int nkv,
+                                            unsigned int hd, unsigned int rows) {
+    const unsigned int kh = blockIdx.x, j = blockIdx.y;
+    if (kh >= nkv || j >= rows) return;
+    const unsigned int hs = kv_q8_head_bytes(hd), rs = nkv * hs;
+    kv_quant_head_q8(src + ((u64) j * nkv + kh) * hd, dst + (u64) (pos0 + j) * rs + (u64) kh * hs, hd);
+}
+
+template <bool FAST>
+static __device__ __forceinline__ void head_norm_rope_qgk_one_q8(const float* qg, float* q, float* gate, const float* wq,
+                                                                 const float* kk, u8* kc_row, const float* wk,
+                                                                 unsigned int nh, unsigned int d, float eps,
+                                                                 unsigned int pos, unsigned int rope_dims, float theta,
+                                                                 unsigned int b) {
+    if (b < nh) {
+        const float* x = qg + (u64) b * 2 * d;
+        float* y = q + (u64) b * d;
+        float* g = gate + (u64) b * d;
+        for (unsigned int i = threadIdx.x; i < d; i += blockDim.x) g[i] = x[d + i];
+        if (FAST) {
+            rmsnorm_one_f(x, wq, y, d, eps);
+            __syncthreads();
+            rope_one_t(y, pos, rope_dims);
+        } else {
+            rmsnorm_one(x, wq, y, d, eps);
+            __syncthreads();
+            rope_one(y, pos, rope_dims, theta);
+        }
+    } else {
+        __shared__ float ktmp[512];
+        const unsigned int kh = b - nh;
+        const float* x = kk + (u64) kh * d;
+        if (FAST) {
+            rmsnorm_one_f(x, wk, ktmp, d, eps);
+            __syncthreads();
+            rope_one_t(ktmp, pos, rope_dims);
+        } else {
+            rmsnorm_one(x, wk, ktmp, d, eps);
+            __syncthreads();
+            rope_one(ktmp, pos, rope_dims, theta);
+        }
+        __syncthreads();
+        kv_quant_head_q8(ktmp, kc_row + (u64) kh * kv_q8_head_bytes(d), d);
+    }
+}
+
+extern "C" __global__ void head_norm_rope_qgk_rows_q8(const float* qg, float* q, float* gate, const float* wq,
+                                                      const float* kk, u8* kc, const float* wk, unsigned int nh,
+                                                      unsigned int nkv, unsigned int d, float eps, unsigned int pos0,
+                                                      unsigned int rope_dims, float theta) {
+    const u64 j = blockIdx.y, qd = (u64) nh * d, kd = (u64) nkv * d, rs = (u64) kv_q8_row_bytes(nkv, d);
+    head_norm_rope_qgk_one_q8<false>(qg + j * 2 * qd, q + j * qd, gate + j * qd, wq, kk + j * kd,
+                                     kc + (pos0 + j) * rs, wk, nh, d, eps, pos0 + (unsigned int) j, rope_dims, theta, blockIdx.x);
+}
+
+extern "C" __global__ void head_norm_rope_qgk_rows_fq8(const float* qg, float* q, float* gate, const float* wq,
+                                                       const float* kk, u8* kc, const float* wk, unsigned int nh,
+                                                       unsigned int nkv, unsigned int d, float eps, unsigned int pos0,
+                                                       unsigned int rope_dims, float theta) {
+    const u64 j = blockIdx.y, qd = (u64) nh * d, kd = (u64) nkv * d, rs = (u64) kv_q8_row_bytes(nkv, d);
+    head_norm_rope_qgk_one_q8<true>(qg + j * 2 * qd, q + j * qd, gate + j * qd, wq, kk + j * kd,
+                                    kc + (pos0 + j) * rs, wk, nh, d, eps, pos0 + (unsigned int) j, rope_dims, theta, blockIdx.x);
+}
+
+static __device__ __forceinline__ float dot4_q8(const float* qs, u32 w) {
+    float p = fmaf(qs[0], (float) (i8) (w & 0xffu), 0.0f);
+    p = fmaf(qs[1], (float) (i8) ((w >> 8) & 0xffu), p);
+    p = fmaf(qs[2], (float) (i8) ((w >> 16) & 0xffu), p);
+    return fmaf(qs[3], (float) (i8) (w >> 24), p);
+}
+
+static __device__ __forceinline__ void attention_head_q8(const float* q, const u8* kc, const u8* vc, const u32* toks,
+                                                         unsigned int ntok, const float* gate, float* o, double* scratch,
+                                                         unsigned int stride, unsigned int nkv, unsigned int hd,
+                                                         unsigned int group, unsigned int h) {
+    const unsigned int g = h / group;
+    const unsigned int hs = kv_q8_head_bytes(hd), rs = nkv * hs, ng = hd >> 5;
+    const float* qh = q + (u64) h * hd;
+    double* sc = scratch + (u64) h * stride;
+    const double scale = 1.0 / sqrt((double) hd);
+    double mx = -1e300;
+    __shared__ float qs[512];
+    __shared__ float scs[256];
+    __shared__ unsigned int ps[256];
+    const bool fast = hd <= 512 && (hd & 31) == 0 && hd <= blockDim.x && blockDim.x <= 256;
+    if (fast) {
+        for (unsigned int i = threadIdx.x; i < hd; i += blockDim.x) qs[i] = qh[i];
+        __syncthreads();
+    }
+    for (unsigned int t = threadIdx.x; t < ntok; t += blockDim.x) {
+        const unsigned int p = toks ? toks[t] : t;
+        const u8* kb = kc + (u64) p * rs + (u64) g * hs;
+        const u16* ks = (const u16*) (kb + hd);
+        double s = 0.0;
+        if (fast) {
+            const uint4* k16 = (const uint4*) kb;
+            for (unsigned int grp = 0; grp < ng; ++grp) {
+                const float sc_k = f16_to_f32(ks[grp]);
+                float part = 0.0f;
+                #pragma unroll
+                for (unsigned int c = 0; c < 2; ++c) {
+                    const uint4 v = k16[grp * 2 + c];
+                    const float* qp = qs + grp * 32 + c * 16;
+                    part += dot4_q8(qp, v.x);
+                    part += dot4_q8(qp + 4, v.y);
+                    part += dot4_q8(qp + 8, v.z);
+                    part += dot4_q8(qp + 12, v.w);
+                }
+                s += (double) (part * sc_k);
+            }
+        } else {
+            const i8* ki = (const i8*) kb;
+            for (unsigned int grp = 0; grp < ng; ++grp) {
+                const float sc_k = f16_to_f32(ks[grp]);
+                float part = 0.0f;
+                for (unsigned int i = 0; i < 32; ++i) part = fmaf(qh[grp * 32 + i], (float) ki[grp * 32 + i], part);
+                s += (double) (part * sc_k);
+            }
+        }
+        s *= scale;
+        sc[t] = s;
+        mx = fmax(mx, s);
+    }
+    mx = block_max(mx);
+    double z = 0.0;
+    for (unsigned int t = threadIdx.x; t < ntok; t += blockDim.x) {
+        const double e = (double) expf((float) (sc[t] - mx));
+        sc[t] = e;
+        z += e;
+    }
+    z = block_sum(z);
+    __syncthreads();
+    if (fast) {
+        const unsigned int j = threadIdx.x;
+        const unsigned int vgrp = j >> 5;
+        double acc = 0.0;
+        for (unsigned int tile = 0; tile < ntok; tile += 256) {
+            const unsigned int t = tile + threadIdx.x;
+            __syncthreads();
+            if (t < ntok) {
+                scs[threadIdx.x] = (float) sc[t];
+                ps[threadIdx.x] = toks ? toks[t] : t;
+            }
+            __syncthreads();
+            if (j < hd) {
+                const unsigned int n = min(256u, ntok - tile);
+                for (unsigned int r0 = 0; r0 < n; r0 += 16) {
+                    float part = 0.0f;
+                    for (unsigned int r = r0; r < r0 + 16 && r < n; ++r) {
+                        const u8* vb = vc + (u64) ps[r] * rs + (u64) g * hs;
+                        const float vv = (float) ((const i8*) vb)[j] * f16_to_f32(((const u16*) (vb + hd))[vgrp]);
+                        part = fmaf(scs[r], vv, part);
+                    }
+                    acc += (double) part;
+                }
+            }
+        }
+        if (j < hd) o[h * hd + j] = (float) (acc / z) * sigmoidf_ref(gate[h * hd + j]);
+        return;
+    }
+    for (unsigned int j = threadIdx.x; j < hd; j += blockDim.x) {
+        const unsigned int vgrp = j >> 5;
+        double acc = 0.0;
+        for (unsigned int t0 = 0; t0 < ntok; t0 += 16) {
+            float part = 0.0f;
+            for (unsigned int t = t0; t < t0 + 16 && t < ntok; ++t) {
+                const unsigned int p = toks ? toks[t] : t;
+                const u8* vb = vc + (u64) p * rs + (u64) g * hs;
+                const float vv = (float) ((const i8*) vb)[j] * f16_to_f32(((const u16*) (vb + hd))[vgrp]);
+                part = fmaf((float) sc[t], vv, part);
+            }
+            acc += (double) part;
+        }
+        o[h * hd + j] = (float) (acc / z) * sigmoidf_ref(gate[h * hd + j]);
+    }
+}
+
+extern "C" __global__ void attention_heads_q8(const float* q, const u8* kc, const u8* vc, const u32* toks,
+                                              unsigned int ntok, const float* gate, float* o, double* scratch,
+                                              unsigned int stride, unsigned int nkv, unsigned int hd, unsigned int group) {
+    attention_head_q8(q, kc, vc, toks, ntok, gate, o, scratch, stride, nkv, hd, group, blockIdx.x);
+}
+
+extern "C" __global__ void attention_heads_rows_q8(const float* q, const u8* kc, const u8* vc, unsigned int ntok0,
+                                                   const float* gate, float* o, double* scratch, unsigned int stride,
+                                                   unsigned int nkv, unsigned int hd, unsigned int group, unsigned int nh) {
+    const u64 j = blockIdx.y, qd = (u64) nh * hd;
+    attention_head_q8(q + j * qd, kc, vc, nullptr, ntok0 + (unsigned int) j, gate + j * qd, o + j * qd,
+                      scratch + j * nh * stride, stride, nkv, hd, group, blockIdx.x);
+}
+
+extern "C" __global__ void attention_heads_sel_rows_q8(const float* q, const u8* kc, const u8* vc, const u32* toks,
+                                                       unsigned int tstride, const u32* ntoks, const float* gate, float* o,
+                                                       double* scratch, unsigned int stride, unsigned int nkv, unsigned int hd,
+                                                       unsigned int group, unsigned int nh) {
+    const u64 j = blockIdx.y, qd = (u64) nh * hd;
+    attention_head_q8(q + j * qd, kc, vc, toks + j * tstride, ntoks[j], gate + j * qd, o + j * qd,
+                      scratch + j * nh * stride, stride, nkv, hd, group, blockIdx.x);
+}
+
+template <bool TC>
+static __device__ __forceinline__ void att_v3_body_q8(const float* q, const u8* kc, const u8* vc, const u32* toks,
+                                                      unsigned int tstride, const u32* ntoks, const float* gate, float* o,
+                                                      double* scratch_d, unsigned int stride, unsigned int nkv, unsigned int hd,
+                                                      unsigned int group, unsigned int nh, unsigned int hb) {
+    const u64 row = blockIdx.y;
+    const unsigned int g = blockIdx.x;
+    const unsigned int h0 = g * group;
+    const unsigned int nhh = group;
+    const unsigned int hs = kv_q8_head_bytes(hd), rs = nkv * hs, ng = hd >> 5;
+    const float* qrow = q + row * nh * hd;
+    const float* gaterow = gate + row * nh * hd;
+    float* orow = o + row * nh * hd;
+    const u32* tk = toks + row * tstride;
+    const unsigned int ntok = ntoks[row];
+    float* scr = (float*) scratch_d + row * nh * stride;
+    __shared__ __align__(16) float qs[V3H * 256];
+    __shared__ __align__(16) float scs[256 * V3H];
+    __shared__ unsigned int ps[256];
+    __shared__ float wred[V3H * 8];
+    const unsigned int tid = threadIdx.x;
+    for (unsigned int idx = tid; idx < V3H * 256; idx += 256) qs[idx] = 0.0f;
+    __syncthreads();
+    for (unsigned int idx = tid; idx < nhh * hd; idx += 256) qs[(idx / hd) * 256 + idx % hd] = qrow[(u64) h0 * hd + idx];
+    __syncthreads();
+    const float scale = 1.0f / sqrtf((float) hd);
+    float mx[V3H];
+    #pragma unroll
+    for (unsigned int a = 0; a < V3H; ++a) mx[a] = -1e30f;
+    if (!TC) {
+        for (unsigned int base = 0; base < ntok; base += 512) {
+            const u8* kb[2];
+            bool ok[2];
+            #pragma unroll
+            for (unsigned int u = 0; u < 2; ++u) {
+                const unsigned int t = base + tid + 256 * u;
+                ok[u] = t < ntok;
+                kb[u] = kc + (u64) (ok[u] ? tk[t] : 0u) * rs + (u64) g * hs;
+            }
+            float s[2][V3H];
+            #pragma unroll
+            for (unsigned int u = 0; u < 2; ++u)
+                #pragma unroll
+                for (unsigned int a = 0; a < V3H; ++a) s[u][a] = 0.0f;
+            for (unsigned int g32 = 0; g32 < ng; ++g32) {
+                float sc_k[2];
+                sc_k[0] = f16_to_f32(((const u16*) (kb[0] + hd))[g32]);
+                sc_k[1] = f16_to_f32(((const u16*) (kb[1] + hd))[g32]);
+                float gp[2][V3H];
+                #pragma unroll
+                for (unsigned int u = 0; u < 2; ++u)
+                    #pragma unroll
+                    for (unsigned int a = 0; a < V3H; ++a) gp[u][a] = 0.0f;
+                #pragma unroll
+                for (unsigned int c = 0; c < 2; ++c) {
+                    const uint4 kv0 = ((const uint4*) kb[0])[g32 * 2 + c];
+                    const uint4 kv1 = ((const uint4*) kb[1])[g32 * 2 + c];
+                    const unsigned int off = g32 * 32 + c * 16;
+                    #pragma unroll
+                    for (unsigned int a = 0; a < V3H; ++a) {
+                        if (a < nhh) {
+                            const float* qp = &qs[a * 256 + off];
+                            gp[0][a] += dot4_q8(qp, kv0.x) + dot4_q8(qp + 4, kv0.y) + dot4_q8(qp + 8, kv0.z) + dot4_q8(qp + 12, kv0.w);
+                            gp[1][a] += dot4_q8(qp, kv1.x) + dot4_q8(qp + 4, kv1.y) + dot4_q8(qp + 8, kv1.z) + dot4_q8(qp + 12, kv1.w);
+                        }
+                    }
+                }
+                #pragma unroll
+                for (unsigned int u = 0; u < 2; ++u)
+                    #pragma unroll
+                    for (unsigned int a = 0; a < V3H; ++a)
+                        if (a < nhh) s[u][a] = fmaf(gp[u][a], sc_k[u], s[u][a]);
+            }
+            #pragma unroll
+            for (unsigned int u = 0; u < 2; ++u) {
+                if (ok[u]) {
+                    const unsigned int t = base + tid + 256 * u;
+                    #pragma unroll
+                    for (unsigned int a = 0; a < V3H; ++a) {
+                        if (a < nhh) {
+                            s[u][a] *= scale;
+                            scr[(u64) (h0 + a) * stride + t] = s[u][a];
+                            mx[a] = fmaxf(mx[a], s[u][a]);
+                        }
+                    }
+                }
+            }
+        }
+        block12_reduce(mx, wred, true);
+    } else {
+        __shared__ __align__(16) unsigned short qh[16][264];
+        __shared__ float wred2[V3H * 8];
+        const unsigned int warp = tid >> 5, lane = tid & 31, grp8 = lane >> 2, tg = lane & 3;
+        for (unsigned int idx = tid; idx < 16 * hd; idx += 256) {
+            const unsigned int a = idx / hd, i = idx % hd;
+            const float x = a < nhh ? qrow[(u64) (h0 + a) * hd + i] : 0.0f;
+            unsigned int hv;
+            asm("cvt.rn.f16x2.f32 %0, %1, %2;" : "=r"(hv) : "f"(0.0f), "f"(x));
+            qh[a][i] = (unsigned short) (hv & 0xffffu);
+        }
+        __syncthreads();
+        float mxl[2][2];
+        #pragma unroll
+        for (unsigned int nt = 0; nt < 2; ++nt) { mxl[nt][0] = -1e30f; mxl[nt][1] = -1e30f; }
+        const unsigned int ntile = (ntok + 15) / 16;
+        for (unsigned int tile = warp; tile < ntile; tile += 8) {
+            const unsigned int t0 = tile * 16, ta = t0 + grp8, tb = t0 + grp8 + 8;
+            const u8* ka_b = kc + (u64) (ta < ntok ? tk[ta] : 0u) * rs + (u64) g * hs;
+            const u8* kb_b = kc + (u64) (tb < ntok ? tk[tb] : 0u) * rs + (u64) g * hs;
+            float c[2][4];
+            #pragma unroll
+            for (unsigned int nt = 0; nt < 2; ++nt)
+                #pragma unroll
+                for (unsigned int e = 0; e < 4; ++e) c[nt][e] = 0.0f;
+            for (unsigned int g32 = 0; g32 < ng; ++g32) {
+                const float sa = f16_to_f32(((const u16*) (ka_b + hd))[g32]);
+                const float sb = f16_to_f32(((const u16*) (kb_b + hd))[g32]);
+                float cg[2][4];
+                #pragma unroll
+                for (unsigned int nt = 0; nt < 2; ++nt)
+                    #pragma unroll
+                    for (unsigned int e = 0; e < 4; ++e) cg[nt][e] = 0.0f;
+                #pragma unroll
+                for (unsigned int ksub = 0; ksub < 32; ksub += 16) {
+                    const unsigned int k0 = g32 * 32 + ksub;
+                    const u16 r00 = *(const u16*) (ka_b + k0 + tg * 2);
+                    const u16 r01 = *(const u16*) (ka_b + k0 + 8 + tg * 2);
+                    const u16 r10 = *(const u16*) (kb_b + k0 + tg * 2);
+                    const u16 r11 = *(const u16*) (kb_b + k0 + 8 + tg * 2);
+                    unsigned int A0, A1, A2, A3;
+                    asm("cvt.rn.f16x2.f32 %0, %1, %2;" : "=r"(A0) : "f"((float) (i8) (r00 >> 8)), "f"((float) (i8) (r00 & 0xffu)));
+                    asm("cvt.rn.f16x2.f32 %0, %1, %2;" : "=r"(A1) : "f"((float) (i8) (r10 >> 8)), "f"((float) (i8) (r10 & 0xffu)));
+                    asm("cvt.rn.f16x2.f32 %0, %1, %2;" : "=r"(A2) : "f"((float) (i8) (r01 >> 8)), "f"((float) (i8) (r01 & 0xffu)));
+                    asm("cvt.rn.f16x2.f32 %0, %1, %2;" : "=r"(A3) : "f"((float) (i8) (r11 >> 8)), "f"((float) (i8) (r11 & 0xffu)));
+                    #pragma unroll
+                    for (unsigned int nt = 0; nt < 2; ++nt) {
+                        const unsigned int B0 = *(const unsigned int*) &qh[nt * 8 + grp8][k0 + tg * 2];
+                        const unsigned int B1 = *(const unsigned int*) &qh[nt * 8 + grp8][k0 + 8 + tg * 2];
+                        asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
+                                     : "+f"(cg[nt][0]), "+f"(cg[nt][1]), "+f"(cg[nt][2]), "+f"(cg[nt][3])
+                                     : "r"(A0), "r"(A1), "r"(A2), "r"(A3), "r"(B0), "r"(B1));
+                    }
+                }
+                #pragma unroll
+                for (unsigned int nt = 0; nt < 2; ++nt) {
+                    c[nt][0] = fmaf(cg[nt][0], sa, c[nt][0]);
+                    c[nt][1] = fmaf(cg[nt][1], sa, c[nt][1]);
+                    c[nt][2] = fmaf(cg[nt][2], sb, c[nt][2]);
+                    c[nt][3] = fmaf(cg[nt][3], sb, c[nt][3]);
+                }
+            }
+            #pragma unroll
+            for (unsigned int nt = 0; nt < 2; ++nt)
+                #pragma unroll
+                for (unsigned int e = 0; e < 4; ++e) {
+                    const unsigned int tok = t0 + grp8 + (e >= 2 ? 8 : 0), head = nt * 8 + tg * 2 + (e & 1);
+                    if (tok < ntok && head < nhh) {
+                        const float sv = c[nt][e] * scale;
+                        scr[(u64) (h0 + head) * stride + tok] = sv;
+                        mxl[nt][e & 1] = fmaxf(mxl[nt][e & 1], sv);
+                    }
+                }
+        }
+        #pragma unroll
+        for (unsigned int nt = 0; nt < 2; ++nt)
+            #pragma unroll
+            for (unsigned int e = 0; e < 2; ++e) {
+                float v = mxl[nt][e];
+                v = fmaxf(v, __shfl_xor_sync(0xffffffffu, v, 4));
+                v = fmaxf(v, __shfl_xor_sync(0xffffffffu, v, 8));
+                v = fmaxf(v, __shfl_xor_sync(0xffffffffu, v, 16));
+                const unsigned int head = nt * 8 + tg * 2 + e;
+                if (grp8 == 0 && head < V3H) wred2[head * 8 + warp] = v;
+            }
+        __syncthreads();
+        #pragma unroll
+        for (unsigned int a = 0; a < V3H; ++a) {
+            float r = wred2[a * 8];
+            #pragma unroll
+            for (unsigned int k = 1; k < 8; ++k) r = fmaxf(r, wred2[a * 8 + k]);
+            mx[a] = r;
+        }
+        __syncthreads();
+    }
+    float zt[V3H];
+    #pragma unroll
+    for (unsigned int a = 0; a < V3H; ++a) zt[a] = 0.0f;
+    const unsigned int grp = tid >> 6, c4 = (tid & 63) * 4, vgrp = c4 >> 5;
+    float4 acc[V3H];
+    #pragma unroll
+    for (unsigned int a = 0; a < V3H; ++a) acc[a] = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+    for (unsigned int tile = 0; tile < ntok; tile += 256) {
+        __syncthreads();
+        const unsigned int n = min(256u, ntok - tile);
+        #pragma unroll
+        for (unsigned int a = 0; a < V3H; ++a) {
+            float e = 0.0f;
+            if (a < nhh && tid < n) {
+                e = expf(scr[(u64) (h0 + a) * stride + tile + tid] - mx[a]);
+                zt[a] += e;
+            }
+            scs[tid * V3H + a] = e;
+        }
+        ps[tid] = tid < n ? tk[tile + tid] : 0u;
+        __syncthreads();
+        if (c4 < hd) {
+            const unsigned int npad = (n + 31) & ~31u;
+            for (unsigned int rb = 0; rb < npad; rb += 32) {
+                #pragma unroll
+                for (unsigned int kb = 0; kb < 8; kb += 4) {
+                    float4 v[4];
+                    #pragma unroll
+                    for (unsigned int k = 0; k < 4; ++k) {
+                        const unsigned int r = rb + grp * 8 + kb + k;
+                        const u8* vb = vc + (u64) ps[r] * rs + (u64) g * hs;
+                        const u32 raw = *(const u32*) (vb + c4);
+                        const float vs = f16_to_f32(((const u16*) (vb + hd))[vgrp]);
+                        v[k] = make_float4(
+                            (float) (i8) (raw & 0xffu) * vs,
+                            (float) (i8) ((raw >> 8) & 0xffu) * vs,
+                            (float) (i8) ((raw >> 16) & 0xffu) * vs,
+                            (float) (i8) (raw >> 24) * vs);
+                    }
+                    #pragma unroll
+                    for (unsigned int k = 0; k < 4; ++k) {
+                        const unsigned int r = rb + grp * 8 + kb + k;
+                        #pragma unroll
+                        for (unsigned int h4 = 0; h4 < V3H / 4; ++h4) {
+                            const float4 w = *(const float4*) &scs[r * V3H + h4 * 4];
+                            acc[h4 * 4 + 0].x = fmaf(w.x, v[k].x, acc[h4 * 4 + 0].x); acc[h4 * 4 + 0].y = fmaf(w.x, v[k].y, acc[h4 * 4 + 0].y);
+                            acc[h4 * 4 + 0].z = fmaf(w.x, v[k].z, acc[h4 * 4 + 0].z); acc[h4 * 4 + 0].w = fmaf(w.x, v[k].w, acc[h4 * 4 + 0].w);
+                            acc[h4 * 4 + 1].x = fmaf(w.y, v[k].x, acc[h4 * 4 + 1].x); acc[h4 * 4 + 1].y = fmaf(w.y, v[k].y, acc[h4 * 4 + 1].y);
+                            acc[h4 * 4 + 1].z = fmaf(w.y, v[k].z, acc[h4 * 4 + 1].z); acc[h4 * 4 + 1].w = fmaf(w.y, v[k].w, acc[h4 * 4 + 1].w);
+                            acc[h4 * 4 + 2].x = fmaf(w.z, v[k].x, acc[h4 * 4 + 2].x); acc[h4 * 4 + 2].y = fmaf(w.z, v[k].y, acc[h4 * 4 + 2].y);
+                            acc[h4 * 4 + 2].z = fmaf(w.z, v[k].z, acc[h4 * 4 + 2].z); acc[h4 * 4 + 2].w = fmaf(w.z, v[k].w, acc[h4 * 4 + 2].w);
+                            acc[h4 * 4 + 3].x = fmaf(w.w, v[k].x, acc[h4 * 4 + 3].x); acc[h4 * 4 + 3].y = fmaf(w.w, v[k].y, acc[h4 * 4 + 3].y);
+                            acc[h4 * 4 + 3].z = fmaf(w.w, v[k].z, acc[h4 * 4 + 3].z); acc[h4 * 4 + 3].w = fmaf(w.w, v[k].w, acc[h4 * 4 + 3].w);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    block12_reduce(zt, wred, false);
+    #pragma unroll
+    for (unsigned int k = 1; k < 4; ++k) {
+        __syncthreads();
+        if (grp == k && c4 < hd) {
+            #pragma unroll
+            for (unsigned int a = 0; a < V3H; ++a) *(float4*) &qs[a * 256 + c4] = acc[a];
+        }
+        __syncthreads();
+        if (grp == 0 && c4 < hd) {
+            #pragma unroll
+            for (unsigned int a = 0; a < V3H; ++a) {
+                const float4 x = *(const float4*) &qs[a * 256 + c4];
+                acc[a].x += x.x; acc[a].y += x.y; acc[a].z += x.z; acc[a].w += x.w;
+            }
+        }
+    }
+    if (grp == 0 && c4 < hd) {
+        #pragma unroll
+        for (unsigned int a = 0; a < V3H; ++a) {
+            if (a < nhh) {
+                const float inv = 1.0f / zt[a];
+                const float* gt = gaterow + (u64) (h0 + a) * hd + c4;
+                float* op = orow + (u64) (h0 + a) * hd + c4;
+                op[0] = (acc[a].x * inv) * sigmoidf_ref(gt[0]);
+                op[1] = (acc[a].y * inv) * sigmoidf_ref(gt[1]);
+                op[2] = (acc[a].z * inv) * sigmoidf_ref(gt[2]);
+                op[3] = (acc[a].w * inv) * sigmoidf_ref(gt[3]);
+            }
+        }
+    }
+}
+
+extern "C" __global__ void __launch_bounds__(256) attention_group_sel_rows_v3_q8(const float* q, const u8* kc, const u8* vc, const u32* toks,
+                                                                                 unsigned int tstride, const u32* ntoks, const float* gate, float* o,
+                                                                                 double* scratch_d, unsigned int stride, unsigned int nkv, unsigned int hd,
+                                                                                 unsigned int group, unsigned int nh, unsigned int hb) {
+    att_v3_body_q8<false>(q, kc, vc, toks, tstride, ntoks, gate, o, scratch_d, stride, nkv, hd, group, nh, hb);
+}
+
+extern "C" __global__ void __launch_bounds__(256) attention_group_sel_rows_tc_q8(const float* q, const u8* kc, const u8* vc, const u32* toks,
+                                                                                 unsigned int tstride, const u32* ntoks, const float* gate, float* o,
+                                                                                 double* scratch_d, unsigned int stride, unsigned int nkv, unsigned int hd,
+                                                                                 unsigned int group, unsigned int nh, unsigned int hb) {
+    att_v3_body_q8<true>(q, kc, vc, toks, tstride, ntoks, gate, o, scratch_d, stride, nkv, hd, group, nh, hb);
+}
+
+template <bool TC>
+static __device__ __forceinline__ void att_dense_body_q8(const float* q, const u8* kc, const u8* vc, unsigned int ntok0, const float* gate, float* o,
+                                                         double* scratch_d, unsigned int stride, unsigned int nkv, unsigned int hd,
+                                                         unsigned int group, unsigned int nh, unsigned int hb) {
+    const u64 row = blockIdx.y;
+    const unsigned int nsplit = (group + hb - 1) / hb;
+    const unsigned int g = blockIdx.x / nsplit, part = blockIdx.x % nsplit;
+    const unsigned int h0 = g * group + part * hb;
+    const unsigned int nhh = min(hb, group - part * hb);
+    const unsigned int hs = kv_q8_head_bytes(hd), rs = nkv * hs, ng = hd >> 5;
+    const float* qrow = q + row * nh * hd;
+    const float* gaterow = gate + row * nh * hd;
+    float* orow = o + row * nh * hd;
+    const unsigned int ntok = ntok0 + (unsigned int) row;
+    float* scr = (float*) scratch_d + row * nh * stride;
+    __shared__ float qs[HBMAX][256];
+    __shared__ float scs[HBMAX][256];
+    __shared__ unsigned int ps[256];
+    for (unsigned int idx = threadIdx.x; idx < nhh * hd; idx += blockDim.x) qs[idx / hd][idx % hd] = qrow[(u64) h0 * hd + idx];
+    __syncthreads();
+    const float scale = 1.0f / sqrtf((float) hd);
+    float mx[HBMAX];
+    #pragma unroll
+    for (unsigned int a = 0; a < HBMAX; ++a) mx[a] = -1e30f;
+    if (!TC) {
+        for (unsigned int t = threadIdx.x; t < ntok; t += blockDim.x) {
+            const u8* kb = kc + (u64) t * rs + (u64) g * hs;
+            const u16* ks = (const u16*) (kb + hd);
+            float s[HBMAX];
+            #pragma unroll
+            for (unsigned int a = 0; a < HBMAX; ++a) s[a] = 0.0f;
+            for (unsigned int g32 = 0; g32 < ng; ++g32) {
+                const float sc_k = f16_to_f32(ks[g32]);
+                float gp[HBMAX];
+                #pragma unroll
+                for (unsigned int a = 0; a < HBMAX; ++a) gp[a] = 0.0f;
+                #pragma unroll
+                for (unsigned int c = 0; c < 2; ++c) {
+                    const uint4 kv = ((const uint4*) kb)[g32 * 2 + c];
+                    const unsigned int off = g32 * 32 + c * 16;
+                    #pragma unroll
+                    for (unsigned int a = 0; a < HBMAX; ++a) {
+                        if (a < nhh) {
+                            const float* qp = &qs[a][off];
+                            gp[a] += dot4_q8(qp, kv.x) + dot4_q8(qp + 4, kv.y) + dot4_q8(qp + 8, kv.z) + dot4_q8(qp + 12, kv.w);
+                        }
+                    }
+                }
+                #pragma unroll
+                for (unsigned int a = 0; a < HBMAX; ++a)
+                    if (a < nhh) s[a] = fmaf(gp[a], sc_k, s[a]);
+            }
+            #pragma unroll
+            for (unsigned int a = 0; a < HBMAX; ++a) {
+                if (a < nhh) {
+                    s[a] *= scale;
+                    scr[(u64) (h0 + a) * stride + t] = s[a];
+                    mx[a] = fmaxf(mx[a], s[a]);
+                }
+            }
+        }
+    } else {
+        __shared__ __align__(16) unsigned short qh[8][264];
+        const unsigned int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, grp8 = lane >> 2, tg = lane & 3;
+        for (unsigned int idx = threadIdx.x; idx < 8 * hd; idx += blockDim.x) {
+            const unsigned int a = idx / hd, i = idx % hd;
+            const float x = a < nhh ? qrow[(u64) (h0 + a) * hd + i] : 0.0f;
+            unsigned int hv;
+            asm("cvt.rn.f16x2.f32 %0, %1, %2;" : "=r"(hv) : "f"(0.0f), "f"(x));
+            qh[a][i] = (unsigned short) (hv & 0xffffu);
+        }
+        __syncthreads();
+        float m0 = -1e30f, m1 = -1e30f;
+        const unsigned int ntile = (ntok + 15) / 16;
+        for (unsigned int tile = warp; tile < ntile; tile += 8) {
+            const unsigned int t0 = tile * 16, ta = min(t0 + grp8, ntok - 1), tb = min(t0 + grp8 + 8, ntok - 1);
+            const u8* ka_b = kc + (u64) ta * rs + (u64) g * hs;
+            const u8* kb_b = kc + (u64) tb * rs + (u64) g * hs;
+            float c0 = 0.0f, c1 = 0.0f, c2 = 0.0f, c3 = 0.0f;
+            for (unsigned int g32 = 0; g32 < ng; ++g32) {
+                const float sa = f16_to_f32(((const u16*) (ka_b + hd))[g32]);
+                const float sb = f16_to_f32(((const u16*) (kb_b + hd))[g32]);
+                float cg0 = 0.0f, cg1 = 0.0f, cg2 = 0.0f, cg3 = 0.0f;
+                #pragma unroll
+                for (unsigned int ksub = 0; ksub < 32; ksub += 16) {
+                    const unsigned int k0 = g32 * 32 + ksub;
+                    const u16 r00 = *(const u16*) (ka_b + k0 + tg * 2);
+                    const u16 r01 = *(const u16*) (ka_b + k0 + 8 + tg * 2);
+                    const u16 r10 = *(const u16*) (kb_b + k0 + tg * 2);
+                    const u16 r11 = *(const u16*) (kb_b + k0 + 8 + tg * 2);
+                    unsigned int A0, A1, A2, A3;
+                    asm("cvt.rn.f16x2.f32 %0, %1, %2;" : "=r"(A0) : "f"((float) (i8) (r00 >> 8)), "f"((float) (i8) (r00 & 0xffu)));
+                    asm("cvt.rn.f16x2.f32 %0, %1, %2;" : "=r"(A1) : "f"((float) (i8) (r10 >> 8)), "f"((float) (i8) (r10 & 0xffu)));
+                    asm("cvt.rn.f16x2.f32 %0, %1, %2;" : "=r"(A2) : "f"((float) (i8) (r01 >> 8)), "f"((float) (i8) (r01 & 0xffu)));
+                    asm("cvt.rn.f16x2.f32 %0, %1, %2;" : "=r"(A3) : "f"((float) (i8) (r11 >> 8)), "f"((float) (i8) (r11 & 0xffu)));
+                    const unsigned int B0 = *(const unsigned int*) &qh[grp8][k0 + tg * 2];
+                    const unsigned int B1 = *(const unsigned int*) &qh[grp8][k0 + 8 + tg * 2];
+                    asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
+                                 : "+f"(cg0), "+f"(cg1), "+f"(cg2), "+f"(cg3)
+                                 : "r"(A0), "r"(A1), "r"(A2), "r"(A3), "r"(B0), "r"(B1));
+                }
+                c0 = fmaf(cg0, sa, c0);
+                c1 = fmaf(cg1, sa, c1);
+                c2 = fmaf(cg2, sb, c2);
+                c3 = fmaf(cg3, sb, c3);
+            }
+            const unsigned int pa = t0 + grp8, pb = t0 + grp8 + 8, h_a = tg * 2, h_b = tg * 2 + 1;
+            if (pa < ntok) {
+                if (h_a < nhh) { const float sv = c0 * scale; scr[(u64) (h0 + h_a) * stride + pa] = sv; m0 = fmaxf(m0, sv); }
+                if (h_b < nhh) { const float sv = c1 * scale; scr[(u64) (h0 + h_b) * stride + pa] = sv; m1 = fmaxf(m1, sv); }
+            }
+            if (pb < ntok) {
+                if (h_a < nhh) { const float sv = c2 * scale; scr[(u64) (h0 + h_a) * stride + pb] = sv; m0 = fmaxf(m0, sv); }
+                if (h_b < nhh) { const float sv = c3 * scale; scr[(u64) (h0 + h_b) * stride + pb] = sv; m1 = fmaxf(m1, sv); }
+            }
+        }
+        #pragma unroll
+        for (unsigned int a = 0; a < HBMAX; ++a) {
+            if (a == tg * 2) mx[a] = m0;
+            if (a == tg * 2 + 1) mx[a] = m1;
+        }
+    }
+    float z[HBMAX];
+    #pragma unroll
+    for (unsigned int a = 0; a < HBMAX; ++a) {
+        z[a] = 1.0f;
+        if (a < nhh) {
+            const float m = (float) block_max((double) mx[a]);
+            float zt = 0.0f;
+            float* sc = scr + (u64) (h0 + a) * stride;
+            for (unsigned int t = threadIdx.x; t < ntok; t += blockDim.x) {
+                const float e = expf(sc[t] - m);
+                sc[t] = e;
+                zt += e;
+            }
+            z[a] = (float) block_sum((double) zt);
+        }
+    }
+    __syncthreads();
+    const unsigned int j = threadIdx.x;
+    const unsigned int vgrp = j >> 5;
+    float acc[HBMAX];
+    #pragma unroll
+    for (unsigned int a = 0; a < HBMAX; ++a) acc[a] = 0.0f;
+    for (unsigned int tile = 0; tile < ntok; tile += 256) {
+        __syncthreads();
+        const unsigned int n = min(256u, ntok - tile);
+        for (unsigned int idx = threadIdx.x; idx < nhh * 256; idx += blockDim.x) {
+            const unsigned int a = idx / 256, r = idx % 256;
+            if (r < n) scs[a][r] = scr[(u64) (h0 + a) * stride + tile + r];
+        }
+        if (threadIdx.x < n) ps[threadIdx.x] = tile + threadIdx.x;
+        __syncthreads();
+        if (j < hd) {
+            for (unsigned int r0 = 0; r0 < n; r0 += 16) {
+                float p[HBMAX];
+                #pragma unroll
+                for (unsigned int a = 0; a < HBMAX; ++a) p[a] = 0.0f;
+                for (unsigned int r = r0; r < r0 + 16 && r < n; ++r) {
+                    const u8* vb = vc + (u64) ps[r] * rs + (u64) g * hs;
+                    const float v = (float) ((const i8*) vb)[j] * f16_to_f32(((const u16*) (vb + hd))[vgrp]);
+                    #pragma unroll
+                    for (unsigned int a = 0; a < HBMAX; ++a) if (a < nhh) p[a] = fmaf(scs[a][r], v, p[a]);
+                }
+                #pragma unroll
+                for (unsigned int a = 0; a < HBMAX; ++a) acc[a] += p[a];
+            }
+        }
+    }
+    if (j < hd) {
+        #pragma unroll
+        for (unsigned int a = 0; a < HBMAX; ++a)
+            if (a < nhh) orow[(u64) (h0 + a) * hd + j] = (acc[a] / z[a]) * sigmoidf_ref(gaterow[(u64) (h0 + a) * hd + j]);
+    }
+}
+
+extern "C" __global__ void attention_group_dense_rows_f32_q8(const float* q, const u8* kc, const u8* vc, unsigned int ntok0, const float* gate, float* o,
+                                                             double* scratch_d, unsigned int stride, unsigned int nkv, unsigned int hd,
+                                                             unsigned int group, unsigned int nh, unsigned int hb) {
+    att_dense_body_q8<false>(q, kc, vc, ntok0, gate, o, scratch_d, stride, nkv, hd, group, nh, hb);
+}
+
+extern "C" __global__ void attention_group_dense_rows_tc_q8(const float* q, const u8* kc, const u8* vc, unsigned int ntok0, const float* gate, float* o,
+                                                            double* scratch_d, unsigned int stride, unsigned int nkv, unsigned int hd,
+                                                            unsigned int group, unsigned int nh, unsigned int hb) {
+    att_dense_body_q8<true>(q, kc, vc, ntok0, gate, o, scratch_d, stride, nkv, hd, group, nh, hb);
+}
+
+// ------------------------------------------------------------------------------------ lm_head Q2_P proxy + sparse top-K
+// Quantizes rotated inputs xr[0..m-1][cols] (from exl3_rotate_rows_f32) into per-128 s8x4 (xq) + f32 scale (x_sc)
+// + precomputed bias correction (-3 * x_sc * sum(xq)) for dp4a.s32.u32 scoring against tile-interleaved 2-bit W_q2.
+// Grid = (cols / 128, m, 1), Block = (128, 1, 1).
+extern "C" __global__ void proxy_q2_quant_x(const float* xr, unsigned int xs, unsigned int* xq, float* x_sc,
+                                            float* x_corr, unsigned int cols) {
+    __shared__ float smax[4];
+    __shared__ int ssum[4];
+    const unsigned int b = blockIdx.x, tok = blockIdx.y, tid = threadIdx.x;
+    const unsigned int n_b = cols >> 7u, lane = tid & 31u, warp = tid >> 5u;
+    pdl_wait();
+    float xv = xr[(u64) tok * xs + b * 128u + tid];
+    float am = fabsf(xv);
+    for (int off = 16; off > 0; off >>= 1) am = fmaxf(am, __shfl_xor_sync(0xffffffffu, am, off));
+    if (lane == 0) smax[warp] = am;
+    __syncthreads();
+    if (tid < 4u) am = smax[tid];
+    if (warp == 0) {
+        am = fmaxf(am, __shfl_xor_sync(0xffffffffu, am, 2));
+        am = fmaxf(am, __shfl_xor_sync(0xffffffffu, am, 1));
+        if (lane == 0) smax[0] = am;
+    }
+    __syncthreads();
+    float amax = smax[0];
+    float sc = (amax > 0.0f) ? (amax / 127.0f) : 0.0f;
+    float inv = (sc > 0.0f) ? (1.0f / sc) : 0.0f;
+    int q = __float2int_rn(fmaxf(-127.0f, fminf(127.0f, xv * inv)));
+    int q_t = q;
+    int q0 = __shfl_sync(0xffffffffu, q_t, (lane & ~3u) | 0u);
+    int q1 = __shfl_sync(0xffffffffu, q_t, (lane & ~3u) | 1u);
+    int q2 = __shfl_sync(0xffffffffu, q_t, (lane & ~3u) | 2u);
+    int q3 = __shfl_sync(0xffffffffu, q_t, (lane & ~3u) | 3u);
+    if ((lane & 3u) == 0u) {
+        unsigned int p4 = ((unsigned int) (unsigned char) (signed char) q0)
+                        | (((unsigned int) (unsigned char) (signed char) q1) << 8)
+                        | (((unsigned int) (unsigned char) (signed char) q2) << 16)
+                        | (((unsigned int) (unsigned char) (signed char) q3) << 24);
+        xq[((u64) tok * n_b + b) * 32u + (tid >> 2u)] = p4;
+    }
+    int qs = q;
+    for (int off = 16; off > 0; off >>= 1) qs += __shfl_xor_sync(0xffffffffu, qs, off);
+    if (lane == 0) ssum[warp] = qs;
+    __syncthreads();
+    if (tid == 0) {
+        int tot = ssum[0] + ssum[1] + ssum[2] + ssum[3];
+        x_sc[(u64) tok * n_b + b] = sc;
+        x_corr[(u64) tok * n_b + b] = -3.0f * (float) tot * sc;
+    }
+    pdl_launch_dependents();
+}
+
+static __device__ __forceinline__ int dp4a_s32_u32(int a_s8x4, unsigned int b_u8x4, int c) {
+    int d;
+    asm("dp4a.s32.u32 %0, %1, %2, %3;" : "=r"(d) : "r"(a_s8x4), "r"(b_u8x4), "r"(c));
+    return d;
+}
+
+template <unsigned int M>
+static __device__ __forceinline__ void proxy_q2_dp4a_impl(const u8* __restrict__ w_q2, const u16* __restrict__ w_sc,
+                                                          const unsigned int* __restrict__ xq, const float* __restrict__ x_sc,
+                                                          const float* __restrict__ x_corr, float* __restrict__ bmax,
+                                                          unsigned int n_ob, unsigned int cols, unsigned int m) {
+    __shared__ int s_xq[M][32];
+    __shared__ float s_xsc[M];
+    __shared__ float s_xcorr[M];
+    __shared__ float s_wmax[4][M];
+    const unsigned int ob = blockIdx.x, tid = threadIdx.x, n_b = cols >> 7u;
+    pdl_wait();
+    float acc[M];
+#pragma unroll
+    for (unsigned int j = 0; j < M; j++) acc[j] = 0.0f;
+    for (unsigned int b = 0; b < n_b; b++) {
+        for (unsigned int idx = tid; idx < m * 32u; idx += 128u) {
+            unsigned int j = idx >> 5u, k = idx & 31u;
+            s_xq[j][k] = (int) xq[((u64) j * n_b + b) * 32u + k];
+        }
+        if (tid < m) {
+            s_xsc[tid] = x_sc[(u64) tid * n_b + b];
+            s_xcorr[tid] = x_corr[(u64) tid * n_b + b];
+        }
+        __syncthreads();
+        int ia[M];
+#pragma unroll
+        for (unsigned int j = 0; j < M; j++) ia[j] = 0;
+#pragma unroll
+        for (unsigned int hb = 0; hb < 2u; hb++) {
+            uint4 qw = ((const uint4*) w_q2)[((u64) ob * (n_b * 2u) + b * 2u + hb) * 128u + tid];
+            unsigned int words[4] = {qw.x, qw.y, qw.z, qw.w};
+#pragma unroll
+            for (unsigned int wi = 0; wi < 4u; wi++) {
+                unsigned int w = words[wi];
+                unsigned int u0 = (w >> 0) & 0x03030303u;
+                unsigned int u1 = (w >> 2) & 0x03030303u;
+                unsigned int u2 = (w >> 4) & 0x03030303u;
+                unsigned int u3 = (w >> 6) & 0x03030303u;
+                unsigned int xbase = hb * 16u + wi * 4u;
+#pragma unroll
+                for (unsigned int j = 0; j < M; j++) {
+                    if (M == 1 || j < m) {
+                        ia[j] = dp4a_s32_u32(s_xq[j][xbase + 0u], u0, ia[j]);
+                        ia[j] = dp4a_s32_u32(s_xq[j][xbase + 1u], u1, ia[j]);
+                        ia[j] = dp4a_s32_u32(s_xq[j][xbase + 2u], u2, ia[j]);
+                        ia[j] = dp4a_s32_u32(s_xq[j][xbase + 3u], u3, ia[j]);
+                    }
+                }
+            }
+        }
+        float wsc = f16_to_f32(w_sc[((u64) ob * n_b + b) * 128u + tid]);
+#pragma unroll
+        for (unsigned int j = 0; j < M; j++) {
+            if (M == 1 || j < m) acc[j] = fmaf(wsc, fmaf(2.0f * s_xsc[j], (float) ia[j], s_xcorr[j]), acc[j]);
+        }
+        __syncthreads();
+    }
+    const unsigned int warp = tid >> 5u, lane = tid & 31u;
+#pragma unroll
+    for (unsigned int j = 0; j < M; j++) {
+        float mx = acc[j];
+        for (int off = 16; off > 0; off >>= 1) mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, off));
+        if (lane == 0) s_wmax[warp][j] = mx;
+    }
+    __syncthreads();
+    if (tid == 0) {
+        for (unsigned int j = 0; j < m && j < M; j++) {
+            float m0 = fmaxf(s_wmax[0][j], s_wmax[1][j]);
+            float m1 = fmaxf(s_wmax[2][j], s_wmax[3][j]);
+            bmax[(u64) j * n_ob + ob] = fmaxf(m0, m1);
+        }
+    }
+    pdl_launch_dependents();
+}
+
+extern "C" __global__ void __launch_bounds__(128) proxy_q2_dp4a_bmax_m1(const u8* w_q2, const u16* w_sc, const unsigned int* xq,
+                                                                        const float* x_sc, const float* x_corr, float* bmax,
+                                                                        unsigned int n_ob, unsigned int cols, unsigned int m) {
+    proxy_q2_dp4a_impl<1>(w_q2, w_sc, xq, x_sc, x_corr, bmax, n_ob, cols, m);
+}
+
+extern "C" __global__ void __launch_bounds__(128) proxy_q2_dp4a_bmax_m4(const u8* w_q2, const u16* w_sc, const unsigned int* xq,
+                                                                        const float* x_sc, const float* x_corr, float* bmax,
+                                                                        unsigned int n_ob, unsigned int cols, unsigned int m) {
+    proxy_q2_dp4a_impl<4>(w_q2, w_sc, xq, x_sc, x_corr, bmax, n_ob, cols, m);
+}
+
+extern "C" __global__ void __launch_bounds__(128) proxy_q2_dp4a_bmax_m8(const u8* w_q2, const u16* w_sc, const unsigned int* xq,
+                                                                        const float* x_sc, const float* x_corr, float* bmax,
+                                                                        unsigned int n_ob, unsigned int cols, unsigned int m) {
+    proxy_q2_dp4a_impl<8>(w_q2, w_sc, xq, x_sc, x_corr, bmax, n_ob, cols, m);
+}
+
+static __device__ __forceinline__ void tk_sort_n(float* sv, unsigned int* si, unsigned int n_sort) {
+    for (unsigned int k = 2u; k <= n_sort; k <<= 1u) {
+        for (unsigned int j = k >> 1u; j > 0u; j >>= 1u) {
+            for (unsigned int t = threadIdx.x; t < n_sort; t += 256u) {
+                unsigned int l = t ^ j;
+                if (l > t) {
+                    bool up = (t & k) == 0u;
+                    bool sw = up ? tk_before(sv[l], si[l], sv[t], si[t]) : tk_before(sv[t], si[t], sv[l], si[l]);
+                    if (sw) {
+                        float tv = sv[t]; sv[t] = sv[l]; sv[l] = tv;
+                        unsigned int ti = si[t]; si[t] = si[l]; si[l] = ti;
+                    }
+                }
+            }
+            __syncthreads();
+        }
+    }
+}
+
+// Grid = (m, 1, 1), Block = (256, 1, 1): finds top k_blk 128-row blocks for row blockIdx.x and marks bitmap g_seen.
+extern "C" __global__ void proxy_pick_rows(const float* bmax, unsigned int n_ob, unsigned int k_blk, unsigned int* g_seen) {
+    __shared__ float sv[1024];
+    __shared__ unsigned int si[1024];
+    const unsigned int row = blockIdx.x, tid = threadIdx.x;
+    const float* r = bmax + (u64) row * n_ob;
+    pdl_wait();
+    float lv[4];
+    unsigned int li[4];
+#pragma unroll
+    for (int k = 0; k < 4; k++) { lv[k] = -3.0e38f; li[k] = 0xffffffffu; }
+    for (unsigned int i = tid; i < n_ob; i += 256u) {
+        float v = r[i];
+        if (v != v) v = -3.0e38f;
+        if (v > lv[3]) {
+            lv[3] = v;
+            li[3] = i;
+#pragma unroll
+            for (int k = 3; k > 0; k--) {
+                if (lv[k] > lv[k - 1] || (lv[k] == lv[k - 1] && li[k] < li[k - 1])) {
+                    float tv = lv[k]; lv[k] = lv[k - 1]; lv[k - 1] = tv;
+                    unsigned int ti = li[k]; li[k] = li[k - 1]; li[k - 1] = ti;
+                }
+            }
+        }
+    }
+#pragma unroll
+    for (int k = 0; k < 4; k++) {
+        sv[tid * 4u + k] = lv[k];
+        si[tid * 4u + k] = li[k];
+    }
+    __syncthreads();
+    tk_sort_n(sv, si, 1024u);
+    for (unsigned int t = tid; t < k_blk && t < n_ob; t += 256u) {
+        unsigned int ob = si[t];
+        if (ob < n_ob) atomicOr(&g_seen[ob >> 5u], 1u << (ob & 31u));
+    }
+    pdl_launch_dependents();
+}
+
+// Grid = (1, 1, 1), Block = (256, 1, 1): compacts g_seen[0..(n_ob+31)/32) into sorted sel_blks[1..=sel_blks[0]] and clears g_seen.
+extern "C" __global__ void proxy_compact_seen(unsigned int* g_seen, unsigned int n_ob, unsigned int max_sel, unsigned int* sel_blks) {
+    __shared__ unsigned int woff[8];
+    const unsigned int tid = threadIdx.x, lane = tid & 31u, warp = tid >> 5u;
+    const unsigned int n_words = (n_ob + 31u) >> 5u;
+    pdl_wait();
+    unsigned int acc_base = 0u;
+    for (unsigned int w0 = 0u; w0 < n_words; w0 += 256u) {
+        unsigned int idx = w0 + tid;
+        unsigned int mask = (idx < n_words) ? g_seen[idx] : 0u;
+        if (idx < n_words) g_seen[idx] = 0u;
+        unsigned int cnt = __popc(mask);
+        unsigned int pref = cnt;
+#pragma unroll
+        for (int off = 1; off < 32; off <<= 1) {
+            unsigned int v = __shfl_up_sync(0xffffffffu, pref, off);
+            if (lane >= (unsigned int) off) pref += v;
+        }
+        if (lane == 31u) woff[warp] = pref;
+        __syncthreads();
+        if (warp == 0u) {
+            unsigned int wt = (lane < 8u) ? woff[lane] : 0u;
+            unsigned int wsum = wt;
+#pragma unroll
+            for (int off = 1; off < 8; off <<= 1) {
+                unsigned int v = __shfl_up_sync(0xffffffffu, wsum, off);
+                if (lane >= (unsigned int) off) wsum += v;
+            }
+            if (lane < 8u) woff[lane] = wsum - wt;
+        }
+        __syncthreads();
+        unsigned int pos = acc_base + woff[warp] + (pref - cnt);
+        while (mask != 0u) {
+            unsigned int bit = (unsigned int) (__ffs((int) mask) - 1);
+            mask &= mask - 1u;
+            if (pos < max_sel) sel_blks[1u + pos] = idx * 32u + bit;
+            pos++;
+        }
+        unsigned int block_total = 0u;
+        if (warp == 7u && lane == 31u) woff[0] = woff[7] + pref;
+        __syncthreads();
+        block_total = woff[0];
+        acc_base += block_total;
+        __syncthreads();
+    }
+    if (tid == 0u) sel_blks[0] = (acc_base < max_sel) ? acc_base : max_sel;
+    pdl_launch_dependents();
+}
+
+#define TK_SP_N 2048u
+extern "C" __global__ void topk_slices_blks(const float* logits, unsigned int ls, const unsigned int* sel_blks,
+                                            unsigned int nb, float* ov, unsigned int* oi) {
+    __shared__ float sv[TK_SP_N];
+    __shared__ unsigned int si[TK_SP_N];
+    const unsigned int row = blockIdx.x / nb, blk = blockIdx.x % nb;
+    pdl_wait();
+    const unsigned int n_elems = sel_blks[0] << 7u;
+    const float* r = logits + (u64) row * ls;
+    for (unsigned int t = threadIdx.x; t < TK_SP_N; t += 256u) {
+        unsigned int i = blk * TK_SP_N + t;
+        bool ok = i < n_elems;
+        float v = ok ? r[i] : __int_as_float(0xff800000);
+        if (v != v) v = __int_as_float(0xff800000);
+        sv[t] = v;
+        si[t] = ok ? ((sel_blks[1u + (i >> 7u)] << 7u) | (i & 127u)) : 0xffffffffu;
+    }
+    __syncthreads();
+    tk_sort_n(sv, si, TK_SP_N);
+    u64 o = ((u64) row * nb + blk) * TK_K;
+    for (unsigned int t = threadIdx.x; t < TK_K; t += 256u) { ov[o + t] = sv[t]; oi[o + t] = si[t]; }
+    pdl_launch_dependents();
+}
+
+extern "C" __global__ void topk_merge_blks(const float* iv, const unsigned int* ii, unsigned int nb, unsigned int* out) {
+    __shared__ float sv[TK_N];
+    __shared__ unsigned int si[TK_N];
+    const unsigned int row = blockIdx.x;
+    const unsigned int n_items = nb * TK_K;
+    unsigned int n_sort = 256u;
+    while (n_sort < n_items && n_sort < TK_N) n_sort <<= 1u;
+    const u64 base = (u64) row * n_items;
+    pdl_wait();
+    for (unsigned int t = threadIdx.x; t < n_sort; t += 256u) {
+        if (t < n_items) { sv[t] = iv[base + t]; si[t] = ii[base + t]; }
+        else { sv[t] = __int_as_float(0xff800000); si[t] = 0xffffffffu; }
+    }
+    __syncthreads();
+    tk_sort_n(sv, si, n_sort);
+    for (unsigned int t = threadIdx.x; t < TK_K; t += 256u) {
+        out[(u64) row * 128u + t] = __float_as_uint(sv[t]);
+        out[(u64) row * 128u + 64u + t] = si[t];
+    }
+    pdl_launch_dependents();
+}
+
+extern "C" __global__ void df_top16_blks(const float* logits, unsigned int ls, const unsigned int* sel_blks,
+                                         unsigned int* ids, float* vals) {
+    __shared__ float sv[256 * 16];
+    __shared__ unsigned int si[256 * 16];
+    __shared__ unsigned int pos[256];
+    __shared__ float bv[256];
+    __shared__ unsigned int bi[256], bt[256];
+    pdl_wait();
+    const unsigned int n_elems = sel_blks[0] << 7u;
+    const float* row = logits + (u64) blockIdx.x * ls;
+    float lv[16];
+    unsigned int li[16];
+#pragma unroll
+    for (int k = 0; k < 16; ++k) { lv[k] = -3.0e38f; li[k] = 0xffffffffu; }
+    for (unsigned int i = threadIdx.x; i < n_elems; i += 256u) {
+        float v = row[i];
+        if (v > lv[15]) {
+            lv[15] = v;
+            li[15] = i;
+#pragma unroll
+            for (int k = 15; k > 0; --k) {
+                if (lv[k] > lv[k - 1] || (lv[k] == lv[k - 1] && li[k] < li[k - 1])) {
+                    float tv = lv[k]; lv[k] = lv[k - 1]; lv[k - 1] = tv;
+                    unsigned int ti = li[k]; li[k] = li[k - 1]; li[k - 1] = ti;
+                }
+            }
+        }
+    }
+#pragma unroll
+    for (int k = 0; k < 16; ++k) { sv[threadIdx.x * 16 + k] = lv[k]; si[threadIdx.x * 16 + k] = li[k]; }
+    pos[threadIdx.x] = 0;
+    __syncthreads();
+    for (int r = 0; r < 16; ++r) {
+        unsigned int p = pos[threadIdx.x];
+        bv[threadIdx.x] = p < 16 ? sv[threadIdx.x * 16 + p] : -3.0e38f;
+        bi[threadIdx.x] = p < 16 ? si[threadIdx.x * 16 + p] : 0xffffffffu;
+        bt[threadIdx.x] = threadIdx.x;
+        __syncthreads();
+        for (unsigned int s = 128; s > 0; s >>= 1) {
+            if (threadIdx.x < s) {
+                float a = bv[threadIdx.x], b = bv[threadIdx.x + s];
+                unsigned int ia = bi[threadIdx.x], ib = bi[threadIdx.x + s];
+                if (b > a || (b == a && ib < ia)) {
+                    bv[threadIdx.x] = b; bi[threadIdx.x] = ib; bt[threadIdx.x] = bt[threadIdx.x + s];
+                }
+            }
+            __syncthreads();
+        }
+        if (threadIdx.x == 0) {
+            unsigned int li_best = bi[0];
+            ids[(u64) blockIdx.x * 16 + r] = (li_best < n_elems) ? ((sel_blks[1u + (li_best >> 7u)] << 7u) | (li_best & 127u)) : 0u;
+            vals[(u64) blockIdx.x * 16 + r] = bv[0];
+            pos[bt[0]]++;
+        }
+        __syncthreads();
+    }
+    pdl_launch_dependents();
 }

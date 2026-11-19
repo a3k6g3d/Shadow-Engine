@@ -154,7 +154,9 @@ fn probe_path(url: &str, path: &str) -> bool {
     let mut body = Vec::new();
     let _ = s.take(65536).read_to_end(&mut body);
     let text = String::from_utf8_lossy(&body);
-    (text.starts_with("HTTP/1.0 200") || text.starts_with("HTTP/1.1 200")) && !text.replace(' ', "").contains("\"state\":\"loading\"")
+    (text.starts_with("HTTP/1.0 200") || text.starts_with("HTTP/1.1 200"))
+        && !text.replace(' ', "").contains("\"state\":\"loading\"")
+        && !text.replace(' ', "").contains("\"state\":\"parked\"")
 }
 
 fn find_shadowzero_exe(cfg: &Config) -> Option<PathBuf> {

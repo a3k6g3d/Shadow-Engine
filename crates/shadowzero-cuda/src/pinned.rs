@@ -290,7 +290,8 @@ impl<'c> PinnedRegion<'c> {
                 let mut dptr = 0u64;
                 let dcode = if flags & 2 == 0 { 0 } else { unsafe { (ctx.api.cuMemHostGetDevicePointer)(&mut dptr, at, 0) } }; // no device mapping: an experiment only (STATUS 155)
                 if dcode != 0 {
-                    return Err(format!("cuMemHostGetDevicePointer failed ({dcode}) for {n} bytes at offset {off} of {len} on {}", ctx.name));
+                    let (vf, vt) = ctx.mem_info().unwrap_or((0, 0));
+                    return Err(format!("cuMemHostGetDevicePointer failed ({dcode}) for {n} bytes at offset {off} of {len} on {} (vram_free={}MiB/{}MiB)", ctx.name, vf >> 20, vt >> 20));
                 }
                 if off == 0 {
                     r.dev_ptr = dptr;
@@ -437,10 +438,19 @@ impl Drop for PinnedRegion<'_> {
         // SAFETY: free each `cuMemHostAlloc` chunk, or unregister what `build` registered and release the reservation once.
         unsafe {
             if !self.ptrs.is_empty() {
-                if self.ctx.bind().is_ok() {
-                    for &(p, _) in &self.ptrs {
-                        (self.ctx.api.cuMemFreeHost)(p as *mut c_void);
+                match self.ctx.bind() {
+                    Ok(()) => {
+                        for &(p, _) in &self.ptrs {
+                            let rc = (self.ctx.api.cuMemFreeHost)(p as *mut c_void);
+                            if rc != 0 {
+                                static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+                                if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                                    eprintln!("pinned drop: cuMemFreeHost failed ({rc}) on {}", self.ctx.name);
+                                }
+                            }
+                        }
                     }
+                    Err(e) => eprintln!("pinned drop: bind failed in PinnedRegion::drop on {}: {e}", self.ctx.name),
                 }
                 for &(_, n) in &self.chunks {
                     PINNED.fetch_sub(n as u64, std::sync::atomic::Ordering::Relaxed);

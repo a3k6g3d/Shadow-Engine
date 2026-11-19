@@ -89,6 +89,7 @@ EXPORT size_t shadowzero_mmq_moe_bytes(int64_t k, int64_t ny_groups, int64_t chu
 EXPORT int shadowzero_mmq_moe(int type, unsigned long long xtab, unsigned long long rec, int64_t ngroups, int64_t ny_groups, int64_t chunk, unsigned long long x, int64_t xs,
                           int64_t k, int64_t rows, unsigned long long dst, int64_t dst_stride, unsigned long long scratch, void * stream) {
     if (k % 256 != 0 || xs % 4 != 0 || (chunk != 32 && chunk != 48 && chunk != 64)) return 2;
+    mark_used();
     cudaStream_t s = (cudaStream_t) stream;
     const int64_t ncols = ny_groups * chunk;
     int * ids = (int *) scratch;

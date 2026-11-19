@@ -307,9 +307,42 @@ pub struct Model {
     dense: HashMap<String, Vec<u8>>,
     /// Dense tensors not held in RAM (`load_lean`): the GPU session reads each from the file when it uploads it.
     lean: std::collections::HashSet<String>,
-    ple_cache: std::sync::RwLock<HashMap<i64, Vec<f32>>>,
+    ple_cache: std::sync::RwLock<PleCache>,
     /// An EXL3 checkpoint's extras (`exl3_model.rs`): computed tensors, the per-expert file table, the n-gram table.  None for a GGUF.
     pub exl3: Option<Box<crate::exl3_model::Exl3Extra>>,
+}
+
+struct PleCache {
+    map: HashMap<i64, Vec<f32>>,
+    order: std::collections::VecDeque<i64>,
+}
+
+impl PleCache {
+    fn new() -> Self {
+        Self { map: HashMap::new(), order: std::collections::VecDeque::new() }
+    }
+
+    fn insert_capped(&mut self, row: i64, val: Vec<f32>) {
+        const CAP: usize = 65536;
+        if self.map.contains_key(&row) {
+            return;
+        }
+        let fifo = !std::env::var("SHADOWZERO_PLE_FIFO").is_ok_and(|v| v == "0");
+        if self.map.len() >= CAP {
+            if !fifo {
+                return;
+            }
+            while self.map.len() >= CAP {
+                if let Some(old) = self.order.pop_front() {
+                    self.map.remove(&old);
+                } else {
+                    break;
+                }
+            }
+        }
+        self.order.push_back(row);
+        self.map.insert(row, val);
+    }
 }
 
 impl Model {
@@ -362,7 +395,7 @@ impl Model {
         let paths: Vec<_> = g.shards.iter().map(|s| s.path.clone()).collect();
         let workers = std::env::var("SHADOWZERO_READ_WORKERS").ok().and_then(|v| v.parse::<usize>().ok()).filter(|&n| n >= 1).unwrap_or(READ_WORKERS);
         let pool = ReadPool::new(&paths, workers)?;
-        Ok(Model { g, cfg, files, pool, dense, lean, ple_cache: std::sync::RwLock::new(HashMap::new()), exl3 })
+        Ok(Model { g, cfg, files, pool, dense, lean, ple_cache: std::sync::RwLock::new(PleCache::new()), exl3 })
     }
 
     /// The companion `.scale` f32 multiplier of a 2-D tensor (1.0 when the model has no `.scale` tensor).
@@ -495,42 +528,44 @@ impl Model {
         self.pool.wait_async().unwrap();
     }
 
+    /// Queues a `ple_prefetch` job onto the background `"shadow-ple"` worker and returns its monotonic sequence ticket (`0` for empty).
+    pub fn ple_prefetch_enqueue(&self, rows: Vec<i64>) -> u64 {
+        if rows.is_empty() {
+            return 0;
+        }
+        let w = ple_worker();
+        let seq = w.seq.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        if w.tx.send((seq, self as *const Model as usize, rows)).is_err() {
+            return 0;
+        }
+        seq
+    }
+
+    /// Waits until background `"shadow-ple"` worker has finished job `seq` (and all earlier queued jobs).
+    pub fn ple_prefetch_wait_seq(&self, seq: u64) {
+        if seq == 0 {
+            return;
+        }
+        let w = ple_worker();
+        let mut done = w.done_val.lock().unwrap();
+        while *done < seq {
+            done = w.done_cv.wait(done).unwrap();
+        }
+    }
+
     /// `ple_prefetch` on a background thread (STATUS 162): the n-gram rows of a verify pass are random reads of a 27 GB table, ~1 ms before the PLE layer, so they are asked for when the
     /// pass starts and `ple_prefetch_wait` (at the PLE layer) joins.  One worker for the process; every start must be followed by a wait before the model is dropped.
     pub fn ple_prefetch_start(&self, rows: Vec<i64>) {
-        let w = PLE_WORKER.get_or_init(|| {
-            let (tx, rx) = std::sync::mpsc::channel::<(usize, Vec<i64>)>();
-            let (dtx, drx) = std::sync::mpsc::channel::<()>();
-            std::thread::Builder::new()
-                .name("shadow-ple".into())
-                .spawn(move || {
-                    while let Ok((model, rows)) = rx.recv() {
-                        // SAFETY: `model` is the address of a live `Model` (the caller waits for this job inside the pass that started it), and `ple_prefetch` takes `&self`
-                        // (its state is behind locks and the read pool).
-                        let m = unsafe { &*(model as *const Model) };
-                        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| m.ple_prefetch(&rows)));
-                        let _ = dtx.send(());
-                    }
-                })
-                .expect("ple worker");
-            PleWorker { tx: std::sync::Mutex::new(tx), done: std::sync::Mutex::new(drx) }
-        });
-        if w.tx.lock().unwrap().send((self as *const Model as usize, rows)).is_ok() {
-            PLE_PENDING.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let seq = self.ple_prefetch_enqueue(rows);
+        if seq > 0 {
+            PLE_LAST_START.store(seq, std::sync::atomic::Ordering::Release);
         }
     }
 
     /// Waits for the `ple_prefetch_start` jobs that are still running.
     pub fn ple_prefetch_wait(&self) {
-        use std::sync::atomic::Ordering::SeqCst;
-        let Some(w) = PLE_WORKER.get() else { return };
-        while PLE_PENDING.load(SeqCst) > 0 {
-            if w.done.lock().unwrap().recv().is_ok() {
-                PLE_PENDING.fetch_sub(1, SeqCst);
-            } else {
-                PLE_PENDING.store(0, SeqCst);
-            }
-        }
+        let seq = PLE_LAST_START.load(std::sync::atomic::Ordering::Acquire);
+        self.ple_prefetch_wait_seq(seq);
     }
 
     /// One row of the n-gram table (ple_head_dim weights), cached in RAM.
@@ -539,7 +574,7 @@ impl Model {
     pub fn ple_prefetch(&self, rows: &[i64]) {
         let missing: Vec<i64> = match self.ple_cache.read() {
             Ok(c) => {
-                let mut m: Vec<i64> = rows.iter().copied().filter(|r| !c.contains_key(r)).collect();
+                let mut m: Vec<i64> = rows.iter().copied().filter(|r| !c.map.contains_key(r)).collect();
                 m.sort_unstable();
                 m.dedup();
                 m
@@ -561,11 +596,10 @@ impl Model {
                     return;
                 }
             }
+            let decoded: Vec<Vec<f32>> = missing.iter().zip(&bufs).map(|(&row, b)| x.ngram.decode(row, b)).collect();
             if let Ok(mut c) = self.ple_cache.write() {
-                for (&row, b) in missing.iter().zip(&bufs) {
-                    if c.len() < 65536 {
-                        c.insert(row, x.ngram.decode(row, b));
-                    }
+                for (&row, v) in missing.iter().zip(decoded) {
+                    c.insert_capped(row, v);
                 }
             }
             return;
@@ -586,16 +620,51 @@ impl Model {
         if let Ok(mut c) = self.ple_cache.write() {
             for (&row, b) in missing.iter().zip(&bufs) {
                 let mut y = vec![0f32; t.dims[0] as usize];
-                if dequantize(t.ty, b, &mut y).is_ok() && c.len() < 65536 {
-                    c.insert(row, y);
+                if dequantize(t.ty, b, &mut y).is_ok() {
+                    c.insert_capped(row, y);
                 }
             }
         }
     }
 
+    /// Appends every row in `rows` into `out` under one read lock when cached, fetching misses in batch if needed.
+    pub fn ple_extend_rows(&self, rows: &[i64], out: &mut Vec<f32>) {
+        if rows.is_empty() {
+            return;
+        }
+        let mut misses: Vec<i64> = Vec::new();
+        if let Ok(c) = self.ple_cache.read() {
+            if rows.iter().all(|r| c.map.contains_key(r)) {
+                for r in rows {
+                    out.extend_from_slice(&c.map[r]);
+                }
+                return;
+            }
+            for &r in rows {
+                if !c.map.contains_key(&r) {
+                    misses.push(r);
+                }
+            }
+        }
+        if misses.len() >= 2 {
+            self.ple_prefetch(&misses);
+        }
+        if let Ok(c) = self.ple_cache.read() {
+            if rows.iter().all(|r| c.map.contains_key(r)) {
+                for r in rows {
+                    out.extend_from_slice(&c.map[r]);
+                }
+                return;
+            }
+        }
+        for &r in rows {
+            out.extend(self.ple_row(r));
+        }
+    }
+
     pub fn ple_row(&self, row: i64) -> Vec<f32> {
         if let Ok(c) = self.ple_cache.read() {
-            if let Some(v) = c.get(&row) {
+            if let Some(v) = c.map.get(&row) {
                 return v.clone();
             }
         }
@@ -605,9 +674,7 @@ impl Model {
             read_at(&self.files[f], &mut b, o).unwrap();
             let y = x.ngram.decode(row, &b);
             if let Ok(mut c) = self.ple_cache.write() {
-                if c.len() < 65536 {
-                    c.insert(row, y.clone());
-                }
+                c.insert_capped(row, y.clone());
             }
             return y;
         }
@@ -619,9 +686,7 @@ impl Model {
         let mut y = vec![0f32; t.dims[0] as usize];
         dequantize(t.ty, &b, &mut y).unwrap();
         if let Ok(mut c) = self.ple_cache.write() {
-            if c.len() < 65536 {
-                c.insert(row, y.clone());
-            }
+            c.insert_capped(row, y.clone());
         }
         y
     }
@@ -1018,10 +1083,58 @@ fn hc_write(r: &mut [f32], g: &[f32], y: &[f32], h: usize) {
     }
 }
 
-/// The router's choice from its logits: the `k` most probable experts, most probable first (lower index first at a
-/// tie), each with its renormalized weight - softmax over all experts, then the top k divided by their sum.
-pub fn route(logits: &[f32], k: usize) -> Vec<(usize, f64)> {
+/// The router's choice from its logits into a caller-owned buffer: the `k` most probable experts, most probable first
+/// (lower index first at a tie), each with its renormalized weight - softmax over all experts, then the top k divided by their sum.
+pub fn route_into(logits: &[f32], k: usize, out: &mut Vec<(usize, f64)>) {
+    out.clear();
+    if k == 0 || logits.is_empty() {
+        return;
+    }
     let mx = logits.iter().cloned().fold(f32::MIN, f32::max);
+    if logits.len() <= 512 && k <= 16 {
+        let mut ex = [0.0f64; 512];
+        let mut z = 0.0f64;
+        for (dst, &v) in ex[..logits.len()].iter_mut().zip(logits) {
+            let e = ((v - mx) as f64).exp();
+            *dst = e;
+            z += e;
+        }
+        let mut top = [0usize; 16];
+        let mut top_len = 0usize;
+        let mut last_ex = f64::NEG_INFINITY;
+        let mut last_idx = usize::MAX;
+        for (i, &ei) in ex[..logits.len()].iter().enumerate() {
+            if top_len == k && (ei < last_ex || (ei == last_ex && i > last_idx)) {
+                continue;
+            }
+            let mut pos = top_len;
+            while pos > 0 {
+                let prev = top[pos - 1];
+                let ep = ex[prev];
+                if ep > ei || (ep == ei && prev < i) {
+                    break;
+                }
+                if pos < k {
+                    top[pos] = prev;
+                }
+                pos -= 1;
+            }
+            if pos < k {
+                top[pos] = i;
+                if top_len < k {
+                    top_len += 1;
+                }
+                let tail = top[top_len - 1];
+                last_ex = ex[tail];
+                last_idx = tail;
+            }
+        }
+        let tz: f64 = top[..top_len].iter().map(|&e| ex[e] / z).sum();
+        for &e in &top[..top_len] {
+            out.push((e, (ex[e] / z) / tz));
+        }
+        return;
+    }
     let ex: Vec<f64> = logits.iter().map(|&v| ((v - mx) as f64).exp()).collect();
     let z: f64 = ex.iter().sum();
     // the first k of a full sort by (ex descending, index ascending), kept by insertion: k is 10 of 512
@@ -1035,9 +1148,16 @@ pub fn route(logits: &[f32], k: usize) -> Vec<(usize, f64)> {
         top.insert(at, i);
         top.truncate(k);
     }
-    let top = &top[..];
     let tz: f64 = top.iter().map(|&e| ex[e] / z).sum();
-    top.iter().map(|&e| (e, (ex[e] / z) / tz)).collect()
+    out.extend(top.iter().map(|&e| (e, (ex[e] / z) / tz)));
+}
+
+/// The router's choice from its logits: the `k` most probable experts, most probable first (lower index first at a
+/// tie), each with its renormalized weight - softmax over all experts, then the top k divided by their sum.
+pub fn route(logits: &[f32], k: usize) -> Vec<(usize, f64)> {
+    let mut out = Vec::with_capacity(k);
+    route_into(logits, k, &mut out);
+    out
 }
 
 /// `route` with a bias added to the logits for the CHOICE only (`bias(e)` in logit units, e.g. towards the experts the cache already holds); the weights stay the
@@ -1182,10 +1302,40 @@ mod route_tests {
     }
 }
 
-/// The background thread of `Model::ple_prefetch_start` and the number of its jobs not yet waited for.
+/// The background thread of `Model::ple_prefetch_start` / `ple_prefetch_enqueue`, tracking completed FIFO job sequence numbers.
 struct PleWorker {
-    tx: std::sync::Mutex<std::sync::mpsc::Sender<(usize, Vec<i64>)>>,
-    done: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
+    tx: std::sync::mpsc::Sender<(u64, usize, Vec<i64>)>,
+    seq: std::sync::atomic::AtomicU64,
+    done_val: std::sync::Mutex<u64>,
+    done_cv: std::sync::Condvar,
 }
 static PLE_WORKER: std::sync::OnceLock<PleWorker> = std::sync::OnceLock::new();
-static PLE_PENDING: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static PLE_LAST_START: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn ple_worker() -> &'static PleWorker {
+    PLE_WORKER.get_or_init(|| {
+        let (tx, rx) = std::sync::mpsc::channel::<(u64, usize, Vec<i64>)>();
+        std::thread::Builder::new()
+            .name("shadow-ple".into())
+            .spawn(move || {
+                while let Ok((seq, model, rows)) = rx.recv() {
+                    // SAFETY: `model` is the address of a live `Model` (caller awaits `ple_prefetch_wait_seq(seq)` inside the pass that started it).
+                    let m = unsafe { &*(model as *const Model) };
+                    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| m.ple_prefetch(&rows)));
+                    let w = PLE_WORKER.get().expect("ple worker initialized");
+                    let mut done = w.done_val.lock().unwrap();
+                    if seq > *done {
+                        *done = seq;
+                    }
+                    w.done_cv.notify_all();
+                }
+            })
+            .expect("ple worker");
+        PleWorker {
+            tx,
+            seq: std::sync::atomic::AtomicU64::new(0),
+            done_val: std::sync::Mutex::new(0),
+            done_cv: std::sync::Condvar::new(),
+        }
+    })
+}

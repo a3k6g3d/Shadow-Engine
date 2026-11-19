@@ -179,7 +179,7 @@ machine pass `--ram-tier-gib` explicitly (or `auto`), or `--exact` with a small 
 
 OpenAI-compatible: `POST /v1/chat/completions` (streaming and not; `reasoning_effort`, `chat_template_kwargs.enable_thinking`, and the sampling parameters below),
 `GET /v1/models`, `/health`, `/metrics` (Prometheus), `/v1/status` (throughput, queue, memory tiers), `/v1/telemetry`
-(CPU, RAM, GPU, expert-cache stats), `/v1/tools` and `/v1/tools/execute` (the native Windows agent tools). The response
+(CPU, RAM, GPU, expert-cache stats), `/v1/tools`, `/v1/tools/execute` (the native Windows agent tools), `GET /v1/media/<file>` (generated photos/videos with HTTP `Range` support), and loopback-only `POST /v1/engine/park` / `POST /v1/engine/resume` (frees/reloads all GPU VRAM & pinned RAM on demand for local media generation). The response
 carries llama.cpp-style `timings` (`predicted_n`, `predicted_ms`, `predicted_per_second`, `prompt_n`, ...), which
 `shadowzero-bench` reads.
 
@@ -194,7 +194,6 @@ the one measurement) and decode a little slower. The chat page sends its own fro
 
 ## MCP tools
 
-`mcp.json` in the ShadowZero folder lists the MCP servers `shadowzero serve` starts (the format of Claude Desktop / Claude Code, so a list can be copied). Shipped on: `time` (current time, time zones) and `thinking`
-(sequential thinking). Shipped off, set `"disabled": false` or delete the line to use them: `git` (`uvx mcp-server-git`) and `files` (the filesystem server on `J:/ShadowZero`). They need `uvx` / `npx` (installed) and the network
+`mcp.json` in the ShadowZero folder lists the MCP servers `shadowzero serve` starts (the format of Claude Desktop / Claude Code, so a list can be copied, plus optional `"timeout_secs"` per server, default `180`). Shipped on: `browser` (`@playwright/mcp`), `time` (`uvx mcp-server-time`), and `media` (`tools/media_mcp.py`, `generate_photo` via Z-Image-Turbo, `generate_video` via Wan2.2-TI2V-5B, and `upscale_media` to 4K via Real-ESRGAN with automatic VRAM park/reload). Shipped off, set `"disabled": false` or delete the line to use them: `thinking` (sequential thinking), `git` (`uvx mcp-server-git`) and `files` (the filesystem server on `J:/ShadowZero`). They need `uvx` / `npx` (installed) and the network
 the first time (the packages are fetched once). Each tool is offered to the model as `mcp__<server>__<tool>` and costs prompt tokens in every chat's start (the first chat reads them once, then the server caches them);
 `mcp.json` is looked for in the working directory, beside the exe, in the checkout ShadowZero was built from, then `%APPDATA%\ShadowZero` (`SHADOWZERO_MCP_CONFIG` names one). The Dashboard's Tools card shows each server and its tool count or error.

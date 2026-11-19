@@ -18,3 +18,8 @@ bytes = "1.12"
 futures-util = { version = "0.3.34", default-features = false }
 serde_json = "1.0.151"
 regex = "1"
+# Remote pairing (docs/PLAN_APK_2026-11-13.md, Phase 1): the OS CSPRNG for the 4-digit pin and
+# the 32-byte bearer token, and SHA-256 for the hashes kept on disk (pair.json holds the
+# token's digest, never the token).  Both are in the local cargo cache already.
+getrandom = "0.2"
+sha2 = "0.10"

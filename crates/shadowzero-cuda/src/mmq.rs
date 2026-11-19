@@ -13,6 +13,18 @@ type MmvqQuantizeFn = unsafe extern "C" fn(x: u64, yq: u64, k: i64, ntok: i64, x
 type MmvqFn = unsafe extern "C" fn(ty: i32, w: u64, yq: u64, dst: u64, rows: i64, k: i64, ntok: i64, dst_stride: i64, stream: u64) -> i32;
 type MoeBytesFn = unsafe extern "C" fn(k: i64, ny_groups: i64, chunk: i64) -> usize;
 type MoeFn = unsafe extern "C" fn(ty: i32, xtab: u64, rec: u64, ngroups: i64, ny_groups: i64, chunk: i64, x: u64, xs: i64, k: i64, rows: i64, dst: u64, dst_stride: i64, scratch: u64, stream: u64) -> i32;
+type ResetFn = unsafe extern "C" fn();
+
+static RESET: std::sync::Mutex<Option<ResetFn>> = std::sync::Mutex::new(None);
+
+/// Releases CUDA runtime scratch buffers and resets device runtime state held by `shadowzero_mmq.dll` after parking.
+pub fn reset() {
+    let f = *RESET.lock().unwrap();
+    if let Some(f) = f {
+        // SAFETY: exported by `shadowzero_mmq.cu`; all session objects are dropped before calling.
+        unsafe { f() };
+    }
+}
 
 pub struct Mmq {
     quantize: QuantizeFn,
@@ -79,6 +91,10 @@ impl Mmq {
                 _ => None,
             }
         };
+        // SAFETY: `shadowzero_mmq_reset` is an optional no-arg export added for clean GPU parking.
+        if let Some(r) = lib.sym("shadowzero_mmq_reset") {
+            *RESET.lock().unwrap() = Some(unsafe { std::mem::transmute::<*mut std::ffi::c_void, ResetFn>(r) });
+        }
         eprintln!("mmq: loaded {} (int8 tensor-core projections for the prompt path{}{})", path.display(), if moe.is_some() { ", grouped experts" } else { "" }, if mmvq.is_some() { ", mul_mat_vec_q" } else { "" });
         Some(Mmq { quantize, gemm, y_bytes, moe, mmvq, _lib: lib })
     }

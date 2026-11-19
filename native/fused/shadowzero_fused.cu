@@ -11,12 +11,35 @@
 #include <cstdio>
 #include <cstdlib>
 #include <algorithm>
+#include <mutex>
 #include <cuda_runtime.h>
 #include "strata/prefill/moe_fused_iq.hpp"
 
 using namespace strata::prefill::fused;
 
 #define SF_API extern "C" __declspec(dllexport)
+
+static std::mutex g_sf_mu;
+static bool g_sf_used[16] = {};
+
+static void mark_used() {
+    int d = 0;
+    if (cudaGetDevice(&d) == cudaSuccess && d >= 0 && d < 16) {
+        std::lock_guard<std::mutex> lock(g_sf_mu);
+        g_sf_used[d] = true;
+    }
+}
+
+SF_API void sf_reset() {
+    std::lock_guard<std::mutex> lock(g_sf_mu);
+    for (int d = 0; d < 16; d++) {
+        if (g_sf_used[d]) {
+            cudaSetDevice(d);
+            cudaDeviceReset();
+            g_sf_used[d] = false;
+        }
+    }
+}
 
 SF_API int sf_init() {
     _putenv_s("STRATA_PF_FUSED", "1");   // the native packs' kernels are opt-in in Strata; here they are the point
@@ -29,7 +52,7 @@ SF_API int sf_supported(int gu_type, int d_type) { return native_supported(gu_ty
 SF_API size_t sf_act_bytes(int64_t rows, int64_t cols) { return act_bytes(rows, cols); }
 SF_API size_t sf_group_bytes(int64_t n, int n_expert) { return group_bytes(n, n_expert); }
 
-SF_API void sf_quantize(const float* x, int64_t rows, int64_t cols, void* xa, void* stream) { quantize_act_native(x, rows, cols, xa, stream); }
+SF_API void sf_quantize(const float* x, int64_t rows, int64_t cols, void* xa, void* stream) { mark_used(); quantize_act_native(x, rows, cols, xa, stream); }
 
 __global__ void mask_kernel(const int32_t* __restrict__ ids, int64_t n, const uint8_t* __restrict__ copied, int phase, int32_t* __restrict__ out) {
     const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
@@ -40,14 +63,16 @@ __global__ void mask_kernel(const int32_t* __restrict__ ids, int64_t n, const ui
 
 /// out[i] = ids[i] when expert ids[i] belongs to `phase` (0: resident, copied[e] == 0; 1: copied), else -1 (the grouping skips it).
 SF_API void sf_mask(const int32_t* ids, int64_t n, const uint8_t* copied, int phase, int32_t* out, void* stream) {
+    mark_used();
     if (n > 0) mask_kernel<<<(unsigned) ((n + 255) / 256), 256, 0, (cudaStream_t) stream>>>(ids, n, copied, phase, out);
 }
 
-SF_API void sf_group(const int32_t* ids, int64_t n, int k, int n_expert, void* scratch, int32_t* slot, int32_t* src, void* stream) { group(ids, n, k, n_expert, scratch, slot, src, stream); }
+SF_API void sf_group(const int32_t* ids, int64_t n, int k, int n_expert, void* scratch, int32_t* slot, int32_t* src, void* stream) { mark_used(); group(ids, n, k, n_expert, scratch, slot, src, stream); }
 
 /// `tab`: DEVICE table of `n_expert` pointers (u64), expert e's blob [gate | up | down] in raw GGUF blocks (2-byte aligned).  Launches in batches of up to kMaxBatch experts.
 SF_API void sf_experts(const uint64_t* tab, int gu_type, int d_type, uint64_t gu_row, uint64_t d_row, uint64_t up_off, uint64_t down_off, int n_expert, int64_t n,
                        const void* scratch, const void* xa, const int32_t* src, void* ha, float* dm, void* stream) {
+    mark_used();
     NativeGeom g;
     g.gu_type = gu_type; g.d_type = d_type; g.gu_row = (size_t) gu_row; g.d_row = (size_t) d_row; g.up_off = (size_t) up_off; g.down_off = (size_t) down_off;
     for (int e0 = 0; e0 < n_expert; e0 += kMaxBatch) {

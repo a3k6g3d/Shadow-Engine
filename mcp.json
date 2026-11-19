@@ -16,6 +16,21 @@
       "command": "uvx",
       "args": ["mcp-server-time"]
     },
+    "media": {
+      "command": "F:\\ShadowMedia\\venv\\Scripts\\python.exe",
+      "args": ["J:\\ShadowZero\\tools\\media_mcp.py"],
+      "timeout_secs": 1200,
+      "env": {
+        "HF_HOME": "F:\\ShadowMedia\\hf_cache",
+        "HF_XET_HIGH_PERFORMANCE": "1",
+        "HF_HUB_DISABLE_SYMLINKS_WARNING": "1"
+      },
+      "hints": {
+        "generate_photo": "Automatically parks ShadowZero GPUs, saves an HD PNG, and reloads ShadowZero; mention the returned /v1/media/ file and saved path in your answer.",
+        "generate_video": "Automatically parks ShadowZero GPUs, saves an HD H.264 MP4 (or animates image_path), and reloads ShadowZero; mention the returned /v1/media/ file and saved path in your answer.",
+        "upscale_media": "Upscales an existing photo or video to 4K (3840x2160 by default) using Real-ESRGAN AI super-resolution and NVENC/H.264, automatically parking/reloading ShadowZero GPUs."
+      }
+    },
     "thinking": {
       "disabled": true,
       "command": "npx",

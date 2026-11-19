@@ -349,10 +349,16 @@ impl<'c, 'm> GpuSession<'c, 'm> {
                                                         f(b.cand.ptr), f(b.unary.ptr)]);
             }
             None => {
-                self.mv_cols("output.weight", hid1, HIDDEN, self.bb.logits.ptr, vocab, slots);
-                lap("head (output.weight x slots)");
-                self.k("df_top16", slots as u32, 256, &[f(self.bb.logits.ptr), Arg::U32(vocab as u32), Arg::U32(vocab as u32), Arg::Ptr(0),
-                                                        f(b.cand.ptr), f(b.unary.ptr)]);
+                if let Some((_max_sel, sparse_ls, sel_ptr)) = self.mv_head_proxy_sparse(hid1, HIDDEN, self.bb.logits.ptr, slots, 16) {
+                    lap("head (q2p sparse x slots)");
+                    self.k("df_top16_blks", slots as u32, 256, &[f(self.bb.logits.ptr), Arg::U32(sparse_ls as u32), Arg::Ptr(sel_ptr),
+                                                                 f(b.cand.ptr), f(b.unary.ptr)]);
+                } else {
+                    self.mv_cols("output.weight", hid1, HIDDEN, self.bb.logits.ptr, vocab, slots);
+                    lap("head (output.weight x slots)");
+                    self.k("df_top16", slots as u32, 256, &[f(self.bb.logits.ptr), Arg::U32(vocab as u32), Arg::U32(vocab as u32), Arg::Ptr(0),
+                                                            f(b.cand.ptr), f(b.unary.ptr)]);
+                }
             }
         }
         lap("top16");

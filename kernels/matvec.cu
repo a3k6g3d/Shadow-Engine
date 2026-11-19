@@ -9,11 +9,13 @@ static __device__ __forceinline__ void matvec_rows(const u8* w, const float* x, 
                                                    unsigned int cols) {
     unsigned int row = blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32, lane = threadIdx.x % 32;
     if (row >= rows) return;
+    pdl_wait();
     const u8* r = w + (u64) row * (cols / Q::QK) * Q::BYTES;
     float acc = 0.0f;
     for (unsigned int i = lane; i < cols; i += 32) acc += Q::at(r + (i / Q::QK) * Q::BYTES, i % Q::QK) * x[i];
     for (int off = 16; off > 0; off >>= 1) acc += __shfl_down_sync(0xffffffffu, acc, off);
     if (lane == 0) y[row] = acc;
+    pdl_launch_dependents();
 }
 
 extern "C" __global__ void matvec_q4_k(const u8* w, const float* x, float* y, unsigned int rows, unsigned int cols) { matvec_rows<Q4K>(w, x, y, rows, cols); }
@@ -488,11 +490,13 @@ static __device__ __forceinline__ void matvec_fast_rows(const u8* w, const float
                                                         unsigned int cols) {
     unsigned int row = blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32, lane = threadIdx.x % 32;
     if (row >= rows) return;
+    pdl_wait();
     const u8* r = w + (u64) row * (cols / Q::QK) * Q::BYTES;
     float acc = 0.0f;
     for (unsigned int c = lane; c < cols / 8; c += 32) acc += Fast<Q>::dot8(r, c * 8, x + c * 8);
     for (int off = 16; off > 0; off >>= 1) acc += __shfl_down_sync(0xffffffffu, acc, off);
     if (lane == 0) y[row] = acc;
+    pdl_launch_dependents();
 }
 
 template <typename Q>
@@ -509,11 +513,13 @@ static __device__ __forceinline__ void matvec_pair_fast_rows(const u8* w0, float
     } else {
         return;
     }
+    pdl_wait();
     const u8* r = w + (u64) row * (cols / Q::QK) * Q::BYTES;
     float acc = 0.0f;
     for (unsigned int c = lane; c < cols / 8; c += 32) acc += Fast<Q>::dot8(r, c * 8, x + c * 8);
     for (int off = 16; off > 0; off >>= 1) acc += __shfl_down_sync(0xffffffffu, acc, off);
     if (lane == 0) y[row] = acc;
+    pdl_launch_dependents();
 }
 
 // Two matrices of different quant types sharing x: rows 0..r0 decode as Q0, rows r0..r0+r1 as Q1.  With r0 % 8 == 0
@@ -525,16 +531,20 @@ static __device__ __forceinline__ void matvec_pair2_fast_rows(const u8* w0, floa
     unsigned int row = blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32, lane = threadIdx.x % 32;
     float acc = 0.0f;
     if (row < r0) {
+        pdl_wait();
         const u8* r = w0 + (u64) row * (cols / Q0::QK) * Q0::BYTES;
         for (unsigned int c = lane; c < cols / 8; c += 32) acc += Fast<Q0>::dot8(r, c * 8, x + c * 8);
         for (int off = 16; off > 0; off >>= 1) acc += __shfl_down_sync(0xffffffffu, acc, off);
         if (lane == 0) y0[row] = acc;
+        pdl_launch_dependents();
     } else if (row < r0 + r1) {
+        pdl_wait();
         row -= r0;
         const u8* r = w1 + (u64) row * (cols / Q1::QK) * Q1::BYTES;
         for (unsigned int c = lane; c < cols / 8; c += 32) acc += Fast<Q1>::dot8(r, c * 8, x + c * 8);
         for (int off = 16; off > 0; off >>= 1) acc += __shfl_down_sync(0xffffffffu, acc, off);
         if (lane == 0) y1[row] = acc;
+        pdl_launch_dependents();
     }
 }
 
@@ -582,11 +592,13 @@ extern "C" __global__ void matvec_pair_bf16(const u8* w0, float* y0, unsigned in
     } else {
         return;
     }
+    pdl_wait();
     const u8* r = w + (u64) row * cols * BF16::BYTES;
     float acc = 0.0f;
     for (unsigned int i = lane; i < cols; i += 32) acc += BF16::at(r + (u64) i * BF16::BYTES, 0) * x[i];
     for (int off = 16; off > 0; off >>= 1) acc += __shfl_down_sync(0xffffffffu, acc, off);
     if (lane == 0) y[row] = acc;
+    pdl_launch_dependents();
 }
 extern "C" __global__ void hc_down_inject_bf16(const u8* w_down, float* down, unsigned int r_down,
                                                const u8* w_inj, float* g, unsigned int r_inj,
@@ -601,6 +613,7 @@ extern "C" __global__ void hc_down_inject_bf16(const u8* w_down, float* down, un
     } else {
         return;
     }
+    pdl_wait();
     const u8* r = w + (u64) row * cols * BF16::BYTES;
     float acc = 0.0f;
     for (unsigned int i = lane; i < cols; i += 32) acc += BF16::at(r + (u64) i * BF16::BYTES, 0) * rn[i];
@@ -611,6 +624,7 @@ extern "C" __global__ void hc_down_inject_bf16(const u8* w_down, float* down, un
         if (is_inj) g[row] = 2.0f * sig;
         else down[row] = v * sig;
     }
+    pdl_launch_dependents();
 }
 extern "C" __global__ void matvec_fast_f32(const u8* w, const float* x, float* y, unsigned int rows, unsigned int cols) { matvec_fast_rows<F32>(w, x, y, rows, cols); }
 extern "C" __global__ void matvec_batch_f32(const u64* wtab, const float* x, unsigned int xs, float* y, unsigned int ys, unsigned int rows, unsigned int cols) { matvec_batch_rows<F32>(wtab, x, xs, y, ys, rows, cols); }
@@ -703,6 +717,7 @@ static __device__ __forceinline__ void matvec_cols_rows_b(const u8* w, const flo
                                                           unsigned int m, unsigned int bx) {
     unsigned int row0 = (bx * (blockDim.x / 32) + threadIdx.x / 32) * COLS_PLAIN, lane = threadIdx.x % 32;
     if (row0 >= rows) return;
+    pdl_wait();
     unsigned int nr = min(rows - row0, (unsigned int) COLS_PLAIN);
     switch (m) {
         case 1: matvec_cols_m<Q, 1>(w, x, xs, y, ys, row0, nr, lane, cols); break;
@@ -714,6 +729,7 @@ static __device__ __forceinline__ void matvec_cols_rows_b(const u8* w, const flo
         case 7: matvec_cols_m<Q, 7>(w, x, xs, y, ys, row0, nr, lane, cols); break;
         default: matvec_cols_m<Q, 8>(w, x, xs, y, ys, row0, nr, lane, cols); break;
     }
+    pdl_launch_dependents();
 }
 
 template <typename Q>
@@ -1510,6 +1526,7 @@ static __device__ __forceinline__ void cols_ref_rows(const u8* w0, float* y0, un
     const unsigned int rw = one ? 1 : COLS_ROWS;
     unsigned int row0 = (blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32) * rw, lane = threadIdx.x % 32;
     if (row0 >= r0 + r1) return;
+    pdl_wait();
     unsigned int nr = min(r0 + r1 - row0, rw);
 #define CR(M) do { if (one) cols_ref_m<Q, M, 1>(w0, y0, r0, ys0, w1, y1, ys1, x, xs, row0, nr, lane, cols, mode, div);                    else cols_ref_m<Q, M, COLS_ROWS>(w0, y0, r0, ys0, w1, y1, ys1, x, xs, row0, nr, lane, cols, mode, div); } while (0)
     switch (m) {
@@ -1523,6 +1540,7 @@ static __device__ __forceinline__ void cols_ref_rows(const u8* w0, float* y0, un
         default: CR(8); break;
     }
 #undef CR
+    pdl_launch_dependents();
 }
 
 extern "C" __global__ void matvec_cols_ref_bf16(const u8* w, const float* x, unsigned int xs, float* y, unsigned int ys, unsigned int rows, unsigned int cols, unsigned int m) { cols_ref_rows<BF16>(w, y, rows, ys, w, y, 0, ys, x, xs, cols, 0, 1.0f, m); }
@@ -1625,6 +1643,7 @@ template <typename Q>
 static __device__ __forceinline__ void grouped_rows(const u64* wtab, const unsigned int* gtab, const float* x,
                                                     unsigned int xs, float* y, unsigned int ys, unsigned int rows,
                                                     unsigned int cols) {
+    pdl_wait();
     const unsigned int* gi = gtab + (u64) blockIdx.y * 17;
     if (gi[0] == 0) return;
     const u8* w = (const u8*) wtab[blockIdx.y];
@@ -1643,6 +1662,7 @@ static __device__ __forceinline__ void grouped_rows(const u64* wtab, const unsig
         case 7: grouped_m<Q, 7, GROUPED_RW>(w, x, xs, y, ys, gi, row0, nr, lane, cols); break;
         default: grouped_m<Q, 8, GROUPED_RW>(w, x, xs, y, ys, gi, row0, nr, lane, cols); break;
     }
+    pdl_launch_dependents();
 }
 
 extern "C" __global__ void GROUPED_LB matvec_grouped_q4_k(const u64* wtab, const unsigned int* gtab, const float* x, unsigned int xs, float* y, unsigned int ys, unsigned int rows, unsigned int cols) { grouped_rows<Q4K>(wtab, gtab, x, xs, y, ys, rows, cols); }
@@ -1711,6 +1731,7 @@ extern "C" __global__ void hc_down_inject_fast_bf16(const u8* w_down, float* dow
     if (valid && row >= r_down) {
         row -= r_down; w = w_inj; inj = true;
     }
+    pdl_wait();
     float acc = 0.0f;
     if (valid) {
         const u8* r = w + (u64) row * cols * BF16::BYTES;
@@ -1723,6 +1744,7 @@ extern "C" __global__ void hc_down_inject_fast_bf16(const u8* w_down, float* dow
         float a = red[sub][0] + red[sub][1] + red[sub][2] + red[sub][3];
         (inj ? g : down)[row] = hc_epilogue(a, div, inj);
     }
+    pdl_launch_dependents();
 }
 
 // The same for m <= 8 inputs (rn + j * rs; down + j * ds, g + j * gs), dotm so each input's sums are the one-input
@@ -1764,6 +1786,7 @@ extern "C" __global__ void hc_down_inject_cols_fast_bf16(const u8* w_down, float
         row -= r_down; w = w_inj; inj = true;
     }
     const u8* r = w + (u64) row * cols * BF16::BYTES;
+    pdl_wait();
     float acc[8];
     switch (m) {
         case 1: hc_cols_fast_m<1>(r, rn, rs, cols, wq, lane, valid, acc); break;
@@ -1785,6 +1808,7 @@ extern "C" __global__ void hc_down_inject_cols_fast_bf16(const u8* w_down, float
             else down[(u64) j * ds + row] = hc_epilogue(a, div, false);
         }
     }
+    pdl_launch_dependents();
 }
 
 // The tensor-core form of hc_down_inject_cols_fast_bf16 for a long prompt (same arguments): rows 0..r_down of the output come from w_down and go through the
@@ -1997,6 +2021,7 @@ extern "C" __global__ void hc_up_mix_cols(const u8* w_up, const float* down, uns
                                           unsigned int streams, unsigned int rank, unsigned int m) {
     const unsigned int i = blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32, lane = threadIdx.x % 32;
     if (i >= h) return;
+    pdl_wait();
     switch (m) {
         case 1: hc_up_mix_m<1>(w_up, down, ds, rn, rs, u, us, h, streams, rank, i, lane); break;
         case 2: hc_up_mix_m<2>(w_up, down, ds, rn, rs, u, us, h, streams, rank, i, lane); break;
@@ -2006,5 +2031,439 @@ extern "C" __global__ void hc_up_mix_cols(const u8* w_up, const float* down, uns
         case 6: hc_up_mix_m<6>(w_up, down, ds, rn, rs, u, us, h, streams, rank, i, lane); break;
         case 7: hc_up_mix_m<7>(w_up, down, ds, rn, rs, u, us, h, streams, rank, i, lane); break;
         default: hc_up_mix_m<8>(w_up, down, ds, rn, rs, u, us, h, streams, rank, i, lane); break;
+    }
+    pdl_launch_dependents();
+}
+
+// ------------------------------------------------------------------------------------ packed per-32 Q8 hyper-connections (hc8)
+// Blob layout for [rows, cols] (cols % 32 == 0):
+//   [0 .. rows * cols)                : i8 weights, row-major
+//   [rows * cols .. + rows*(cols/16)) : u16 fp16 per-32 scales, row-major
+// Activations remain fp32; weights are unpacked word-by-word (4 i8 per u32) from coalesced uint4 loads so M=1..4
+// stay completely free of register spills and achieve full occupancy.
+static __device__ __forceinline__ int sbyte(unsigned int w, unsigned int sh) {
+    return (int) (signed char) ((w >> sh) & 0xffu);
+}
+
+template <unsigned int M>
+static __device__ __forceinline__ void hc8_word_step(unsigned int qw, const float* x_base, unsigned int xs,
+                                                     float* gsum) {
+    float w0 = (float) sbyte(qw, 0);
+    float w1 = (float) sbyte(qw, 8);
+    float w2 = (float) sbyte(qw, 16);
+    float w3 = (float) sbyte(qw, 24);
+    float4 xv[M];
+#pragma unroll
+    for (unsigned int j = 0; j < M; j++) xv[j] = *(const float4*) (x_base + (u64) j * xs);
+#pragma unroll
+    for (unsigned int j = 0; j < M; j++) {
+        gsum[j] = fmaf(w0, xv[j].x, gsum[j]);
+        gsum[j] = fmaf(w1, xv[j].y, gsum[j]);
+        gsum[j] = fmaf(w2, xv[j].z, gsum[j]);
+        gsum[j] = fmaf(w3, xv[j].w, gsum[j]);
+    }
+}
+
+template <unsigned int M>
+static __device__ __forceinline__ void hc8_down_cols_m(const u8* r_i8, const unsigned short* r_sc, const float* rn,
+                                                       unsigned int rs, unsigned int cols, unsigned int wq,
+                                                       unsigned int lane, bool valid, float* acc) {
+#pragma unroll
+    for (unsigned int j = 0; j < M; j++) acc[j] = 0.0f;
+    if (valid) {
+        // 32 lanes * 4 weights = 128 contiguous weights (= 4 g32 groups, 128B coalesced weights, 512B coalesced rn).
+        const unsigned int n4 = cols >> 2, grp_in_warp = lane >> 3;
+        const unsigned int* r_u32 = (const unsigned int*) r_i8;
+        for (unsigned int i4 = wq * 32 + lane; i4 < n4; i4 += 128) {
+            unsigned int qw = r_u32[i4];
+            float sc = f16_to_f32(r_sc[i4 >> 3]);
+            float w0 = (float) sbyte(qw, 0) * sc;
+            float w1 = (float) sbyte(qw, 8) * sc;
+            float w2 = (float) sbyte(qw, 16) * sc;
+            float w3 = (float) sbyte(qw, 24) * sc;
+            const unsigned int off = i4 * 4;
+#pragma unroll
+            for (unsigned int j = 0; j < M; j++) {
+                float4 xv = *(const float4*) (rn + (u64) j * rs + off);
+                acc[j] = fmaf(w0, xv.x, acc[j]);
+                acc[j] = fmaf(w1, xv.y, acc[j]);
+                acc[j] = fmaf(w2, xv.z, acc[j]);
+                acc[j] = fmaf(w3, xv.w, acc[j]);
+            }
+        }
+        (void) grp_in_warp;
+    }
+#pragma unroll
+    for (unsigned int j = 0; j < M; j++)
+        for (int off = 16; off > 0; off >>= 1) acc[j] += __shfl_down_sync(0xffffffffu, acc[j], off);
+}
+
+template <unsigned int MAX_M>
+static __device__ __forceinline__ void hc8_down_inject_impl(const u8* w_down, float* down, unsigned int r_down,
+                                                            unsigned int ds, const u8* w_inj, float* g,
+                                                            unsigned int r_inj, unsigned int gs, const float* rn,
+                                                            unsigned int rs, unsigned int cols, float div,
+                                                            unsigned int m) {
+    __shared__ float red[2][4][MAX_M];
+    const unsigned int sub = threadIdx.x / 128, wq = (threadIdx.x / 32) % 4, lane = threadIdx.x % 32;
+    unsigned int row = blockIdx.x * 2 + sub;
+    const bool valid = row < r_down + r_inj;
+    bool inj = false;
+    const u8* w = w_down;
+    unsigned int r_mat = r_down;
+    if (valid && row >= r_down) {
+        row -= r_down; w = w_inj; r_mat = r_inj; inj = true;
+    }
+    const unsigned int ngrp = cols >> 5;
+    const u8* r_i8 = w + (u64) row * cols;
+    const unsigned short* r_sc = (const unsigned short*) (w + (u64) r_mat * cols) + (u64) row * ngrp;
+    pdl_wait();
+    float acc[MAX_M];
+    if constexpr (MAX_M == 1) {
+        hc8_down_cols_m<1>(r_i8, r_sc, rn, rs, cols, wq, lane, valid, acc);
+    } else if constexpr (MAX_M == 4) {
+        switch (m) {
+            case 1: hc8_down_cols_m<1>(r_i8, r_sc, rn, rs, cols, wq, lane, valid, acc); break;
+            case 2: hc8_down_cols_m<2>(r_i8, r_sc, rn, rs, cols, wq, lane, valid, acc); break;
+            case 3: hc8_down_cols_m<3>(r_i8, r_sc, rn, rs, cols, wq, lane, valid, acc); break;
+            default: hc8_down_cols_m<4>(r_i8, r_sc, rn, rs, cols, wq, lane, valid, acc); break;
+        }
+    } else {
+        switch (m) {
+            case 5: hc8_down_cols_m<5>(r_i8, r_sc, rn, rs, cols, wq, lane, valid, acc); break;
+            case 6: hc8_down_cols_m<6>(r_i8, r_sc, rn, rs, cols, wq, lane, valid, acc); break;
+            case 7: hc8_down_cols_m<7>(r_i8, r_sc, rn, rs, cols, wq, lane, valid, acc); break;
+            default: hc8_down_cols_m<8>(r_i8, r_sc, rn, rs, cols, wq, lane, valid, acc); break;
+        }
+    }
+    if (lane == 0)
+        for (unsigned int j = 0; j < m && j < MAX_M; j++) red[sub][wq][j] = acc[j];
+    __syncthreads();
+    if (valid && wq == 0 && lane == 0) {
+        for (unsigned int j = 0; j < m && j < MAX_M; j++) {
+            float a = red[sub][0][j] + red[sub][1][j] + red[sub][2][j] + red[sub][3][j];
+            if (inj) g[(u64) j * gs + row] = hc_epilogue(a, div, true);
+            else down[(u64) j * ds + row] = hc_epilogue(a, div, false);
+        }
+    }
+    pdl_launch_dependents();
+}
+
+extern "C" __global__ void hc8_down_inject_m1(const u8* w_down, float* down, unsigned int r_down, unsigned int ds,
+                                              const u8* w_inj, float* g, unsigned int r_inj, unsigned int gs,
+                                              const float* rn, unsigned int rs, unsigned int cols, float div,
+                                              unsigned int m) {
+    hc8_down_inject_impl<1>(w_down, down, r_down, ds, w_inj, g, r_inj, gs, rn, rs, cols, div, m);
+}
+extern "C" __global__ void hc8_down_inject_m4(const u8* w_down, float* down, unsigned int r_down, unsigned int ds,
+                                              const u8* w_inj, float* g, unsigned int r_inj, unsigned int gs,
+                                              const float* rn, unsigned int rs, unsigned int cols, float div,
+                                              unsigned int m) {
+    hc8_down_inject_impl<4>(w_down, down, r_down, ds, w_inj, g, r_inj, gs, rn, rs, cols, div, m);
+}
+extern "C" __global__ void hc8_down_inject_cols(const u8* w_down, float* down, unsigned int r_down, unsigned int ds,
+                                                const u8* w_inj, float* g, unsigned int r_inj, unsigned int gs,
+                                                const float* rn, unsigned int rs, unsigned int cols, float div,
+                                                unsigned int m) {
+    hc8_down_inject_impl<8>(w_down, down, r_down, ds, w_inj, g, r_inj, gs, rn, rs, cols, div, m);
+}
+
+static __device__ __forceinline__ unsigned int h2_mul(unsigned int a, unsigned int b) {
+    unsigned int r;
+    asm("mul.rn.f16x2 %0, %1, %2;" : "=r"(r) : "r"(a), "r"(b));
+    return r;
+}
+
+static __device__ __forceinline__ uint4 hc8_dec16_h2(uint4 qw, unsigned int sc2) {
+    uint4 out;
+    out.x = h2_mul(pack_half2((float) sbyte(qw.x, 0),  (float) sbyte(qw.x, 8)),  sc2);
+    out.y = h2_mul(pack_half2((float) sbyte(qw.x, 16), (float) sbyte(qw.x, 24)), sc2);
+    out.z = h2_mul(pack_half2((float) sbyte(qw.y, 0),  (float) sbyte(qw.y, 8)),  sc2);
+    out.w = h2_mul(pack_half2((float) sbyte(qw.y, 16), (float) sbyte(qw.y, 24)), sc2);
+    return out;
+}
+
+extern "C" __global__ void mma_hc8_down_inject(const u8* w_down, float* down, unsigned int r_down, unsigned int ds,
+                                               const u8* w_inj, float* g, unsigned int r_inj, unsigned int gs,
+                                               const float* rn, unsigned int rs, unsigned int cols, float div,
+                                               unsigned int m) {
+    __shared__ __align__(16) unsigned short ws[MMA_ROWS][MMA_K + MMA_PAD];
+    __shared__ __align__(16) unsigned short xt[MMA_TOK][MMA_K + MMA_PAD];
+    const unsigned int tid = threadIdx.x, warp = tid / 32, lane = tid % 32, grp = lane / 4, tig = lane % 4;
+    const unsigned int row_base = blockIdx.x * MMA_ROWS, tok_base = blockIdx.y * MMA_TOK, rows = r_down + r_inj;
+    const unsigned int ngrp = cols >> 5;
+    float acc[4][4];
+#pragma unroll
+    for (unsigned int n = 0; n < 4; n++)
+#pragma unroll
+        for (unsigned int e = 0; e < 4; e++) acc[n][e] = 0.0f;
+    for (unsigned int kc = 0; kc < cols; kc += MMA_K) {
+#pragma unroll
+        for (unsigned int t = 0; t < 2; t++) {
+            unsigned int ch = tid + 128 * t, row = ch / 4, kk = (ch % 4) * 16, R = row_base + row;
+            uint4 p0 = make_uint4(0, 0, 0, 0), p1 = make_uint4(0, 0, 0, 0);
+            if (R < rows) {
+                const bool inj = R >= r_down;
+                const u8* rw = inj ? w_inj : w_down;
+                const unsigned int rr = inj ? (R - r_down) : R, rr_tot = inj ? r_inj : r_down;
+                const unsigned short sh = ((const unsigned short*) (rw + (u64) rr_tot * cols))[(u64) rr * ngrp + ((kc + kk) >> 5)];
+                const unsigned int sc2 = (unsigned int) sh | ((unsigned int) sh << 16);
+                const uint4 qw = *(const uint4*) (rw + (u64) rr * cols + kc + kk);
+                p0 = hc8_dec16_h2(qw, sc2);
+                uint4 qw2 = make_uint4(qw.z, qw.w, 0, 0);
+                p1 = hc8_dec16_h2(qw2, sc2);
+            }
+            *(uint4*) &ws[row][kk] = p0;
+            *(uint4*) &ws[row][kk + 8] = p1;
+        }
+#pragma unroll
+        for (unsigned int t = 0; t < 4; t++) {
+            unsigned int idx = tid + 128 * t, tok = idx / 16, kq = (idx % 16) * 4;
+            float4 f = make_float4(0.f, 0.f, 0.f, 0.f);
+            if (tok_base + tok < m) f = *(const float4*) (rn + (u64) (tok_base + tok) * rs + kc + kq);
+            uint2 p;
+            p.x = pack_half2(f.x, f.y); p.y = pack_half2(f.z, f.w);
+            *(uint2*) &xt[tok][kq] = p;
+        }
+        __syncthreads();
+#pragma unroll
+        for (unsigned int ks = 0; ks < MMA_K / 16; ks++) {
+            const unsigned int k0 = ks * 16 + tig * 2;
+            unsigned int a0 = *(const unsigned int*) &ws[warp * 16 + grp][k0];
+            unsigned int a1 = *(const unsigned int*) &ws[warp * 16 + grp + 8][k0];
+            unsigned int a2 = *(const unsigned int*) &ws[warp * 16 + grp][k0 + 8];
+            unsigned int a3 = *(const unsigned int*) &ws[warp * 16 + grp + 8][k0 + 8];
+#pragma unroll
+            for (unsigned int n = 0; n < 4; n++) {
+                unsigned int b0 = *(const unsigned int*) &xt[n * 8 + grp][k0];
+                unsigned int b1 = *(const unsigned int*) &xt[n * 8 + grp][k0 + 8];
+                asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
+                             : "+f"(acc[n][0]), "+f"(acc[n][1]), "+f"(acc[n][2]), "+f"(acc[n][3])
+                             : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+            }
+        }
+        __syncthreads();
+    }
+#pragma unroll
+    for (unsigned int n = 0; n < 4; n++)
+#pragma unroll
+        for (unsigned int e = 0; e < 4; e++) {
+            unsigned int R = row_base + warp * 16 + grp + (e >= 2 ? 8 : 0), tok = tok_base + n * 8 + tig * 2 + (e & 1);
+            if (R < rows && tok < m) {
+                if (R < r_down) down[(u64) tok * ds + R] = hc_epilogue(acc[n][e], div, false);
+                else g[(u64) tok * gs + (R - r_down)] = hc_epilogue(acc[n][e], div, true);
+            }
+        }
+}
+
+extern "C" __global__ void mma_hc8_cols(const u8* w, const float* x, unsigned int xs, float* y, unsigned int ys,
+                                        unsigned int rows, unsigned int cols, unsigned int m) {
+    __shared__ __align__(16) unsigned short ws[MMA_ROWS][MMA_K + MMA_PAD];
+    __shared__ __align__(16) unsigned short xt[MMA_TOK][MMA_K + MMA_PAD];
+    const unsigned int tid = threadIdx.x, warp = tid / 32, lane = tid % 32, grp = lane / 4, tig = lane % 4;
+    const unsigned int row_base = blockIdx.x * MMA_ROWS, tok_base = blockIdx.y * MMA_TOK;
+    const unsigned int ngrp = cols >> 5;
+    const unsigned short* w_sc_base = (const unsigned short*) (w + (u64) rows * cols);
+    float acc[4][4];
+#pragma unroll
+    for (unsigned int n = 0; n < 4; n++)
+#pragma unroll
+        for (unsigned int e = 0; e < 4; e++) acc[n][e] = 0.0f;
+    for (unsigned int kc = 0; kc < cols; kc += MMA_K) {
+#pragma unroll
+        for (unsigned int t = 0; t < 2; t++) {
+            unsigned int ch = tid + 128 * t, row = ch / 4, kk = (ch % 4) * 16, R = row_base + row;
+            uint4 p0 = make_uint4(0, 0, 0, 0), p1 = make_uint4(0, 0, 0, 0);
+            if (R < rows) {
+                const unsigned short sh = w_sc_base[(u64) R * ngrp + ((kc + kk) >> 5)];
+                const unsigned int sc2 = (unsigned int) sh | ((unsigned int) sh << 16);
+                const uint4 qw = *(const uint4*) (w + (u64) R * cols + kc + kk);
+                p0 = hc8_dec16_h2(qw, sc2);
+                uint4 qw2 = make_uint4(qw.z, qw.w, 0, 0);
+                p1 = hc8_dec16_h2(qw2, sc2);
+            }
+            *(uint4*) &ws[row][kk] = p0;
+            *(uint4*) &ws[row][kk + 8] = p1;
+        }
+#pragma unroll
+        for (unsigned int t = 0; t < 4; t++) {
+            unsigned int idx = tid + 128 * t, tok = idx / 16, kq = (idx % 16) * 4;
+            float4 f = make_float4(0.f, 0.f, 0.f, 0.f);
+            if (tok_base + tok < m) f = *(const float4*) (x + (u64) (tok_base + tok) * xs + kc + kq);
+            uint2 p;
+            p.x = pack_half2(f.x, f.y); p.y = pack_half2(f.z, f.w);
+            *(uint2*) &xt[tok][kq] = p;
+        }
+        __syncthreads();
+#pragma unroll
+        for (unsigned int ks = 0; ks < MMA_K / 16; ks++) {
+            const unsigned int k0 = ks * 16 + tig * 2;
+            unsigned int a0 = *(const unsigned int*) &ws[warp * 16 + grp][k0];
+            unsigned int a1 = *(const unsigned int*) &ws[warp * 16 + grp + 8][k0];
+            unsigned int a2 = *(const unsigned int*) &ws[warp * 16 + grp][k0 + 8];
+            unsigned int a3 = *(const unsigned int*) &ws[warp * 16 + grp + 8][k0 + 8];
+#pragma unroll
+            for (unsigned int n = 0; n < 4; n++) {
+                unsigned int b0 = *(const unsigned int*) &xt[n * 8 + grp][k0];
+                unsigned int b1 = *(const unsigned int*) &xt[n * 8 + grp][k0 + 8];
+                asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
+                             : "+f"(acc[n][0]), "+f"(acc[n][1]), "+f"(acc[n][2]), "+f"(acc[n][3])
+                             : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+            }
+        }
+        __syncthreads();
+    }
+#pragma unroll
+    for (unsigned int n = 0; n < 4; n++)
+#pragma unroll
+        for (unsigned int e = 0; e < 4; e++) {
+            unsigned int R = row_base + warp * 16 + grp + (e >= 2 ? 8 : 0), tok = tok_base + n * 8 + tig * 2 + (e & 1);
+            if (R < rows && tok < m) y[(u64) tok * ys + R] = acc[n][e];
+        }
+}
+
+template <unsigned int M>
+static __device__ __forceinline__ void hc8_up_mix_m(const u8* w_up, const float* down, unsigned int ds, const float* rn,
+                                                    unsigned int rs, float* u, unsigned int us, unsigned int h,
+                                                    unsigned int streams, unsigned int rank, unsigned int i,
+                                                    unsigned int lane) {
+    float mix[M];
+#pragma unroll
+    for (unsigned int j = 0; j < M; j++) mix[j] = 0.0f;
+    // 4 sub-warps (sl = 0..3) x 8 lanes (t8 = 0..7): each g32 group is 8 lanes x 4 weights -> 128B L1 down broadcast,
+    // 32B coalesced u32 weights, 1 shared f16 scale, ZERO shared memory and ZERO bank conflicts.
+    const unsigned int sl = lane >> 3, t8 = lane & 7, ngrp = rank >> 5;
+    const unsigned short* sc_base = (const unsigned short*) (w_up + (u64) (streams * h) * rank);
+    for (unsigned int sb = 0; sb < streams; sb += 4) {
+        const unsigned int s = sb + sl;
+        float acc[M];
+#pragma unroll
+        for (unsigned int j = 0; j < M; j++) acc[j] = 0.0f;
+        if (s < streams) {
+            const unsigned int row = s * h + i;
+            const unsigned int* r_u32 = (const unsigned int*) (w_up + (u64) row * rank);
+            const unsigned short* r_sc = sc_base + (u64) row * ngrp;
+            for (unsigned int g = 0; g < ngrp; g++) {
+                unsigned int qw = r_u32[g * 8 + t8];
+                float sc = f16_to_f32(r_sc[g]);
+                float w0 = (float) sbyte(qw, 0) * sc;
+                float w1 = (float) sbyte(qw, 8) * sc;
+                float w2 = (float) sbyte(qw, 16) * sc;
+                float w3 = (float) sbyte(qw, 24) * sc;
+                const unsigned int off = g * 32 + t8 * 4;
+#pragma unroll
+                for (unsigned int j = 0; j < M; j++) {
+                    float4 xv = *(const float4*) (down + (u64) j * ds + off);
+                    acc[j] = fmaf(w0, xv.x, acc[j]);
+                    acc[j] = fmaf(w1, xv.y, acc[j]);
+                    acc[j] = fmaf(w2, xv.z, acc[j]);
+                    acc[j] = fmaf(w3, xv.w, acc[j]);
+                }
+            }
+        }
+#pragma unroll
+        for (unsigned int j = 0; j < M; j++) {
+            acc[j] += __shfl_xor_sync(0xffffffffu, acc[j], 4);
+            acc[j] += __shfl_xor_sync(0xffffffffu, acc[j], 2);
+            acc[j] += __shfl_xor_sync(0xffffffffu, acc[j], 1);
+            if (t8 == 0 && s < streams) mix[j] += sigmoidf_ref(acc[j]) * rn[(u64) j * rs + (u64) s * h + i];
+        }
+    }
+#pragma unroll
+    for (unsigned int j = 0; j < M; j++) {
+        mix[j] += __shfl_xor_sync(0xffffffffu, mix[j], 16);
+        mix[j] += __shfl_xor_sync(0xffffffffu, mix[j], 8);
+        if (lane == 0) u[(u64) j * us + i] = mix[j] / (float) streams;
+    }
+}
+
+template <unsigned int MAX_M>
+static __device__ __forceinline__ void hc8_up_mix_impl(const u8* w_up, const float* down, unsigned int ds, const float* rn,
+                                                       unsigned int rs, float* u, unsigned int us, unsigned int h,
+                                                       unsigned int streams, unsigned int rank, unsigned int m) {
+    const unsigned int i = blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32, lane = threadIdx.x % 32;
+    if (i >= h) return;
+    pdl_wait();
+    if constexpr (MAX_M == 1) {
+        hc8_up_mix_m<1>(w_up, down, ds, rn, rs, u, us, h, streams, rank, i, lane);
+    } else if constexpr (MAX_M == 4) {
+        switch (m) {
+            case 1: hc8_up_mix_m<1>(w_up, down, ds, rn, rs, u, us, h, streams, rank, i, lane); break;
+            case 2: hc8_up_mix_m<2>(w_up, down, ds, rn, rs, u, us, h, streams, rank, i, lane); break;
+            case 3: hc8_up_mix_m<3>(w_up, down, ds, rn, rs, u, us, h, streams, rank, i, lane); break;
+            default: hc8_up_mix_m<4>(w_up, down, ds, rn, rs, u, us, h, streams, rank, i, lane); break;
+        }
+    } else {
+        switch (m) {
+            case 5: hc8_up_mix_m<5>(w_up, down, ds, rn, rs, u, us, h, streams, rank, i, lane); break;
+            case 6: hc8_up_mix_m<6>(w_up, down, ds, rn, rs, u, us, h, streams, rank, i, lane); break;
+            case 7: hc8_up_mix_m<7>(w_up, down, ds, rn, rs, u, us, h, streams, rank, i, lane); break;
+            default: hc8_up_mix_m<8>(w_up, down, ds, rn, rs, u, us, h, streams, rank, i, lane); break;
+        }
+    }
+    pdl_launch_dependents();
+}
+
+extern "C" __global__ void hc8_up_mix_m1(const u8* w_up, const float* down, unsigned int ds, const float* rn,
+                                         unsigned int rs, float* u, unsigned int us, unsigned int h,
+                                         unsigned int streams, unsigned int rank, unsigned int m) {
+    hc8_up_mix_impl<1>(w_up, down, ds, rn, rs, u, us, h, streams, rank, m);
+}
+extern "C" __global__ void hc8_up_mix_m4(const u8* w_up, const float* down, unsigned int ds, const float* rn,
+                                         unsigned int rs, float* u, unsigned int us, unsigned int h,
+                                         unsigned int streams, unsigned int rank, unsigned int m) {
+    hc8_up_mix_impl<4>(w_up, down, ds, rn, rs, u, us, h, streams, rank, m);
+}
+extern "C" __global__ void hc8_up_mix_cols(const u8* w_up, const float* down, unsigned int ds, const float* rn,
+                                           unsigned int rs, float* u, unsigned int us, unsigned int h,
+                                           unsigned int streams, unsigned int rank, unsigned int m) {
+    hc8_up_mix_impl<8>(w_up, down, ds, rn, rs, u, us, h, streams, rank, m);
+}
+
+template <unsigned int M>
+static __device__ __forceinline__ void matvec_cols_hc8_m(const u8* w, const float* x, unsigned int xs, float* y,
+                                                         unsigned int ys, unsigned int rows, unsigned int cols,
+                                                         unsigned int m) {
+    const unsigned int i = blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32, lane = threadIdx.x % 32;
+    if (i >= rows) return;
+    const unsigned int ngrp = cols >> 5, nvec = cols >> 4;
+    const u8* r_i8 = w + (u64) i * cols;
+    const unsigned short* r_sc = (const unsigned short*) (w + (u64) rows * cols) + (u64) i * ngrp;
+    float acc[M];
+#pragma unroll
+    for (unsigned int j = 0; j < M; j++) acc[j] = 0.0f;
+    for (unsigned int v = lane; v < nvec; v += 32) {
+        uint4 qw = ((const uint4*) r_i8)[v];
+        float sc = f16_to_f32(r_sc[v >> 1]);
+        float gsum[M];
+#pragma unroll
+        for (unsigned int j = 0; j < M; j++) gsum[j] = 0.0f;
+        const float* xb = x + (u64) v * 16;
+        hc8_word_step<M>(qw.x, xb + 0, xs, gsum);
+        hc8_word_step<M>(qw.y, xb + 4, xs, gsum);
+        hc8_word_step<M>(qw.z, xb + 8, xs, gsum);
+        hc8_word_step<M>(qw.w, xb + 12, xs, gsum);
+#pragma unroll
+        for (unsigned int j = 0; j < M; j++) acc[j] = fmaf(sc, gsum[j], acc[j]);
+    }
+#pragma unroll
+    for (unsigned int j = 0; j < M; j++) {
+        float a = acc[j];
+        for (int off = 16; off > 0; off >>= 1) a += __shfl_down_sync(0xffffffffu, a, off);
+        if (lane == 0 && j < m) y[(u64) j * ys + i] = a;
+    }
+}
+
+extern "C" __global__ void matvec_cols_hc8(const u8* w, const float* x, unsigned int xs, float* y, unsigned int ys,
+                                           unsigned int rows, unsigned int cols, unsigned int m) {
+    switch (m) {
+        case 1: matvec_cols_hc8_m<1>(w, x, xs, y, ys, rows, cols, m); break;
+        case 2: matvec_cols_hc8_m<2>(w, x, xs, y, ys, rows, cols, m); break;
+        case 3: matvec_cols_hc8_m<3>(w, x, xs, y, ys, rows, cols, m); break;
+        case 4: matvec_cols_hc8_m<4>(w, x, xs, y, ys, rows, cols, m); break;
+        case 5: matvec_cols_hc8_m<5>(w, x, xs, y, ys, rows, cols, m); break;
+        case 6: matvec_cols_hc8_m<6>(w, x, xs, y, ys, rows, cols, m); break;
+        case 7: matvec_cols_hc8_m<7>(w, x, xs, y, ys, rows, cols, m); break;
+        default: matvec_cols_hc8_m<8>(w, x, xs, y, ys, rows, cols, m); break;
     }
 }

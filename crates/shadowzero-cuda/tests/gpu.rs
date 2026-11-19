@@ -114,3 +114,86 @@ fn every_registered_kernel_file_compiles_and_every_entry_point_resolves() {
         }
     }
 }
+
+/// New O(1) `route_plan_res_small` matches the reference kernel bit-for-bit across `m = 1..=4` (ties, repeated experts, `ne = 512`),
+/// and prints per-launch latency on GPU 1 (`RTX 5060 Ti`, if present) and GPU 0.
+#[test]
+fn route_plan_res_small_o1_equals_reference() {
+    if Context::new(0).is_err() || nvrtc::version().is_err() {
+        return eprintln!("SKIPPED, not passed: no CUDA device or no NVRTC");
+    }
+    let f = file("forward.cu").unwrap();
+    let dir_new = std::env::temp_dir().join(format!("shadow-res-o1-{}", std::process::id()));
+    let dir_ref = std::env::temp_dir().join(format!("shadow-res-ref-{}", std::process::id()));
+    let _ = (std::fs::remove_dir_all(&dir_new), std::fs::remove_dir_all(&dir_ref));
+    let mut ref_src = shadowzero_cuda::kernels::PRELUDE.to_string() + "\n#define RES_SMALL_REF 1\n" + f.source;
+    let new_src = shadowzero_cuda::kernels::PRELUDE.to_string() + "\n" + f.source;
+    let _ = &mut ref_src;
+    let (ne, k, max_m) = (512usize, 10usize, 4usize);
+    let mut rng = 0x9e37_79b9_7f4a_7c15u64;
+    let mut nxt = || { rng ^= rng << 13; rng ^= rng >> 7; rng ^= rng << 17; rng };
+    for dev in [0i32, 1i32] {
+        let Ok(ctx) = Context::new(dev) else { continue };
+        let c_new = shadowzero_cuda::nvrtc::compile("forward.cu", &new_src, ctx.cc, &dir_new).unwrap();
+        let c_ref = shadowzero_cuda::nvrtc::compile("forward.cu", &ref_src, ctx.cc, &dir_ref).unwrap();
+        let m_new = ctx.load_module(&c_new.image).unwrap();
+        let m_ref = ctx.load_module(&c_ref.image).unwrap();
+        let fn_new = m_new.function("route_plan_res_small").unwrap();
+        let fn_ref = m_ref.function("route_plan_res_small").unwrap();
+        let g = max_m * k;
+        let rec_bytes = 4 * (1 + 2 * 8);
+        let a0 = 0u32;
+        let r0 = (3 * g * 8) as u32;
+        let w_off = r0 + (3 * g * rec_bytes) as u32;
+        let counts_off = w_off + (max_m * k * 4) as u32;
+        let base_bytes = counts_off as usize + max_m * 4;
+        let deaddr = ctx.alloc(3 * ne * 8).unwrap();
+        let ea: Vec<u8> = (0..3 * ne).flat_map(|i| (0x1000_0000u64 + (i as u64) * 4096).to_le_bytes()).collect();
+        deaddr.upload(&ea).unwrap();
+        let dlog = ctx.alloc(max_m * ne * 4).unwrap();
+        let mut db_new = ctx.alloc(base_bytes).unwrap();
+        let mut db_ref = ctx.alloc(base_bytes).unwrap();
+        for m in 1..=max_m {
+            let logits: Vec<f32> = (0..m * ne).map(|i| ((nxt() % 200) as f32) * 0.01f32 + if i % 17 == 0 { 5.0 } else { 0.0 }).collect();
+            dlog.upload(&logits.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>()).unwrap();
+            let (mut out_new, mut out_ref) = (vec![0u8; base_bytes], vec![0u8; base_bytes]);
+            db_new.zero().unwrap();
+            db_ref.zero().unwrap();
+            let gm = m * k;
+            let mut vals: [u64; 12] = [dlog.ptr, deaddr.ptr, 0, ne as u64, k as u64, m as u64, gm as u64, (max_m * k) as u64, a0 as u64, r0 as u64, w_off as u64, counts_off as u64];
+            vals[2] = db_new.ptr;
+            let mut ptrs: Vec<*mut std::ffi::c_void> = vals.iter_mut().map(|v| v as *mut u64 as *mut std::ffi::c_void).collect();
+            unsafe { fn_new.launch((1, 1, 1), (256, 1, 1), 0, None, &mut ptrs).unwrap() };
+            vals[2] = db_ref.ptr;
+            let mut ptrs2: Vec<*mut std::ffi::c_void> = vals.iter_mut().map(|v| v as *mut u64 as *mut std::ffi::c_void).collect();
+            unsafe { fn_ref.launch((1, 1, 1), (256, 1, 1), 0, None, &mut ptrs2).unwrap() };
+            ctx.synchronize().unwrap();
+            db_new.download(&mut out_new).unwrap();
+            db_ref.download(&mut out_ref).unwrap();
+            assert_eq!(out_new, out_ref, "dev {dev} m={m}: O(1) route_plan_res_small differs from reference");
+        }
+        // latency check at m=4
+        let gm = max_m * k;
+        let mut vals_n: [u64; 12] = [dlog.ptr, deaddr.ptr, db_new.ptr, ne as u64, k as u64, max_m as u64, gm as u64, (max_m * k) as u64, a0 as u64, r0 as u64, w_off as u64, counts_off as u64];
+        let mut ptrs_n: Vec<*mut std::ffi::c_void> = vals_n.iter_mut().map(|v| v as *mut u64 as *mut std::ffi::c_void).collect();
+        let mut vals_r = vals_n;
+        vals_r[2] = db_ref.ptr;
+        let mut ptrs_r: Vec<*mut std::ffi::c_void> = vals_r.iter_mut().map(|v| v as *mut u64 as *mut std::ffi::c_void).collect();
+        for _ in 0..10 {
+            unsafe { fn_ref.launch((1, 1, 1), (256, 1, 1), 0, None, &mut ptrs_r).unwrap() };
+            unsafe { fn_new.launch((1, 1, 1), (256, 1, 1), 0, None, &mut ptrs_n).unwrap() };
+        }
+        ctx.synchronize().unwrap();
+        let (e0, e1) = (ctx.event().unwrap(), ctx.event().unwrap());
+        e0.record(None).unwrap();
+        for _ in 0..200 { unsafe { fn_ref.launch((1, 1, 1), (256, 1, 1), 0, None, &mut ptrs_r).unwrap() }; }
+        e1.record(None).unwrap(); e1.synchronize().unwrap();
+        let ref_us = e1.since(&e0).unwrap() as f64 * 1e3 / 200.0;
+        e0.record(None).unwrap();
+        for _ in 0..200 { unsafe { fn_new.launch((1, 1, 1), (256, 1, 1), 0, None, &mut ptrs_n).unwrap() }; }
+        e1.record(None).unwrap(); e1.synchronize().unwrap();
+        let new_us = e1.since(&e0).unwrap() as f64 * 1e3 / 200.0;
+        eprintln!("route_plan_res_small dev {dev} ({}): ref {ref_us:.1} us -> o1 {new_us:.1} us", ctx.name);
+    }
+    let _ = (std::fs::remove_dir_all(&dir_new), std::fs::remove_dir_all(&dir_ref));
+}

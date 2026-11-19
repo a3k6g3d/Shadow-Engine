@@ -53,7 +53,7 @@ pub struct Stats {
 /// What /health, /v1/status, /props and /metrics read.
 #[derive(Debug, Clone, Default)]
 pub struct Status {
-    pub state: &'static str, // "loading", "ready", "failed"
+    pub state: &'static str, // "loading", "ready", "parked", "failed"
     pub error: Option<String>,
     pub model: String,
     pub n_ctx: usize,
@@ -283,7 +283,7 @@ pub struct Config {
 
 /// How many of the model's last layers the second card can hold with every expert resident, as a split point: its VRAM less ~3 GiB (the head, the buffers, the
 /// driver's share) and the KV window of its attention layers, over ~1.04 GiB a layer (experts and the layer's dense weights).
-fn auto_split(model: &Model, vram: usize, n_ctx: usize, extra_gib: f64) -> usize {
+fn auto_split(model: &Model, vram: usize, n_ctx: usize, extra_gib: f64, kv_q8: bool) -> usize {
     let c = &model.cfg;
     let gib = (1u64 << 30) as f64;
     let vram = vram as f64 - extra_gib * gib;
@@ -291,7 +291,8 @@ fn auto_split(model: &Model, vram: usize, n_ctx: usize, extra_gib: f64) -> usize
     let per = |l: usize| -> f64 {
         ["ffn_gate_exps", "ffn_up_exps", "ffn_down_exps"].iter().filter_map(|r| model.g.tensor(&format!("blk.{l}.{r}.weight")).map(|t| t.nbytes() as f64)).sum::<f64>() + 80.0 * 1024.0 * 1024.0
     };
-    let kv_per_layer = n_ctx as f64 * 57.0 * 1024.0 / c.n_layer as f64;
+    let kv_per_pos = if kv_q8 { 22.0 * 1024.0 } else { 57.0 * 1024.0 };
+    let kv_per_layer = n_ctx as f64 * kv_per_pos / c.n_layer as f64;
     let mut room = vram as f64 - 3.0 * gib;
     let mut n_peer = 0;
     for l in (0..c.n_layer).rev() {
@@ -307,13 +308,14 @@ fn auto_split(model: &Model, vram: usize, n_ctx: usize, extra_gib: f64) -> usize
 
 /// How many of the model's first layers (`0..split`) a resident first-stage card (e.g. the 16 GiB RTX 5060 Ti when the faster RTX 5070 runs the tail + head + DFlash)
 /// can hold with every expert resident plus ~3.2 GiB reserved for its dense weights, KV window and 2,048-row prompt batch buffers (capped at 15 so only tap 5 crosses the split).
-fn auto_split_first(model: &Model, vram: usize, n_ctx: usize) -> usize {
+fn auto_split_first(model: &Model, vram: usize, n_ctx: usize, kv_q8: bool) -> usize {
     let c = &model.cfg;
     let gib = (1u64 << 30) as f64;
     let per = |l: usize| -> f64 {
         ["ffn_gate_exps", "ffn_up_exps", "ffn_down_exps"].iter().filter_map(|r| model.g.tensor(&format!("blk.{l}.{r}.weight")).map(|t| t.nbytes() as f64)).sum::<f64>() + 80.0 * 1024.0 * 1024.0
     };
-    let kv_per_layer = n_ctx as f64 * 57.0 * 1024.0 / c.n_layer as f64;
+    let kv_per_pos = if kv_q8 { 22.0 * 1024.0 } else { 57.0 * 1024.0 };
+    let kv_per_layer = n_ctx as f64 * kv_per_pos / c.n_layer as f64;
     let mut room = vram as f64 - 3.2 * gib;
     let mut n_first = 0;
     for l in 0..c.n_layer.min(15) {
@@ -327,9 +329,16 @@ fn auto_split_first(model: &Model, vram: usize, n_ctx: usize) -> usize {
     n_first.max(1)
 }
 
-/// Starts the engine thread; requests go in through the returned sender.
-pub fn start(cfg: Config, status: Arc<Mutex<Status>>) -> std::sync::mpsc::Sender<Request> {
-    let (tx, rx) = std::sync::mpsc::channel::<Request>();
+/// Command sent to the engine thread: a chat request or a GPU VRAM park/resume request.
+pub enum Cmd {
+    Chat(Request),
+    Park(std::sync::mpsc::Sender<Result<(), String>>),
+    Resume(std::sync::mpsc::Sender<Result<(), String>>),
+}
+
+/// Starts the engine thread; commands go in through the returned sender.
+pub fn start(cfg: Config, status: Arc<Mutex<Status>>) -> std::sync::mpsc::Sender<Cmd> {
+    let (tx, rx) = std::sync::mpsc::channel::<Cmd>();
     std::thread::Builder::new()
         .name("shadow-engine".into())
         .spawn(move || {
@@ -349,11 +358,72 @@ pub fn start(cfg: Config, status: Arc<Mutex<Status>>) -> std::sync::mpsc::Sender
     tx
 }
 
+fn clear_parked_status(status: &Mutex<Status>) {
+    let mut s = status.lock().unwrap();
+    s.state = "parked";
+    s.busy = false;
+    s.vram_free = 0;
+    s.vram_total = 0;
+    s.vram_slots = 0;
+    s.ram_tier_experts = 0;
+    s.ram_tier_bytes = 0;
+    s.session_tokens = 0;
+    s.mtp_active = false;
+    s.dflash_active = false;
+    s.report = "parked (VRAM freed for media generation)".to_string();
+    eprintln!("shadowzero serve: parked (all GPU VRAM and pinned RAM released)");
+}
+
 fn run(
     cfg: Config,
-    rx: std::sync::mpsc::Receiver<Request>,
+    rx: std::sync::mpsc::Receiver<Cmd>,
     status: &Mutex<Status>,
 ) -> Result<(), String> {
+    let mut pending_req: Option<Request> = None;
+    let mut resume_waiters: Vec<std::sync::mpsc::Sender<Result<(), String>>> = Vec::new();
+    loop {
+        match run_cycle(&cfg, &rx, status, &mut pending_req, &mut resume_waiters) {
+            Ok(Some(park_reply)) => {
+                clear_parked_status(status);
+                let _ = park_reply.send(Ok(()));
+                loop {
+                    match rx.recv() {
+                        Ok(Cmd::Park(r)) => {
+                            let _ = r.send(Ok(()));
+                        }
+                        Ok(Cmd::Resume(r)) => {
+                            resume_waiters.push(r);
+                            break;
+                        }
+                        Ok(Cmd::Chat(req)) => {
+                            pending_req = Some(req);
+                            break;
+                        }
+                        Err(_) => return Ok(()),
+                    }
+                }
+            }
+            Ok(None) => return Ok(()),
+            Err(e) => {
+                for r in resume_waiters.drain(..) {
+                    let _ = r.send(Err(e.clone()));
+                }
+                if let Some(req) = pending_req.take() {
+                    let _ = req.tx.send(Event::Error(e.clone()));
+                }
+                return Err(e);
+            }
+        }
+    }
+}
+
+fn run_cycle(
+    cfg: &Config,
+    rx: &std::sync::mpsc::Receiver<Cmd>,
+    status: &Mutex<Status>,
+    pending_req: &mut Option<Request>,
+    resume_waiters: &mut Vec<std::sync::mpsc::Sender<Result<(), String>>>,
+) -> Result<Option<std::sync::mpsc::Sender<Result<(), String>>>, String> {
     let t0 = Instant::now();
     {
         let mut s = status.lock().unwrap();
@@ -395,11 +465,12 @@ fn run(
             let (c_a, ord_a, c_b, ord_b) = if swap { (c1, pair.ordinal, &ctx, cfg.gpu) } else { (&ctx, cfg.gpu, c1, pair.ordinal) };
             let drafter = cfg.tiers.dflash_dir.is_some();
             let first_resident = c_a.sms < c_b.sms || pair.split.is_some_and(|s| s <= n / 2);
+            let kv_q8 = shadowzero_cuda::session::kv_q8_enabled(model.cfg.head_dim, cfg.tiers.tensor_prompt);
             let split = pair.split.unwrap_or_else(|| {
                 if first_resident {
-                    auto_split_first(&model, c_a.total_mem, cfg.n_ctx)
+                    auto_split_first(&model, c_a.total_mem, cfg.n_ctx, kv_q8)
                 } else {
-                    auto_split(&model, c_b.total_mem, cfg.n_ctx, if drafter { 1.5 } else { 0.0 })
+                    auto_split(&model, c_b.total_mem, cfg.n_ctx, if drafter { 1.5 } else { 0.0 }, kv_q8)
                 }
             }).clamp(1, n - 1);
             eprintln!("shadowzero serve: two cards: layers 0..{split} on GPU {ord_a} ({}, {:.1} GiB), layers {split}..{n} on GPU {ord_b} ({}, {:.1} GiB)",
@@ -431,7 +502,7 @@ fn run(
             a.attach_peer(b)?;
             a
         }
-        _ => GpuSession::with_tiers(&ctx, &model, cfg.n_ctx, cfg.tiers)?,
+        _ => GpuSession::with_tiers(&ctx, &model, cfg.n_ctx, cfg.tiers.clone())?,
     };
     let im_end = tok.id("<|im_end|>");
     let think_end = tok.id("</think>").or_else(|| tok.id("<|/thought|>"));
@@ -459,6 +530,9 @@ fn run(
         s.dflash_active = sess.drafter().is_some();
         eprintln!("shadowzero serve: ready in {:.1} s; {}", s.load_secs, s.report);
     }
+    for r in resume_waiters.drain(..) {
+        let _ = r.send(Ok(()));
+    }
     let mut last_logits: Vec<f32> = Vec::new();
     let mut prefix = PrefixCache {
         snap: None,
@@ -474,13 +548,32 @@ fn run(
         cur: vec![],
     };
     loop {
-        let req = match rx.recv_timeout(std::time::Duration::from_secs(30)) {
-            Ok(r) => r,
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                spill(&mut prefix);
+        let cmd = if let Some(req) = pending_req.take() {
+            Cmd::Chat(req)
+        } else {
+            match rx.recv_timeout(std::time::Duration::from_secs(30)) {
+                Ok(c) => c,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    spill(&mut prefix);
+                    continue;
+                }
+                Err(_) => return Ok(None),
+            }
+        };
+        let req = match cmd {
+            Cmd::Chat(req) => req,
+            Cmd::Park(reply) => {
+                drop(sess);
+                drop((pics, prefix, last_logits));
+                drop((ctx1, ctx, model));
+                shadowzero_cuda::mmq::reset();
+                shadowzero_cuda::fused::reset();
+                return Ok(Some(reply));
+            }
+            Cmd::Resume(reply) => {
+                let _ = reply.send(Ok(()));
                 continue;
             }
-            Err(_) => break,
         };
         status.lock().unwrap().busy = true;
         // a panic inside one answer (an assumption of the cache broken by some state) must not kill the engine thread and leave every later request waiting
@@ -569,7 +662,6 @@ fn run(
             }
         }
     }
-    Ok(())
 }
 
 /// Turns bytes into text as whole UTF-8 characters arrive (a token can end inside a character).
@@ -597,8 +689,11 @@ struct Emitter {
     reasoning: bool,
     first_content: bool,
     utf8: Utf8,
-    /// the `<tool_call>` token: a model that opens a tool call while it is still thinking (no `</think>` first) has finished thinking
+    /// the `<tool_call>` token: a model that opens a real tool call (`<tool_call>\n<function=...>`) while still
+    /// thinking (no `</think>` first) has finished thinking; prose merely mentioning `<tool_call>` stays inside thinking.
     tool_open: Option<u32>,
+    /// buffered `<tool_call>...` prefix while peeking at the next non-whitespace tokens inside `<think>`
+    pending_tool: Option<String>,
     /// the think block was left by a `<tool_call>`, so a `</think>` that follows is not shown
     left_for_tool: bool,
 }
@@ -606,6 +701,7 @@ struct Emitter {
 /// What token `t` does to the think block: `(still reasoning, left for a tool call, token is a marker to swallow)`.  `</think>` closes it and is swallowed;
 /// a `<tool_call>` inside it closes it too and is kept (it opens the content, where the client looks for tool calls: the turn used to end with the
 /// calls sitting inside the "thinking" and nothing run); a `</think>` after that is swallowed.
+#[cfg_attr(not(test), allow(dead_code))]
 fn think_step(
     reasoning: bool,
     left_for_tool: bool,
@@ -623,6 +719,74 @@ fn think_step(
 }
 
 impl Emitter {
+    /// Streams one decoded piece for token `t`; false when the client has gone away.
+    fn push_piece(
+        &mut self,
+        t: u32,
+        piece: String,
+        think_end: Option<u32>,
+        tx: &tokio::sync::mpsc::UnboundedSender<Event>,
+    ) -> bool {
+        if Some(t) == think_end && (self.reasoning || self.left_for_tool) {
+            if let Some(buf) = self.pending_tool.take() {
+                if !buf.is_empty() && !tx.send(Event::Reasoning(buf)).is_ok() {
+                    return false;
+                }
+            }
+            self.reasoning = false;
+            return true;
+        }
+        if self.reasoning {
+            if let Some(mut buf) = self.pending_tool.take() {
+                buf.push_str(&piece);
+                let after = buf
+                    .strip_prefix("<tool_call>")
+                    .unwrap_or(&buf)
+                    .trim_start();
+                if after.starts_with("<function=") {
+                    self.reasoning = false;
+                    self.left_for_tool = true;
+                    let trimmed = if self.first_content {
+                        buf.trim_start().to_string()
+                    } else {
+                        buf
+                    };
+                    if trimmed.is_empty() {
+                        return true;
+                    }
+                    self.first_content = false;
+                    return tx.send(Event::Content(trimmed)).is_ok();
+                }
+                if (after.is_empty() && buf.len() < 32)
+                    || (!after.is_empty() && "<function=".starts_with(after))
+                {
+                    self.pending_tool = Some(buf);
+                    return true;
+                }
+                // Not followed by `<function=`: the model only mentioned `<tool_call>` inside its thoughts.
+                return tx.send(Event::Reasoning(buf)).is_ok();
+            }
+            if Some(t) == self.tool_open {
+                self.pending_tool = Some(piece);
+                return true;
+            }
+            if piece.is_empty() {
+                return true;
+            }
+            return tx.send(Event::Reasoning(piece)).is_ok();
+        }
+        let piece = if self.first_content {
+            piece.trim_start().to_string() // the template's "\n\n" after </think>
+        } else {
+            piece
+        };
+        if piece.is_empty() {
+            return true;
+        }
+        self.first_content = false;
+        tx.send(Event::Content(piece)).is_ok()
+    }
+
     /// Streams token t; false when the client has gone away.
     fn push(
         &mut self,
@@ -631,32 +795,26 @@ impl Emitter {
         think_end: Option<u32>,
         tx: &tokio::sync::mpsc::UnboundedSender<Event>,
     ) -> bool {
-        let (reasoning, left, swallow) = think_step(
-            self.reasoning,
-            self.left_for_tool,
-            t,
-            think_end,
-            self.tool_open,
-        );
-        self.reasoning = reasoning;
-        self.left_for_tool = left;
-        if swallow {
-            return true;
+        if Some(t) == think_end && (self.reasoning || self.left_for_tool) {
+            return self.push_piece(t, String::new(), think_end, tx);
         }
-        let mut piece = self.utf8.push(&tok.decode_bytes(&[t]));
-        if !self.reasoning && self.first_content {
-            piece = piece.trim_start().to_string(); // the template's "\n\n" after </think>
+        let piece = self.utf8.push(&tok.decode_bytes(&[t]));
+        self.push_piece(t, piece, think_end, tx)
+    }
+
+    /// Flushes any buffered `<tool_call>` lookahead at end of generation.
+    fn flush(&mut self, tx: &tokio::sync::mpsc::UnboundedSender<Event>) {
+        if let Some(buf) = self.pending_tool.take() {
+            if !buf.is_empty() {
+                let ev = if self.reasoning {
+                    Event::Reasoning(buf)
+                } else {
+                    self.first_content = false;
+                    Event::Content(buf)
+                };
+                let _ = tx.send(ev);
+            }
         }
-        if piece.is_empty() {
-            return true;
-        }
-        let ev = if self.reasoning {
-            Event::Reasoning(piece)
-        } else {
-            self.first_content = false;
-            Event::Content(piece)
-        };
-        tx.send(ev).is_ok()
     }
 }
 
@@ -678,6 +836,476 @@ fn lookup_from(hist: &[u32], k: usize, lens: &[usize]) -> Vec<u32> {
         }
     }
     vec![]
+}
+
+const SUFFIX_WAYS: usize = 4;
+
+#[derive(Clone, Copy, Default)]
+struct SuffixSlot {
+    key: u64,
+    pos: [u32; SUFFIX_WAYS],
+    n: u8,
+}
+
+/// Incremental O(1) 4-way open-addressing trigram suffix drafter (adapted and extended from Basalt / Strata-HotRod `SuffixDrafter`).
+/// Maps every trigram `(hist[end-2], hist[end-1], hist[end])` to its `SUFFIX_WAYS` most recent end positions, extends candidate matches
+/// backward up to `max_match` tokens to find the true longest suffix match (most recent on ties), and supports `propose_after` to chain
+/// suffix lookup continuations onto the end of a neural drafter (`DFlash 2` / `MTP`) proposal.
+struct SuffixDrafter {
+    min_match: usize,
+    max_match: usize,
+    hist: Vec<u32>,
+    table: Vec<SuffixSlot>,
+    mask: usize,
+}
+
+impl SuffixDrafter {
+    fn new(min_match: usize, max_match: usize, capacity_tokens: usize) -> Self {
+        let min_match = min_match.max(3);
+        let max_match = max_match.max(min_match);
+        let cap = (capacity_tokens.max(1024) * 2).next_power_of_two();
+        Self {
+            min_match,
+            max_match,
+            hist: Vec::with_capacity(capacity_tokens),
+            table: vec![SuffixSlot::default(); cap],
+            mask: cap - 1,
+        }
+    }
+
+    #[inline]
+    fn mix(mut x: u64) -> u64 {
+        x ^= x >> 33;
+        x = x.wrapping_mul(0xff51afd7ed558ccd);
+        x ^= x >> 33;
+        x = x.wrapping_mul(0xc4ceb9fe1a85ec53);
+        x ^ (x >> 33)
+    }
+
+    #[inline]
+    fn key_at(slice: &[u32], end: usize) -> u64 {
+        let a = slice[end - 2] as u64;
+        let b = slice[end - 1] as u64;
+        let c = slice[end] as u64;
+        Self::mix(
+            a.wrapping_mul(0x9E3779B97F4A7C15)
+                ^ Self::mix(b.wrapping_add(0x632BE59BD9B4E019))
+                ^ (c << 1),
+        ) | 1
+    }
+
+    fn find_slot(&self, key: u64) -> Option<&SuffixSlot> {
+        let mut i = (key as usize) & self.mask;
+        for _ in 0..=self.mask {
+            let s = &self.table[i];
+            if s.key == key {
+                return Some(s);
+            }
+            if s.key == 0 {
+                return None;
+            }
+            i = (i + 1) & self.mask;
+        }
+        None
+    }
+
+    fn find_slot_mut(&mut self, key: u64) -> Option<&mut SuffixSlot> {
+        let mask = self.mask;
+        let mut i = (key as usize) & mask;
+        for _ in 0..=mask {
+            if self.table[i].key == key {
+                return Some(&mut self.table[i]);
+            }
+            if self.table[i].key == 0 {
+                self.table[i].key = key;
+                return Some(&mut self.table[i]);
+            }
+            i = (i + 1) & mask;
+        }
+        None
+    }
+
+    fn push(&mut self, token: u32) {
+        self.hist.push(token);
+        let end = self.hist.len() - 1;
+        if end < 2 {
+            return;
+        }
+        let key = Self::key_at(&self.hist, end);
+        if let Some(s) = self.find_slot_mut(key) {
+            for w in (1..SUFFIX_WAYS).rev() {
+                s.pos[w] = s.pos[w - 1];
+            }
+            s.pos[0] = end as u32;
+            if (s.n as usize) < SUFFIX_WAYS {
+                s.n += 1;
+            }
+        }
+    }
+
+    fn extend(&mut self, tokens: &[u32]) {
+        for &t in tokens {
+            self.push(t);
+        }
+    }
+
+    /// Proposes up to `max_k` tokens continuing the longest earlier occurrence (of at least `min_match` tokens)
+    /// of the current history suffix. Returns `(draft_tokens, match_len)`.
+    fn propose_with_min(&self, max_k: usize, min_match: usize) -> (Vec<u32>, usize) {
+        let min_m = min_match.max(3);
+        let n = self.hist.len();
+        if n < min_m + 1 || max_k == 0 {
+            return (Vec::new(), 0);
+        }
+        let cur = n - 1;
+        let Some(s) = self.find_slot(Self::key_at(&self.hist, cur)) else {
+            return (Vec::new(), 0);
+        };
+        let mut best_end = 0usize;
+        let mut best_len = 0usize;
+        for w in 0..(s.n as usize) {
+            let p = s.pos[w] as usize;
+            if p >= cur {
+                continue;
+            }
+            let mut len = 0usize;
+            while len < self.max_match && len <= p && self.hist[p - len] == self.hist[cur - len] {
+                len += 1;
+            }
+            if len > best_len {
+                best_len = len;
+                best_end = p;
+            }
+        }
+        if best_len < min_m {
+            return (Vec::new(), 0);
+        }
+        let mut out = Vec::with_capacity(max_k);
+        let mut q = best_end + 1;
+        while q <= cur && out.len() < max_k {
+            out.push(self.hist[q]);
+            q += 1;
+        }
+        (out, best_len)
+    }
+
+    fn propose(&self, max_k: usize) -> (Vec<u32>, usize) {
+        self.propose_with_min(max_k, self.min_match)
+    }
+
+    /// Proposes up to `max_k` tokens continuing `self.hist` followed by `extra` (the neural drafter's proposal),
+    /// without mutating the trigram index. Returns `(chained_tokens, match_len)`.
+    fn propose_after(&mut self, extra: &[u32], max_k: usize) -> (Vec<u32>, usize) {
+        if extra.is_empty() {
+            return self.propose(max_k);
+        }
+        if max_k == 0 {
+            return (Vec::new(), 0);
+        }
+        let n0 = self.hist.len();
+        self.hist.extend_from_slice(extra);
+        let res = self.propose(max_k);
+        self.hist.truncate(n0);
+        res
+    }
+}
+
+const DP_MAX_T: usize = shadowzero_cuda::session::MAX_VERIFY;
+const DP_BUCKETS: usize = 4;
+const DP_SHAPE: [f64; DP_MAX_T + 1] = [0.0, 1.0, 1.35, 1.70, 2.05, 2.45, 2.85, 3.25, 3.60];
+const DP_COST_ALPHA: f64 = 0.10;
+const DP_TOK_ALPHA: f64 = 0.05;
+const DP_DECAY: f64 = 0.97;
+const DP_PRIOR_Q: [f64; DP_BUCKETS] = [0.75, 0.88, 0.93, 0.96];
+const DP_CHAIN_PRIOR: [f64; DP_BUCKETS] = [0.45, 0.65, 0.80, 0.90];
+const DP_PRIOR_N: f64 = 4.0;
+const DP_PROBES: f64 = 3.0;
+const DP_STALE_ROUNDS: f64 = 300.0;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct DraftPick {
+    lookup: bool,
+    t: usize, // window size (1 + drafts)
+}
+
+#[derive(Clone, Copy, Debug)]
+enum RoundKind {
+    Lookup { t: usize, match_len: usize },
+    Neural { t: usize },
+    Chained { t_mtp: usize, k_chain: usize, match_len: usize },
+}
+
+/// Online cost-per-ms speculative draft policy (adapted and extended from Basalt / Strata-HotRod `DraftPolicy` + `Controller`):
+/// - Compares expected committed tokens per millisecond (`E / cost_ms(t)`) between the neural drafter (`DFlash 2` / `MTP`)
+///   and suffix lookup across 4 match-length buckets (`<6`, `6..11`, `12..23`, `>=24`), with stale-size probing so a single slow
+///   stretch never permanently prices out wider windows.
+/// - Decides how many suffix-chained tokens (`propose_after`) to append after a neural draft window (`chain`).
+/// - Dynamically adapts the active neural draft depth `k_cur` around `base_spec` (`3`) based on an exponential moving average
+///   of acceptance rate and full-accept / zero-accept streaks.
+struct DraftPolicy {
+    max_t: usize,
+    base_spec: usize,
+    margin: f64,
+    cost: [f64; DP_MAX_T + 1],
+    cost_n: [f64; DP_MAX_T + 1],
+    mtp_tok: [f64; DP_MAX_T + 1],
+    mtp_n: [f64; DP_MAX_T + 1],
+    ok: [f64; DP_BUCKETS],
+    bad: [f64; DP_BUCKETS],
+    cok: [f64; DP_BUCKETS],
+    cbad: [f64; DP_BUCKETS],
+    rounds: f64,
+    last: [f64; DP_MAX_T + 1],
+    accept_ema: f64,
+    full_streak: usize,
+    zero_streak: usize,
+}
+
+impl DraftPolicy {
+    fn new(max_t: usize, base_spec: usize, margin: f64) -> Self {
+        Self {
+            max_t: max_t.clamp(1, DP_MAX_T),
+            base_spec: base_spec.clamp(1, DP_MAX_T - 1),
+            margin,
+            cost: [0.0; DP_MAX_T + 1],
+            cost_n: [0.0; DP_MAX_T + 1],
+            mtp_tok: [0.0; DP_MAX_T + 1],
+            mtp_n: [0.0; DP_MAX_T + 1],
+            ok: [0.0; DP_BUCKETS],
+            bad: [0.0; DP_BUCKETS],
+            cok: [0.0; DP_BUCKETS],
+            cbad: [0.0; DP_BUCKETS],
+            rounds: 0.0,
+            last: [0.0; DP_MAX_T + 1],
+            accept_ema: 0.65,
+            full_streak: 0,
+            zero_streak: 0,
+        }
+    }
+
+    #[inline]
+    fn bucket(match_len: usize) -> usize {
+        if match_len < 6 {
+            0
+        } else if match_len < 12 {
+            1
+        } else if match_len < 24 {
+            2
+        } else {
+            3
+        }
+    }
+
+    fn lookup_rate(&self, match_len: usize) -> f64 {
+        let b = Self::bucket(match_len);
+        (self.ok[b] + DP_PRIOR_N * DP_PRIOR_Q[b]) / (self.ok[b] + self.bad[b] + DP_PRIOR_N)
+    }
+
+    fn chain_rate(&self, match_len: usize) -> f64 {
+        let b = Self::bucket(match_len);
+        (self.cok[b] + DP_PRIOR_N * DP_CHAIN_PRIOR[b]) / (self.cok[b] + self.cbad[b] + DP_PRIOR_N)
+    }
+
+    fn cost_ms(&self, t: usize) -> f64 {
+        let t = t.clamp(1, DP_MAX_T);
+        if self.cost_n[t] > 0.0 {
+            return self.cost[t];
+        }
+        let mut num = 0.0;
+        let mut den = 0.0;
+        for u in 1..=DP_MAX_T {
+            if self.cost_n[u] > 0.0 {
+                let w = self.cost_n[u].min(20.0);
+                num += w * self.cost[u] * DP_SHAPE[t] / DP_SHAPE[u];
+                den += w;
+            }
+        }
+        if den > 0.0 { num / den } else { DP_SHAPE[t] }
+    }
+
+    fn stale(&self, t: usize) -> bool {
+        self.cost_n[t] > 0.0 && self.rounds - self.last[t] > DP_STALE_ROUNDS
+    }
+
+    fn mtp_tokens(&self, t: usize) -> f64 {
+        let t = t.clamp(1, DP_MAX_T);
+        if self.mtp_n[t] > 0.0 {
+            self.mtp_tok[t]
+        } else {
+            1.0 + 0.70 * (t.saturating_sub(1) as f64)
+        }
+    }
+
+    /// Adaptive neural draft count `k` around `base_spec` (`3`):
+    /// expands up to `base_spec + 1` (`4`) when EMA acceptance is high and consecutive full windows are accepted;
+    /// contracts to `2` when EMA acceptance drops and consecutive 0-accept windows occur.
+    fn neural_k(&self, rem_tokens: usize) -> usize {
+        let max_k = (self.max_t - 1).min(rem_tokens);
+        if max_k == 0 {
+            return 0;
+        }
+        let mut k = self.base_spec;
+        if self.full_streak >= 2 && self.accept_ema >= 0.75 {
+            k = (self.base_spec + 1).min(self.max_t - 1);
+        } else if self.zero_streak >= 3 && self.accept_ema < 0.25 {
+            k = 2.min(self.base_spec);
+        }
+        k.min(max_k)
+    }
+
+    fn choose(&self, t_mtp: usize, lookup_k: usize, match_len: usize) -> DraftPick {
+        let mut p = DraftPick {
+            lookup: false,
+            t: t_mtp.clamp(1, self.max_t),
+        };
+        if lookup_k == 0 {
+            return p;
+        }
+        let base = self.mtp_tokens(p.t) / self.cost_ms(p.t);
+        let q = self.lookup_rate(match_len);
+        let mut e = 1.0;
+        let mut qi = 1.0;
+        let mut best = 0.0;
+        let mut best_t = 0usize;
+        let k_lim = lookup_k.min(self.max_t - 1);
+        for k in 1..=k_lim {
+            qi *= q;
+            e += qi;
+            let r = e / self.cost_ms(k + 1);
+            if r > best {
+                best = r;
+                best_t = k + 1;
+            }
+        }
+        let t_full = k_lim + 1;
+        if best_t > 0 && best > base * (1.0 + self.margin) {
+            p.lookup = true;
+            p.t = best_t;
+            if best_t < t_full && q >= 0.85 && self.stale(t_full) {
+                p.t = t_full;
+            }
+            return p;
+        }
+        if t_full > p.t && (self.cost_n[t_full] < DP_PROBES || self.stale(t_full)) && q >= 0.85 {
+            p.lookup = true;
+            p.t = t_full;
+        }
+        p
+    }
+
+    fn chain(&self, t_mtp: usize, p_mtp: f64, k_avail: usize, match_len: usize) -> usize {
+        let t_mtp = t_mtp.clamp(1, self.max_t);
+        let kmax = k_avail.min(self.max_t.saturating_sub(t_mtp));
+        if kmax == 0 {
+            return 0;
+        }
+        let e0 = self.mtp_tokens(t_mtp);
+        let base = e0 / self.cost_ms(t_mtp);
+        let c = self.chain_rate(match_len);
+        let p_mtp = p_mtp.clamp(0.0, 1.0);
+        let mut gain = 0.0;
+        let mut ci = 1.0;
+        let mut best = 0.0;
+        let mut best_k = 0usize;
+        for k in 1..=kmax {
+            ci *= c;
+            gain += ci;
+            let r = (e0 + p_mtp * gain) / self.cost_ms(t_mtp + k);
+            if r > best {
+                best = r;
+                best_k = k;
+            }
+        }
+        let t_full = t_mtp + kmax;
+        if best_k > 0 && best > base * (1.0 + self.margin) {
+            if best_k < kmax && p_mtp * c >= 0.60 && self.stale(t_full) {
+                return kmax;
+            }
+            return best_k;
+        }
+        if (self.cost_n[t_full] < DP_PROBES || self.stale(t_full)) && p_mtp * c >= 0.60 {
+            return kmax;
+        }
+        0
+    }
+
+    fn note_streak(&mut self, drafted: usize, accepted: usize) {
+        if drafted > 0 {
+            let rate = (accepted.min(drafted) as f64) / (drafted as f64);
+            self.accept_ema = 0.75 * self.accept_ema + 0.25 * rate;
+            if accepted >= drafted {
+                self.full_streak += 1;
+                self.zero_streak = 0;
+            } else if accepted == 0 {
+                self.zero_streak += 1;
+                self.full_streak = 0;
+            } else {
+                self.full_streak = 0;
+                self.zero_streak = 0;
+            }
+        }
+    }
+
+    fn observe(&mut self, lookup: bool, t: usize, accepted: usize, match_len: usize, round_ms: f64) {
+        let t = t.clamp(1, DP_MAX_T);
+        if round_ms > 0.0 {
+            self.cost[t] = if self.cost_n[t] > 0.0 {
+                (1.0 - DP_COST_ALPHA) * self.cost[t] + DP_COST_ALPHA * round_ms
+            } else {
+                round_ms
+            };
+            self.cost_n[t] += 1.0;
+            self.last[t] = self.rounds;
+        }
+        self.rounds += 1.0;
+        if lookup {
+            let b = Self::bucket(match_len);
+            self.ok[b] = DP_DECAY * self.ok[b] + (accepted as f64);
+            self.bad[b] = DP_DECAY * self.bad[b] + if accepted < t.saturating_sub(1) { 1.0 } else { 0.0 };
+        } else {
+            let drafted = t.saturating_sub(1);
+            self.note_streak(drafted, accepted);
+            let got = (accepted as f64) + 1.0;
+            self.mtp_tok[t] = if self.mtp_n[t] > 0.0 {
+                (1.0 - DP_TOK_ALPHA) * self.mtp_tok[t] + DP_TOK_ALPHA * got
+            } else {
+                got
+            };
+            self.mtp_n[t] += 1.0;
+        }
+    }
+
+    fn observe_chain(&mut self, t_mtp: usize, k_chain: usize, accepted: usize, match_len: usize, round_ms: f64) {
+        let t_mtp = t_mtp.clamp(1, DP_MAX_T);
+        let t = (t_mtp + k_chain).clamp(1, DP_MAX_T);
+        if round_ms > 0.0 {
+            self.cost[t] = if self.cost_n[t] > 0.0 {
+                (1.0 - DP_COST_ALPHA) * self.cost[t] + DP_COST_ALPHA * round_ms
+            } else {
+                round_ms
+            };
+            self.cost_n[t] += 1.0;
+            self.last[t] = self.rounds;
+        }
+        self.rounds += 1.0;
+        let mtp_drafted = t_mtp.saturating_sub(1);
+        let mtp_acc = accepted.min(mtp_drafted);
+        self.note_streak(mtp_drafted, mtp_acc);
+        let got = (mtp_acc as f64) + 1.0;
+        self.mtp_tok[t_mtp] = if self.mtp_n[t_mtp] > 0.0 {
+            (1.0 - DP_TOK_ALPHA) * self.mtp_tok[t_mtp] + DP_TOK_ALPHA * got
+        } else {
+            got
+        };
+        self.mtp_n[t_mtp] += 1.0;
+        if accepted < mtp_drafted {
+            return;
+        }
+        let b = Self::bucket(match_len);
+        let ok = accepted - mtp_drafted;
+        self.cok[b] = DP_DECAY * self.cok[b] + (ok as f64);
+        self.cbad[b] = DP_DECAY * self.cbad[b] + if ok < k_chain { 1.0 } else { 0.0 };
+    }
 }
 
 fn argmax(v: &[f32]) -> u32 {
@@ -1443,6 +2071,7 @@ fn answer<'c>(
             pending: Vec::new(),
         },
         tool_open: tok.id("<tool_call>"),
+        pending_tool: None,
         left_for_tool: false,
     };
     let mut n = 0;
@@ -1482,6 +2111,16 @@ fn answer<'c>(
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(4);
+    let suffix_on = spec > 0 && !std::env::var("SHADOWZERO_SUFFIX_DRAFT").is_ok_and(|v| v == "0");
+    let policy_on = spec > 0 && !std::env::var("SHADOWZERO_DRAFT_POLICY").is_ok_and(|v| v == "0");
+    let chain_on = suffix_on && policy_on && !std::env::var("SHADOWZERO_LOOKUP_CHAIN").is_ok_and(|v| v == "0");
+    let dyn_neural_k = policy_on && std::env::var("SHADOWZERO_DYN_NEURAL_K").is_ok_and(|v| v == "1");
+    let mut suffix_drafter = suffix_on.then(|| {
+        let mut sd = SuffixDrafter::new(lookup_min.max(3), 32, sess.capacity().max(ids.len() + max_tokens + 64));
+        sd.extend(&ids);
+        sd
+    });
+    let mut draft_policy = DraftPolicy::new(shadowzero_cuda::session::MAX_VERIFY, spec.max(1), 0.03);
     // per draft position: (tried, right)
     let mut spec_pos = [(0usize, 0usize); 8];
     // `--dflash-min-p`: the DFlash chain stops after a draft the selector gives less than this
@@ -1554,6 +2193,9 @@ fn answer<'c>(
             }
             if spec > 0 {
                 hist.extend_from_slice(&closer);
+                if let Some(sd) = suffix_drafter.as_mut() {
+                    sd.extend(&closer);
+                }
             }
             *last_logits = sess.step_batch(&closer).pop().unwrap();
             last_top = None;
@@ -1583,30 +2225,128 @@ fn answer<'c>(
         }
         if spec > 0 {
             hist.push(next);
-            let k = spec.min(max_tokens - n);
+            if let Some(sd) = suffix_drafter.as_mut() {
+                sd.push(next);
+            }
+            let rem = max_tokens - n;
+            let k_neural = if dyn_neural_k {
+                draft_policy.neural_k(rem)
+            } else {
+                spec.min(rem)
+            };
+            let k_lookup_max = if policy_on {
+                (shadowzero_cuda::session::MAX_VERIFY - 1).min(rem)
+            } else {
+                k_neural
+            };
             let t_d = Instant::now();
-            // a long repeat in the conversation drafts for free (and usually right); else the MTP layer
-            let repeat = if lookup_min > 0 {
-                lookup_from(&hist, k, &[8, 6, lookup_min])
-            } else {
-                vec![]
-            };
-            let draft = if repeat.len() >= 2 {
-                spec_n.3 += 1;
-                repeat
-            } else if has_df {
-                let d = sess.dflash_draft(next, k, df_min_p);
-                if d.is_empty() && has_mtp {
-                    sess.mtp_draft(next, k, spec_min_p)
+            // a long repeat in the conversation drafts for free (and usually right); else the neural drafter (DFlash 2 / MTP)
+            let (mut repeat, match_len) = if lookup_min > 0 {
+                if let Some(sd) = suffix_drafter.as_ref() {
+                    sd.propose(k_lookup_max)
                 } else {
-                    d
+                    (lookup_from(&hist, k_lookup_max, &[8, 6, lookup_min]), lookup_min)
                 }
-            } else if has_mtp {
-                sess.mtp_draft(next, k, spec_min_p)
             } else {
-                lookup(&hist, k)
+                (vec![], 0)
             };
-            spec_t[0] += t_d.elapsed().as_secs_f64();
+            let use_lookup = if repeat.len() >= 2 {
+                if policy_on && (has_df || has_mtp) {
+                    let pick = draft_policy.choose(1 + k_neural, repeat.len(), match_len);
+                    if pick.lookup && pick.t > 1 {
+                        repeat.truncate((pick.t - 1).min(repeat.len()));
+                        repeat.len() >= 2
+                    } else {
+                        false
+                    }
+                } else {
+                    true
+                }
+            } else {
+                false
+            };
+            let (draft, round_kind) = if use_lookup {
+                spec_n.3 += 1;
+                let t = 1 + repeat.len();
+                (repeat, RoundKind::Lookup { t, match_len })
+            } else if has_df {
+                let mut d = sess.dflash_draft(next, k_neural, df_min_p);
+                if d.is_empty() && has_mtp {
+                    d = sess.mtp_draft(next, k_neural, spec_min_p);
+                }
+                let t_mtp = 1 + d.len();
+                let mut rk = RoundKind::Neural { t: t_mtp };
+                if !d.is_empty() && chain_on {
+                    let max_chain = (shadowzero_cuda::session::MAX_VERIFY - 1)
+                        .min(rem)
+                        .saturating_sub(d.len());
+                    if max_chain > 0 {
+                        if let Some(sd) = suffix_drafter.as_mut() {
+                            let (chained, c_match) = sd.propose_after(&d, max_chain);
+                            if !chained.is_empty() {
+                                let p_mtp = draft_policy
+                                    .accept_ema
+                                    .clamp(0.35, 0.95)
+                                    .powi(d.len() as i32);
+                                let k_add = draft_policy.chain(t_mtp, p_mtp, chained.len(), c_match);
+                                if k_add > 0 {
+                                    d.extend_from_slice(&chained[..k_add]);
+                                    rk = RoundKind::Chained {
+                                        t_mtp,
+                                        k_chain: k_add,
+                                        match_len: c_match,
+                                    };
+                                }
+                            }
+                        }
+                    }
+                }
+                (d, rk)
+            } else if has_mtp {
+                let mut d = sess.mtp_draft(next, k_neural, spec_min_p);
+                let t_mtp = 1 + d.len();
+                let mut rk = RoundKind::Neural { t: t_mtp };
+                if !d.is_empty() && chain_on {
+                    let max_chain = (shadowzero_cuda::session::MAX_VERIFY - 1)
+                        .min(rem)
+                        .saturating_sub(d.len());
+                    if max_chain > 0 {
+                        if let Some(sd) = suffix_drafter.as_mut() {
+                            let (chained, c_match) = sd.propose_after(&d, max_chain);
+                            if !chained.is_empty() {
+                                let p_mtp = draft_policy
+                                    .accept_ema
+                                    .clamp(0.35, 0.95)
+                                    .powi(d.len() as i32);
+                                let k_add = draft_policy.chain(t_mtp, p_mtp, chained.len(), c_match);
+                                if k_add > 0 {
+                                    d.extend_from_slice(&chained[..k_add]);
+                                    rk = RoundKind::Chained {
+                                        t_mtp,
+                                        k_chain: k_add,
+                                        match_len: c_match,
+                                    };
+                                }
+                            }
+                        }
+                    }
+                }
+                (d, rk)
+            } else if let Some(sd) = suffix_drafter.as_ref() {
+                let (d, m_len) = sd.propose_with_min(k_lookup_max, 3);
+                let mut d = d;
+                if d.is_empty() {
+                    d = lookup(&hist, k_neural);
+                }
+                let t = 1 + d.len();
+                (d, RoundKind::Lookup { t, match_len: m_len.max(2) })
+            } else {
+                let d = lookup(&hist, k_neural);
+                let t = 1 + d.len();
+                (d, RoundKind::Lookup { t, match_len: 3 })
+            };
+            let draft_s = t_d.elapsed().as_secs_f64();
+            spec_t[0] += draft_s;
             if draft.is_empty() {
                 match if top_mode { sess.step_top(next) } else { None } {
                     Some(t) => {
@@ -1632,7 +2372,8 @@ fn answer<'c>(
                 Some(t) => (Vec::new(), t),
                 None => (sess.step_batch_verify(&batch), Vec::new()),
             };
-            spec_t[1] += t_v.elapsed().as_secs_f64();
+            let verify_s = t_v.elapsed().as_secs_f64();
+            spec_t[1] += verify_s;
             let mut keep = 1; // the tokens of `batch` the session keeps
             let mut cancelled = false;
             for (i, &d) in draft.iter().enumerate() {
@@ -1654,6 +2395,9 @@ fn answer<'c>(
                 keep += 1;
                 spec_pos[i.min(7)].1 += 1;
                 hist.push(d);
+                if let Some(sd) = suffix_drafter.as_mut() {
+                    sd.push(d);
+                }
                 if loop_guard {
                     made.push(d);
                 }
@@ -1666,10 +2410,31 @@ fn answer<'c>(
             spec_n.0 += 1;
             spec_n.1 += draft.len();
             spec_n.2 += keep - 1;
+            let mut rollback_s = 0.0;
             if keep < batch.len() {
                 let t_r = Instant::now();
                 sess.rollback(snap.as_ref().unwrap(), &batch[..keep])?;
-                spec_t[2] += t_r.elapsed().as_secs_f64();
+                rollback_s = t_r.elapsed().as_secs_f64();
+                spec_t[2] += rollback_s;
+            }
+            if policy_on {
+                let round_ms = (draft_s + verify_s + rollback_s) * 1e3;
+                let accepted = keep - 1;
+                match round_kind {
+                    RoundKind::Lookup { t, match_len } => {
+                        draft_policy.observe(true, t, accepted, match_len, round_ms);
+                    }
+                    RoundKind::Neural { t } => {
+                        draft_policy.observe(false, t, accepted, 0, round_ms);
+                    }
+                    RoundKind::Chained {
+                        t_mtp,
+                        k_chain,
+                        match_len,
+                    } => {
+                        draft_policy.observe_chain(t_mtp, k_chain, accepted, match_len, round_ms);
+                    }
+                }
             }
             if outs_top.is_empty() {
                 *last_logits = outs.swap_remove(keep - 1);
@@ -1687,6 +2452,7 @@ fn answer<'c>(
         *last_logits = sess.step(next);
         last_top = None;
     }
+    em.flush(&req.tx);
     if spec > 0 {
         eprintln!("shadowzero serve: speculation: {} passes ({} drafted by lookup), {} of {} drafted tokens accepted, {} tokens in {:.1} s                    (drafting {:.2} s, checking {:.2} s, rolling back {:.2} s)",
                   spec_n.0, spec_n.3, spec_n.2, spec_n.1, n, t1.elapsed().as_secs_f64(), spec_t[0], spec_t[1], spec_t[2]);
@@ -1792,6 +2558,62 @@ mod tests {
             think_step(true, false, TOOL, None, None),
             (true, false, false)
         );
+    }
+
+    #[test]
+    fn emitter_keeps_prose_tool_call_mention_inside_thinking_and_exits_on_real_call() {
+        const END: u32 = 10;
+        const TOOL: u32 = 20;
+        const WORD: u32 = 30;
+        let run = |seq: &[(u32, &str)]| -> (String, String) {
+            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+            let mut em = Emitter {
+                reasoning: true,
+                first_content: true,
+                utf8: Utf8 { pending: Vec::new() },
+                tool_open: Some(TOOL),
+                pending_tool: None,
+                left_for_tool: false,
+            };
+            for &(t, s) in seq {
+                assert!(em.push_piece(t, s.to_string(), Some(END), &tx));
+            }
+            em.flush(&tx);
+            let mut r = String::new();
+            let mut c = String::new();
+            while let Ok(ev) = rx.try_recv() {
+                match ev {
+                    Event::Reasoning(s) => r.push_str(&s),
+                    Event::Content(s) => c.push_str(&s),
+                    _ => {}
+                }
+            }
+            (r, c)
+        };
+
+        // Mentioning `<tool_call>` in prose inside `<think>` must NOT exit thinking
+        let (r, c) = run(&[
+            (WORD, "Strip `"),
+            (TOOL, "<tool_call>"),
+            (WORD, "` and `</tool_call>` blocks."),
+            (END, "</think>"),
+            (WORD, "\n\nDone."),
+        ]);
+        assert_eq!(r, "Strip `<tool_call>` and `</tool_call>` blocks.");
+        assert_eq!(c, "Done.");
+
+        // A genuine `<tool_call>\n<function=write_file>` opened inside `<think>` exits thinking
+        let (r2, c2) = run(&[
+            (WORD, "Let me write it."),
+            (TOOL, "<tool_call>"),
+            (WORD, "\n"),
+            (WORD, "<function"),
+            (WORD, "=write_file>"),
+            (END, "</think>"),
+            (WORD, "ok"),
+        ]);
+        assert_eq!(r2, "Let me write it.");
+        assert_eq!(c2, "<tool_call>\n<function=write_file>ok");
     }
 
     #[test]
@@ -2072,5 +2894,49 @@ OUTPUT{k} {}
             n + 2048.min(cap / 4) + 8 <= cap + 64,
             "the prompt leaves room for the reply: {n} tokens of {cap}"
         );
+    }
+
+    #[test]
+    fn suffix_drafter_finds_longest_and_most_recent_match_and_chains_after_neural_drafts() {
+        let mut sd = SuffixDrafter::new(4, 32, 4096);
+        // First occurrence of [10, 11, 12, 13] followed by [20, 21, 22]
+        sd.extend(&[1, 2, 10, 11, 12, 13, 20, 21, 22, 99]);
+        // Second occurrence with a longer 5-token prefix [9, 10, 11, 12, 13] followed by [30, 31, 32, 33]
+        sd.extend(&[5, 9, 10, 11, 12, 13, 30, 31, 32, 33, 88]);
+        // Current suffix matches the 5-token prefix [9, 10, 11, 12, 13]
+        sd.extend(&[9, 10, 11, 12, 13]);
+        let (draft, m_len) = sd.propose(4);
+        assert_eq!(m_len, 5);
+        assert_eq!(draft, vec![30, 31, 32, 33]);
+
+        // Now test `propose_after`: if neural drafter proposes [30, 31], `propose_after` continues with [32, 33, 88]
+        let hist_len_before = sd.hist.len();
+        let (chained, c_len) = sd.propose_after(&[30, 31], 3);
+        assert_eq!(sd.hist.len(), hist_len_before, "propose_after must not mutate history");
+        assert_eq!(c_len, 7);
+        assert_eq!(chained, vec![32, 33, 88]);
+    }
+
+    #[test]
+    fn draft_policy_adapts_window_and_neural_depth_by_cost_and_acceptance() {
+        let mut dp = DraftPolicy::new(8, 3, 0.03);
+        assert_eq!(dp.neural_k(100), 3);
+
+        // High acceptance expands neural_k from 3 to 4
+        for _ in 0..4 {
+            dp.observe(false, 4, 3, 0, 12.0);
+        }
+        assert_eq!(dp.neural_k(100), 4);
+
+        // Long 16-token match lookup with 6 available tokens beats 4-token neural window
+        let pick = dp.choose(4, 6, 16);
+        assert!(pick.lookup);
+        assert!(pick.t >= 5);
+
+        // Consecutive zero-accept rounds contract neural_k to 2
+        for _ in 0..8 {
+            dp.observe(false, 4, 0, 0, 12.0);
+        }
+        assert_eq!(dp.neural_k(100), 2);
     }
 }

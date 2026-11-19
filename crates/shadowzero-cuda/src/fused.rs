@@ -13,6 +13,18 @@ type QuantizeFn = unsafe extern "C" fn(x: u64, rows: i64, cols: i64, xa: u64, st
 type MaskFn = unsafe extern "C" fn(ids: u64, n: i64, copied: u64, phase: i32, out: u64, stream: u64);
 type GroupFn = unsafe extern "C" fn(ids: u64, n: i64, k: i32, ne: i32, scratch: u64, slot: u64, src: u64, stream: u64);
 type ExpertsFn = unsafe extern "C" fn(tab: u64, gu: i32, d: i32, gu_row: u64, d_row: u64, up_off: u64, down_off: u64, ne: i32, n: i64, scratch: u64, xa: u64, src: u64, ha: u64, dm: u64, stream: u64);
+type ResetFn = unsafe extern "C" fn();
+
+static RESET: std::sync::Mutex<Option<ResetFn>> = std::sync::Mutex::new(None);
+
+/// Releases CUDA runtime primary context retains held by `shadowzero_fused.dll`.
+pub fn reset() {
+    let f = *RESET.lock().unwrap();
+    if let Some(f) = f {
+        // SAFETY: exported by `shadowzero_fused.cu`; call only after ShadowZero contexts are dropped.
+        unsafe { f() };
+    }
+}
 
 pub struct Fused {
     supported: SupportedFn,
@@ -88,6 +100,10 @@ impl Fused {
                 _lib: lib,
             }
         };
+        if let Some(r) = f._lib.sym("sf_reset") {
+            // SAFETY: `sf_reset` has signature `extern "C" fn()`.
+            *RESET.lock().unwrap() = Some(unsafe { std::mem::transmute::<*mut std::ffi::c_void, ResetFn>(r) });
+        }
         eprintln!("fused: loaded {} (Strata's int8 fused experts for the prompt path)", path.display());
         Some(f)
     }

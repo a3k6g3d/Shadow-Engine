@@ -58,3 +58,11 @@ this repository and is not covered by this license.
 Pictures (2026-11-01): `bin/strata-vision.exe` (not in git; copied from a Strata build) is Strata's picture encoder, a thin wrapper
 around llama.cpp's mtmd library (MIT, Copyright (c) 2023-2026 The ggml authors). Shadow starts it as a child process
 (`crates/shadow-serve/src/vision.rs`) and does the rest itself; the vision projector it reads is the model's own mmproj file.
+
+Basalt & Strata-HotRod adaptations (2026-11-19, v0.1.65-v0.1.69): architectural ideas adapted and re-implemented in Rust/NVRTC for EXL3
+from Basalt (https://github.com/jesdga95/basalt, MIT, Copyright (c) 2026 Niko1221 / jesdga95 and contributors) and Strata-HotRod
+(https://github.com/sangharshadhyeta/Strata-HotRod, MIT): packed per-32 symmetric Q8_KV cache + Tensor Core m16n8k16 Q8 GQA attention
+(`kernels/forward.cu`), packed per-32 symmetric Q8 hyper-connections (`hc8`, `kernels/matvec.cu`), 2-bit Q2_P dp4a lm_head proxy screen +
+sparse EXL3 128-row-block rescore (`kernels/exl3.cu`, `kernels/forward.cu`), Blackwell Programmatic Dependent Launch (`PDL`,
+`kernels/prelude.cuh`, `crates/shadowzero-cuda/src/driver.rs`), and the 4-way open-addressing trigram `SuffixDrafter` with `propose_after`
+lookup chaining and cost-per-ms `DraftPolicy` (`crates/shadowzero-serve/src/engine.rs`).

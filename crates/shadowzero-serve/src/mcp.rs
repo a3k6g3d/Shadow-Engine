@@ -47,12 +47,28 @@ pub struct Server {
     /// Tools the server has that `"allow"` keeps from the model (ShadowZero itself may still call them: the browser pane's screenshots).
     pub hidden: Vec<String>,
     pub error: Option<String>,
+    /// Per-server `tools/call` timeout (`"timeout_secs"` in `mcp.json`, default 180 s).
+    pub timeout: Duration,
     io: Option<Mutex<Io>>,
     child: Mutex<Option<Child>>,
 }
 
 static SERVERS: Mutex<Vec<Arc<Server>>> = Mutex::new(Vec::new());
 static START: Once = Once::new();
+
+fn call_timeout(cfg: &Value) -> Duration {
+    let secs = cfg
+        .get("timeout_secs")
+        .and_then(Value::as_u64)
+        .or_else(|| {
+            std::env::var("SHADOWZERO_MCP_TIMEOUT_SECS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+        })
+        .unwrap_or(180)
+        .max(1);
+    Duration::from_secs(secs)
+}
 
 /// A name safe inside a tool name: letters, digits, `_` and `-`.
 fn clean(s: &str) -> String {
@@ -234,11 +250,13 @@ fn rpc(io: &mut Io, method: &str, params: Value, timeout: Duration) -> Result<Va
 }
 
 fn start_server(name: &str, cfg: &Value) -> Server {
+    let timeout = call_timeout(cfg);
     let fail = |e: String| Server {
         name: name.to_string(),
         tools: vec![],
         hidden: vec![],
         error: Some(e),
+        timeout,
         io: None,
         child: Mutex::new(None),
     };
@@ -342,6 +360,7 @@ fn start_server(name: &str, cfg: &Value) -> Server {
         tools,
         hidden,
         error: None,
+        timeout,
         io: Some(Mutex::new(io)),
         child: Mutex::new(Some(child)),
     }
@@ -426,7 +445,7 @@ fn call_raw(server: &Server, raw: &str, arguments: &Value) -> Result<McpOut, Str
         &mut io.lock().unwrap(),
         "tools/call",
         json!({"name": raw, "arguments": args}),
-        Duration::from_secs(180),
+        server.timeout,
     )?;
     let (mut text, mut images) = (String::new(), vec![]);
     for part in r
@@ -508,5 +527,12 @@ mod tests {
     #[test]
     fn names_are_made_safe() {
         assert_eq!(clean("my server.v2"), "my_server_v2");
+    }
+
+    #[test]
+    fn server_timeout_reads_timeout_secs() {
+        assert_eq!(call_timeout(&json!({"timeout_secs": 1200})), Duration::from_secs(1200));
+        assert_eq!(call_timeout(&json!({"timeout_secs": 0})), Duration::from_secs(1));
+        assert_eq!(call_timeout(&json!({})), Duration::from_secs(180));
     }
 }

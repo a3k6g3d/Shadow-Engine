@@ -2,8 +2,12 @@
 //! Executes local tools (read_file, glob, grep, edit_file, write_file, cmd) natively on Windows, and the web tools (web_search, web_fetch: `webtools.rs`).
 
 use serde_json::{json, Value};
+use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone)]
 pub struct ToolInvocation {
@@ -314,6 +318,7 @@ const ARGUMENT_ALIASES: &[(&str, &str, &str)] = &[
     ("search", "k", "max_results"),
     ("search", "folder", "path"),
     ("search", "directory", "path"),
+    ("cmd", "timeout", "timeout_secs"),
 ];
 
 pub fn coerce_arguments(name: &str, arguments: &Value) -> Value {
@@ -371,7 +376,12 @@ pub fn coerce_arguments(name: &str, arguments: &Value) -> Value {
 }
 
 pub fn execute_tool(inv: &ToolInvocation) -> ToolResult {
-    let mut r = execute_tool_inner(inv);
+    let never = AtomicBool::new(false);
+    execute_tool_with_cancel(inv, &never)
+}
+
+pub fn execute_tool_with_cancel(inv: &ToolInvocation, cancel: &AtomicBool) -> ToolResult {
+    let mut r = execute_tool_inner(inv, cancel);
     // a long output goes to the session's log and says its number (`recall` reads it again once the conversation has shortened it)
     if !r.is_error
         && inv.name != "recall"
@@ -508,7 +518,7 @@ fn replace_lines(name: &str, args: &Value) -> ToolResult {
     }
 }
 
-fn execute_tool_inner(inv: &ToolInvocation) -> ToolResult {
+fn execute_tool_inner(inv: &ToolInvocation, cancel: &AtomicBool) -> ToolResult {
     let fixed = ToolInvocation {
         name: inv.name.clone(),
         arguments: coerce_arguments(&inv.name, &inv.arguments),
@@ -1067,68 +1077,10 @@ fn execute_tool_inner(inv: &ToolInvocation) -> ToolResult {
             }
         }
 
-        "cmd" | "bash" | "powershell" => {
-            let command = inv
-                .arguments
-                .get("command")
-                .or_else(|| inv.arguments.get("cmd"))
-                .and_then(Value::as_str)
-                .unwrap_or("");
-            let cwd = inv
-                .arguments
-                .get("cwd")
-                .and_then(Value::as_str)
-                .unwrap_or(".");
+        "cmd" | "bash" | "powershell" => run_cmd_tool(&inv.name, &inv.arguments, cancel),
 
-            if command.is_empty() {
-                return ToolResult {
-                    name: inv.name.clone(),
-                    output: "error: missing required argument 'command'".into(),
-                    is_error: true,
-                    images: vec![],
-                };
-            }
-
-            // Execute natively via Windows PowerShell
-            let mut cmd = Command::new("powershell");
-            cmd.args([
-                "-NoProfile",
-                "-ExecutionPolicy",
-                "Bypass",
-                "-Command",
-                command,
-            ]);
-            cmd.current_dir(cwd);
-
-            match cmd.output() {
-                Ok(output) => {
-                    let stdout = String::from_utf8_lossy(&output.stdout);
-                    let stderr = String::from_utf8_lossy(&output.stderr);
-                    let mut combined = stdout.trim().to_string();
-                    if !stderr.trim().is_empty() {
-                        if !combined.is_empty() {
-                            combined.push('\n');
-                        }
-                        combined.push_str("STDERR:\n");
-                        combined.push_str(stderr.trim());
-                    }
-                    if combined.is_empty() {
-                        combined = "(Command executed successfully with no output)".into();
-                    }
-                    ToolResult {
-                        name: inv.name.clone(),
-                        output: tail_clip(combined),
-                        is_error: !output.status.success(),
-                        images: vec![],
-                    }
-                }
-                Err(e) => ToolResult {
-                    name: inv.name.clone(),
-                    output: format!("error launching PowerShell command on Windows: {e}"),
-                    is_error: true,
-                    images: vec![],
-                },
-            }
+        other if other.starts_with("pc_") => {
+            crate::pc_control::execute_tool(other, &inv.arguments, cancel)
         }
 
         other if other.starts_with("mcp__") => match crate::mcp::call(other, &inv.arguments) {
@@ -1169,8 +1121,348 @@ pub fn tool_definitions() -> Value {
     let mut v = builtin_tool_definitions_with(finish_tool_enabled());
     v.as_array_mut()
         .expect("an array")
+        .extend(crate::pc_control::tool_definitions());
+    v.as_array_mut()
+        .expect("an array")
         .extend(crate::mcp::tool_definitions());
     v
+}
+
+const DEFAULT_CMD_TIMEOUT_SECS: u64 = 300;
+const MIN_CMD_TIMEOUT_SECS: u64 = 1;
+const MAX_CMD_TIMEOUT_SECS: u64 = 1800;
+const CMD_POST_EXIT_PIPE_GRACE: Duration = Duration::from_millis(500);
+const MAX_RAW_PIPE_BYTES: usize = 2_000_000;
+
+/// Per-command Windows Job Object configured with `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`.
+/// Assigning the shell child here ensures `cmd` cancellation, timeout, or drop tears down
+/// the entire process tree (e.g., `gradle.bat` -> `GradleDaemon`), releasing inherited stdio pipes.
+#[cfg(windows)]
+struct CmdJob(isize);
+
+#[cfg(windows)]
+impl CmdJob {
+    fn attach(child: &std::process::Child) -> Option<Self> {
+        use std::os::windows::io::AsRawHandle;
+        #[repr(C)]
+        struct Limits {
+            basic: [u8; 64],
+            io: [u8; 48],
+            rest: [usize; 4],
+        }
+        #[link(name = "kernel32")]
+        extern "system" {
+            fn CreateJobObjectW(attrs: *const u8, name: *const u16) -> isize;
+            fn SetInformationJobObject(
+                job: isize,
+                class: i32,
+                info: *const Limits,
+                len: u32,
+            ) -> i32;
+            fn AssignProcessToJobObject(job: isize, process: isize) -> i32;
+        }
+        unsafe {
+            let job = CreateJobObjectW(std::ptr::null(), std::ptr::null());
+            if job == 0 {
+                return None;
+            }
+            let mut l = Limits {
+                basic: [0; 64],
+                io: [0; 48],
+                rest: [0; 4],
+            };
+            // JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE (0x2000) sits at byte offset 16.
+            l.basic[16..20].copy_from_slice(&0x2000u32.to_le_bytes());
+            if SetInformationJobObject(job, 9, &l, std::mem::size_of::<Limits>() as u32) != 0 {
+                AssignProcessToJobObject(job, child.as_raw_handle() as isize);
+            }
+            Some(Self(job))
+        }
+    }
+
+    fn terminate(&self) {
+        #[link(name = "kernel32")]
+        extern "system" {
+            fn TerminateJobObject(job: isize, exit_code: u32) -> i32;
+        }
+        if self.0 != 0 {
+            unsafe { TerminateJobObject(self.0, 1) };
+        }
+    }
+}
+
+#[cfg(windows)]
+impl Drop for CmdJob {
+    fn drop(&mut self) {
+        #[link(name = "kernel32")]
+        extern "system" {
+            fn CloseHandle(handle: isize) -> i32;
+        }
+        if self.0 != 0 {
+            unsafe { CloseHandle(self.0) };
+            self.0 = 0;
+        }
+    }
+}
+
+#[cfg(not(windows))]
+struct CmdJob;
+
+#[cfg(not(windows))]
+impl CmdJob {
+    fn attach(_child: &std::process::Child) -> Option<Self> {
+        Some(Self)
+    }
+    fn terminate(&self) {}
+}
+
+struct PipeCapture {
+    buf: Arc<Mutex<Vec<u8>>>,
+    done: Arc<AtomicBool>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+impl PipeCapture {
+    fn spawn<R: Read + Send + 'static>(reader: Option<R>) -> Self {
+        let buf = Arc::new(Mutex::new(Vec::new()));
+        let done = Arc::new(AtomicBool::new(reader.is_none()));
+        let handle = reader.map(|mut r| {
+            let b = Arc::clone(&buf);
+            let d = Arc::clone(&done);
+            std::thread::spawn(move || {
+                let mut chunk = [0u8; 8192];
+                loop {
+                    match r.read(&mut chunk) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => {
+                            if let Ok(mut guard) = b.lock() {
+                                if guard.len() + n > MAX_RAW_PIPE_BYTES {
+                                    let drop_len = (guard.len() + n) - MAX_RAW_PIPE_BYTES;
+                                    let drain_n = drop_len.min(guard.len());
+                                    guard.drain(..drain_n);
+                                }
+                                let keep = n.min(MAX_RAW_PIPE_BYTES);
+                                guard.extend_from_slice(&chunk[n - keep..n]);
+                            }
+                        }
+                    }
+                }
+                d.store(true, Ordering::Release);
+            })
+        });
+        Self { buf, done, handle }
+    }
+
+    fn is_done(&self) -> bool {
+        self.done.load(Ordering::Acquire)
+    }
+
+    fn finish_and_take(&mut self) -> Vec<u8> {
+        if self.is_done() {
+            if let Some(h) = self.handle.take() {
+                let _ = h.join();
+            }
+        }
+        self.buf
+            .lock()
+            .map(|mut g| std::mem::take(&mut *g))
+            .unwrap_or_default()
+    }
+}
+
+fn resolve_cmd_timeout_secs(args: &Value) -> u64 {
+    let from_arg = args.get("timeout_secs").and_then(|v| {
+        v.as_u64()
+            .or_else(|| v.as_i64().filter(|&n| n > 0).map(|n| n as u64))
+    });
+    let from_env = std::env::var("SHADOWZERO_CMD_TIMEOUT_SECS")
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok());
+    from_arg
+        .or(from_env)
+        .unwrap_or(DEFAULT_CMD_TIMEOUT_SECS)
+        .clamp(MIN_CMD_TIMEOUT_SECS, MAX_CMD_TIMEOUT_SECS)
+}
+
+fn combine_cmd_streams(stdout: &[u8], stderr: &[u8]) -> String {
+    let out_s = String::from_utf8_lossy(stdout);
+    let err_s = String::from_utf8_lossy(stderr);
+    let mut combined = out_s.trim().to_string();
+    if !err_s.trim().is_empty() {
+        if !combined.is_empty() {
+            combined.push('\n');
+        }
+        combined.push_str("STDERR:\n");
+        combined.push_str(err_s.trim());
+    }
+    combined
+}
+
+fn wait_for_pipes(out: &PipeCapture, err: &PipeCapture, max_wait: Duration, cancel: &AtomicBool) -> bool {
+    let start = Instant::now();
+    while !(out.is_done() && err.is_done()) {
+        if cancel.load(Ordering::Relaxed) || start.elapsed() >= max_wait {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    true
+}
+
+fn run_cmd_tool(tool_name: &str, args: &Value, cancel: &AtomicBool) -> ToolResult {
+    let command = args
+        .get("command")
+        .or_else(|| args.get("cmd"))
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let cwd = args.get("cwd").and_then(Value::as_str).unwrap_or(".");
+
+    if command.is_empty() {
+        return ToolResult {
+            name: tool_name.to_string(),
+            output: "error: missing required argument 'command'".into(),
+            is_error: true,
+            images: vec![],
+        };
+    }
+
+    let timeout_secs = resolve_cmd_timeout_secs(args);
+    let deadline = Instant::now() + Duration::from_secs(timeout_secs);
+
+    let mut cmd = Command::new("powershell");
+    cmd.args([
+        "-NoProfile",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-Command",
+        command,
+    ])
+    .current_dir(cwd)
+    .stdin(Stdio::null())
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped());
+
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+    }
+
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) => {
+            return ToolResult {
+                name: tool_name.to_string(),
+                output: format!("error launching PowerShell command on Windows: {e}"),
+                is_error: true,
+                images: vec![],
+            };
+        }
+    };
+
+    let job = CmdJob::attach(&child);
+    let mut out_cap = PipeCapture::spawn(child.stdout.take());
+    let mut err_cap = PipeCapture::spawn(child.stderr.take());
+
+    let mut aborted_reason: Option<String> = None;
+    let mut exit_status: Option<std::process::ExitStatus> = None;
+
+    loop {
+        if cancel.load(Ordering::Relaxed) {
+            aborted_reason = Some("Cancelled: command interrupted by user.".into());
+            break;
+        }
+        match child.try_wait() {
+            Ok(Some(st)) => {
+                exit_status = Some(st);
+                break;
+            }
+            Ok(None) => {
+                if Instant::now() >= deadline {
+                    aborted_reason = Some(format!(
+                        "error: command timed out after {timeout_secs}s and was terminated."
+                    ));
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(25));
+            }
+            Err(e) => {
+                aborted_reason = Some(format!("error waiting for command process: {e}"));
+                break;
+            }
+        }
+    }
+
+    if let Some(reason) = aborted_reason {
+        if let Some(ref j) = job {
+            j.terminate();
+        }
+        let _ = child.kill();
+        let _ = child.wait();
+        let never = AtomicBool::new(false);
+        wait_for_pipes(&out_cap, &err_cap, Duration::from_millis(250), &never);
+        let partial = combine_cmd_streams(&out_cap.finish_and_take(), &err_cap.finish_and_take());
+        drop(job);
+        let output = if partial.is_empty() {
+            reason
+        } else {
+            format!("{partial}\n\n{reason}")
+        };
+        return ToolResult {
+            name: tool_name.to_string(),
+            output: tail_clip(output),
+            is_error: true,
+            images: vec![],
+        };
+    }
+
+    // Shell exited: drain any remaining stdio briefly. If a background child daemon
+    // (such as GradleDaemon) inherited the pipes and kept them open past the grace window,
+    // terminate the command's Job Object so the tool call never hangs on pipe EOF.
+    let mut killed_lingering = false;
+    if !wait_for_pipes(&out_cap, &err_cap, CMD_POST_EXIT_PIPE_GRACE, cancel) {
+        killed_lingering = true;
+        if let Some(ref j) = job {
+            j.terminate();
+        }
+        let never = AtomicBool::new(false);
+        wait_for_pipes(&out_cap, &err_cap, Duration::from_millis(250), &never);
+    }
+
+    let mut combined = combine_cmd_streams(&out_cap.finish_and_take(), &err_cap.finish_and_take());
+    drop(job);
+
+    if cancel.load(Ordering::Relaxed) {
+        let msg = "Cancelled: command interrupted by user.";
+        let output = if combined.is_empty() {
+            msg.to_string()
+        } else {
+            format!("{combined}\n\n{msg}")
+        };
+        return ToolResult {
+            name: tool_name.to_string(),
+            output: tail_clip(output),
+            is_error: true,
+            images: vec![],
+        };
+    }
+
+    if combined.is_empty() {
+        combined = "(Command executed successfully with no output)".into();
+    }
+    if killed_lingering {
+        combined.push_str(
+            "\n(note: terminated lingering child process(es) that kept stdout/stderr pipes open after shell exit)",
+        );
+    }
+
+    let ok = exit_status.is_some_and(|s| s.success());
+    ToolResult {
+        name: tool_name.to_string(),
+        output: tail_clip(combined),
+        is_error: !ok,
+        images: vec![],
+    }
 }
 
 /// The `finish` tool: the model ends a task that used tools by saying what is done, what is pending or unverified and, only when it cannot go on without the user, one
@@ -1405,7 +1697,8 @@ fn builtin_tool_definitions_core() -> Value {
                 "properties": {
                     "command": { "type": "string", "description": "PowerShell command to run on Windows" },
                     "description": { "type": "string", "description": "A few words saying what this command does, shown to the user instead of the command line (for example: Run the unit tests)" },
-                    "cwd": { "type": "string", "description": "Working directory" }
+                    "cwd": { "type": "string", "description": "Working directory" },
+                    "timeout_secs": { "type": "integer", "description": "Optional command timeout in seconds (1-1800; default 300)" }
                 },
                 "required": ["command"]
             }
@@ -1849,5 +2142,77 @@ five
         let res_read = execute_tool(&inv_read);
         assert!(!res_read.is_error);
         assert!(res_read.output.contains("workspace"));
+    }
+
+    #[test]
+    fn cmd_times_out_when_deadline_exceeded() {
+        let started = Instant::now();
+        let inv = ToolInvocation {
+            name: "cmd".into(),
+            arguments: json!({
+                "command": "Write-Output 'before-timeout'; Start-Sleep -Seconds 20",
+                "timeout_secs": 1
+            }),
+        };
+        let res = execute_tool(&inv);
+        assert!(res.is_error, "expected timeout error, got: {}", res.output);
+        assert!(
+            res.output.contains("timed out after 1s"),
+            "unexpected timeout message: {}",
+            res.output
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(6),
+            "timeout took too long: {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn cmd_cancels_promptly_when_signalled() {
+        let cancel = Arc::new(AtomicBool::new(false));
+        let cancel_trigger = Arc::clone(&cancel);
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(200));
+            cancel_trigger.store(true, Ordering::Relaxed);
+        });
+        let started = Instant::now();
+        let inv = ToolInvocation {
+            name: "cmd".into(),
+            arguments: json!({"command": "Start-Sleep -Seconds 20"}),
+        };
+        let res = execute_tool_with_cancel(&inv, &cancel);
+        assert!(res.is_error);
+        assert!(
+            res.output.contains("Cancelled"),
+            "expected cancellation message, got: {}",
+            res.output
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(6),
+            "cancellation took too long: {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn cmd_does_not_hang_on_grandchild_holding_pipe() {
+        let started = Instant::now();
+        // Spawns a detached child inside the same console/stdio pipes and exits powershell immediately.
+        let inv = ToolInvocation {
+            name: "cmd".into(),
+            arguments: json!({
+                "command": "Start-Process -NoNewWindow -FilePath 'powershell' -ArgumentList '-NoProfile','-Command','Start-Sleep -Seconds 20'; Write-Output 'parent-exited'",
+                "timeout_secs": 15
+            }),
+        };
+        let res = execute_tool(&inv);
+        assert!(!res.is_error, "unexpected error: {}", res.output);
+        assert!(res.output.contains("parent-exited"), "output: {}", res.output);
+        assert!(
+            started.elapsed() < Duration::from_secs(6),
+            "pipe grace hang exceeded expected duration: {:?}",
+            started.elapsed()
+        );
     }
 }

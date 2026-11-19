@@ -33,3 +33,20 @@ static __device__ __forceinline__ u16 f32_to_bf16(float f) {
     asm("{ .reg .b16 t; cvt.rn.bf16.f32 t, %1; mov.b16 %0, t; }" : "=h"(h) : "f"(f));
     return h;
 }
+
+// Programmatic Dependent Launch (PDL, SM 9.0+ / Blackwell SM 12.0): lets a dependent kernel start its CTA prologue
+// as soon as the primary kernel finishes its work, and wait for the primary kernel's global stores before reading them.
+// By default (`griddepcontrol.wait;` at kernel start + `CU_LAUNCH_ATTRIBUTE_PROGRAMMATIC_STREAM_SERIALIZATION` on launch),
+// the hardware automatically signals dependents at primary kernel completion while overlapping dependent CTA setup.
+// Explicit `griddepcontrol.launch_dependents;` is opt-in (`PDL_EARLY_SIGNAL`) for single-wave primary kernels.
+static __device__ __forceinline__ void pdl_wait() {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900) && !defined(PDL_NO_GRIDDEP)
+    asm volatile("griddepcontrol.wait;");
+#endif
+}
+
+static __device__ __forceinline__ void pdl_launch_dependents() {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900) && !defined(PDL_NO_GRIDDEP) && defined(PDL_EARLY_SIGNAL)
+    asm volatile("griddepcontrol.launch_dependents;");
+#endif
+}

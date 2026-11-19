@@ -4,6 +4,7 @@
 //!
 //! Sampling: see sampler.rs.
 
+pub mod auth;
 pub mod convdisk;
 pub mod cpuinfo;
 pub mod engine;
@@ -12,6 +13,7 @@ pub mod mcp;
 pub mod memory;
 
 pub mod orchestrator;
+pub mod pc_control;
 pub mod sessions;
 pub mod sampler;
 pub mod semsearch;
@@ -33,7 +35,7 @@ use std::sync::{Arc, Mutex};
 type Body = BoxBody<Bytes, Infallible>;
 
 struct App {
-    engine: Mutex<std::sync::mpsc::Sender<engine::Request>>,
+    engine: Mutex<std::sync::mpsc::Sender<engine::Cmd>>,
     status: Arc<Mutex<Status>>,
     started: std::time::Instant,
     /// Requests handed to the engine (the engine counts the ones it finished: the difference is the queue).
@@ -42,6 +44,8 @@ struct App {
     /// Pushes telemetry ticks, engine-status changes and tool results to every
     /// open browser tab over `/v1/events` (see events.rs).
     events: events::EventHub,
+    /// Remote pairing: the live pin, the paired phone's bearer-token hash (auth.rs).
+    pairing: Arc<auth::Pairing>,
 }
 
 pub struct ServeConfig {
@@ -49,8 +53,38 @@ pub struct ServeConfig {
     pub addr: std::net::SocketAddr,
 }
 
+/// Folder where generated photos and videos are stored and served from (`/v1/media/<file>`).
+pub fn media_dir() -> std::path::PathBuf {
+    if let Ok(p) = std::env::var("SHADOWZERO_MEDIA_DIR") {
+        let t = p.trim();
+        if !t.is_empty() {
+            return std::path::PathBuf::from(t);
+        }
+    }
+    if let Some(root) = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(|p| p.parent())
+    {
+        if root.is_dir() {
+            return root.join("outputs");
+        }
+    }
+    std::env::current_dir()
+        .unwrap_or_else(|_| std::path::PathBuf::from("."))
+        .join("outputs")
+}
+
 /// Runs the server until the process ends.
 pub fn run(cfg: ServeConfig) -> Result<(), String> {
+    if cfg.addr.port() != 0 {
+        std::env::set_var(
+            "SHADOWZERO_SERVE_URL",
+            format!("http://127.0.0.1:{}", cfg.addr.port()),
+        );
+    }
+    let mdir = media_dir();
+    let _ = std::fs::create_dir_all(&mdir);
+    std::env::set_var("SHADOWZERO_MEDIA_DIR", &mdir);
     mcp::start_background();
     let status = Arc::new(Mutex::new(Status {
         state: "loading",
@@ -64,9 +98,9 @@ pub fn run(cfg: ServeConfig) -> Result<(), String> {
         sent: std::sync::atomic::AtomicU64::new(0),
         telemetry: telemetry::TelemetryService::new(),
         events: events::EventHub::new(),
+        pairing: Arc::new(auth::Pairing::load()),
     });
-    // A clone for the push pump task, which runs alongside the accept loop and
-    // needs the same telemetry, status and started-clock the routes read.
+    pc_control::bind_events(app.events.clone());
     let pump_app = app.clone();
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
@@ -104,10 +138,10 @@ pub fn run(cfg: ServeConfig) -> Result<(), String> {
             }
         });
         loop {
-            let (stream, _) = listener.accept().await.map_err(|e| e.to_string())?;
+            let (stream, peer) = listener.accept().await.map_err(|e| e.to_string())?;
             let app = app.clone();
             tokio::spawn(async move {
-                let svc = hyper::service::service_fn(move |req| handle(req, app.clone()));
+                let svc = hyper::service::service_fn(move |req| handle(req, app.clone(), peer));
                 let _ = hyper::server::conn::http1::Builder::new()
                     .serve_connection(hyper_util::rt::TokioIo::new(stream), svc)
                     .await;
@@ -135,9 +169,63 @@ fn error(status: StatusCode, msg: &str) -> Response<Body> {
     )
 }
 
-async fn handle(req: Request<Incoming>, app: Arc<App>) -> Result<Response<Body>, Infallible> {
+/// One value out of a URL query string (`path=crates/foo.rs`), percent-decoded.
+fn query_param(q: Option<&str>, key: &str) -> String {
+    let Some(q) = q else { return String::new() };
+    for pair in q.split('&') {
+        let mut it = pair.splitn(2, '=');
+        if it.next() == Some(key) {
+            let raw = it.next().unwrap_or("");
+            let mut out = String::with_capacity(raw.len());
+            let mut chars = raw.bytes();
+            while let Some(b) = chars.next() {
+                if b == b'%' {
+                    let hex: String = (&mut chars).take(2).map(|b| b as char).collect();
+                    if let Ok(n) = u8::from_str_radix(&hex, 16) {
+                        out.push(n as char);
+                        continue;
+                    }
+                    out.push('%');
+                    out.push_str(&hex);
+                } else if b == b'+' {
+                    out.push(' ');
+                } else {
+                    out.push(b as char);
+                }
+            }
+            return out;
+        }
+    }
+    String::new()
+}
+
+async fn handle(req: Request<Incoming>, app: Arc<App>, peer: std::net::SocketAddr) -> Result<Response<Body>, Infallible> {
     let path = req.uri().path().to_string();
-    Ok(match (req.method(), path.as_str()) {
+    let local = auth::is_local(peer);
+    let origin = req
+        .headers()
+        .get("origin")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string());
+    // A browser on another machine sends OPTIONS before its POST/DELETE; it gets the
+    // allowed verbs back and no route is looked up.  A native client sends no Origin
+    // at all, so it never preflights and cors() below leaves its replies untouched.
+    if req.method() == Method::OPTIONS {
+        let mut resp = full(StatusCode::NO_CONTENT, "text/plain; charset=utf-8", "");
+        auth::cors(origin.as_deref(), &mut resp);
+        return Ok(resp);
+    }
+    // Everything under /v1 from a peer that is not this machine needs the paired
+    // bearer token (auth.rs); the /pair endpoints themselves stay open so a phone
+    // can fetch its token, and /pair/pin is answered on loopback only.  A server
+    // bound to 127.0.0.1 therefore behaves exactly as it did before auth existed.
+    if !local && path.starts_with("/v1") && !app.pairing.check(&auth::presented(&req)) {
+        return Ok(error(
+            StatusCode::UNAUTHORIZED,
+            "not paired: ask the desktop for its pin (GET /pair/pin) and send it to POST /pair",
+        ));
+    }
+    let mut resp = match (req.method(), path.as_str()) {
         (&Method::GET, "/") | (&Method::GET, "/index.html") => ui::index_response(),
         (&Method::GET, "/monitor") | (&Method::GET, "/monitor.html") => ui::monitor_response(),
         (&Method::GET, "/v1/telemetry") | (&Method::GET, "/telemetry") => {
@@ -147,16 +235,19 @@ async fn handle(req: Request<Incoming>, app: Arc<App>) -> Result<Response<Body>,
                 .load(std::sync::atomic::Ordering::SeqCst)
                 .saturating_sub(s.finished);
             let uptime = app.started.elapsed().as_secs_f64();
-            let snap = app.telemetry.snapshot(&s, uptime, queued);
+            let mut snap = app.telemetry.snapshot(&s, uptime, queued);
+            if let Some(obj) = snap.as_object_mut() {
+                obj.insert("pc_control".into(), pc_control::status_json());
+            }
             json_resp(StatusCode::OK, &snap)
         }
         (&Method::GET, "/health") => {
             let s = app.status.lock().unwrap().clone();
             match s.state {
                 "ready" => json_resp(StatusCode::OK, &json!({"status": "ok"})),
-                "loading" => json_resp(
+                "loading" | "parked" => json_resp(
                     StatusCode::SERVICE_UNAVAILABLE,
-                    &json!({"status": "loading"}),
+                    &json!({"status": s.state}),
                 ),
                 _ => json_resp(
                     StatusCode::INTERNAL_SERVER_ERROR,
@@ -251,7 +342,41 @@ async fn handle(req: Request<Incoming>, app: Arc<App>) -> Result<Response<Body>,
                 Err(e) => error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
             }
         }
+        (&Method::GET, "/v1/projects") => {
+            match tokio::task::spawn_blocking(sessions::list_projects).await {
+                Ok(rows) => json_resp(StatusCode::OK, &Value::Array(rows)),
+                Err(e) => error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+            }
+        }
+        (&Method::POST, _) | (&Method::PUT, _) | (&Method::DELETE, _)
+            if path == "/v1/projects" || path.starts_with("/v1/projects/") =>
+        {
+            projects_api(req, &path).await
+        }
         (&Method::POST, "/v1/tools/execute") => tool_execute(req, app.clone()).await,
+        (&Method::GET, "/v1/pc-control") => json_resp(StatusCode::OK, &pc_control::status_json()),
+        (&Method::POST, "/v1/pc-control") => {
+            if !local {
+                error(StatusCode::FORBIDDEN, "PC Control can only be toggled from this PC")
+            } else {
+                let bytes = match req.into_body().collect().await {
+                    Ok(b) => b.to_bytes(),
+                    Err(e) => return Ok(error(StatusCode::BAD_REQUEST, &e.to_string())),
+                };
+                let body: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+                let enable = body
+                    .get("enabled")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                let st = pc_control::set_enabled(enable);
+                json_resp(StatusCode::OK, &st)
+            }
+        }
+        (&Method::POST, "/v1/engine/park") => engine_park(&app, local).await,
+        (&Method::POST, "/v1/engine/resume") => engine_resume(&app, local).await,
+        (m, _) if (*m == Method::GET || *m == Method::HEAD) && path.starts_with("/v1/media/") => {
+            serve_media(&path, &req, *m == Method::HEAD).await
+        }
         (&Method::GET, "/v1/events") => sse_events(app.clone()),
         (&Method::POST, "/v1/chat/completions") => chat(req, app).await,
         // for shadowzero-bench, which ends each run's server this way; only ever bound to what --host says
@@ -262,11 +387,64 @@ async fn handle(req: Request<Incoming>, app: Arc<App>) -> Result<Response<Body>,
             });
             json_resp(StatusCode::OK, &json!({"status": "shutting down"}))
         }
+        // Remote pairing (auth.rs, docs/PLAN_APK_2026-11-13.md Phase 1): the pin is
+        // shown on this machine only - the four digits never cross the LAN - while
+        // POST /pair is open to any peer, since that is how a phone gets its token
+        // in the first place.  /pair/status lets it ask whether a pin is waiting
+        // before it shows the input field.
+        (&Method::GET, "/pair/pin") => {
+            if local {
+                json_resp(StatusCode::OK, &app.pairing.pin())
+            } else {
+                error(StatusCode::FORBIDDEN, "the pin is shown on the desktop only")
+            }
+        }
+        (&Method::GET, "/pair/status") => json_resp(StatusCode::OK, &app.pairing.status()),
+        (&Method::POST, "/pair") => {
+            let bytes = match req.into_body().collect().await {
+                Ok(b) => b.to_bytes(),
+                Err(e) => return Ok(error(StatusCode::BAD_REQUEST, &e.to_string())),
+            };
+            let typed = match serde_json::from_slice::<Value>(&bytes) {
+                Ok(v) => v
+                    .get("pin")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .trim()
+                    .to_string(),
+                Err(e) => {
+                    return Ok(error(StatusCode::BAD_REQUEST, &format!("bad JSON body: {e}")))
+                }
+            };
+            match app.pairing.pair(&typed) {
+                // The token shows once, here, and is what the phone keeps.
+                Ok(token) => json_resp(StatusCode::OK, &json!({"token": token})),
+                Err(e) => error(StatusCode::UNAUTHORIZED, &e.message()),
+            }
+        }
+        // Forgets this phone: a remote caller's own token must match, so a stray
+        // request cannot unpair everybody (auth::unpair); an empty token is only
+        // honoured for this machine, where the pin dialog lives (auth::is_local).
+        (&Method::DELETE, "/pair") => {
+            let presented = auth::presented(&req);
+            if !local && presented.trim().is_empty() {
+                error(StatusCode::FORBIDDEN, "a remote device must forget itself with its own token")
+            } else {
+                match app.pairing.unpair(&presented) {
+                    Ok(()) => json_resp(StatusCode::OK, &json!({"paired": false})),
+                    Err(e) => error(StatusCode::FORBIDDEN, &e),
+                }
+            }
+        }
         _ => error(
             StatusCode::NOT_FOUND,
             &format!("no route for {} {path}", req.method()),
         ),
-    })
+    };
+    // A browser across the LAN sent an Origin and needs it reflected; a native
+    // client sends none, so its replies stay untouched.
+    auth::cors(origin.as_deref(), &mut resp);
+    Ok(resp)
 }
 
 /// What a picture is in the prompt text: the chat template's own marker; the engine widens the one pad token to the picture's rows.
@@ -325,6 +503,62 @@ fn neutralize_with(s: &str, specials: Option<&std::collections::HashSet<String>>
         i += ch.len_utf8();
     }
     out
+}
+
+fn disarm_xml_tags(s: &str, tags: &[&str]) -> String {
+    if !s.contains('<') {
+        return s.to_string();
+    }
+    let mut out = s.to_string();
+    for tag in tags {
+        if out.contains(tag) {
+            let disarmed = format!("<\u{200b}{}", &tag[1..]);
+            out = out.replace(tag, &disarmed);
+        }
+    }
+    out
+}
+
+/// Strips one outer `<tool_response>...</tool_response>` wrapper (which the web UI adds) and
+/// disarms inner Qwen XML control tokens (`</tool_response>`, `<tool_call>`, `</think>`, ...)
+/// inside tool outputs / user messages so source code containing those literals cannot prematurely
+/// close a `<tool_response>` block during tokenization.
+fn disarm_control_tags(role: Role, text: String) -> String {
+    match role {
+        Role::Tool => {
+            let mut body = text.as_str();
+            if let Some(rest) = body
+                .trim_start()
+                .strip_prefix("<tool_response>")
+                .and_then(|s| s.trim_end().strip_suffix("</tool_response>"))
+            {
+                let rest = rest
+                    .strip_prefix("\r\n")
+                    .or_else(|| rest.strip_prefix('\n'))
+                    .unwrap_or(rest);
+                body = rest
+                    .strip_suffix("\r\n")
+                    .or_else(|| rest.strip_suffix('\n'))
+                    .unwrap_or(rest);
+            }
+            disarm_xml_tags(
+                body,
+                &[
+                    "<tool_response>",
+                    "</tool_response>",
+                    "<tool_call>",
+                    "</tool_call>",
+                    "<think>",
+                    "</think>",
+                ],
+            )
+        }
+        Role::User => disarm_xml_tags(
+            &text,
+            &["<tool_response>", "</tool_response>", "<think>", "</think>"],
+        ),
+        _ => text,
+    }
 }
 
 /// A message's content: a string, or an array of parts: text ones are joined, a picture becomes `IMAGE_MARK` (its bytes come from
@@ -725,10 +959,11 @@ pub fn parse_chat(body: &Value) -> Result<(Vec<Message>, Options, usize, bool), 
             Some("tool") => Role::Tool,
             other => return Err(format!("unknown role {other:?}")),
         };
-        let mut msg = Message::new(
+        let content = disarm_control_tags(
             role,
-            &content_text(m.get("content").unwrap_or(&Value::Null))?,
+            content_text(m.get("content").unwrap_or(&Value::Null))?,
         );
+        let mut msg = Message::new(role, &content);
         msg.reasoning = m
             .get("reasoning_content")
             .and_then(Value::as_str)
@@ -881,8 +1116,7 @@ async fn sessions_api(req: Request<Incoming>, path: &str) -> Response<Body> {
             }
         }
         (Method::PUT, Some(id)) => {
-            let title = body.get("title").and_then(Value::as_str).unwrap_or("").to_string();
-            match tokio::task::spawn_blocking(move || sessions::rename(&id, &title)).await {
+            match tokio::task::spawn_blocking(move || sessions::update(&id, &body)).await {
                 Ok(Ok(())) => json_resp(StatusCode::OK, &json!({"ok": true})),
                 Ok(Err(e)) => error(StatusCode::BAD_REQUEST, &e),
                 Err(e) => error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
@@ -896,6 +1130,66 @@ async fn sessions_api(req: Request<Incoming>, path: &str) -> Response<Body> {
             }
         }
         _ => error(StatusCode::NOT_FOUND, "no such session request"),
+    }
+}
+
+/// POST /v1/projects {name, description?}: create a project/job;
+/// PUT /v1/projects/<id> {name?, description?, archived?}: update;
+/// DELETE /v1/projects/<id>: remove project (keeps conversations unassigned);
+/// POST /v1/projects/<id>/archive-older {keep_newest?}: archive oldest conversations in project.
+async fn projects_api(req: Request<Incoming>, path: &str) -> Response<Body> {
+    let method = req.method().clone();
+    let tail = path.strip_prefix("/v1/projects").unwrap_or("");
+    let bytes = match req.into_body().collect().await {
+        Ok(b) => b.to_bytes(),
+        Err(e) => return error(StatusCode::BAD_REQUEST, &e.to_string()),
+    };
+    let body: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+    if method == Method::POST && (tail.is_empty() || tail == "/") {
+        return match tokio::task::spawn_blocking(move || sessions::create_project(&body)).await {
+            Ok(Ok(p)) => json_resp(StatusCode::OK, &p),
+            Ok(Err(e)) => error(StatusCode::BAD_REQUEST, &e),
+            Err(e) => error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+        };
+    }
+    let rest = tail.trim_start_matches('/');
+    if method == Method::POST && rest.ends_with("/archive-older") {
+        let id = rest.trim_end_matches("/archive-older").to_string();
+        let keep = body
+            .get("keep_newest")
+            .and_then(Value::as_u64)
+            .map(|n| n as usize)
+            .unwrap_or(3);
+        return match tokio::task::spawn_blocking(move || {
+            sessions::archive_older_in_project(&id, keep)
+        })
+        .await
+        {
+            Ok(Ok(n)) => json_resp(StatusCode::OK, &json!({"archived": n})),
+            Ok(Err(e)) => error(StatusCode::BAD_REQUEST, &e),
+            Err(e) => error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+        };
+    }
+    let id = rest.to_string();
+    if id.is_empty() || id.contains('/') {
+        return error(StatusCode::NOT_FOUND, "no such project request");
+    }
+    match method {
+        Method::PUT => {
+            match tokio::task::spawn_blocking(move || sessions::update_project(&id, &body)).await {
+                Ok(Ok(p)) => json_resp(StatusCode::OK, &p),
+                Ok(Err(e)) => error(StatusCode::BAD_REQUEST, &e),
+                Err(e) => error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+            }
+        }
+        Method::DELETE => {
+            match tokio::task::spawn_blocking(move || sessions::delete_project(&id)).await {
+                Ok(Ok(())) => json_resp(StatusCode::OK, &json!({"ok": true})),
+                Ok(Err(e)) => error(StatusCode::BAD_REQUEST, &e),
+                Err(e) => error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+            }
+        }
+        _ => error(StatusCode::NOT_FOUND, "no such project request"),
     }
 }
 
@@ -920,16 +1214,28 @@ async fn tool_execute(req: Request<Incoming>, app: Arc<App>) -> Response<Body> {
         .to_string();
     let arguments = v.get("arguments").cloned().unwrap_or(Value::Null);
     let inv = orchestrator::ToolInvocation { name, arguments };
-    // a tool can take a while (a command, a web page, an MCP server): not on the server's async threads
+    // a tool can take a while (a command, a web page, an MCP server): not on the server's async threads.
+    // Dropping this handler (e.g. client aborts /v1/tools/execute on Stop / Send now) signals the tool to terminate cleanly.
+    let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    struct CancelOnDrop(Arc<std::sync::atomic::AtomicBool>);
+    impl Drop for CancelOnDrop {
+        fn drop(&mut self) {
+            self.0.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+    let _cancel_guard = CancelOnDrop(Arc::clone(&cancel));
+    let cancel_bg = Arc::clone(&cancel);
     let name = inv.name.clone();
-    let res = tokio::task::spawn_blocking(move || orchestrator::execute_tool(&inv))
-        .await
-        .unwrap_or_else(|e| orchestrator::ToolResult {
-            name,
-            output: format!("the tool crashed: {e}"),
-            is_error: true,
-            images: vec![],
-        });
+    let res = tokio::task::spawn_blocking(move || {
+        orchestrator::execute_tool_with_cancel(&inv, &cancel_bg)
+    })
+    .await
+    .unwrap_or_else(|e| orchestrator::ToolResult {
+        name,
+        output: format!("the tool crashed: {e}"),
+        is_error: true,
+        images: vec![],
+    });
     // Tell every open tab about the result the moment it lands: the UI's tool
     // cards, the Browser pane and the permission gate see it without waiting for
     // the HTTP response of the request that produced it (which still arrives too).
@@ -979,9 +1285,187 @@ fn sse_events(app: Arc<App>) -> Response<Body> {
         .unwrap()
 }
 
+async fn engine_lifecycle(app: &App, local: bool, park: bool) -> Response<Body> {
+    if !local {
+        return error(
+            StatusCode::FORBIDDEN,
+            "engine lifecycle endpoints are loopback-only",
+        );
+    }
+    let (tx, rx) = std::sync::mpsc::channel();
+    let cmd = if park {
+        engine::Cmd::Park(tx)
+    } else {
+        engine::Cmd::Resume(tx)
+    };
+    if app.engine.lock().unwrap().send(cmd).is_err() {
+        return error(StatusCode::INTERNAL_SERVER_ERROR, "the engine has stopped");
+    }
+    let timeout = std::time::Duration::from_secs(if park { 120 } else { 600 });
+    match tokio::task::spawn_blocking(move || rx.recv_timeout(timeout)).await {
+        Ok(Ok(Ok(()))) => json_resp(
+            StatusCode::OK,
+            &json!({"status": if park { "parked" } else { "ready" }}),
+        ),
+        Ok(Ok(Err(e))) => error(StatusCode::INTERNAL_SERVER_ERROR, &e),
+        Ok(Err(_)) => error(
+            StatusCode::GATEWAY_TIMEOUT,
+            if park {
+                "timed out waiting for the engine to park"
+            } else {
+                "timed out waiting for the engine to reload"
+            },
+        ),
+        Err(e) => error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    }
+}
+
+async fn engine_park(app: &Arc<App>, local: bool) -> Response<Body> {
+    engine_lifecycle(app, local, true).await
+}
+
+async fn engine_resume(app: &Arc<App>, local: bool) -> Response<Body> {
+    engine_lifecycle(app, local, false).await
+}
+
+fn is_safe_media_name(name: &str) -> bool {
+    !name.is_empty()
+        && !name.starts_with('.')
+        && !name.contains("..")
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'))
+}
+
+fn media_mime(name: &str) -> Option<&'static str> {
+    let ext = name.rsplit('.').next()?.to_ascii_lowercase();
+    match ext.as_str() {
+        "png" => Some("image/png"),
+        "jpg" | "jpeg" => Some("image/jpeg"),
+        "webp" => Some("image/webp"),
+        "mp4" => Some("video/mp4"),
+        "webm" => Some("video/webm"),
+        _ => None,
+    }
+}
+
+fn parse_byte_range(hdr: &str, size: u64) -> Option<Result<(u64, u64), ()>> {
+    let spec = hdr.strip_prefix("bytes=")?.split(',').next()?.trim();
+    let (a, b) = spec.split_once('-')?;
+    if a.is_empty() && b.is_empty() {
+        return Some(Err(()));
+    }
+    if size == 0 {
+        return Some(Err(()));
+    }
+    if a.is_empty() {
+        let suffix: u64 = b.parse().ok()?;
+        if suffix == 0 {
+            return Some(Err(()));
+        }
+        let start = size.saturating_sub(suffix);
+        return Some(Ok((start, size - 1)));
+    }
+    let start: u64 = a.parse().ok()?;
+    let end = if b.is_empty() {
+        size - 1
+    } else {
+        b.parse::<u64>().ok()?.min(size - 1)
+    };
+    if start >= size || start > end {
+        return Some(Err(()));
+    }
+    Some(Ok((start, end)))
+}
+
+async fn serve_media(path: &str, req: &Request<Incoming>, head: bool) -> Response<Body> {
+    let dir = media_dir();
+    let path = path.to_string();
+    let range_hdr = req
+        .headers()
+        .get("range")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
+    match tokio::task::spawn_blocking(move || read_media_response(&dir, &path, range_hdr.as_deref(), head)).await {
+        Ok(resp) => resp,
+        Err(e) => error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    }
+}
+
+fn read_media_response(
+    dir: &std::path::Path,
+    path: &str,
+    range_hdr: Option<&str>,
+    head: bool,
+) -> Response<Body> {
+    use std::io::{Read, Seek, SeekFrom};
+    let name = path.trim_start_matches("/v1/media/");
+    if !is_safe_media_name(name) {
+        return error(StatusCode::BAD_REQUEST, "invalid media filename");
+    }
+    let Some(mime) = media_mime(name) else {
+        return error(StatusCode::NOT_FOUND, "unsupported media type");
+    };
+    let file_path = dir.join(name);
+    let Ok(mut f) = std::fs::File::open(&file_path) else {
+        return error(StatusCode::NOT_FOUND, "media file not found");
+    };
+    let Ok(meta) = f.metadata() else {
+        return error(StatusCode::INTERNAL_SERVER_ERROR, "failed to stat media file");
+    };
+    let size = meta.len();
+    if let Some(rh) = range_hdr {
+        if let Some(parsed) = parse_byte_range(rh, size) {
+            match parsed {
+                Err(()) => {
+                    return Response::builder()
+                        .status(StatusCode::RANGE_NOT_SATISFIABLE)
+                        .header("content-range", format!("bytes */{size}"))
+                        .body(Full::new(Bytes::new()).boxed())
+                        .unwrap();
+                }
+                Ok((start, end)) => {
+                    let len = (end - start + 1) as usize;
+                    let mut buf = Vec::new();
+                    if !head {
+                        if f.seek(SeekFrom::Start(start)).is_err() {
+                            return error(StatusCode::INTERNAL_SERVER_ERROR, "seek failed");
+                        }
+                        buf.resize(len, 0);
+                        if f.read_exact(&mut buf).is_err() {
+                            return error(StatusCode::INTERNAL_SERVER_ERROR, "read failed");
+                        }
+                    }
+                    return Response::builder()
+                        .status(StatusCode::PARTIAL_CONTENT)
+                        .header("content-type", mime)
+                        .header("accept-ranges", "bytes")
+                        .header("content-range", format!("bytes {start}-{end}/{size}"))
+                        .header("content-length", len.to_string())
+                        .header("cache-control", "public, max-age=3600")
+                        .body(Full::new(Bytes::from(buf)).boxed())
+                        .unwrap();
+                }
+            }
+        }
+    }
+    let mut buf = Vec::new();
+    if !head && f.read_to_end(&mut buf).is_err() {
+        return error(StatusCode::INTERNAL_SERVER_ERROR, "read failed");
+    }
+    Response::builder()
+        .status(StatusCode::OK)
+        .header("content-type", mime)
+        .header("accept-ranges", "bytes")
+        .header("content-length", size.to_string())
+        .header("cache-control", "public, max-age=3600")
+        .body(Full::new(Bytes::from(buf)).boxed())
+        .unwrap()
+}
+
 async fn chat(req: Request<Incoming>, app: Arc<App>) -> Response<Body> {
     let state = app.status.lock().unwrap().state;
-    if state != "ready" {
+    if state != "ready" && state != "parked" {
         return error(
             StatusCode::SERVICE_UNAVAILABLE,
             &format!("the model is {state}"),
@@ -1020,7 +1504,7 @@ async fn chat(req: Request<Incoming>, app: Arc<App>) -> Response<Body> {
         .engine
         .lock()
         .unwrap()
-        .send(engine::Request {
+        .send(engine::Cmd::Chat(engine::Request {
             messages,
             opts,
             max_tokens,
@@ -1028,7 +1512,7 @@ async fn chat(req: Request<Incoming>, app: Arc<App>) -> Response<Body> {
             cache_prompt,
             sampling,
             tx,
-        })
+        }))
         .is_err()
     {
         return error(StatusCode::INTERNAL_SERVER_ERROR, "the engine has stopped");
@@ -1266,6 +1750,13 @@ mod tests {
             "a <|role|> b <\u{200b}|im_start|> c"
         );
         assert_eq!(neutralize_with("a <|role|> b", Some(&sp)), "a <|role|> b");
+        // literal </tool_response> inside a tool output (e.g. reading source code) is disarmed without double-wrapping
+        let tool_wrapped = "<tool_response>\n247: const val TOOL_CLOSE = \"\\n</tool_response>\"\n</tool_response>";
+        let disarmed = disarm_control_tags(Role::Tool, tool_wrapped.to_string());
+        assert_eq!(
+            disarmed,
+            "247: const val TOOL_CLOSE = \"\\n<\u{200b}/tool_response>\""
+        );
         // a fetched page that mentions the picture token does not make picture slots; a real picture still does
         let b = json!({"messages": [
             {"role": "tool", "content": "{\"image_token\":\"<|image_pad|>\",\"v\":\"<|vision_start|>\"}"},
@@ -1331,5 +1822,50 @@ mod tests {
             resp.headers().get("content-type").unwrap(),
             "text/html; charset=utf-8"
         );
+    }
+
+    #[test]
+    fn media_name_and_byte_range_validation() {
+        assert!(is_safe_media_name("photo_1.png"));
+        assert!(is_safe_media_name("clip-2026.mp4"));
+        assert!(!is_safe_media_name(""));
+        assert!(!is_safe_media_name(".hidden.png"));
+        assert!(!is_safe_media_name("../secret.png"));
+        assert!(!is_safe_media_name("dir/file.png"));
+        assert_eq!(parse_byte_range("bytes=0-99", 1000), Some(Ok((0, 99))));
+        assert_eq!(parse_byte_range("bytes=500-", 1000), Some(Ok((500, 999))));
+        assert_eq!(parse_byte_range("bytes=-200", 1000), Some(Ok((800, 999))));
+        assert_eq!(parse_byte_range("bytes=900-5000", 1000), Some(Ok((900, 999))));
+        assert_eq!(parse_byte_range("bytes=1000-1200", 1000), Some(Err(())));
+        assert_eq!(parse_byte_range("bytes=200-100", 1000), Some(Err(())));
+    }
+
+    #[tokio::test]
+    async fn serves_media_files_and_byte_ranges() {
+        let dir = std::env::temp_dir().join(format!("sz_media_test_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("clip.mp4");
+        std::fs::write(&file, b"0123456789abcdef").unwrap();
+
+        let full = read_media_response(&dir, "/v1/media/clip.mp4", None, false);
+        assert_eq!(full.status(), StatusCode::OK);
+        assert_eq!(full.headers().get("content-type").unwrap(), "video/mp4");
+        assert_eq!(full.headers().get("content-length").unwrap(), "16");
+        let body = full.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(&body[..], b"0123456789abcdef");
+
+        let part = read_media_response(&dir, "/v1/media/clip.mp4", Some("bytes=4-9"), false);
+        assert_eq!(part.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(part.headers().get("content-range").unwrap(), "bytes 4-9/16");
+        let pbody = part.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(&pbody[..], b"456789");
+
+        let bad = read_media_response(&dir, "/v1/media/../secret.mp4", None, false);
+        assert_eq!(bad.status(), StatusCode::BAD_REQUEST);
+
+        let oob = read_media_response(&dir, "/v1/media/clip.mp4", Some("bytes=100-200"), false);
+        assert_eq!(oob.status(), StatusCode::RANGE_NOT_SATISFIABLE);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

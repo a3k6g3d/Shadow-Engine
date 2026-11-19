@@ -56,6 +56,14 @@ struct scratch_pool : ggml_cuda_pool {
     int device = 0;
     void * buf = nullptr; size_t cap = 0;
     explicit scratch_pool(int dev) : device(dev) {}
+    ~scratch_pool() override {
+        if (buf) {
+            int prev = 0; cudaGetDevice(&prev); cudaSetDevice(device);
+            cudaFree(buf);
+            buf = nullptr; cap = 0;
+            cudaSetDevice(prev);
+        }
+    }
     void * alloc(size_t size, size_t * actual) override {
         if (size > cap) {
             int prev = 0; cudaGetDevice(&prev); cudaSetDevice(device);
@@ -70,13 +78,38 @@ struct scratch_pool : ggml_cuda_pool {
 };
 std::unique_ptr<ggml_cuda_pool> ggml_backend_cuda_context::new_pool_for_device(int device, int) { return std::make_unique<scratch_pool>(device); }
 
+static std::mutex g_ctx_mu;
+static ggml_backend_cuda_context * g_ctx[GGML_CUDA_MAX_DEVICES] = {};
+static bool g_used[GGML_CUDA_MAX_DEVICES] = {};
+
+static void mark_used() {
+    int d = 0;
+    if (cudaGetDevice(&d) == cudaSuccess && d >= 0 && d < GGML_CUDA_MAX_DEVICES) {
+        std::lock_guard<std::mutex> lock(g_ctx_mu);
+        g_used[d] = true;
+    }
+}
+
 static ggml_backend_cuda_context & ctx() {
-    static std::mutex mu;
-    static ggml_backend_cuda_context * c[GGML_CUDA_MAX_DEVICES] = {};
     const int d = ggml_cuda_get_device();
-    std::lock_guard<std::mutex> lock(mu);
-    if (!c[d]) c[d] = new ggml_backend_cuda_context(d);
-    return *c[d];
+    std::lock_guard<std::mutex> lock(g_ctx_mu);
+    if (d >= 0 && d < GGML_CUDA_MAX_DEVICES) g_used[d] = true;
+    if (!g_ctx[d]) g_ctx[d] = new ggml_backend_cuda_context(d);
+    return *g_ctx[d];
+}
+
+EXPORT void shadowzero_mmq_reset() {
+    std::lock_guard<std::mutex> lock(g_ctx_mu);
+    for (int d = 0; d < GGML_CUDA_MAX_DEVICES; d++) {
+        if (g_ctx[d]) { delete g_ctx[d]; g_ctx[d] = nullptr; }
+    }
+    for (int d = 0; d < GGML_CUDA_MAX_DEVICES; d++) {
+        if (g_used[d]) {
+            cudaSetDevice(d);
+            cudaDeviceReset();
+            g_used[d] = false;
+        }
+    }
 }
 
 EXPORT int shadowzero_mmq_version() { return 1; }
@@ -88,6 +121,7 @@ EXPORT size_t shadowzero_mmq_y_bytes(int64_t k, int64_t ntok) {
 
 EXPORT int shadowzero_mmq_quantize(const float * x, void * yq, int64_t k, int64_t ntok, int64_t xs, int type, void * stream) {
     if (k % 4 != 0) return 2;
+    mark_used();
     const int64_t k_pad = GGML_PAD(k, MATRIX_ROW_PADDING);
     quantize_mmq_q8_1_cuda(x, nullptr, yq, (ggml_type) type, k, xs, xs * ntok, xs * ntok, k_pad, ntok, 1, 1, (cudaStream_t) stream);
     return cudaGetLastError() == cudaSuccess ? 0 : 3;
@@ -97,6 +131,7 @@ template <ggml_type T>
 static void run(const mmq_args & a, cudaStream_t s) { mul_mat_q_case<T>(ctx(), a, s); }
 
 EXPORT int shadowzero_mmq_gemm(int type, const void * w, const void * yq, float * dst, int64_t rows, int64_t k, int64_t ntok, int64_t dst_stride, void * stream) {
+    mark_used();
     const ggml_type t = (ggml_type) type;
     const int64_t qk = t == GGML_TYPE_IQ4_NL ? 32 : 256;   // the supported types: K-quants and IQ4_XS are 256-value blocks
     if (k % qk != 0) return 2;
@@ -165,6 +200,7 @@ EXPORT size_t shadowzero_mmvq_y_bytes(int64_t k, int64_t ntok) {
 
 EXPORT int shadowzero_mmvq_quantize(const float * x, void * yq, int64_t k, int64_t ntok, int64_t xs, void * stream) {
     if (k % QK8_1 != 0 || ntok < 1 || ntok > MMVQ_MAX_BATCH_SIZE) return 2;
+    mark_used();
     const int64_t k_pad = GGML_PAD(k, MATRIX_ROW_PADDING);
     quantize_row_q8_1_cuda(x, nullptr, yq, GGML_TYPE_F32, k, xs, xs * ntok, xs * ntok, k_pad, ntok, 1, 1, (cudaStream_t) stream);
     return cudaGetLastError() == cudaSuccess ? 0 : 3;
@@ -172,6 +208,7 @@ EXPORT int shadowzero_mmvq_quantize(const float * x, void * yq, int64_t k, int64
 
 EXPORT int shadowzero_mmvq_gemv(int type, const void * w, const void * yq, float * dst, int64_t rows, int64_t k, int64_t ntok, int64_t dst_stride, void * stream) {
     if (ntok < 1 || ntok > MMVQ_MAX_BATCH_SIZE || k % QK8_1 != 0 || dst_stride < rows) return 2;
+    mark_used();
     switch ((ggml_type) type) {
         case GGML_TYPE_Q8_0: case GGML_TYPE_Q4_K: case GGML_TYPE_Q5_K: case GGML_TYPE_Q6_K: case GGML_TYPE_IQ4_NL: case GGML_TYPE_IQ4_XS: break;
         default: return 1;
