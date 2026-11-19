@@ -1,0 +1,15 @@
+# Gradle / Android build outputs
+.gradle/
+build/
+local.properties
+captures/
+*.iml
+.idea/
+.kotlin/
+# Generated wrapper jar is committed; the rest of wrapper is fine
+# Keystore / signing
+*.keystore
+*.jks
+!debug.keystore
+# JVM heap dumps from OOM crashes
+*.hprof
